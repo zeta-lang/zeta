@@ -1,0 +1,13 @@
+[package]
+name = "zeta_compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+#cranelift-codegen = "0.68.0"
+#cranelift-frontend = "0.68.0"
+#cranelift-module = "0.68.0"
+#cranelift-simplejit = "0.68.0"
+#target-lexicon = "0.13.2"
+pest = "2.8.0"
+pest_derive = "2.8.0"
