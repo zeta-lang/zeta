@@ -1,150 +1,71 @@
-WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
-COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n" }
+WHITESPACE   = _{ " " | "\t" | "\r" | "\n" }
+COMMENT      = _{ "#" ~ (!"\n" ~ ANY)* }
 
-//////////////////////
-// Tokens and Base
-//////////////////////
-ident       = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
-number      = @{ ASCII_DIGIT+ }
-string      = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+program      =  { SOI ~ stmt* ~ EOI }
 
-program = { SOI ~ stmt* ~ EOI }
+stmt         = _{ import_stmt | let_stmt | return_stmt | if_stmt | while_stmt | for_stmt | match_stmt | unsafe_block | fun_decl | class_decl | expr_stmt }
 
-//////////////////////
-// Statements
-//////////////////////
-
-stmt = _{
-    import_stmt
-  | let_stmt
-  | return_stmt
-  | if_stmt
-  | while_stmt
-  | for_stmt
-  | match_stmt
-  | unsafe_block
-  | func_decl
-  | class_decl
-  | expr_stmt
-}
-
-//////////////////////
-// Imports
-//////////////////////
-import_stmt = { "import" ~ ident ~ ("::" ~ ident)* }
-
-//////////////////////
-// Let and Return
-//////////////////////
-let_stmt = { "let" ~ mut_keyword? ~ ident ~ type_annotation? ~ "=" ~ expr }
-mut_keyword   = { "mut" }
-type_ident = _{ ref_type | ident }
-
-ref_type = { "&" ~ "mut"? ~ type_ident }
-
-type_annotation = { ":" ~ type_ident }
-
-return_stmt = { "return" ~ expr? }
-expr_stmt   = { expr }
-
-//////////////////////
-// If / While / For / Match / Unsafe
-//////////////////////
-if_stmt = {
-    "if" ~ "(" ~ expr ~ ")" ~ block
-    ~ ("else" ~ if_stmt)?
-    ~ ("else" ~ block)?
-}
-
-while_stmt = { "while" ~ "(" ~ expr ~ ")" ~ block }
-for_stmt   = { "for" ~ "(" ~ let_stmt ~ expr ~ expr ~ ")" ~ block }
-
-match_stmt = { "match" ~ expr ~ "{" ~ match_arm+ ~ "}" }
-
-match_arm = { pattern ~ "=>" ~ block }
-
-pattern = { ident | number | string | tuple_pattern }
-
-tuple_pattern = { "(" ~ pattern ~ ("," ~ pattern)* ~ ")" }
-
-
-param_list = { param ~ ("," ~ param)* }
-param      = { ident ~ ":" ~ ident }
-
+import_stmt  = { "import" ~ string }
+let_stmt     = { "let" ~ mut_keyword? ~ ident ~ type_annotation? ~ "=" ~ expr }
+return_stmt  = { "return" ~ expr? }
+if_stmt      = { "if" ~ expr ~ block ~ (("else" ~ (block | if_stmt))?) }
+while_stmt   = { "while" ~ expr ~ block }
+for_stmt     = { "for" ~ let_stmt ~ ";" ~ expr ~ ";" ~ expr ~ block }
+match_stmt   = { "match" ~ expr ~ "{" ~ match_arm* ~ "}" }
 unsafe_block = { "unsafe" ~ block }
+expr_stmt    = { expr }
 
-//////////////////////
-// Function / Class
-//////////////////////
-func_decl = {
-    visibility? ~ "func" ~ ident ~ "(" ~ param_list? ~ ")" ~ type_annotation? ~ block
+
+
+fun_decl = {
+    visibility_modifier? ~ async_modifier? ~ unsafe_modifier? ~ "fun" ~ ident ~ param_list ~ type_annotation? ~ block
 }
 
-class_decl = {
-    visibility? ~ "class" ~ ident ~ ("(" ~ param_list? ~ ")")? ~ block
-}
+visibility_modifier = { "public" | "private" | "protected" }
+async_modifier = { "async" }
+unsafe_modifier = { "unsafe" }
 
-visibility = { public_keyword | private_keyword | "protected" }
+
+class_decl   = { visibility? ~ "class" ~ ident ~ param_list? ~ block }
+
+param_list   = { "(" ~ (param ~ ("," ~ param)*)? ~ ")" }
+param        = { ident ~ type_annotation? }
+type_annotation = { ":" ~ ident }
+
+block        = { "{" ~ stmt* ~ "}" }
+
+match_arm    = { pattern ~ "=>" ~ block }
+
+pattern      = _{ ident | number | string | tuple_pattern | wildcard_pattern }
+tuple_pattern = { "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")" }
+wildcard_pattern = { "_" }
+
+visibility   = _{ public_keyword | private_keyword | protected_keyword }
 public_keyword    = { "public" }
-private_keyword = { "private" }
+private_keyword   = { "private" }
 protected_keyword = { "protected" }
 
-//////////////////////
-// Expressions
-//////////////////////
-expr = { assignment }
+mut_keyword  = { "mut" }
 
-assignment = {
-    lhs ~ assign_op ~ expr
-  | logic_or
-}
+ident        = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+number       = @{ ASCII_DIGIT+ }
+string       = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 
-assign_op = {
-    "=" | "+=" | "-=" | "*=" | "/=" | "%=" |
-    "&=" | "|=" | "^=" | "<<=" | ">>="
-}
+expr         = { assignment }
 
-lhs = { accessor }
+assignment   = { lhs ~ "=" ~ expr | logic_or }
 
-//////////////////////
-// Expression Hierarchy
-//////////////////////
-logic_or  = { logic_and ~ ( "||" ~ logic_and )* }
-logic_and = { bit_or    ~ ( "&&" ~ bit_or )* }
-bit_or    = { bit_xor   ~ ( "|" ~ bit_xor )* }
-bit_xor   = { bit_and   ~ ( "^" ~ bit_and )* }
-bit_and   = { equality  ~ ( "&" ~ equality )* }
-equality  = { comparison ~ ( ("==" | "!=") ~ comparison )* }
-comparison = { shift ~ ( ("<" | ">" | "<=" | ">=") ~ shift )* }
-shift     = { term ~ ( ("<<" | ">>") ~ term )* }
-term      = { factor ~ ( ("+" | "-") ~ factor )* }
-factor    = { unary ~ ( ("*" | "/" | "%") ~ unary )* }
+lhs          = { ident }
 
-unary = {
-    ( "&mut" | "&" | "*" | "!" | "-" )* ~ primary
-}
-
-primary = _{
-    number
-  | string
-  | ident
-  | function_call
-  | accessor
-  | "(" ~ expr ~ ")"
-}
-
-//////////////////////
-// Accessors and Calls
-//////////////////////
-function_call = {
-    accessor ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")"
-}
-
-accessor = {
-    ident ~ ("." ~ ident)*
-}
-
-//////////////////////
-// Blocks
-//////////////////////
-block = { "{" ~ stmt* ~ "}" }
+logic_or     = { logic_and ~ ("||" ~ logic_and)* }
+logic_and    = { bit_or ~ ("&&" ~ bit_or)* }
+bit_or       = { bit_xor ~ ("|" ~ bit_xor)* }
+bit_xor      = { bit_and ~ ("^" ~ bit_and)* }
+bit_and      = { equality ~ ("&" ~ equality)* }
+equality     = { comparison ~ (("==" | "!=") ~ comparison)* }
+comparison   = { shift ~ (("<" | ">" | "<=" | ">=") ~ shift)* }
+shift        = { term ~ (("<<" | ">>") ~ term)* }
+term         = { factor ~ (("+" | "-") ~ factor)* }
+factor       = { unary ~ (("*" | "/" | "%") ~ unary)* }
+unary        = { ("!" | "-" | "+")* ~ primary }
+primary      = _{ number | string | ident | "(" ~ expr ~ ")" }

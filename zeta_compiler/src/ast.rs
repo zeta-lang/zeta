@@ -1,52 +1,57 @@
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Import(ImportStmt),
     Let(LetStmt),
     Return(ReturnStmt),
     If(IfStmt),
+    Else(ElseBranch),
     While(WhileStmt),
     For(ForStmt),
     Match(MatchStmt),
     UnsafeBlock(UnsafeBlock),
     FuncDecl(FuncDecl),
     ClassDecl(ClassDecl),
-    ExprStmt(ExprStmt),
+    ExprStmt(InternalExprStmt),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImportStmt {
-    pub path: String,  // For simplicity, storing the full path
+    pub path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LetStmt {
     pub mutability: Option<MutKeyword>,
     pub ident: String,
-    pub type_annotation: Option<String>,  // For simplicity
+    pub type_annotation: Option<String>,
     pub value: Box<Expr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReturnStmt {
     pub value: Option<Box<Expr>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IfStmt {
-    pub condition: Box<Expr>,
-    pub if_block: Block,
-    pub else_if: Option<Box<IfStmt>>,
-    pub else_block: Option<Block>,
+    pub condition: Expr,
+    pub then_branch: Block,
+    pub else_branch: Option<Box<ElseBranch>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum ElseBranch {
+    If(Box<IfStmt>),
+    Else(Block),
+}
+
+#[derive(Debug, Clone)]
 pub struct WhileStmt {
     pub condition: Box<Expr>,
     pub block: Block,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForStmt {
     pub let_stmt: LetStmt,
     pub condition: Box<Expr>,
@@ -54,111 +59,82 @@ pub struct ForStmt {
     pub block: Block,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MatchStmt {
     pub expr: Expr,
     pub arms: Vec<MatchArm>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MatchArm {
-    pub(crate) pattern: Pattern,
-    pub(crate) block: Block,
+    pub pattern: Pattern,
+    pub block: Block,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pattern {
     Ident(String),
-    Wildcard,
-    Number(i32),
+    Number(i64),
     String(String),
     Tuple(Vec<Pattern>),
+    Wildcard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnsafeBlock {
-    block: Block,
+    pub block: Block,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FuncDecl {
-    name: String,
-    params: Vec<Param>,
-    return_type: Option<String>,
-    body: Block,
+    pub visibility: Option<String>,
+    pub is_async: bool,
+    pub is_unsafe: bool,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<String>,
+    pub body: Block,
 }
 
-#[derive(Debug)]
-pub struct Param {
-    name: String,
-    type_annotation: Option<String>,
-}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassDecl {
-    name: String,
-    params: Option<Vec<Param>>,
-    body: Block,
+    pub visibility: Option<String>,
+    pub name: String,
+    pub params: Option<Vec<Param>>,
+    pub body: Block,
 }
 
-#[derive(Debug)]
-pub struct ExprStmt {
-    expr: Box<Expr>,
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub type_annotation: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
-    pub(crate) stmts: Vec<Stmt>,
+    pub block: Vec<Stmt>,
 }
 
-#[derive(Debug)]
-pub enum Expr {
-    Number(i32),
-    String(String),
-    Ident(String),
-    UnaryOp(UnaryOp, Box<Expr>),
-    BinaryOp(BinaryOp, Box<Expr>, Box<Expr>),
-    Assignment(Box<Expr>, AssignOp, Box<Expr>),
-    FunctionCall(Box<Expr>, Vec<Expr>),
-    Accessor(Box<Expr>, Vec<String>),  // Accessor path e.g., `a.b.c`
+#[derive(Debug, Clone)]
+pub struct InternalExprStmt {
+    pub expr: Box<Expr>,
 }
 
-#[derive(Debug)]
-pub enum UnaryOp {
-    Not,
-    Deref,
-    AddressOf,
-    Neg,
-}
-
-#[derive(Debug)]
-pub enum BinaryOp {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Modulo,
-    And,
-    Or,
-    Equal,
-    NotEqual,
-    LessThan,
-    GreaterThan,
-    LessThanOrEqual,
-    GreaterThanOrEqual,
-}
-
-#[derive(Debug)]
-pub enum AssignOp {
-    Assign,
-    AddAssign,
-    SubtractAssign,
-    MultiplyAssign,
-    DivideAssign,
-    ModuloAssign,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MutKeyword {
     Mut,
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Number(i64),
+    String(String),
+    Ident(String),
+    Binary {
+        left: Box<Expr>,
+        op: String,
+        right: Box<Expr>,
+    },
+    Assignment(Box<Expr>, String, Box<Expr>),
 }
