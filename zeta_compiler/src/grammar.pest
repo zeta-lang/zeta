@@ -10,7 +10,7 @@ let_stmt     = { "let" ~ mut_keyword? ~ ident ~ type_annotation? ~ "=" ~ expr }
 return_stmt  = { "return" ~ expr? }
 if_stmt      = { "if" ~ expr ~ block ~ (("else" ~ (block | if_stmt))?) }
 while_stmt   = { "while" ~ expr ~ block }
-for_stmt     = { "for" ~ let_stmt ~ ";" ~ expr ~ ";" ~ expr ~ block }
+for_stmt = { "for" ~ "(" ~ let_stmt? ~ ";" ~ expr? ~ ";" ~ expr? ~ ")" ~ block }
 match_stmt   = { "match" ~ expr ~ "{" ~ match_arm* ~ "}" }
 unsafe_block = { "unsafe" ~ block }
 expr_stmt    = { expr }
@@ -53,7 +53,7 @@ string       = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 
 expr         = { assignment }
 
-assignment   = { lhs ~ "=" ~ expr | logic_or }
+assignment   = { lhs ~ assign_op ~ expr | logic_or }
 
 lhs          = { ident }
 
@@ -69,3 +69,21 @@ term         = { factor ~ (("+" | "-") ~ factor)* }
 factor       = { unary ~ (("*" | "/" | "%") ~ unary)* }
 unary        = { ("!" | "-" | "+")* ~ primary }
 primary      = _{ number | string | ident | "(" ~ expr ~ ")" }
+
+compound_assign_op = {
+    "+=" | "-=" | "*=" | "/=" | "%=" |
+    ">>=" | "<<=" | "&=" | "|=" | "^="
+}
+
+assign_expr = {
+    ident ~ (assign_op | compound_assign_op) ~ expr
+}
+
+assign_op = { "=" | compound_assign_op }
+
+comparison_op = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
+
+comparison_expr = {
+    expr ~ comparison_op ~ expr
+}
+

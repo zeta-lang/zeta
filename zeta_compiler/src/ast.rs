@@ -53,11 +53,24 @@ pub struct WhileStmt {
 
 #[derive(Debug, Clone)]
 pub struct ForStmt {
-    pub let_stmt: LetStmt,
-    pub condition: Box<Expr>,
-    pub increment: Box<Expr>,
+    pub let_stmt: Option<LetStmt>,
+    pub condition: Option<Box<Expr>>,
+    pub increment: Option<Box<Expr>>,
     pub block: Block,
 }
+
+#[derive(Debug, Clone)]
+pub enum Op {
+    Add, Sub, Mul, Div, Mod,
+    Shl, Shr, BitOr, BitXor, BitAnd,
+    Assign,
+    AddAssign, SubAssign, MulAssign, DivAssign,
+    ShlAssign, ShrAssign, BitOrAssign, BitXorAssign, BitAndAssign,
+    Eq, Neq, Lt, Lte, Gt, Gte,
+    // etc.
+    ModAssign,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct MatchStmt {
@@ -133,7 +146,7 @@ pub enum Expr {
     Ident(String),
     Binary {
         left: Box<Expr>,
-        op: String,
+        op: Op,
         right: Box<Expr>,
     },
     Assignment(Box<Expr>, String, Box<Expr>),
