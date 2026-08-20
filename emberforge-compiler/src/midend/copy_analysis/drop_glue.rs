@@ -1,15 +1,15 @@
 use crate::midend::copy_analysis::drop_emitter::{AllocatorResolver, DropEmitter};
 use crate::midend::ir::block_data::CurrentBlockData;
-use ir::hir::{self, DropKind, HirStruct, HirType, ProvenanceAnnotation, StrId};
+use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::{FxHashBuilder, FxHashMap};
+use ir::ir_hasher::HashMap;
 use ir::registry::global_registry::GlobalRegistry;
 use ir::ssa_ir::{
     AllocatorKind, BasicBlock, BlockId, Function, Instruction, Operand, SsaType, Value,
 };
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::sync::Arc;
+use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
 struct GlueAllocatorResolver;
@@ -34,17 +34,25 @@ impl AllocatorResolver for GlueAllocatorResolver {
 /// Whole-program registry of which structs need drop glue and what each
 /// glue function is called
 pub struct DropGlueRegistry {
-    is_droppable: FxHashMap<StrId, bool>,
-    glue_names: FxHashMap<StrId, StrId>,
-    has_own_drop: FxHashMap<StrId, bool>,
+    is_droppable: HashMap<StrId, bool>,
+    glue_names: HashMap<StrId, StrId>,
+    has_own_drop: HashMap<StrId, bool>,
 }
 
 impl DropGlueRegistry {
     pub fn new<'a, 'bump>(registry: &GlobalRegistry<'a, 'bump>, context: Arc<StringPool>) -> Self {
         let drop_iface = StrId(context.intern("Drop"));
-        let struct_names: Vec<StrId> = registry.structs.borrow().keys().copied().collect();
 
-        let mut is_droppable: FxHashMap<StrId, bool> = FxHashMap::default();
+        let struct_names: Vec<StrId> = {
+            let structs = registry.structs.borrow();
+            structs
+                .iter()
+                .filter(|(_, hir_struct)| hir_struct.generics.is_none())
+                .map(|(&name, _)| name)
+                .collect()
+        };
+
+        let mut is_droppable: HashMap<StrId, bool> = HashMap::default();
         for &name in &struct_names {
             is_droppable.insert(name, false);
         }
@@ -58,7 +66,7 @@ impl DropGlueRegistry {
                 .unwrap_or(false)
         };
 
-        let mut has_own_drop: FxHashMap<StrId, bool> = FxHashMap::default();
+        let mut has_own_drop: HashMap<StrId, bool> = HashMap::default();
         for &name in &struct_names {
             has_own_drop.insert(name, implements_drop(name));
         }
@@ -86,11 +94,11 @@ impl DropGlueRegistry {
             }
         }
 
-        let mut glue_names: FxHashMap<StrId, StrId> = FxHashMap::default();
+        let mut glue_names: HashMap<StrId, StrId> = HashMap::default();
         for &name in &struct_names {
             if is_droppable.get(&name).copied().unwrap_or(false) {
                 let mangled_name = context.resolve_string(&name);
-                let glue_name = StrId(context.intern(&format!("{}_drop_glue", mangled_name)));
+                let glue_name = StrId(intern_fmt!(context, "{}_drop_glue", mangled_name));
                 glue_names.insert(name, glue_name);
             }
         }
@@ -111,7 +119,7 @@ impl DropGlueRegistry {
 
     fn type_is_droppable<'a, 'bump>(
         ty: &HirType<'a, 'bump>,
-        is_droppable: &FxHashMap<StrId, bool>,
+        is_droppable: &HashMap<StrId, bool>,
     ) -> bool {
         match ty {
             HirType::Struct { name, .. } => is_droppable.get(name).copied().unwrap_or(false),
@@ -156,10 +164,11 @@ pub struct DropGlueBuilder;
 impl DropGlueBuilder {
     pub fn build_all<'a, 'bump>(
         glue_registry: &DropGlueRegistry,
-        structs: &HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        struct_mangled_map: &HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_field_offsets: &HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-        allocator_kind: &HashMap<StrId, AllocatorKind, FxHashBuilder>,
+        structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+        enums: &HashMap<StrId, HirEnum<'a, 'bump>>,
+        struct_mangled_map: &HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_field_offsets: &HashMap<StrId, HashMap<StrId, usize>>,
+        allocator_kind: &HashMap<StrId, AllocatorKind>,
         context: Arc<StringPool>,
         struct_names_owned_by_this_module: &[StrId],
     ) -> Vec<(StrId, Function)> {
@@ -169,6 +178,7 @@ impl DropGlueBuilder {
                 Self::build_one(
                     glue_registry,
                     structs,
+                    enums,
                     struct_mangled_map,
                     struct_field_offsets,
                     allocator_kind,
@@ -181,10 +191,11 @@ impl DropGlueBuilder {
 
     fn build_one<'a, 'bump>(
         glue_registry: &DropGlueRegistry,
-        structs: &HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        struct_mangled_map: &HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_field_offsets: &HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-        allocator_kind: &HashMap<StrId, AllocatorKind, FxHashBuilder>,
+        structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+        enums: &HashMap<StrId, HirEnum<'a, 'bump>>,
+        struct_mangled_map: &HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_field_offsets: &HashMap<StrId, HashMap<StrId, usize>>,
+        allocator_kind: &HashMap<StrId, AllocatorKind>,
         context: Arc<StringPool>,
         struct_name: StrId,
     ) -> Option<(StrId, Function)> {
@@ -207,13 +218,13 @@ impl DropGlueBuilder {
             params: SmallVec::new(),
             ret_type: SsaType::Void,
             blocks: SmallVec::new(),
-            value_types: HashMap::with_hasher(FxHashBuilder),
+            value_types: HashMap::default(),
             entry: BlockId(0),
             function_metadata: Default::default(),
         };
         func.params.push((this_val, this_ty.clone()));
 
-        let mut value_types = HashMap::with_hasher(FxHashBuilder);
+        let mut value_types = HashMap::default();
         value_types.insert(this_val, this_ty);
 
         let entry_bb = BlockId(0);
@@ -286,6 +297,7 @@ impl DropGlueBuilder {
             struct_mangled_map,
             struct_field_offsets,
             structs,
+            enums,
             allocator_kind,
             glue_registry,
         );
@@ -316,7 +328,7 @@ impl DropGlueBuilder {
                     pointee_ty,
                     allocator,
                 } => {
-                    let field_ssa_ty = lower_type_hir(&pointee_ty);
+                    let field_ssa_ty = lower_type_hir(&pointee_ty, enums);
                     let field_addr = emitter.current_block_data.fresh_value();
                     emitter.current_block_data.value_types.insert(
                         field_addr,
