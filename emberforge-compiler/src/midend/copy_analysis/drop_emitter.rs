@@ -2,18 +2,18 @@ use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::DropMoveState;
 use crate::midend::ir::block_data::CurrentBlockData;
 use codex_dependency_graph::DepGraph;
-use ir::hir::{self, DropKind, HirStruct, HirType, ProvenanceAnnotation, StrId};
+use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
 use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::FxHashBuilder;
+use ir::ir_hasher::HashMap;
 use ir::layout::{Layout, TargetInfo, layout_of_ssa, sizeof_ssa};
 use ir::ssa_ir::{
     AllocatorKind, BinOp, BlockId, Instruction, IntrinsicOp, Operand, SsaType, Value,
 };
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
+use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
 pub trait AllocatorResolver {
@@ -24,7 +24,7 @@ pub trait AllocatorResolver {
 }
 
 pub struct FnAllocatorResolver<'r> {
-    pub var_map: &'r HashMap<StrId, Value, FxHashBuilder>,
+    pub var_map: &'r HashMap<StrId, Value>,
     pub context: Arc<StringPool>,
     pub dep_graph: &'r RefCell<DepGraph>,
 }
@@ -81,11 +81,11 @@ impl<'r> AllocatorResolver for FnAllocatorResolver<'r> {
 pub struct DropEmitter<'x, 'a, 'bump, 'f> {
     pub current_block_data: &'x mut CurrentBlockData<'f>,
     pub context: Arc<StringPool>,
-    pub struct_mangled_map: &'x HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-    pub struct_field_offsets:
-        &'x HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    pub structs: &'x HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-    pub allocator_kind: &'x HashMap<StrId, AllocatorKind, FxHashBuilder>,
+    pub struct_mangled_map: &'x HashMap<StrId, HashMap<StrId, StrId>>,
+    pub struct_field_offsets: &'x HashMap<StrId, HashMap<StrId, usize>>,
+    pub structs: &'x HashMap<StrId, HirStruct<'a, 'bump>>,
+    pub enums: &'x HashMap<StrId, HirEnum<'a, 'bump>>,
+    pub allocator_kind: &'x HashMap<StrId, AllocatorKind>,
     pub glue_registry: &'x DropGlueRegistry,
 }
 
@@ -93,14 +93,11 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
     pub fn new(
         current_block_data: &'x mut CurrentBlockData<'f>,
         context: Arc<StringPool>,
-        struct_mangled_map: &'x HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_field_offsets: &'x HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        structs: &'x HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        allocator_kind: &'x HashMap<StrId, AllocatorKind, FxHashBuilder>,
+        struct_mangled_map: &'x HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_field_offsets: &'x HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'x HashMap<StrId, HirStruct<'a, 'bump>>,
+        enums: &'x HashMap<StrId, HirEnum<'a, 'bump>>,
+        allocator_kind: &'x HashMap<StrId, AllocatorKind>,
         glue_registry: &'x DropGlueRegistry,
     ) -> Self {
         Self {
@@ -109,6 +106,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             struct_mangled_map,
             struct_field_offsets,
             structs,
+            enums,
             allocator_kind,
             glue_registry,
         }
@@ -123,7 +121,15 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         allocator: &ProvenanceAnnotation<'bump>,
         resolver: &mut R,
     ) -> Value {
-        let root_val = match &allocator.root {
+        self.resolve_allocator_value_named(allocator, resolver).0
+    }
+
+    fn resolve_allocator_value_named<R: AllocatorResolver>(
+        &mut self,
+        allocator: &ProvenanceAnnotation<'bump>,
+        resolver: &mut R,
+    ) -> (Value, Option<StrId>) {
+        let mut base = match &allocator.root {
             hir::ProvenanceRoot::Global { module_idx, name } => {
                 let mangled = resolver.lower_global_ref(*module_idx, *name);
                 let dest = self.current_block_data.fresh_value();
@@ -139,7 +145,35 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             }
             root => resolver.resolve_root(root),
         };
-        self.apply_provenance_path(root_val, allocator.path)
+
+        let mut known_name: Option<StrId> = None;
+        for seg in allocator.path {
+            match seg {
+                hir::ProvenancePathSegment::Field(field) => {
+                    let (addr, _field_ty, name) = self.field_addr_on_value(base, *field);
+                    base = addr;
+                    known_name = name;
+                }
+                hir::ProvenancePathSegment::Deref => {
+                    let dest = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Load {
+                        dest,
+                        ptr: Operand::Value(base),
+                    });
+                    let pointee_ty = match self.current_block_data.value_types.get(&base) {
+                        Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                        other => {
+                            panic!("[resolve_allocator_value] Deref of non-pointer {:?}", other)
+                        }
+                    };
+                    self.current_block_data.value_types.insert(dest, pointee_ty);
+                    base = dest;
+                    known_name = None;
+                }
+            }
+        }
+
+        (base, known_name)
     }
 
     pub fn apply_provenance_path(
@@ -150,7 +184,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         for seg in path {
             match seg {
                 hir::ProvenancePathSegment::Field(field) => {
-                    let (addr, _field_ty) = self.field_addr_on_value(base, *field);
+                    let (addr, _field_ty, _known_name) = self.field_addr_on_value(base, *field);
                     base = addr;
                 }
                 hir::ProvenancePathSegment::Deref => {
@@ -171,7 +205,11 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         base
     }
 
-    pub fn field_addr_on_value(&mut self, obj_val: Value, field: StrId) -> (Value, SsaType) {
+    pub fn field_addr_on_value(
+        &mut self,
+        obj_val: Value,
+        field: StrId,
+    ) -> (Value, SsaType, Option<StrId>) {
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
             Some(SsaType::User(name, _)) => *name,
             Some(SsaType::Pointer(inner)) => match inner.as_ref() {
@@ -195,12 +233,43 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .get(&field)
             .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name));
 
-        let field_ty = self
+        let hir_field = self
             .structs
             .get(&cls_name)
-            .and_then(|hc| hc.fields.iter().find(|f| f.name == field))
-            .map(|f| lower_type_hir(&f.field_type))
-            .unwrap_or(SsaType::I64);
+            .unwrap_or_else(|| {
+                panic!(
+                    "[field_addr_on_value] struct `{}` not found in DropEmitter's struct map \
+                     (looking up field `{}`), even though struct_field_offsets has an entry for \
+                     it.",
+                    cls_name, field
+                )
+            })
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .unwrap_or_else(|| {
+                panic!(
+                    "[field_addr_on_value] struct `{}` has no field `{}`",
+                    cls_name, field
+                )
+            });
+
+        if let HirType::Generic(param) = hir_field.field_type {
+            panic!(
+                "[field_addr_on_value] field `{}` on struct `{}` has unresolved generic type \
+                 parameter `{}`.",
+                field, cls_name, param
+            );
+        }
+
+        let known_name = match &hir_field.field_type {
+            HirType::Struct { name, .. }
+            | HirType::Enum { name, .. }
+            | HirType::DynInterface(name, _) => Some(*name),
+            _ => None,
+        };
+
+        let field_ty = lower_type_hir(&hir_field.field_type, self.enums);
 
         let addr = self.current_block_data.fresh_value();
         self.emit(Instruction::FieldAddr {
@@ -212,7 +281,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .value_types
             .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
 
-        (addr, field_ty)
+        (addr, field_ty, known_name)
     }
 
     pub fn mangled_method_name(&self, struct_name: StrId, method_name: &str) -> StrId {
@@ -237,7 +306,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
     ) -> StrId {
         let base = self.mangled_method_name(struct_name, method_name);
         let suffix = type_suffix_with_pool(self.context.clone(), ty);
-        StrId(self.context.intern(&format!("{}{}", base.as_str(), suffix)))
+        StrId(intern_fmt!(self.context, "{}{}", base.as_str(), suffix))
     }
 
     pub fn struct_name_of_value(&self, v: Value) -> Option<StrId> {
@@ -274,7 +343,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         ptr_val: Value,
     ) {
         let (data_ptr, size_v, align_v) = if let HirType::Slice(inner) = pointee_ty {
-            let elem_ssa = lower_type_hir(inner);
+            let elem_ssa = lower_type_hir(inner, self.enums);
             let Layout {
                 size: elem_size,
                 align: elem_align,
@@ -334,7 +403,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
 
             (data_ptr, total_size_v, align_v)
         } else {
-            let query_ty = lower_type_hir(pointee_ty);
+            let query_ty = lower_type_hir(pointee_ty, self.enums);
             let size_v = self.current_block_data.fresh_value();
             self.emit(Instruction::Intrinsic {
                 dest: Some(size_v),
@@ -373,6 +442,42 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         });
     }
 
+    pub fn emit_owned_pointer_drop_with_known_allocator_ty<R: AllocatorResolver>(
+        &mut self,
+        owner: Option<StrId>,
+        pointee: &DropKind<'a, 'bump>,
+        pointee_ty: &HirType<'a, 'bump>,
+        allocator: &ProvenanceAnnotation<'bump>,
+        known_allocator_field_ty: Option<&HirType<'a, 'bump>>,
+        ptr_val: Value,
+        track_partial_moves: bool,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+    ) {
+        let alloc_val = match (allocator.root, allocator.path, known_allocator_field_ty) {
+            (
+                hir::ProvenanceRoot::ThisRoot,
+                [hir::ProvenancePathSegment::Field(field)],
+                Some(field_ty),
+            ) => {
+                let this_val = resolver.resolve_root(&hir::ProvenanceRoot::ThisRoot);
+                self.field_addr_typed(this_val, *field, field_ty).0
+            }
+            _ => self.resolve_allocator_value(allocator, resolver),
+        };
+        self.emit_owned_pointer_drop_from_alloc(
+            owner,
+            pointee,
+            pointee_ty,
+            allocator,
+            alloc_val,
+            ptr_val,
+            track_partial_moves,
+            drop_state,
+            resolver,
+        );
+    }
+
     pub fn emit_owned_pointer_drop<R: AllocatorResolver>(
         &mut self,
         owner: Option<StrId>,
@@ -384,9 +489,122 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         drop_state: Option<&DropMoveState<'a, 'bump>>,
         resolver: &mut R,
     ) {
-        let alloc_val = self.resolve_allocator_value(allocator, resolver);
+        let (alloc_val, known_name) = self.resolve_allocator_value_named(allocator, resolver);
+        let alloc_cls_name = known_name
+            .or_else(|| self.struct_name_of_value(alloc_val))
+            .unwrap_or_else(|| {
+                panic!(
+                    "emit_owned_pointer_drop: could not determine allocator's struct type \
+                     (alloc_val={:?}, resolved SsaType={:?}, allocator={})",
+                    alloc_val,
+                    self.current_block_data.value_types.get(&alloc_val),
+                    allocator,
+                )
+            });
+
+        let kind = self
+            .allocator_kind
+            .get(&alloc_cls_name)
+            .copied()
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "struct `{}` used as an allocator but has no AllocatorKind entry",
+                    alloc_cls_name
+                )
+            });
+
+        let partial_move = track_partial_moves
+            && owner.is_some()
+            && drop_state.map_or(false, |ds| ds.has_any_field_moves(owner.unwrap()));
+
+        match pointee {
+            DropKind::Type(struct_name) => match (kind, partial_move) {
+                (AllocatorKind::Owning, false) => {
+                    self.emit_owning_free_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+                }
+                (AllocatorKind::Owning, true) | (AllocatorKind::RawOnly, true) => {
+                    if let (Some(o), Some(ds)) = (owner, drop_state) {
+                        self.emit_partial_struct_field_drops(o, *struct_name, ptr_val, ds);
+                    }
+                    self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+                }
+                (AllocatorKind::RawOnly, false) => {
+                    if let Some(glue) = self.glue_registry.glue_name_for(*struct_name) {
+                        self.emit(Instruction::Call {
+                            dest: None,
+                            func: Operand::FunctionRef(glue),
+                            args: SmallVec::from_slice_copy(&[Operand::Value(ptr_val)]),
+                        });
+                    }
+                    self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+                }
+            },
+
+            DropKind::Slice {
+                element,
+                element_ty,
+            } => {
+                self.emit_slice_loop_drop(element, element_ty, ptr_val, resolver);
+                self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+            }
+
+            DropKind::Undroppable => {
+                self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+            }
+
+            DropKind::OwnedPointer {
+                pointee: inner_pointee,
+                pointee_ty: inner_pointee_ty,
+                allocator: inner_allocator,
+            } => {
+                let inner_val = if matches!(inner_pointee_ty, HirType::Slice(_)) {
+                    ptr_val
+                } else {
+                    let loaded = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Load {
+                        dest: loaded,
+                        ptr: Operand::Value(ptr_val),
+                    });
+                    self.current_block_data
+                        .value_types
+                        .insert(loaded, lower_type_hir(pointee_ty, self.enums));
+                    loaded
+                };
+                self.emit_owned_pointer_drop(
+                    owner,
+                    inner_pointee,
+                    inner_pointee_ty,
+                    inner_allocator,
+                    inner_val,
+                    false,
+                    drop_state,
+                    resolver,
+                );
+                self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+            }
+        }
+    }
+
+    fn emit_owned_pointer_drop_from_alloc<R: AllocatorResolver>(
+        &mut self,
+        owner: Option<StrId>,
+        pointee: &DropKind<'a, 'bump>,
+        pointee_ty: &HirType<'a, 'bump>,
+        allocator: &ProvenanceAnnotation<'bump>,
+        alloc_val: Value,
+        ptr_val: Value,
+        track_partial_moves: bool,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+    ) {
         let alloc_cls_name = self.struct_name_of_value(alloc_val).unwrap_or_else(|| {
-            panic!("emit_owned_pointer_drop: could not determine allocator's struct type")
+            panic!(
+                "emit_owned_pointer_drop: could not determine allocator's struct type \
+                 (alloc_val={:?}, resolved SsaType={:?}, allocator={})",
+                alloc_val,
+                self.current_block_data.value_types.get(&alloc_val),
+                allocator,
+            )
         });
 
         let kind = self
@@ -454,7 +672,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     });
                     self.current_block_data
                         .value_types
-                        .insert(loaded, lower_type_hir(pointee_ty));
+                        .insert(loaded, lower_type_hir(pointee_ty, self.enums));
                     loaded
                 };
                 self.emit_owned_pointer_drop(
@@ -470,6 +688,54 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
             }
         }
+    }
+
+    fn field_addr_typed(
+        &mut self,
+        obj_val: Value,
+        field: StrId,
+        known_field_ty: &HirType<'a, 'bump>,
+    ) -> (Value, SsaType) {
+        let cls_name = match self.current_block_data.value_types.get(&obj_val) {
+            Some(SsaType::User(name, _)) => *name,
+            Some(SsaType::Pointer(inner)) => match inner.as_ref() {
+                SsaType::User(name, _) => *name,
+                other => panic!("[field_addr_typed] pointer to non-User type: {:?}", other),
+            },
+            other => panic!(
+                "[field_addr_typed] could not determine struct type: {:?}",
+                other
+            ),
+        };
+
+        let offsets = self
+            .struct_field_offsets
+            .get(&cls_name)
+            .unwrap_or_else(|| panic!("Unknown struct {} in provenance path", cls_name));
+        let offset = *offsets
+            .get(&field)
+            .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name));
+
+        if let HirType::Generic(param) = known_field_ty {
+            panic!(
+                "[field_addr_typed] field `{}` on struct `{}` has unresolved generic type \
+                 parameter `{}`.",
+                field, cls_name, param
+            );
+        }
+        let field_ty = lower_type_hir(known_field_ty, self.enums);
+
+        let addr = self.current_block_data.fresh_value();
+        self.emit(Instruction::FieldAddr {
+            dest: addr,
+            base: Operand::Value(obj_val),
+            offset,
+        });
+        self.current_block_data
+            .value_types
+            .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
+
+        (addr, field_ty)
     }
 
     pub fn emit_element_drop<R: AllocatorResolver>(
@@ -500,7 +766,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 });
                 self.current_block_data
                     .value_types
-                    .insert(loaded, lower_type_hir(pointee_ty));
+                    .insert(loaded, lower_type_hir(pointee_ty, self.enums));
                 self.emit_owned_pointer_drop(
                     None, pointee, pointee_ty, allocator, loaded, false, None, resolver,
                 );
@@ -545,7 +811,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             return;
         }
 
-        let elem_ssa = lower_type_hir(element_ty);
+        let elem_ssa = lower_type_hir(element_ty, self.enums);
         let elem_size = sizeof_ssa(&elem_ssa, TargetInfo { ptr_bytes: 8 })
             .expect("slice element type has no known size");
 
