@@ -10,6 +10,27 @@ use zetaruntime::string_pool::StringPool;
 
 pub type NodeIdx = usize;
 
+#[derive(Debug)]
+pub struct PackageMismatch {
+    pub module_idx: usize,
+    pub file_path: PathBuf,
+    pub declared_package: String,
+    pub expected_package: String,
+}
+
+impl std::fmt::Display for PackageMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: package mismatch: declared as `package {};`, but its location under \
+             the source root implies `package {};`",
+            self.file_path.display(),
+            self.declared_package,
+            self.expected_package,
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct AstModule<'a, 'bump> {
     pub name: StrId,
@@ -171,6 +192,7 @@ pub struct DepGraph {
 
     current_locals: HashMap<StrId, StrId>,
     current_self_type: Option<StrId>,
+    package_segments: HashMap<usize, Vec<StrId>>,
 }
 
 impl DepGraph {
@@ -187,7 +209,73 @@ impl DepGraph {
             method_symbol_table: HashMap::default(),
             current_locals: HashMap::default(),
             current_self_type: None,
+            package_segments: HashMap::default(),
         }
+    }
+
+    /// `module_idx`'s package, split into mangle segments (on "::"), or
+    /// empty if the module declares no package.
+    pub fn package_mangle_segments(&self, module_idx: usize, pool: &StringPool) -> Vec<StrId> {
+        match self.get_module_package(module_idx) {
+            Some(pkg) => pool
+                .resolve_string(&pkg)
+                .split("::")
+                .map(|seg| StrId(pool.intern(seg)))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Mangled name for a free function `name` declared in `module_idx`.
+    /// `extern "C"` functions are never mangled.
+    pub fn mangle_free_function(
+        &self,
+        module_idx: usize,
+        name: StrId,
+        is_extern_c: bool,
+        pool: &StringPool,
+    ) -> StrId {
+        if is_extern_c {
+            return name;
+        }
+        let segments = self.package_mangle_segments(module_idx, pool);
+        Self::scoped_name(&segments, name, pool)
+    }
+
+    /// Mangled name for a bare type (struct/enum/interface) `name`
+    /// declared in `module_idx`.
+    pub fn mangle_type_name(&self, module_idx: usize, name: StrId, pool: &StringPool) -> StrId {
+        let segments = self.package_mangle_segments(module_idx, pool);
+        Self::scoped_name(&segments, name, pool)
+    }
+
+    /// Mangled name for `struct_name`'s method `method_name`, where
+    /// `struct_name` is the type's own (already-mangled or bare) key and
+    /// `module_idx` is the module the *method* is declared in.
+    pub fn mangle_struct_method(
+        &self,
+        module_idx: usize,
+        struct_name: StrId,
+        method_name: StrId,
+        pool: &StringPool,
+    ) -> StrId {
+        let mut segments = Vec::with_capacity(4);
+        segments.push(struct_name);
+        segments.extend(self.package_mangle_segments(module_idx, pool));
+        Self::scoped_name(&segments, method_name, pool)
+    }
+
+    fn scoped_name(segments: &[StrId], name: StrId, pool: &StringPool) -> StrId {
+        let mut joined = segments
+            .iter()
+            .map(|s| pool.resolve_string(s))
+            .collect::<Vec<_>>()
+            .join("_");
+        if !joined.is_empty() {
+            joined.push('_');
+        }
+        joined.push_str(pool.resolve_string(&name));
+        StrId(pool.intern(&joined))
     }
 
     fn builtin_type_strid(&self, kind: &TypeKind, pool: &StringPool) -> Option<StrId> {
@@ -371,6 +459,7 @@ impl DepGraph {
                 let path_str = path_to_strid(&pkg.path, pool);
                 self.package_hierarchy.insert(module_idx, path_str);
                 let seg_vec: Vec<StrId> = pkg.path.path.to_vec();
+                self.package_segments.insert(module_idx, seg_vec.clone());
                 self.path_index.insert(seg_vec, module_idx);
             }
         }
@@ -557,9 +646,8 @@ impl DepGraph {
                 if let Stmt::Package(pkg) = stmt {
                     let path_str = path_to_strid(&pkg.path, pool);
                     self.package_hierarchy.insert(midx, path_str);
-
                     let seg_vec: Vec<StrId> = pkg.path.path.to_vec();
-
+                    self.package_segments.insert(midx, seg_vec.clone());
                     self.path_index.insert(seg_vec, midx);
                 }
             }
@@ -568,6 +656,100 @@ impl DepGraph {
                 self.create_node_for_stmt(midx, item_idx, stmt, pool);
             }
         }
+    }
+
+    pub fn package_segments(&self, module_idx: usize) -> Option<&[StrId]> {
+        self.package_segments.get(&module_idx).map(|v| v.as_slice())
+    }
+
+    /// True if any `import` statement anywhere in the graph never resolved to
+    /// a known module.
+    pub fn has_unresolved_imports(&self) -> bool {
+        !self.unresolved_imports.is_empty()
+    }
+
+    /// Human-readable messages for every unresolved import, one per import
+    /// statement, naming the importing file and the path it tried to import.
+    pub fn unresolved_import_messages(&self, pool: &StringPool) -> Vec<String> {
+        self.unresolved_imports
+            .iter()
+            .map(|imp| {
+                let path_str = imp
+                    .path
+                    .iter()
+                    .map(|s| pool.resolve_string(s).to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let file = self
+                    .module_paths
+                    .get(&imp.from_module_idx)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| format!("<module {}>", imp.from_module_idx));
+                format!(
+                    "{}: cannot resolve import `{}`: no module is registered for this path \
+                     (check the file exists and its `package` declaration matches this path)",
+                    file, path_str
+                )
+            })
+            .collect()
+    }
+
+    /// Checks every module that has both a known on-disk path and a declared
+    /// `package` statement against `roots` (the source directories that were
+    /// scanned, e.g. `./lib`, `./src`). A module is checked against whichever
+    /// root contains it; a module under none of `roots` is skipped, since
+    /// there's nothing to validate its package against.
+    pub fn check_package_paths(
+        &self,
+        roots: &[PathBuf],
+        pool: &StringPool,
+    ) -> Vec<PackageMismatch> {
+        let mut mismatches = Vec::new();
+
+        for (&module_idx, segments) in &self.package_segments {
+            let Some(file_path) = self.module_paths.get(&module_idx) else {
+                continue;
+            };
+
+            let canonical_file = file_path
+                .canonicalize()
+                .unwrap_or_else(|_| file_path.clone());
+
+            let Some(rel) = roots.iter().find_map(|root| {
+                let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                canonical_file.strip_prefix(&canonical_root).ok()
+            }) else {
+                continue;
+            };
+
+            let mut expected_components: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+
+            // Strip the `.zeta` extension from the last (file-name) component.
+            if let Some(last) = expected_components.last_mut() {
+                if let Some(stem) = std::path::Path::new(last.as_str()).file_stem() {
+                    *last = stem.to_string_lossy().into_owned();
+                }
+            }
+
+            let declared: Vec<String> = segments
+                .iter()
+                .map(|s| pool.resolve_string(s).to_string())
+                .collect();
+
+            if declared != expected_components {
+                mismatches.push(PackageMismatch {
+                    module_idx,
+                    file_path: file_path.clone(),
+                    declared_package: declared.join("::"),
+                    expected_package: expected_components.join("::"),
+                });
+            }
+        }
+
+        mismatches
     }
 
     fn create_node_for_stmt<'a, 'bump>(
@@ -1915,6 +2097,6 @@ fn path_to_strid<'a, 'bump>(path: &Path<'a, 'bump>, pool: &StringPool) -> StrId 
         .iter()
         .map(|s| pool.resolve_string(s))
         .collect::<Vec<_>>()
-        .join("_");
+        .join("::");
     StrId(pool.intern(&joined))
 }
