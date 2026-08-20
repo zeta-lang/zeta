@@ -8,48 +8,45 @@ use ir::hir::{
     HirStruct, HirType, Operator, StrId,
 };
 use ir::ir_conversion::{assign_op_to_bin_op, lower_operator_bin, lower_type_hir};
-use ir::ir_hasher::{FxHashBuilder, HashSet};
+use ir::ir_hasher::{HashMap, HashSet};
 use ir::layout::TargetInfo;
+use ir::span::SourceSpan;
 use ir::ssa_ir::{BinOp, BlockId, Function, Instruction, Operand, SsaType, Value, cast_kind};
 use smallvec::SmallVec;
 use smallvec::smallvec;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
-/// MIR Expr Lowerer, which converts HIR expressions to MIR expressions.
-/// MIR is similar to a higher level representation of assembly which can be optimized in Zeta specific ways or lowered to backends and this is the most portable way
-/// If we are here this means we passed all type safety, memory safety and semantic checks, and we can safely discard of stuff and all debug like span's
 pub struct MirExprLowerer<'el, 'f, 'a, 'cx, 'bump> {
     pub current_block_data: &'el mut CurrentBlockData<'f>,
-    pub var_map: &'el mut HashMap<StrId, Value, FxHashBuilder>,
+    pub var_map: &'el mut HashMap<StrId, Value>,
     pub context: Arc<StringPool>,
     phantom_data: PhantomData<&'bump ()>,
 
-    pub funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-    enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
-    pub struct_field_offsets:
-        &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    pub struct_method_slots:
-        &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    pub struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-    pub struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-    pub interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-    pub interface_method_slots:
-        &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    pub structs: &'a HashMap<StrId, HirStruct<'a, 'a>, FxHashBuilder>,
+    pub funcs: &'a HashMap<StrId, Function>,
+    enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+    pub struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    pub struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    pub struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+    pub struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+    pub interface_id_map: &'a HashMap<StrId, usize>,
+    pub interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    pub structs: &'a HashMap<StrId, HirStruct<'a, 'a>>,
 
     pub cx_phantom: PhantomData<&'cx ()>,
     pub extern_c_names: &'a HashSet<StrId>,
     pub dep_graph: &'a RefCell<DepGraph>,
     pub module_idx: usize,
-    global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
+    global_funcs: &'a HashMap<StrId, Function>,
     pub scope_stack: &'el [DropScope<'a, 'bump>],
     pub drop_state: &'el mut DropMoveState<'a, 'bump>,
-    pub interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
+    pub interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+    module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+    module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+    pub constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
 }
 
 impl<'el, 'f, 'a, 'cx, 'bump> MirExprLowerer<'el, 'f, 'a, 'cx, 'bump>
@@ -59,36 +56,27 @@ where
     #[inline(always)]
     pub fn new(
         current_block_data: &'el mut CurrentBlockData<'f>,
-        funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        var_map: &'el mut HashMap<StrId, Value, FxHashBuilder>,
+        funcs: &'a HashMap<StrId, Function>,
+        global_funcs: &'a HashMap<StrId, Function>,
+        var_map: &'el mut HashMap<StrId, Value>,
         context: Arc<StringPool>,
-        struct_field_offsets: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-        interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-        interface_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
+        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'a HashMap<StrId, usize>,
+        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
         extern_c_names: &'a HashSet<StrId>,
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
         scope_stack: &'el [DropScope<'a, 'bump>],
         drop_state: &'el mut DropMoveState<'a, 'bump>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
     ) -> Self {
         Self {
             current_block_data,
@@ -112,6 +100,9 @@ where
             drop_state,
             interface_methods,
             enums,
+            module_import_aliases,
+            module_named_imports,
+            constants,
         }
     }
 
@@ -130,7 +121,7 @@ where
             self.var_map.insert(name.clone(), v);
             self.current_block_data
                 .value_types
-                .insert(v, lower_type_hir(&ty));
+                .insert(v, lower_type_hir(&ty, self.enums));
         }
 
         for (name, ty) in locals.iter().copied() {
@@ -138,7 +129,7 @@ where
             self.var_map.insert(name.clone(), v);
             self.current_block_data
                 .value_types
-                .insert(v, lower_type_hir(&ty));
+                .insert(v, lower_type_hir(&ty, self.enums));
         }
     }
 
@@ -154,13 +145,20 @@ where
                 span: _,
             } => self.lower_expr_binary(left, op, right),
 
-            HirExpr::Ident(name, _) => *self.var_map.get(name).unwrap_or_else(|| {
-                panic!(
-                    "lower_expr: variable {:?} referenced before definition",
-                    name
-                )
-            }),
-
+            HirExpr::Ident(name, span) => {
+                if let Some(&v) = self.var_map.get(name) {
+                    v
+                } else if let Some(const_expr) = self.constants.get(name) {
+                    self.lower_expr(const_expr)
+                } else {
+                    panic!(
+                        "lower_expr: variable `{}` (StrId {:?}) referenced before definition at span {}",
+                        self.context.resolve_string(name),
+                        name,
+                        span
+                    )
+                }
+            }
             HirExpr::StructInit {
                 name,
                 args,
@@ -169,7 +167,7 @@ where
             } => self.lower_struct_init(name, args),
 
             HirExpr::Undefined { span: _, ty } => {
-                let ssa_ty = lower_type_hir(ty);
+                let ssa_ty = lower_type_hir(ty, self.enums);
                 self.lower_zeroed_value(&ssa_ty)
             }
 
@@ -268,13 +266,17 @@ where
                 enum_name,
                 variant,
                 args,
-                span: _,
+                span,
                 type_args: _,
-            } => self.lower_enum_init(enum_name, variant, args),
+            } => self.lower_enum_init(enum_name, variant, args, span),
 
             HirExpr::ExprList { list, span: _ } => {
                 if list.is_empty() {
                     let v = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Undef {
+                        dest: v,
+                        ty: SsaType::Void,
+                    });
                     self.current_block_data.value_types.insert(v, SsaType::Void);
                     v
                 } else {
@@ -311,8 +313,8 @@ where
 
                 v
             }
-            HirExpr::Ref { expr, .. } => {
-                let (addr, _pointee_ty) = self.lower_place_addr(expr);
+            HirExpr::Ref { expr, span, .. } => {
+                let (addr, _pointee_ty) = self.lower_place_addr(expr, span);
                 addr
             }
 
@@ -336,6 +338,19 @@ where
                 dest
             }
             HirExpr::ModuleAccess(hir_module_access) => {
+                if let Some(v) = self.try_lower_bare_enum_variant(
+                    &hir_module_access.member,
+                    &hir_module_access.member,
+                ) {
+                    return v;
+                }
+                for path_seg in hir_module_access.path.iter().rev() {
+                    if let Some(v) =
+                        self.try_lower_bare_enum_variant(path_seg, &hir_module_access.member)
+                    {
+                        return v;
+                    }
+                }
                 let mangled = optimized_string_buffering::build_module_scoped_name(
                     hir_module_access.path,
                     hir_module_access.member,
@@ -370,7 +385,7 @@ where
                 let mut src = self.lower_expr(expr);
 
                 let mut src_ty = self.current_block_data.value_types[&src].clone();
-                let dst_ty = lower_type_hir(target_type);
+                let dst_ty = lower_type_hir(target_type, self.enums);
 
                 if dst_ty.is_pointer() {
                     match &src_ty {
@@ -442,9 +457,27 @@ where
                 match kind {
                     IntrinsicKind::Reinterpret => {
                         let src = self.lower_expr(&args[0]);
-                        let target_ty = lower_type_hir(&type_args[0]);
-                        self.current_block_data.value_types.insert(src, target_ty);
-                        src
+                        let src_ty = self
+                            .current_block_data
+                            .value_types
+                            .get(&src)
+                            .cloned()
+                            .expect("$reinterpret: source value has no known type");
+                        let target_ty = lower_type_hir(&type_args[0], self.enums);
+
+                        if src_ty == target_ty {
+                            src
+                        } else {
+                            let kind = cast_kind(&src_ty, &target_ty);
+                            let dest = self.current_block_data.fresh_value();
+                            self.emit(Instruction::Cast {
+                                dest,
+                                value: Operand::Value(src),
+                                kind,
+                            });
+                            self.current_block_data.value_types.insert(dest, target_ty);
+                            dest
+                        }
                     }
                     IntrinsicKind::Unreachable => {
                         let dest = self.current_block_data.fresh_value();
@@ -466,7 +499,7 @@ where
                         dest
                     }
                     IntrinsicKind::SizeOf | IntrinsicKind::AlignOf | IntrinsicKind::TypeName => {
-                        let query_ty = lower_type_hir(&type_args[0]);
+                        let query_ty = lower_type_hir(&type_args[0], self.enums);
                         let op = match kind {
                             IntrinsicKind::SizeOf => IntrinsicOp::SizeOf,
                             IntrinsicKind::AlignOf => IntrinsicOp::AlignOf,
@@ -569,7 +602,7 @@ where
                         self.current_block_data
                             .value_types
                             .insert(msg, SsaType::String);
-                        // todo: panic here
+                        // TODO: panic here
 
                         self.current_block_data.switch_to(cont_bb);
                         let dest = self.current_block_data.fresh_value();
@@ -654,8 +687,8 @@ where
                     }
                     IntrinsicKind::AtomicCasU32 => {
                         let ptr_val = self.lower_expr(&args[0]);
-                        let expected_val = self.lower_expr(&args[1]);
-                        let new_val = self.lower_expr(&args[2]);
+                        let expected_val = self.lower_expr_as_u32(&args[1]);
+                        let new_val = self.lower_expr_as_u32(&args[2]);
 
                         let dest = self.current_block_data.fresh_value();
                         self.emit(Instruction::Intrinsic {
@@ -689,10 +722,9 @@ where
                             .insert(dest, SsaType::U32);
                         dest
                     }
-
                     IntrinsicKind::AtomicStoreU32 => {
                         let ptr_val = self.lower_expr(&args[0]);
-                        let val_val = self.lower_expr(&args[1]);
+                        let val_val = self.lower_expr_as_u32(&args[1]);
 
                         self.emit(Instruction::Intrinsic {
                             dest: None,
@@ -785,8 +817,35 @@ where
                     .insert(data_ptr, SsaType::Pointer(Box::new(elem_inner.clone())));
                 (data_ptr, elem_inner)
             }
+
+            SsaType::Pointer(inner) if matches!(inner.as_ref(), SsaType::Owned(_)) => {
+                let SsaType::Owned(slice_inner) = inner.as_ref() else {
+                    unreachable!()
+                };
+                let SsaType::Slice(elem_ty) = slice_inner.as_ref() else {
+                    panic!(
+                        "lower_index_base: Pointer(Owned(_)) base whose inner Owned \
+                         isn't a Slice: {:?}",
+                        inner
+                    );
+                };
+                let elem_inner = (**elem_ty).clone();
+                let data_ptr = self.current_block_data.fresh_value();
+                self.emit(Instruction::LoadField {
+                    dest: data_ptr,
+                    base: Operand::Value(base),
+                    offset: 0, // ptr
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(data_ptr, SsaType::Pointer(Box::new(elem_inner.clone())));
+                (data_ptr, elem_inner)
+            }
+
             SsaType::Pointer(inner) => (base, (**inner).clone()),
+
             SsaType::Array(inner, _) => (base, (**inner).clone()),
+
             SsaType::Slice(inner) => {
                 let data_ptr = self.current_block_data.fresh_value();
                 self.emit(Instruction::LoadField {
@@ -799,6 +858,7 @@ where
                     .insert(data_ptr, SsaType::Pointer(Box::new((**inner).clone())));
                 (data_ptr, (**inner).clone())
             }
+
             SsaType::Owned(inner) => match inner.as_ref() {
                 SsaType::Slice(inner) => {
                     let data_ptr = self.current_block_data.fresh_value();
@@ -814,6 +874,7 @@ where
                 }
                 _ => panic!("[lower_index_base] cannot index into {:?}", inner),
             },
+
             other => panic!("[lower_index_base] cannot index into {:?}", other),
         }
     }
@@ -825,11 +886,37 @@ where
         (value + align - 1) & !(align - 1)
     }
 
+    fn try_lower_bare_enum_variant(&mut self, enum_name: &StrId, variant: &StrId) -> Option<Value> {
+        let hir_enum = self.enums.get(enum_name).or_else(|| {
+            let base_str = self.context.resolve_string(enum_name);
+            let candidates: Vec<&HirEnum> = self
+                .enums
+                .values()
+                .filter(|e| {
+                    e.name.as_str() == base_str && e.variants.iter().any(|v| v.name == *variant)
+                })
+                .collect();
+            if candidates.len() == 1 {
+                Some(candidates[0])
+            } else {
+                candidates.into_iter().find(|e| e.name == *enum_name)
+            }
+        })?;
+
+        let resolved_enum_name = hir_enum.name;
+        hir_enum
+            .variants
+            .iter()
+            .any(|v| v.name == *variant)
+            .then(|| self.lower_enum_init(&resolved_enum_name, variant, &[], &Default::default()))
+    }
+
     fn lower_enum_init(
         &mut self,
         enum_name: &StrId,
         variant: &StrId,
         args: &[HirExpr<'a, 'bump>],
+        span: &SourceSpan<'a>,
     ) -> Value {
         let arg_values: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
         let arg_types: Vec<SsaType> = arg_values
@@ -849,25 +936,30 @@ where
         for ty in &arg_types {
             let (size, align) = ir::layout::layout_of_ssa(ty, target)
                 .map(|l| (l.size, l.align))
-                .unwrap_or((8, 8)); // conservative fallback
+                .unwrap_or((8, 8));
             cursor = Self::align_up(cursor, align);
             offsets.push(cursor);
             cursor += size;
         }
         let payload_size = cursor;
 
-        let hir_enum = self.enums.get(enum_name).unwrap_or_else(|| {
-            panic!(
-                "lower_enum_init: unknown enum `{}`; the type checker should have caught this",
-                enum_name
-            )
-        });
-        let tag = hir_enum.variants.iter().position(|v| v.name == *variant).unwrap_or_else(|| {
-            panic!(
-                "lower_enum_init: enum `{}` has no variant `{}`; the type checker should have caught this",
-                enum_name, variant
-            )
-        }) as i64;
+        let hir_enum = self
+            .enums
+            .get(enum_name)
+            .unwrap_or_else(|| panic!("[lower_enum_init] unknown enum `{}` in {span}.", enum_name));
+
+        let resolved_enum_name = hir_enum.name;
+
+        let tag = hir_enum
+            .variants
+            .iter()
+            .position(|v| v.name == *variant)
+            .unwrap_or_else(|| {
+                panic!(
+                    "[lower_enum_init] enum `{}` has no variant `{}` in {span}",
+                    resolved_enum_name, variant
+                )
+            }) as i64;
 
         let tag_v = self.current_block_data.fresh_value();
         self.emit(Instruction::Const {
@@ -879,38 +971,61 @@ where
             .value_types
             .insert(tag_v, SsaType::I64);
 
-        let size_v = self.current_block_data.fresh_value();
-        self.emit(Instruction::Const {
-            dest: size_v,
-            ty: SsaType::I64,
-            value: Operand::ConstInt(payload_size as i64),
-        });
-        self.current_block_data
-            .value_types
-            .insert(size_v, SsaType::I64);
-
-        let enum_new_fn = StrId(self.context.intern("__enum_new"));
+        let total_size = 8 + payload_size;
         let obj = self.current_block_data.fresh_value();
-        self.emit(Instruction::Call {
-            dest: Some(obj),
-            func: Operand::FunctionRef(enum_new_fn),
-            args: smallvec![Operand::Value(tag_v), Operand::Value(size_v)],
+        self.emit(Instruction::StackAlloc {
+            dest: obj,
+            ty: SsaType::Array(Box::new(SsaType::I8), total_size),
+            count: 1,
         });
-        self.current_block_data
-            .value_types
-            .insert(obj, SsaType::Enum(*enum_name, vec![]));
+        let lowered_variants: Vec<Vec<SsaType>> = hir_enum
+            .variants
+            .iter()
+            .map(|v| {
+                v.fields
+                    .iter()
+                    .map(|f| lower_type_hir(&f.field_type, self.enums))
+                    .collect()
+            })
+            .collect();
+
+        self.current_block_data.value_types.insert(
+            obj,
+            SsaType::Enum {
+                name: resolved_enum_name,
+                variants: lowered_variants,
+            },
+        );
+
+        self.emit(Instruction::StoreField {
+            base: Operand::Value(obj),
+            offset: 0,
+            value: Operand::Value(tag_v),
+        });
 
         for ((val, _ty), field_offset) in
             arg_values.iter().zip(arg_types.iter()).zip(offsets.iter())
         {
             self.emit(Instruction::StoreField {
                 base: Operand::Value(obj),
-                offset: 8 + field_offset, // tag occupies bytes [0, 8)
+                offset: 8 + field_offset,
                 value: Operand::Value(*val),
             });
         }
 
         obj
+    }
+
+    fn is_aggregate_ssa_type(ty: &SsaType) -> bool {
+        matches!(
+            ty,
+            SsaType::User(..)
+                | SsaType::Enum { .. }
+                | SsaType::Tuple(_)
+                | SsaType::Array(..)
+                | SsaType::Slice(_)
+                | SsaType::Owned(_)
+        )
     }
 
     fn lower_range_expr(&mut self, start: &HirExpr<'a, 'bump>, end: &HirExpr<'a, 'bump>) -> Value {
@@ -939,30 +1054,23 @@ where
         dest
     }
 
-    fn slice_pseudo_field(&self, ty: &SsaType, field: StrId) -> Option<(usize, SsaType)> {
-        let actual_ty = match ty {
-            SsaType::Pointer(inner) => inner.as_ref(),
-            other => other,
-        };
-        match (self.context.resolve_string(&field), actual_ty) {
-            ("len", SsaType::Owned(inner)) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
-                Some((8, SsaType::Usize))
-            }
-            ("cap" | "capacity", SsaType::Owned(inner))
-                if matches!(inner.as_ref(), SsaType::Slice(_)) =>
-            {
-                Some((16, SsaType::Usize))
-            }
-            ("len", SsaType::Slice(_)) => Some((8, SsaType::Usize)),
-            ("cap" | "capacity", SsaType::Slice(_)) => Some((16, SsaType::Usize)),
+    fn slice_kind(&self, ty: &SsaType) -> Option<bool> {
+        match ty {
+            SsaType::Pointer(inner) => self.slice_kind(inner),
+            SsaType::Owned(inner) => match inner.as_ref() {
+                SsaType::Slice(_) => Some(true),
+                _ => self.slice_kind(inner).map(|_| true),
+            },
+            SsaType::Slice(_) => Some(false),
             _ => None,
         }
     }
 
     fn resolve_slice_pseudo_field(&self, ty: &SsaType, field: StrId) -> Option<(usize, SsaType)> {
-        match ty {
-            SsaType::Slice(_) | SsaType::Owned(_) => self.slice_pseudo_field(ty, field),
-            SsaType::Pointer(inner) => self.resolve_slice_pseudo_field(inner, field),
+        let is_owned = self.slice_kind(ty)?;
+        match self.context.resolve_string(&field) {
+            "len" => Some((8, SsaType::Usize)),
+            "cap" if is_owned => Some((16, SsaType::Usize)),
             _ => None,
         }
     }
@@ -1072,6 +1180,27 @@ where
         result
     }
 
+    fn reconcile_phi_type(&self, incoming: &[(BlockId, Value)]) -> SsaType {
+        let mut types = incoming.iter().map(|(_, v)| {
+            self.current_block_data
+                .value_type(*v)
+                .unwrap_or_else(|| panic!("phi incoming value {:?} has no known type", v))
+                .clone()
+        });
+        let first = types.next().expect("phi with no incoming edges");
+        for (i, (bb, v)) in incoming.iter().enumerate().skip(1) {
+            let t = self.current_block_data.value_type(*v).unwrap();
+            if *t != first {
+                panic!(
+                    "phi type mismatch: incoming edge 0 has type {:?}, but edge {} \
+                     (block {:?}, value {:?}) has type {:?}",
+                    first, i, bb, v, t
+                );
+            }
+        }
+        first
+    }
+
     fn lower_if_expr(
         &mut self,
         condition: &HirExpr<'a, 'bump>,
@@ -1131,24 +1260,33 @@ where
 
         self.current_block_data.switch_to(merge_bb);
 
-        let result = self.current_block_data.fresh_value();
-        let mut incoming = SmallVec::new();
-        if !then_terminated {
-            incoming.push((then_end, then_val));
-        }
-        if !else_terminated {
-            incoming.push((else_end, else_val));
-        }
-        self.emit(Instruction::Phi {
-            dest: result,
-            incoming,
-        });
-
         let ty = self
             .value_type(if !then_terminated { then_val } else { else_val })
             .cloned()
             .unwrap_or(SsaType::Void);
-        self.current_block_data.value_types.insert(result, ty);
+
+        let result = if ty == SsaType::Void {
+            self.unit_value()
+        } else {
+            let result = self.current_block_data.fresh_value();
+            let mut incoming = SmallVec::new();
+            if !then_terminated {
+                incoming.push((then_end, then_val));
+            }
+            if !else_terminated {
+                incoming.push((else_end, else_val));
+            }
+
+            let ty = self.reconcile_phi_type(&incoming);
+            self.emit(Instruction::Phi {
+                dest: result,
+                incoming,
+            });
+            self.current_block_data
+                .value_types
+                .insert(result, ty.clone());
+            result
+        };
 
         result
     }
@@ -1170,7 +1308,6 @@ where
         }
     }
 
-    // TODO replace with real `lower_stmt` for highest reusability and flexibility
     fn lower_block_stmt_for_effect(&mut self, stmt: &HirStmt<'a, 'bump>) {
         match stmt {
             HirStmt::Expr(e) => {
@@ -1180,9 +1317,28 @@ where
                 let v = self.lower_expr(value);
                 self.var_map.insert(*name, v);
             }
+            HirStmt::Return(expr) => {
+                let value = expr.as_ref().map(|e| Operand::Value(self.lower_expr(e)));
+                self.emit(Instruction::Ret { value });
+            }
+            // Nested blocks inside an if-expression arm.
+            HirStmt::Block { body } => {
+                self.lower_block_value(body);
+            }
+            HirStmt::UnsafeBlock { body } => {
+                self.lower_block_stmt_for_effect(body);
+            }
+            // Nested if/else inside an if-expression arm.
+            HirStmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.lower_if_expr(cond, then_block, *else_block);
+            }
             other => panic!(
                 "lower_block_stmt_for_effect: {:?} inside an if-expression arm isn't \
-                 wired up yet, needs the real statement lowerer",
+                 supported yet",
                 other
             ),
         }
@@ -1198,12 +1354,24 @@ where
 
     fn unit_value(&mut self) -> Value {
         let v = self.current_block_data.fresh_value();
+        if !self.block_terminated() {
+            self.emit(Instruction::Undef {
+                dest: v,
+                ty: SsaType::Void,
+            });
+        }
         self.current_block_data.value_types.insert(v, SsaType::Void);
         v
     }
 
     fn unreachable_value(&mut self) -> Value {
         let v = self.current_block_data.fresh_value();
+        if !self.block_terminated() {
+            self.emit(Instruction::Undef {
+                dest: v,
+                ty: SsaType::Void,
+            });
+        }
         self.current_block_data.value_types.insert(v, SsaType::Void);
         v
     }
@@ -1433,17 +1601,13 @@ where
                         else_bb: trap_bb,
                     });
                     self.current_block_data.switch_to(trap_bb);
-                    let msg = self.current_block_data.fresh_value();
-                    let msg_str = self.context.intern("non-exhaustive match: no arm matched");
-                    self.emit(Instruction::Const {
-                        dest: msg,
-                        ty: SsaType::String,
-                        value: Operand::ConstString(StrId(msg_str)),
+                    let abort_fn = StrId(self.context.intern("abort"));
+                    self.emit(Instruction::Call {
+                        dest: None,
+                        func: Operand::FunctionRef(abort_fn),
+                        args: SmallVec::new(),
                     });
-                    self.current_block_data
-                        .value_types
-                        .insert(msg, SsaType::String);
-                    // TODO: lower panic
+                    self.emit(Instruction::Ret { value: None }); // unreachable; abort() doesn't return
                 }
                 (None, _) => {
                     self.emit(Instruction::Jump { target: body_bb });
@@ -1473,11 +1637,16 @@ where
             return self.unreachable_value();
         }
 
-        let result = self.current_block_data.fresh_value();
         let ty = incoming
             .first()
             .and_then(|(_, v)| self.current_block_data.value_types.get(v).cloned())
             .unwrap_or(SsaType::Void);
+
+        if ty == SsaType::Void {
+            return self.unit_value();
+        }
+
+        let result = self.current_block_data.fresh_value();
         self.emit(Instruction::Phi {
             dest: result,
             incoming,
@@ -1497,13 +1666,13 @@ where
 
             HirPattern::Array(elems) => {
                 let SsaType::Array(elem_ty, _) = scrutinee_ty.expect(
-                    "lower_pattern_test: array pattern has no scrutinee type; the type checker should have caught this"
+                    "[lower_pattern_test] array pattern has no scrutinee type; the type checker should have caught this"
                 ) else {
-                    panic!("lower_pattern_test: array pattern used on a non-array scrutinee");
+                    panic!("[lower_pattern_test] array pattern used on a non-array scrutinee");
                 };
                 let elem_ty = (**elem_ty).clone();
                 let elem_size = ir::layout::sizeof_ssa(&elem_ty, TargetInfo { ptr_bytes: 8 })
-                    .expect("lower_pattern_test: array element type has no known size")
+                    .expect("[lower_pattern_test] array element type has no known size")
                     as i64;
 
                 let mut combined: Option<Value> = None;
@@ -1536,42 +1705,128 @@ where
             }
 
             HirPattern::Struct { name, fields } => {
-                let offsets = self
-                    .struct_field_offsets
-                    .get(name)
-                    .unwrap_or_else(|| panic!("lower_pattern_test: unknown struct `{}`", name));
-                let hir_struct = self.structs.get(name);
+                if let Some(offsets) = self.struct_field_offsets.get(name) {
+                    let hir_struct = self.structs.get(name);
+                    let mut combined: Option<Value> = None;
+                    for (field_name, field_pat) in fields.iter() {
+                        let offset = *offsets.get(field_name).unwrap_or_else(|| {
+                            panic!(
+                                "lower_pattern_test: unknown field `{}` on struct `{}`",
+                                field_name, name
+                            )
+                        });
+                        let field_ty = hir_struct
+                            .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
+                            .map(|f| lower_type_hir(&f.field_type, self.enums))
+                            .unwrap_or(SsaType::I64);
+                        let field_val = self.current_block_data.fresh_value();
+                        if Self::is_aggregate_ssa_type(&field_ty) {
+                            self.emit(Instruction::FieldAddr {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset,
+                            });
+                        } else {
+                            self.emit(Instruction::LoadField {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset,
+                            });
+                        }
+                        self.current_block_data
+                            .value_types
+                            .insert(field_val, field_ty.clone());
+                        if let Some(cond) =
+                            self.lower_pattern_test(field_pat, field_val, Some(&field_ty))
+                        {
+                            combined = Some(self.and_conds(combined, cond));
+                        }
+                    }
+                    return combined;
+                }
 
-                let mut combined: Option<Value> = None;
-                for (field_name, field_pat) in fields.iter() {
-                    let offset = *offsets.get(field_name).unwrap_or_else(|| {
+                let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
+                    panic!(
+                        "lower_pattern_test: `{}` is neither a known struct nor is the scrutinee ({:?}) \
+                         an enum",
+                        name, scrutinee_ty
+                    );
+                });
+                let hir_enum = self.resolve_enum_for_variant(enum_name, name);
+                let (expected_tag, variant_def) = hir_enum
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, v)| v.name == *name)
+                    .map(|(i, v)| (i as i64, v))
+                    .unwrap_or_else(|| {
                         panic!(
-                            "lower_pattern_test: unknown field `{}` on struct `{}`",
-                            field_name, name
+                            "lower_pattern_test: enum `{}` has no variant `{}`",
+                            enum_name, name
                         )
                     });
-                    let field_ty = hir_struct
-                        .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
-                        .map(|f| lower_type_hir(&f.field_type))
-                        .unwrap_or(SsaType::I64);
 
-                    let field_val = self.current_block_data.fresh_value();
-                    self.emit(Instruction::LoadField {
-                        dest: field_val,
-                        base: Operand::Value(scrutinee),
-                        offset,
-                    });
-                    self.current_block_data
-                        .value_types
-                        .insert(field_val, field_ty.clone());
+                let tag_val = self.current_block_data.fresh_value();
+                self.emit(Instruction::LoadField {
+                    dest: tag_val,
+                    base: Operand::Value(scrutinee),
+                    offset: 0,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(tag_val, SsaType::I64);
 
-                    if let Some(cond) =
-                        self.lower_pattern_test(field_pat, field_val, Some(&field_ty))
+                let mut combined = self.current_block_data.fresh_value();
+                self.emit(Instruction::Binary {
+                    dest: combined,
+                    op: BinOp::Eq,
+                    left: Operand::Value(tag_val),
+                    right: Operand::ConstInt(expected_tag),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(combined, SsaType::Bool);
+                let mut result = Some(combined);
+
+                let target = TargetInfo { ptr_bytes: 8 };
+                let mut cursor = 0usize;
+                for vf in variant_def.fields.iter() {
+                    let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums);
+                    let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
+                    cursor = Self::align_up(cursor, align);
+
+                    if let Some((_, field_pat)) = fields.iter().find(|(fname, _)| fname == &vf.name)
                     {
-                        combined = Some(self.and_conds(combined, cond));
+                        let field_val = self.current_block_data.fresh_value();
+                        if Self::is_aggregate_ssa_type(&field_ssa_ty) {
+                            self.emit(Instruction::FieldAddr {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset: 8 + cursor,
+                            });
+                        } else {
+                            self.emit(Instruction::LoadField {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset: 8 + cursor,
+                            });
+                        }
+                        self.current_block_data
+                            .value_types
+                            .insert(field_val, field_ssa_ty.clone());
+                        if let Some(cond) =
+                            self.lower_pattern_test(field_pat, field_val, Some(&field_ssa_ty))
+                        {
+                            combined = self.and_conds(result, cond);
+                            result = Some(combined);
+                        }
                     }
+
+                    let size = ir::layout::sizeof_ssa(&field_ssa_ty, target).unwrap_or(8);
+                    cursor += size;
                 }
-                combined
+
+                result
             }
 
             HirPattern::Or(alts) => {
@@ -1657,19 +1912,14 @@ where
             }
 
             HirPattern::EnumVariant { variant, .. } => {
-                let SsaType::User(enum_name, _) = scrutinee_ty.expect(
-                    "lower_pattern_test: enum pattern has no scrutinee type; the type checker should have caught this"
-                ) else {
+                let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
                     panic!(
-                        "lower_pattern_test: enum pattern `{}(..)` used on a non-enum scrutinee; \
+                        "lower_pattern_test: enum pattern `{}(..)` used on a non-enum scrutinee ({:?}); \
                          the type checker should have caught this",
-                        variant
+                        variant, scrutinee_ty
                     );
-                };
-                let hir_enum = self
-                    .enums
-                    .get(&enum_name)
-                    .unwrap_or_else(|| panic!("lower_pattern_test: unknown enum `{}`", enum_name));
+                });
+                let hir_enum = self.resolve_enum_for_variant(enum_name, variant);
                 let expected_tag = hir_enum.variants.iter().position(|v| v.name == *variant)
                     .unwrap_or_else(|| panic!(
                         "lower_pattern_test: enum `{}` has no variant `{}`; the type checker should have caught this",
@@ -1704,6 +1954,30 @@ where
                 todo!("tuple patterns aren't implemented upstream in lower_pattern either")
             }
         }
+    }
+
+    fn extract_enum_name_from_ty<'b>(&'b self, ty: Option<&'b SsaType>) -> Option<&'b StrId> {
+        let mut curr = ty?;
+        loop {
+            match curr {
+                SsaType::Enum { name, .. } => return Some(name),
+                SsaType::User(name, _) => return Some(name),
+                SsaType::Pointer(inner) | SsaType::Owned(inner) | SsaType::Nullable(inner) => {
+                    curr = inner.as_ref();
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn resolve_enum_for_variant(&self, enum_name: &StrId, variant: &StrId) -> &HirEnum<'a, 'bump> {
+        self.enums.get(enum_name).unwrap_or_else(|| {
+            println!("All enums: {:?}", self.enums.keys().collect::<Vec<_>>());
+            panic!(
+                "[resolve_enum_for_variant] unknown enum {}.{}",
+                enum_name, variant
+            )
+        })
     }
 
     fn bind_pattern(
@@ -1752,35 +2026,98 @@ where
             }
 
             HirPattern::Struct { name, fields } => {
-                let offsets = self
-                    .struct_field_offsets
-                    .get(name)
-                    .unwrap_or_else(|| panic!("bind_pattern: unknown struct `{}`", name));
-                let hir_struct = self.structs.get(name);
+                if let Some(offsets) = self.struct_field_offsets.get(name) {
+                    let hir_struct = self.structs.get(name);
 
-                for (field_name, field_pat) in fields.iter() {
-                    let offset = *offsets.get(field_name).unwrap_or_else(|| {
+                    for (field_name, field_pat) in fields.iter() {
+                        let offset = *offsets.get(field_name).unwrap_or_else(|| {
+                            panic!(
+                                "[bind_pattern] unknown field `{}` on struct `{}`",
+                                field_name, name
+                            )
+                        });
+                        let field_ty = hir_struct
+                            .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
+                            .map(|f| lower_type_hir(&f.field_type, self.enums))
+                            .unwrap_or(SsaType::I64);
+
+                        let field_val = self.current_block_data.fresh_value();
+                        if Self::is_aggregate_ssa_type(&field_ty) {
+                            self.emit(Instruction::FieldAddr {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset,
+                            });
+                        } else {
+                            self.emit(Instruction::LoadField {
+                                dest: field_val,
+                                base: Operand::Value(scrutinee),
+                                offset,
+                            });
+                        }
+                        self.current_block_data
+                            .value_types
+                            .insert(field_val, field_ty.clone());
+
+                        self.bind_pattern(field_pat, field_val, Some(&field_ty));
+                    }
+                } else {
+                    let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
                         panic!(
-                            "bind_pattern: unknown field `{}` on struct `{}`",
-                            field_name, name
-                        )
+                            "[bind_pattern] `{}` is neither a known struct nor is the scrutinee ({:?}) \
+                             an enum",
+                            name, scrutinee_ty
+                        );
                     });
-                    let field_ty = hir_struct
-                        .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
-                        .map(|f| lower_type_hir(&f.field_type))
-                        .unwrap_or(SsaType::I64);
 
-                    let field_val = self.current_block_data.fresh_value();
-                    self.emit(Instruction::LoadField {
-                        dest: field_val,
-                        base: Operand::Value(scrutinee),
-                        offset,
-                    });
-                    self.current_block_data
-                        .value_types
-                        .insert(field_val, field_ty.clone());
+                    let hir_enum = self.resolve_enum_for_variant(enum_name, name);
+                    let variant_def = hir_enum
+                        .variants
+                        .iter()
+                        .find(|v| v.name == *name)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[bind_pattern] enum `{}` has no variant `{}`",
+                                enum_name, name
+                            )
+                        });
 
-                    self.bind_pattern(field_pat, field_val, Some(&field_ty));
+                    // Compute per-field payload offsets (tag occupies the first 8 bytes).
+                    let target = TargetInfo { ptr_bytes: 8 };
+                    let mut cursor = 0usize;
+                    for vf in variant_def.fields.iter() {
+                        let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums);
+                        let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
+                        cursor = Self::align_up(cursor, align);
+
+                        // Only bind fields that appear in the pattern.
+                        if let Some((_, field_pat)) =
+                            fields.iter().find(|(fname, _)| fname == &vf.name)
+                        {
+                            let field_val = self.current_block_data.fresh_value();
+                            if Self::is_aggregate_ssa_type(&field_ssa_ty) {
+                                self.emit(Instruction::FieldAddr {
+                                    dest: field_val,
+                                    base: Operand::Value(scrutinee),
+                                    offset: 8 + cursor,
+                                });
+                            } else {
+                                self.emit(Instruction::LoadField {
+                                    dest: field_val,
+                                    base: Operand::Value(scrutinee),
+                                    offset: 8 + cursor,
+                                });
+                            }
+                            self.current_block_data
+                                .value_types
+                                .insert(field_val, field_ssa_ty.clone());
+
+                            self.bind_pattern(field_pat, field_val, Some(&field_ssa_ty));
+                        }
+
+                        let size = ir::layout::sizeof_ssa(&field_ssa_ty, target).unwrap_or(8);
+                        cursor += size;
+                    }
                 }
             }
 
@@ -1792,19 +2129,14 @@ where
             HirPattern::EnumVariant {
                 variant, bindings, ..
             } if !bindings.is_empty() => {
-                let SsaType::User(enum_name, _) = scrutinee_ty.expect(
-                    "bind_pattern: enum pattern has no scrutinee type; the type checker should have caught this"
-                ) else {
+                let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
                     panic!(
-                        "bind_pattern: enum pattern `{}(..)` used on a non-enum scrutinee; \
+                        "bind_pattern: enum pattern `{}(..)` used on a non-enum scrutinee ({:?}); \
                          the type checker should have caught this",
-                        variant
+                        variant, scrutinee_ty
                     );
-                };
-                let hir_enum = self
-                    .enums
-                    .get(enum_name)
-                    .unwrap_or_else(|| panic!("bind_pattern: unknown enum `{}`", enum_name));
+                });
+                let hir_enum = self.resolve_enum_for_variant(enum_name, variant);
                 let variant_def = hir_enum.variants.iter().find(|v| v.name == *variant)
                     .unwrap_or_else(|| panic!(
                         "bind_pattern: enum `{}` has no variant `{}`; the type checker should have caught this",
@@ -1821,20 +2153,28 @@ where
                 let target = TargetInfo { ptr_bytes: 8 };
                 let mut cursor = 0usize;
                 for (&binding_name, field) in bindings.iter().zip(variant_def.fields.iter()) {
-                    let field_ssa_ty = lower_type_hir(&field.field_type);
+                    let field_ssa_ty = lower_type_hir(&field.field_type, self.enums);
                     let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
                     cursor = Self::align_up(cursor, align);
 
                     let dest = self.current_block_data.fresh_value();
-                    self.emit(Instruction::LoadField {
-                        dest,
-                        base: Operand::Value(scrutinee),
-                        offset: 8 + cursor, // tag occupies bytes [0, 8), matches lower_enum_init
-                    });
+                    if Self::is_aggregate_ssa_type(&field_ssa_ty) {
+                        self.emit(Instruction::FieldAddr {
+                            dest,
+                            base: Operand::Value(scrutinee),
+                            offset: 8 + cursor,
+                        });
+                    } else {
+                        self.emit(Instruction::LoadField {
+                            dest,
+                            base: Operand::Value(scrutinee),
+                            offset: 8 + cursor,
+                        });
+                    }
                     self.current_block_data
                         .value_types
                         .insert(dest, field_ssa_ty.clone());
-                    self.var_map.insert(binding_name, dest);
+                    self.var_map.insert(binding_name, dest); // (or recurse into bind_pattern for the Struct arm)
 
                     let size = ir::layout::sizeof_ssa(&field_ssa_ty, target).unwrap_or(8);
                     cursor += size;
@@ -1890,12 +2230,9 @@ where
 
         dest
     }
-
     fn try_flatten_module_path(&self, expr: &HirExpr<'a, 'bump>) -> Option<StrId> {
         match expr {
-            HirExpr::ModuleAccess(acc) => {
-                Some(self.resolve_module_qualified_name(acc.path, acc.member, None))
-            }
+            HirExpr::ModuleAccess(acc) => self.resolve_module_access_callee(acc.path, acc.member),
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 if let HirExpr::ModuleAccess(acc) = object {
                     Some(self.resolve_module_qualified_name(acc.path, acc.member, Some(*field)))
@@ -1905,6 +2242,62 @@ where
             }
             _ => None,
         }
+    }
+
+    fn resolve_module_access_callee(&self, path: &[StrId], member: StrId) -> Option<StrId> {
+        let module_target = self
+            .dep_graph
+            .borrow()
+            .resolve_module_path(path)
+            .or_else(|| {
+                if path.len() == 1 {
+                    self.module_import_aliases
+                        .get(&self.module_idx)
+                        .and_then(|aliases| aliases.get(&path[0]))
+                        .copied()
+                } else {
+                    None
+                }
+            });
+        if let Some(target_idx) = module_target {
+            if self.extern_c_names.contains(&member) {
+                return Some(member);
+            }
+            return Some(self.dep_graph.borrow().mangle_free_function(
+                target_idx,
+                member,
+                false,
+                &self.context,
+            ));
+        }
+
+        if path.len() == 1 {
+            let type_module_idx = self
+                .module_named_imports
+                .get(&self.module_idx)
+                .and_then(|named| named.get(&path[0]))
+                .copied()
+                .unwrap_or(self.module_idx);
+
+            let mangled_type =
+                self.dep_graph
+                    .borrow()
+                    .mangle_type_name(type_module_idx, path[0], &self.context);
+
+            if let Some(mangled_method) = self
+                .struct_mangled_map
+                .get(&mangled_type)
+                .and_then(|methods| methods.get(&member))
+            {
+                return Some(*mangled_method);
+            }
+        }
+
+        if self.extern_c_names.contains(&member) {
+            return Some(member);
+        }
+
+        None
     }
 
     fn resolve_module_qualified_name(
@@ -1919,10 +2312,25 @@ where
             return bare_name;
         }
 
+        let target_module_idx = self
+            .dep_graph
+            .borrow()
+            .resolve_module_path(path)
+            .or_else(|| {
+                if path.len() == 1 {
+                    self.module_import_aliases
+                        .get(&self.module_idx)
+                        .and_then(|aliases| aliases.get(&path[0]))
+                        .copied()
+                } else {
+                    None
+                }
+            });
+
         match extra {
             Some(method_name) => {
                 let mut segments: Vec<StrId> = Vec::with_capacity(path.len() + 1);
-                segments.push(member); // struct name
+                segments.push(member);
                 segments.extend_from_slice(path);
                 optimized_string_buffering::build_module_scoped_name(
                     &segments,
@@ -1931,13 +2339,30 @@ where
                     self.context.clone(),
                 )
             }
-            // Plain module-qualified free function/global: `path::name`.
-            None => optimized_string_buffering::build_module_scoped_name(
-                path,
-                member,
-                None,
-                self.context.clone(),
-            ),
+            None => {
+                let Some(target_idx) = target_module_idx else {
+                    return optimized_string_buffering::build_module_scoped_name(
+                        path,
+                        member,
+                        None,
+                        self.context.clone(),
+                    );
+                };
+                let Some(pkg) = self.dep_graph.borrow().get_module_package(target_idx) else {
+                    return member;
+                };
+                let pkg_str = pkg.to_string();
+                let segments: Vec<StrId> = pkg_str
+                    .split("::")
+                    .map(|seg| StrId(self.context.intern(seg)))
+                    .collect();
+                optimized_string_buffering::build_module_scoped_name(
+                    &segments,
+                    member,
+                    None,
+                    self.context.clone(),
+                )
+            }
         }
     }
 
@@ -1985,9 +2410,6 @@ where
         arr_v
     }
 
-    /// Recursively materializes a zero value of `ssa_ty`. For scalars this is
-    /// a plain `Const 0`. For arrays/structs/tuples, it stack-allocates and
-    /// stores a recursively-zeroed value into every field/element.
     fn lower_zeroed_value(&mut self, ssa_ty: &SsaType) -> Value {
         match ssa_ty {
             SsaType::Array(inner, len) => {
@@ -2187,6 +2609,17 @@ where
             value: Operand::ConstInt(0),
         });
         self.current_block_data.value_types.insert(v, SsaType::Null);
+        v
+    }
+
+    fn lower_expr_number(&mut self, n: i64) -> Value {
+        let v = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: v,
+            ty: SsaType::I64,
+            value: Operand::ConstInt(n),
+        });
+        self.current_block_data.value_types.insert(v, SsaType::I64);
         v
     }
 
@@ -2407,16 +2840,39 @@ where
         new_value
     }
 
-    fn lower_expr_number(&mut self, n: i64) -> Value {
-        let v = self.current_block_data.fresh_value();
-        self.emit(Instruction::Const {
-            dest: v,
-            ty: SsaType::I64,
-            value: Operand::ConstInt(n),
-        });
+    fn lower_expr_as_u32(&mut self, expr: &HirExpr<'a, 'bump>) -> Value {
+        if let HirExpr::Number(n, _) = expr {
+            let v = self.current_block_data.fresh_value();
+            self.emit(Instruction::Const {
+                dest: v,
+                ty: SsaType::U32,
+                value: Operand::ConstInt(*n),
+            });
+            self.current_block_data.value_types.insert(v, SsaType::U32);
+            return v;
+        }
 
-        self.current_block_data.value_types.insert(v, SsaType::I64);
-        v
+        let v = self.lower_expr(expr);
+        let src_ty = self
+            .current_block_data
+            .value_types
+            .get(&v)
+            .cloned()
+            .unwrap_or(SsaType::I64);
+        if src_ty == SsaType::U32 {
+            return v;
+        }
+
+        let dest = self.current_block_data.fresh_value();
+        self.emit(Instruction::Cast {
+            dest,
+            value: Operand::Value(v),
+            kind: cast_kind(&src_ty, &SsaType::U32),
+        });
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::U32);
+        dest
     }
 
     fn lower_expr_binary(
@@ -2456,7 +2912,7 @@ where
             hir_struct
                 .fields
                 .iter()
-                .map(|f| lower_type_hir(&f.field_type))
+                .map(|f| lower_type_hir(&f.field_type, self.enums))
                 .collect()
         } else {
             panic!("Struct {} not found", struct_name)
@@ -2602,17 +3058,22 @@ where
                 self.current_block_data.value_types.insert(dest, field_ty);
                 return dest;
             }
+
+            if self.slice_kind(&obj_ty).is_some() {
+                panic!(
+                    "lower_field_access: `.{}` is not a valid slice field on {:?} \
+                     (only `.len`, and `.cap`/`.capacity` on *owned* slices, are supported)",
+                    self.context.resolve_string(&field),
+                    obj_ty
+                );
+            }
         }
 
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _)) => {
-                let resolved = self.context.resolve_string(name);
-                StrId(self.context.intern(resolved))
-            }
+            Some(SsaType::User(name, _)) => *name,
             Some(SsaType::Pointer(inner)) => {
                 if let SsaType::User(name, _) = inner.as_ref() {
-                    let resolved = self.context.resolve_string(name);
-                    StrId(self.context.intern(resolved))
+                    *name
                 } else {
                     panic!("FieldAccess through pointer to non-User type: {:?}", inner)
                 }
@@ -2636,7 +3097,7 @@ where
             .structs
             .get(&cls_name)
             .and_then(|hir_struct| hir_struct.fields.iter().find(|f| f.name == field))
-            .map(|hir_field| lower_type_hir(&hir_field.field_type))
+            .map(|hir_field| lower_type_hir(&hir_field.field_type, self.enums))
             .unwrap_or_else(|| {
                 eprintln!(
                     "WARNING: lower_field_access could not find field {:?} on struct {:?}, defaulting to I64",
@@ -2759,13 +3220,17 @@ where
             HirExpr::FieldAccess {
                 object,
                 field,
-                span: _,
+                span,
             }
             | HirExpr::Get {
                 object,
                 field,
-                span: _,
-            } => self.lower_method_call(object, *field, args),
+                span,
+            } => self.lower_method_call(object, *field, args, span),
+
+            HirExpr::ModuleAccess(acc) if acc.path.len() == 1 => {
+                self.lower_static_call(acc.path[0], acc.member, args)
+            }
 
             other => unimplemented!(
                 "Non-identifier callee not yet supported in Call: {:?}",
@@ -2774,7 +3239,108 @@ where
         }
     }
 
-    fn lower_place_addr(&mut self, expr: &HirExpr<'a, 'bump>) -> (Value, SsaType) {
+    fn lower_static_call(
+        &mut self,
+        type_name: StrId,
+        method: StrId,
+        args: &[HirExpr<'a, 'bump>],
+    ) -> Value {
+        let struct_key = self
+            .resolve_static_receiver_struct_name(type_name, method)
+            .or_else(|| {
+                let type_module_idx = self
+                    .module_named_imports
+                    .get(&self.module_idx)
+                    .and_then(|named| named.get(&type_name))
+                    .copied()
+                    .unwrap_or(self.module_idx);
+
+                let mangled = self.dep_graph.borrow().mangle_type_name(
+                    type_module_idx,
+                    type_name,
+                    &self.context,
+                );
+
+                if self.struct_mangled_map.contains_key(&mangled) {
+                    Some(mangled)
+                } else {
+                    let type_str = self.context.resolve_string(&type_name);
+                    self.struct_mangled_map
+                        .keys()
+                        .find(|k| {
+                            let k_str = self.context.resolve_string(k);
+                            (k_str == type_str || k_str.contains(&format!("_{}", type_str)))
+                                && self
+                                    .struct_mangled_map
+                                    .get(k)
+                                    .map(|mmap| mmap.contains_key(&method))
+                                    .unwrap_or(false)
+                        })
+                        .copied()
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "[lower_static_call] could not resolve type {} for static call {}",
+                    type_name, method,
+                )
+            });
+
+        let direct_name = *self
+            .struct_mangled_map
+            .get(&struct_key)
+            .and_then(|mmap| mmap.get(&method))
+            .unwrap_or_else(|| {
+                panic!(
+                    "[lower_static_call] struct `{}` has no static method `{}` in struct_mangled_map",
+                    struct_key, method,
+                )
+            });
+
+        let param_types: Vec<SsaType> = self
+            .funcs
+            .get(&direct_name)
+            .map(|f| f.params.iter().map(|(_, ty)| ty.clone()).collect())
+            .unwrap_or_default();
+
+        let arg_ops: SmallVec<Operand, 8> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if matches!(param_types.get(i), Some(SsaType::User(_, _))) {
+                    record_move_if_any(self.scope_stack, self.drop_state, a);
+                }
+                Operand::Value(self.lower_expr(a))
+            })
+            .collect();
+
+        let dest = self.current_block_data.fresh_value();
+        self.emit(Instruction::Call {
+            dest: Some(dest),
+            func: Operand::FunctionRef(direct_name),
+            args: arg_ops,
+        });
+
+        let ret_ty = self
+            .funcs
+            .get(&direct_name)
+            .or_else(|| self.global_funcs.get(&direct_name))
+            .map(|f| f.ret_type.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "[lower_static_call] resolved `{}` but it isn't in funcs or global_funcs",
+                    direct_name
+                )
+            });
+        self.current_block_data.value_types.insert(dest, ret_ty);
+        dest
+    }
+
+    fn lower_place_addr(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        span: &SourceSpan<'a>,
+    ) -> (Value, SsaType) {
         match expr {
             HirExpr::Index {
                 object,
@@ -2785,20 +3351,18 @@ where
             HirExpr::FieldAccess {
                 object,
                 field,
-                span: _,
+                span,
             }
             | HirExpr::Get {
                 object,
                 field,
-                span: _,
-            } => self.lower_field_addr(object, *field),
+                span,
+            } => self.lower_field_addr(object, *field, span),
 
             HirExpr::Deref {
                 expr: inner,
                 span: _,
             } => {
-                // &*ptr == ptr; no load needed, the pointer value already is
-                // the address.
                 let ptr = self.lower_expr(inner);
                 let pointee_ty = match self.current_block_data.value_types.get(&ptr).cloned() {
                     Some(SsaType::Pointer(inner_ty)) => *inner_ty,
@@ -2807,18 +3371,24 @@ where
                 (ptr, pointee_ty)
             }
 
-            // Whole-variable refs: if the value is already a pointer (arrays,
-            // structs, anything StackAlloc'd), that pointer IS the address.
-            // Scalar locals that were never stack-allocated have no address
-            // to take.
             other => {
                 let val = self.lower_expr(other);
                 match self.current_block_data.value_types.get(&val).cloned() {
                     Some(SsaType::Pointer(inner_ty)) => (val, *inner_ty),
+
+                    Some(
+                        ty @ (SsaType::User(_, _)
+                        | SsaType::Enum { .. }
+                        | SsaType::Slice(_)
+                        | SsaType::Owned(_)
+                        | SsaType::Tuple(_)
+                        | SsaType::Array(_, _)),
+                    ) => (val, ty),
+
                     Some(ty) => panic!(
                         "[lower_place_addr] cannot take address of a non-pointer-backed value of type {:?}, \
-                         scalar locals must be stack-allocated to be referenced, not yet implemented",
-                        ty
+                         scalar locals must be stack-allocated to be referenced, not yet implemented, span {}",
+                        ty, span
                     ),
                     None => panic!("[lower_place_addr] value has no known type"),
                 }
@@ -2826,7 +3396,12 @@ where
         }
     }
 
-    fn lower_field_addr(&mut self, object: &HirExpr<'a, 'bump>, field: StrId) -> (Value, SsaType) {
+    fn lower_field_addr(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        field: StrId,
+        span: &SourceSpan<'a>,
+    ) -> (Value, SsaType) {
         let obj_val = self.lower_expr_as_receiver(object);
 
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
@@ -2844,7 +3419,8 @@ where
         let offsets = self
             .struct_field_offsets
             .get(&cls_name)
-            .unwrap_or_else(|| panic!("Unknown struct {} in FieldAccess", cls_name));
+            .unwrap_or_else(|| panic!("Unknown struct {} in FieldAccess at {span}", cls_name));
+
         let offset = *offsets
             .get(&field)
             .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name));
@@ -2853,7 +3429,7 @@ where
             .structs
             .get(&cls_name)
             .and_then(|hc| hc.fields.iter().find(|f| f.name == field))
-            .map(|f| lower_type_hir(&f.field_type))
+            .map(|f| lower_type_hir(&f.field_type, self.enums))
             .unwrap_or(SsaType::I64);
 
         let addr = self.current_block_data.fresh_value();
@@ -2869,21 +3445,67 @@ where
         (addr, field_ty)
     }
 
+    fn resolve_static_receiver_struct_name(&self, bare_name: StrId, field: StrId) -> Option<StrId> {
+        if let Some(type_module_idx) = self
+            .module_named_imports
+            .get(&self.module_idx)
+            .and_then(|named| named.get(&bare_name))
+            .copied()
+        {
+            let mangled =
+                self.dep_graph
+                    .borrow()
+                    .mangle_type_name(type_module_idx, bare_name, &self.context);
+            if let Some(mmap) = self.struct_mangled_map.get(&mangled) {
+                if mmap.contains_key(&field) {
+                    return Some(mangled);
+                }
+            }
+        }
+
+        let pkg = self.dep_graph.borrow().get_module_package(self.module_idx);
+        let bare_str = self.context.resolve_string(&bare_name);
+        let candidate = pkg.map(|p| {
+            let pkg_str = self.context.resolve_string(&p).replace("::", "_");
+            StrId(intern_fmt!(self.context, "{}_{}", pkg_str, bare_str))
+        });
+
+        if let Some(cand) = candidate {
+            if let Some(mmap) = self.struct_mangled_map.get(&cand) {
+                if mmap.contains_key(&field) {
+                    return Some(cand);
+                }
+            }
+        }
+
+        None
+    }
+
     fn lower_method_call(
         &mut self,
         object: &HirExpr<'a, 'bump>,
         field: StrId,
         args: &[HirExpr<'a, 'bump>],
+        span: &SourceSpan<'a>,
     ) -> Value {
         if let HirExpr::Ident(scope_name, _) = object {
             if !self.var_map.contains_key(scope_name) {
-                let direct_name: StrId = optimized_string_buffering::mangle_method_name(
-                    self.dep_graph,
-                    self.module_idx,
-                    *scope_name,
-                    field,
-                    self.context.clone(),
-                );
+                let mangled_struct_name =
+                    self.resolve_static_receiver_struct_name(*scope_name, field);
+
+                let direct_name: Option<StrId> = mangled_struct_name
+                    .and_then(|cls| self.struct_mangled_map.get(&cls))
+                    .and_then(|mmap| mmap.get(&field))
+                    .copied()
+                    .or_else(|| self.resolve_module_access_callee(&[*scope_name], field));
+
+                let Some(direct_name) = direct_name else {
+                    panic!(
+                        "lower_method_call (static): could not resolve `{}.{}` to a mangled \
+                         function via struct_mangled_map. resolved struct key: {:?} at span {}",
+                        scope_name, field, mangled_struct_name, span,
+                    );
+                };
 
                 let param_types: Vec<SsaType> = self
                     .funcs
@@ -2906,9 +3528,19 @@ where
                     args: operands,
                 });
 
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::I64);
+                let ret_ty = self
+                    .funcs
+                    .get(&direct_name)
+                    .or_else(|| self.global_funcs.get(&direct_name))
+                    .map(|f| f.ret_type.clone())
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "lower_method_call (static): resolved `{}` via struct_mangled_map but \
+                             it isn't in funcs or global_funcs; registry inconsistency",
+                            self.context.resolve_string(&direct_name)
+                        )
+                    });
+                self.current_block_data.value_types.insert(dest, ret_ty);
                 return dest;
             }
         }
@@ -2938,12 +3570,6 @@ where
             }
         }
 
-        if cls_name_id.is_some() {
-            self.current_block_data
-                .value_types
-                .insert(obj_val, SsaType::I64);
-        }
-
         operands.push(Operand::Value(obj_val));
         for a in args {
             let av = self.lower_expr(a);
@@ -2955,15 +3581,18 @@ where
         }
 
         panic!(
-            "[lower_method_call] no mangled mapping or vtable slot found for method `{}` on struct `{:?}`.",
+            "[lower_method_call] no mangled mapping or vtable slot found for method `{}` on struct `{:?}` at span {}.",
             self.context.resolve_string(&field),
-            cls_name_id.map(|id| self.context.resolve_string(&id).to_string())
+            cls_name_id.map(|id| self.context.resolve_string(&id).to_string()),
+            span
         );
     }
 
     fn resolve_receiver_target_key(&self, ty: &SsaType) -> Option<StrId> {
         match ty {
             SsaType::User(name, _) => Some(*name),
+            SsaType::Enum { name, .. } => Some(*name),
+            SsaType::Interface(name) => Some(*name),
             SsaType::Pointer(inner) | SsaType::Owned(inner) => {
                 self.resolve_receiver_target_key(inner)
             }
@@ -3035,15 +3664,15 @@ where
         if let HirExpr::FieldAccess {
             object: base_obj,
             field,
-            ..
+            span,
         }
         | HirExpr::Get {
             object: base_obj,
             field,
-            ..
+            span,
         } = object
         {
-            let (addr, _) = self.lower_field_addr(base_obj, *field);
+            let (addr, _) = self.lower_field_addr(base_obj, *field, span);
             return addr;
         }
         self.lower_expr(object)
@@ -3060,18 +3689,54 @@ where
             return None;
         };
 
-        if let Some(mmap) = self.struct_mangled_map.get(&cls_name) {
-            if let Some(mangled_name) = mmap.get(&field) {
+        let mmap = self.struct_mangled_map.get(&cls_name).or_else(|| {
+            self.struct_mangled_map.iter().find_map(
+                |(k, v)| {
+                    if *k == cls_name { Some(v) } else { None }
+                },
+            )
+        });
+
+        if let Some(mmap) = mmap {
+            let field_str = self.context.resolve_string(&field);
+            let mangled_name = mmap.get(&field).copied().or_else(|| {
+                mmap.iter().find_map(|(k, v)| {
+                    if self.context.resolve_string(k) == field_str {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            if let Some(mangled_name) = mangled_name {
+                let actual_func_name = if self.funcs.contains_key(&mangled_name) {
+                    mangled_name
+                } else {
+                    let base_str = self.context.resolve_string(&mangled_name);
+                    self.funcs
+                        .keys()
+                        .find_map(|k| {
+                            let k_str = self.context.resolve_string(k);
+                            if k_str == base_str || k_str.starts_with(&format!("{}_", base_str)) {
+                                Some(*k)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(mangled_name)
+                };
+
                 let dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::Call {
                     dest: Some(dest),
-                    func: Operand::FunctionRef(mangled_name.clone()),
+                    func: Operand::FunctionRef(actual_func_name),
                     args: operands.clone(),
                 });
 
                 let ret_ty = self
                     .funcs
-                    .get(mangled_name)
+                    .get(&actual_func_name)
                     .map(|f| f.ret_type.clone())
                     .unwrap_or(SsaType::I64);
                 self.current_block_data.value_types.insert(dest, ret_ty);
@@ -3079,7 +3744,13 @@ where
             }
         }
 
-        if let Some(struct_slots) = self.struct_method_slots.get(&cls_name) {
+        let struct_slots = self.struct_method_slots.get(&cls_name).or_else(|| {
+            self.struct_method_slots
+                .iter()
+                .find_map(|(k, v)| if *k == cls_name { Some(v) } else { None })
+        });
+
+        if let Some(struct_slots) = struct_slots {
             if let Some(slot_idx) = struct_slots.get(&field) {
                 let dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::InterfaceDispatch {
@@ -3088,9 +3759,40 @@ where
                     method_slot: *slot_idx,
                     args: operands.clone(),
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::I64);
+                let ret_ty = self
+                    .interface_methods
+                    .get(&cls_name)
+                    .and_then(|methods| methods.iter().find(|(name, _, _)| name == &field))
+                    .map(|(_, _, ret)| ret.clone())
+                    .unwrap_or(SsaType::I64);
+                self.current_block_data.value_types.insert(dest, ret_ty);
+                return Some(dest);
+            }
+        }
+
+        let iface_slots = self.interface_method_slots.get(&cls_name).or_else(|| {
+            self.interface_method_slots
+                .iter()
+                .find_map(|(k, v)| if *k == cls_name { Some(v) } else { None })
+        });
+
+        if let Some(iface_slots) = iface_slots {
+            if let Some(slot_idx) = iface_slots.get(&field) {
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::InterfaceDispatch {
+                    dest: Some(dest),
+                    object: obj_val,
+                    method_slot: *slot_idx,
+                    args: operands.clone(),
+                });
+                let ret_ty = self
+                    .struct_vtable_slots
+                    .get(&cls_name)
+                    .filter(|slots| *slot_idx < slots.len())
+                    .and_then(|slots| self.funcs.get(&slots[*slot_idx]))
+                    .map(|f| f.ret_type.clone())
+                    .unwrap_or(SsaType::Void);
+                self.current_block_data.value_types.insert(dest, ret_ty);
                 return Some(dest);
             }
         }
@@ -3192,10 +3894,10 @@ where
 
     fn get_field_offset(&mut self, obj: &Value, field: StrId) -> usize {
         let cls_name = match self.current_block_data.value_types.get(obj) {
-            Some(SsaType::User(name, _)) => *name,
+            Some(SsaType::User(name, _)) => name,
             Some(SsaType::Pointer(inner)) => {
                 if let SsaType::User(name, _) = inner.as_ref() {
-                    *name
+                    name
                 } else {
                     panic!("[get_field_offset] pointer to non-User type: {:?}", inner)
                 }

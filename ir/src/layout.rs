@@ -28,13 +28,49 @@ const fn round_up(x: usize, align: usize) -> usize {
     (x + m) & !m
 }
 
-fn tag_bytes(variants: usize) -> usize {
-    match variants {
-        0..=0x100 => 1,
-        0x101..=0x1_0000 => 2,
-        0x1_0001..=0x1_0000_0000 => 4,
-        _ => 8,
+pub struct EnumLayout {
+    pub layout: Layout,
+    pub tag_offset: usize,
+    pub tag_size: usize,
+    pub payload_offset: usize,
+}
+
+pub fn enum_layout_of_ssa(
+    variants: &[Vec<SsaType>],
+    target: TargetInfo,
+) -> Result<EnumLayout, LayoutError> {
+    if variants.is_empty() {
+        return Ok(EnumLayout {
+            layout: Layout { size: 0, align: 1 },
+            tag_offset: 0,
+            tag_size: 0,
+            payload_offset: 0,
+        });
     }
+
+    let mut max_payload = Layout { size: 0, align: 1 };
+    for fields in variants {
+        let l = layout_of_ssa(&SsaType::Tuple(fields.clone()), target)?;
+        max_payload.size = max_payload.size.max(l.size);
+        max_payload.align = max_payload.align.max(l.align);
+    }
+
+    let tag_size = 8usize;
+    let tag_offset = 0usize;
+    // payload must start on its own alignment boundary, not just right after the tag
+    let payload_offset = round_up_to_align(tag_size, max_payload.align.max(1));
+    let struct_align = max_payload.align.max(tag_size);
+    let size = round_up_to_align(payload_offset + max_payload.size, struct_align);
+
+    Ok(EnumLayout {
+        layout: Layout {
+            size,
+            align: struct_align,
+        },
+        tag_offset,
+        tag_size,
+        payload_offset,
+    })
 }
 
 pub fn sizeof_ssa(ty: &SsaType, target: TargetInfo) -> Result<usize, LayoutError> {
@@ -86,29 +122,8 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
         }
 
         // Enums/sum types: Simple tagged union:
-        SsaType::Enum(_, variants) => {
-            if variants.is_empty() {
-                return Ok(Layout { size: 0, align: 1 });
-            }
-            let mut max_variant = Layout { size: 0, align: 1 };
-            for v in variants {
-                let l = layout_of_ssa(v, target)?;
-                max_variant.size = max_variant.size.max(l.size);
-                max_variant.align = max_variant.align.max(l.align);
-            }
-            let tag = Layout {
-                size: tag_bytes(variants.len()),
-                align: 1,
-            }; // define tag width
-            let union_size = round_up(max_variant.size, max_variant.align);
-            let total = round_up(union_size, tag.align)
-                .checked_add(tag.size)
-                .ok_or(LayoutError::Unknown)?;
-            Ok(Layout {
-                size: total,
-                align: max_variant.align.max(tag.align),
-            })
-        }
+        SsaType::Enum { variants, .. } => Ok(enum_layout_of_ssa(variants, target)?.layout),
+
         SsaType::I128 => Ok(Layout {
             size: 16,
             align: 16,
@@ -195,7 +210,7 @@ pub fn layout_of_hir(ty: &HirType, target: TargetInfo) -> Result<Layout, LayoutE
             align: target.ptr_bytes as usize,
         }),
 
-        HirType::Struct { .. } | HirType::DynInterface(_, _) | HirType::Enum(_, _) => Ok(Layout {
+        HirType::Struct { .. } | HirType::DynInterface(_, _) | HirType::Enum { .. } => Ok(Layout {
             // TODO: fix to be based on the real size
             size: target.ptr_bytes as usize,
             align: target.ptr_bytes as usize,

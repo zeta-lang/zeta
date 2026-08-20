@@ -1,5 +1,6 @@
 use crate::{
-    hir::{AssignmentOperator, HirType, Operator},
+    hir::{AssignmentOperator, HirEnum, HirType, Operator, StrId},
+    ir_hasher::HashMap,
     ssa_ir::{BinOp, SsaType},
 };
 
@@ -20,7 +21,7 @@ pub fn assign_op_to_bin_op(op: AssignmentOperator) -> BinOp {
     bin_op
 }
 
-pub fn lower_type_hir(ty: &HirType) -> SsaType {
+pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> SsaType {
     match ty {
         HirType::I8 => SsaType::I8,
         HirType::I16 => SsaType::I16,
@@ -36,15 +37,45 @@ pub fn lower_type_hir(ty: &HirType) -> SsaType {
         HirType::F64 => SsaType::F64,
         HirType::Boolean => SsaType::Bool,
         HirType::String => SsaType::String,
+
         HirType::Struct {
             name,
             field_types: args,
             ..
+        } => {
+            let lowered_args: Vec<SsaType> =
+                args.iter().map(|arg| lower_type_hir(arg, enums)).collect();
+            SsaType::User(*name, lowered_args)
         }
-        | HirType::DynInterface(name, args)
-        | HirType::Enum(name, args) => {
-            SsaType::User(*name, args.iter().map(lower_type_hir).collect())
+
+        HirType::DynInterface(name, _args) => SsaType::Interface(*name),
+
+        HirType::Enum { name, .. } => {
+            let hir_enum = enums.get(name).unwrap_or_else(|| {
+                println!("enums: {:#?}", enums.keys().collect::<Vec<_>>());
+                panic!(
+                    "lower_type_hir: enum `{}` not found in registry, it must be \
+                             registered (post-monomorphization, under its final concrete name) \
+                             before any HirType::Enum referencing it is lowered",
+                    name
+                )
+            });
+            let variants = hir_enum
+                .variants
+                .iter()
+                .map(|v| {
+                    v.fields
+                        .iter()
+                        .map(|f| lower_type_hir(&f.field_type, enums))
+                        .collect()
+                })
+                .collect();
+            SsaType::Enum {
+                name: *name,
+                variants,
+            }
         }
+
         HirType::Void => SsaType::Void,
         HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. } => {
             // `*dyn T` / `[*]dyn T`: don't drill into the interface's own
@@ -65,10 +96,12 @@ pub fn lower_type_hir(ty: &HirType) -> SsaType {
                         None => SsaType::Pointer(Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_type_hir(inner))),
+                _ => SsaType::Pointer(Box::new(lower_type_hir(inner, enums))),
             }
         }
-        HirType::OwnedPointer { inner, .. } => SsaType::Owned(Box::new(lower_type_hir(inner))),
+        HirType::OwnedPointer { inner, .. } => {
+            SsaType::Owned(Box::new(lower_type_hir(inner, enums)))
+        }
         HirType::Lambda { .. } => {
             unreachable!()
         }
@@ -102,10 +135,10 @@ pub fn lower_type_hir(ty: &HirType) -> SsaType {
                         None => SsaType::Pointer(Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_type_hir(inner))),
+                _ => SsaType::Pointer(Box::new(lower_type_hir(inner, enums))),
             }
         }
-        HirType::Nullable(hir_type) => SsaType::Nullable(Box::new(lower_type_hir(hir_type))),
+        HirType::Nullable(hir_type) => SsaType::Nullable(Box::new(lower_type_hir(hir_type, enums))),
         HirType::Dyn { bounds } => {
             let iface = bounds.iter().find_map(|b| match b {
                 HirType::DynInterface(name, _) => Some(*name),
@@ -117,16 +150,18 @@ pub fn lower_type_hir(ty: &HirType) -> SsaType {
             }
         }
         HirType::Unknown => unreachable!(),
-        HirType::Tuple(args) => SsaType::Tuple(args.iter().map(lower_type_hir).collect()),
-        HirType::Array(hir_type, length) => {
-            SsaType::Array(Box::new(lower_type_hir(hir_type)), *length)
+        HirType::Tuple(args) => {
+            SsaType::Tuple(args.iter().map(|arg| lower_type_hir(arg, enums)).collect())
         }
-        HirType::Slice(hir_type) => SsaType::Slice(Box::new(lower_type_hir(hir_type))),
+        HirType::Array(hir_type, length) => {
+            SsaType::Array(Box::new(lower_type_hir(hir_type, enums)), *length)
+        }
+        HirType::Slice(hir_type) => SsaType::Slice(Box::new(lower_type_hir(hir_type, enums))),
         HirType::Usize => SsaType::Usize,
         HirType::Isize => SsaType::Isize,
         HirType::Never => SsaType::Void,
         HirType::Range { elem, inclusive: _ } => {
-            let elem_ssa = lower_type_hir(elem);
+            let elem_ssa = lower_type_hir(elem, enums);
             SsaType::Tuple(vec![elem_ssa.clone(), elem_ssa])
         }
     }
