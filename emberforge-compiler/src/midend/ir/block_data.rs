@@ -1,15 +1,14 @@
 use ir::{
-    ir_hasher::FxHashBuilder,
+    ir_hasher::HashMap,
     ssa_ir::{BasicBlock, BlockId, Function, SsaType, Value},
 };
-use std::collections::HashMap;
 
 pub struct CurrentBlockData<'f> {
     pub func: &'f mut Function,
     pub current_block: BlockId,
     pub next_value: usize,
     pub next_block: usize,
-    pub value_types: HashMap<Value, SsaType, FxHashBuilder>,
+    pub value_types: HashMap<Value, SsaType>,
 }
 
 impl<'f> CurrentBlockData<'f> {
@@ -18,7 +17,7 @@ impl<'f> CurrentBlockData<'f> {
         current_block: BlockId,
         next_value: usize,
         next_block: usize,
-        value_types: HashMap<Value, SsaType, FxHashBuilder>,
+        value_types: HashMap<Value, SsaType>,
     ) -> Self {
         Self {
             func,
