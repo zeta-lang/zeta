@@ -1,2 +1,2 @@
-package zeta::lang::strings;
+package zeta::strings;
 struct YYHEH {}

@@ -36,7 +36,7 @@ interface Writer {
 struct StdOutWriter {}
 impl StdOutWriter by Writer {
     unsafe func write_raw(&mut this, bytes: &[]u8): usize {
-        let n: isize = libc.write(1, bytes.ptr as [*]const void, bytes.len);
+        let n: isize = libc.write(1, bytes as [*]const void, bytes.len);
         if (n < 0) {
             debug.debug_panic("write to stdout failed");
         }
@@ -47,7 +47,7 @@ impl StdOutWriter by Writer {
 struct StdErrWriter {}
 impl StdErrWriter by Writer {
     unsafe func write_raw(&mut this, bytes: &[]u8): usize {
-        let n: isize = libc.write(2, bytes.ptr as [*]const void, bytes.len);
+        let n: isize = libc.write(2, bytes as [*]const void, bytes.len);
         if (n < 0) {
             debug.debug_panic("write to stderr failed");
         }

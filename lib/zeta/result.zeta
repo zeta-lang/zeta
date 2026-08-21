@@ -19,7 +19,7 @@ impl<T, E> Result<T, E> {
         return !this.is_ok();
     }
 
-    func unwrap(this): T {
+    func unwrap(&this): T {
         return match (this) {
             case Result.Ok { value } -> value,
             case Result.Err { error } -> debug.debug_panic("called unwrap() on an Err value"),
@@ -70,7 +70,7 @@ impl<T, E> Result<T, E> {
 
     func map<U, F: func(T): U>(this, f: F): Result<U, E> {
         return match (this) {
-            case Result.Ok { value } -> Result.Ok(f(value)),
+            case Result.Ok { value } -> Result.Ok { value: f(value) },
             case Result.Err { error } -> Result.Err { error },
         };
     }

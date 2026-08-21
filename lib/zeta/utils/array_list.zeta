@@ -89,6 +89,7 @@ impl<T, A: Allocator> ArrayList<T, A> {
     func as_slice(&this): &[]T {
         return this.data[0..this.data.len];
     }
+
     func clear(&mut this) {
         this.data.len = 0;
     }

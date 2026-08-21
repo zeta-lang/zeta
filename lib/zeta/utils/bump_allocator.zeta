@@ -40,7 +40,9 @@ impl<A: Allocator> BumpAllocator<A> {
         let start: usize = align_up(this.memory.len, $alignof<T>());
         let end: usize = start + $sizeof<T>();
 
-        debug.assert(end <= this.memory.cap);
+        if (end > this.memory.cap) {
+            debug.debug_panic("end exceeds memory cap");
+        }
 
         let ptr: [*]mut u8 = (this.memory as [*]mut u8) + start;
 
@@ -56,7 +58,9 @@ impl<A: Allocator> BumpAllocator<A> {
         let start: usize = this.align_up(this.memory.len, align);
         let end: usize = start + size;
 
-        $assert(end <= this.memory.cap);
+        if (end > this.memory.cap) {
+            debug.debug_panic("end exceeds memory cap");
+        }
 
         let ptr: [*]mut u8 =
             (this.memory as [*]mut u8) + start;

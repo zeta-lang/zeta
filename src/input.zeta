@@ -1,53 +1,90 @@
-package zeta::input;
+package input;
 
-import zeta::utils::array_list.ArrayList;
+import zeta::io;
+import zeta::file.File;
+import zeta::file.FileWriter;
+import zeta::file.FileReader;
+import zeta::buf_writer.BufWriter;
 import zeta::utils::mallocator.Mallocator;
-import zeta::utils::mallocator.RawMallocator;
-
-extern "C" func println_int(num: i64);
-
-public struct Inner {
-    tag: i64
-}
-
-public struct Outer {
-    inner: Inner,
-    count: i64
-}
-
-impl Outer by Drop {
-    func drop(mut this) {
-        println_int(1);
-    }
-}
+import zeta::utils::array_list.ArrayList;
+import zeta::result.Result;
+import zeta::io_error.IOError;
 
 func main(): i64 {
+    io.stdout().writeln("=== Zeta Standard Library Integration Test ===");
+
+    // 1. Test ArrayList
     let alloc: Mallocator = Mallocator {};
-    let mut list: ArrayList<Outer, Mallocator> = ArrayList.with_capacity(3, alloc);
+    let mut list: ArrayList<i64, Mallocator> = ArrayList.new<i64, Mallocator>(alloc);
 
-    list.push(Outer {
-        inner: Inner { tag: 10 },
-        count: 100,
-    });
+    list.push(100);
+    list.push(200);
+    list.push(300);
 
-    list.push(Outer {
-        inner: Inner { tag: 20 },
-        count: 200,
-    });
+    let len: usize = list.len();
+    let v0: i64 = *list.get(0);
+    let v1: i64 = *list.get(1);
+    let v2: i64 = *list.get(2);
 
-    list.push(Outer {
-        inner: Inner { tag: 30 },
-        count: 300,
-    });
+    if (len == 3 && v0 == 100 && v1 == 200 && v2 == 300) {
+        io.stdout().writeln("[PASS] ArrayList<i64, Mallocator> verified.");
+    } else {
+        io.stdout().writeln("[FAIL] ArrayList test failed!");
+        return 1;
+    }
 
-    let i: usize = 1;
-    let second: &mut Outer = list.get_mut(i);
-    let third: &mut Outer = list.get_mut(i + 1);
-    second.inner.tag = 123;
-    second.count = 456;
-    println_int(second.inner.tag);
-    third.inner.tag = 789;
-    third.count = 999;
+    // 2. Test File I/O & BufWriter
+    let mut file_obj: File = match (File.create("./build/test_output.txt")) {
+        case Result.Ok { value } -> value,
+        case Result.Err { error } -> { // it gets here when _ is used but not when Result.Err is used
+            io.stdout().writeln("[FAIL] Could not create file!");
+            return 2;
+        },
+    };
 
+    let file_writer: FileWriter = file_obj.writer();
+    let mut writer: BufWriter<FileWriter, Mallocator> = BufWriter.new<FileWriter, Mallocator>(file_writer, alloc);
+
+    let writeln_ok: bool = match (writer.write_all("Hello from Zeta BufWriter & File I/O!".as_bytes())) {
+        case Result.Ok { value } -> true,
+        case Result.Err { error } -> false,
+    };
+    if (writeln_ok) {
+        io.stdout().writeln("[PASS] BufWriter.writeln succeeded.");
+    } else {
+        io.stdout().writeln("[FAIL] BufWriter.writeln failed!");
+        return 3;
+    }
+
+    let flush_res: Result<bool, IOError> = writer.flush();
+
+    let close_res: Result<void, IOError> = file_obj.close();
+
+    // 3. Re-open and Read File
+    let mut read_file: File = match (File.open("./build/test_output.txt")) {
+        case Result.Ok { value } -> value,
+        case Result.Err { error } -> {
+            io.stdout().writeln("[FAIL] Could not open file for reading!");
+            return 4;
+        },
+    };
+
+    let mut read_buf: [128]u8 = undefined;
+    let mut reader: FileReader = read_file.reader();
+    let read_bytes: usize = match (unsafe { reader.read_raw(&mut read_buf[0..128]) }) { // line 75
+        case Result.Ok { value } -> value,
+        case Result.Err { error } -> 0,
+    };
+
+    if (read_bytes > 0) {
+        io.stdout().writeln("[PASS] File read back successfully!");
+    } else {
+        io.stdout().writeln("[FAIL] File read returned 0 bytes.");
+        return 5;
+    }
+
+    let read_close_res: Result<void, IOError> = read_file.close();
+
+    io.stdout().writeln("=== All Integration Tests Passed Successfully! ===");
     return 0;
 }

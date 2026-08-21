@@ -40,6 +40,36 @@ impl<A: Allocator> String<A> {
         // push_str/push_byte-of-ASCII.
         unsafe { return str.from_utf8_unchecked(this.as_bytes()); }
     }
+
+    func write(&mut this, bytes: &[]u8): Result<usize, IOError> {
+        unsafe { return this.write_raw(bytes); };
+    }
+
+    func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
+        let mut written: usize = 0;
+        while (written < bytes.len) {
+            let n: usize = match (unsafe { this.write_raw(bytes[written..bytes.len]) }) {
+                case Result.Ok { value } -> value,
+                case Result.Err { error } -> return Result.Err { error },
+            };
+            if (n == 0) {
+                return Result.Err { error: IOError.WriteZero };
+            }
+            written += n;
+        }
+        return Result.Ok { value: written };
+    }
+
+    func writeln(&mut this, s: str): Result<bool, IOError> {
+        return match (this.write_all(s.as_bytes())) {
+            case Result.Err { error } -> Result.Err { error },
+            case Result.Ok { value } -> this.write_all("\n".as_bytes()),
+        }
+    }
+
+    func flush(&mut this): Result<bool, IOError> {
+        return Result.Ok { value: false };
+    }
 }
 
 impl<A: Allocator> String<A> by WriteChannel {
@@ -47,6 +77,6 @@ impl<A: Allocator> String<A> by WriteChannel {
         for (let i: usize = 0; i < bytes.len; i += 1) {
             this.data.push(bytes[i]);
         }
-        return Result.Ok(bytes.len);
+        return Result.Ok { value: bytes.len };
     }
 }
