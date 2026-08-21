@@ -559,12 +559,6 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
         }
     }
 
-    /// Incrementally refresh the enum cache for the given modules (an edit
-    /// may add/remove/rename enums), then rerun the whole-program fixpoint.
-    /// The fixpoint itself can't be scoped to just `updated_modules`, a
-    /// struct anywhere in the program may hold a field of an enum/struct
-    /// that just changed, so Copy-ness has to be re-derived globally. This
-    /// only avoids the O(program) rescan `new()` used to require on every edit.
     pub fn recompute(&mut self, updated_modules: &[(usize, &HirModule<'a, 'bump>)]) {
         for &(module_idx, module) in updated_modules {
             self.upsert_module_enums(module_idx, module);
@@ -699,6 +693,7 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             | HirType::Void
             | HirType::This
             | HirType::Null
+            | HirType::String
             | HirType::Lambda { .. }
             | HirType::Never
             | HirType::Range { .. } => true,
@@ -716,11 +711,11 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             HirType::Nullable(inner) => self.type_is_copy(inner),
 
             HirType::Struct { name, .. } => self.is_copy.get(name).copied().unwrap_or(false),
-            HirType::Enum(name, _) => self.is_copy.get(name).copied().unwrap_or(false),
+            HirType::Enum { name, .. } => self.is_copy.get(name).copied().unwrap_or(false),
 
             HirType::Dyn { .. } | HirType::DynInterface(..) => false,
 
-            HirType::String | HirType::Generic(_) | HirType::Unknown => false,
+            HirType::Generic(_) | HirType::Unknown => false,
             HirType::Tuple(args) => args.iter().all(|arg| self.type_is_copy(arg)),
 
             // A kind of pointer known to be able to store multiple elements
