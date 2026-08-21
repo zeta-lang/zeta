@@ -208,6 +208,7 @@ where
     pub unmangled_name: StrId,
     pub declaring_module_idx: usize,
     pub impl_target: Option<StrId>,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -253,13 +254,13 @@ pub struct HirEnum<'a, 'bump> {
     pub variants: &'bump [HirEnumVariant<'a, 'bump>],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct HirEnumVariant<'a, 'bump> {
     pub name: StrId,
     pub fields: &'bump [HirField<'a, 'bump>],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct HirField<'a, 'bump>
 where
     'bump: 'a,
@@ -376,7 +377,11 @@ where
         type_args: &'bump [HirType<'a, 'bump>],
     },
     DynInterface(StrId, &'bump [HirType<'a, 'bump>]),
-    Enum(StrId, &'bump [HirType<'a, 'bump>]),
+    Enum {
+        name: StrId,
+        variants: &'bump [HirEnumVariant<'a, 'bump>],
+        type_args: &'bump [HirType<'a, 'bump>],
+    },
     SafePointer {
         inner: &'a HirType<'a, 'bump>,
         mutability_state: MutabilityState,
@@ -546,6 +551,7 @@ pub struct HirFuncProto<'a, 'bump> {
     pub function_metadata: FuncModifiers,
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub unmangled_name: StrId,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -799,7 +805,9 @@ where
             } => Self::write_args(f, name, args),
 
             HirType::DynInterface(name, args) => Self::write_args(f, name, args),
-            HirType::Enum(name, args) => Self::write_args(f, name, args),
+            HirType::Enum {
+                name, type_args, ..
+            } => Self::write_args(f, name, type_args),
             HirType::Lambda {
                 params,
                 return_type,
@@ -980,7 +988,7 @@ where
     pub fn drop_kind(&self) -> DropKind<'a, 'bump> {
         match self {
             HirType::Struct { name, .. }
-            | HirType::Enum(name, _)
+            | HirType::Enum { name, .. }
             | HirType::DynInterface(name, _) => DropKind::Type(*name),
 
             HirType::OwnedPointer { inner, allocator } => DropKind::OwnedPointer {
@@ -1008,7 +1016,7 @@ where
     pub fn nominal_type_name(&self) -> Option<StrId> {
         match self {
             HirType::Struct { name, .. }
-            | HirType::Enum(name, _)
+            | HirType::Enum { name, .. }
             | HirType::DynInterface(name, _) => Some(*name),
 
             HirType::Ref { inner, .. }
