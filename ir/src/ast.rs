@@ -848,7 +848,7 @@ pub enum MutabilityState {
     Const,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Default, Eq)]
 pub enum Visibility {
     #[default]
     Public,
