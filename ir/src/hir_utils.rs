@@ -1,11 +1,10 @@
-use smallvec::SmallVec;
-use std::sync::Arc;
-use zetaruntime::string_pool::StringPool;
-
 use crate::{
-    ast,
+    ast::{self, MutabilityState},
     hir::{self, HirType, Operator, StrId},
 };
+use smallvec::SmallVec;
+use std::sync::Arc;
+use zetaruntime::{intern_fmt, string_pool::StringPool};
 
 pub const fn lower_visibility(visibility: &ast::Visibility) -> hir::Visibility {
     match visibility {
@@ -28,7 +27,6 @@ pub const fn lower_cmp_operator(op: ast::Op) -> Operator {
     }
 }
 
-#[allow(unused)] // TODO: probably finish, lol
 pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
     StrId(match ty {
         HirType::I32 => pool.intern("i32"),
@@ -39,7 +37,6 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
         HirType::F64 => pool.intern("f64"),
         HirType::String => pool.intern("str"),
         HirType::Boolean => pool.intern("boolean"),
-
         HirType::Struct {
             name, type_args, ..
         } => {
@@ -59,9 +56,10 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
                 pool.intern(s)
             }
         }
-
-        HirType::Generic(name) => unreachable!(),
-
+        HirType::Generic(name) => unreachable!(
+            "[type_suffix_with_pool] unresolved generic parameter `{}` reached name mangling",
+            name
+        ),
         HirType::Void => pool.intern("void"),
         HirType::I8 => pool.intern("i8"),
         HirType::I16 => pool.intern("i16"),
@@ -69,32 +67,164 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
         HirType::U16 => pool.intern("u16"),
         HirType::I128 => pool.intern("i128"),
         HirType::U128 => pool.intern("u128"),
-        HirType::SafePointer { .. } => todo!(),
+
+        HirType::SafePointer {
+            inner,
+            mutability_state,
+        } => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            let tag = if *mutability_state == MutabilityState::Mut {
+                "ptrmut"
+            } else {
+                "ptrconst"
+            };
+            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+        }
+
+        HirType::UnsafePointer {
+            inner,
+            mutability_state,
+        } => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            let tag = if *mutability_state == MutabilityState::Mut {
+                "uptrmut"
+            } else {
+                "uptrconst"
+            };
+            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+        }
+
         HirType::Ref {
             inner,
             mutability_state,
-            provenance,
-        } => todo!(),
-        HirType::UnsafePointer { .. } => todo!(),
-        HirType::OwnedPointer { .. } => todo!(),
+            provenance: _,
+        } => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            let tag = if *mutability_state == MutabilityState::Mut {
+                "refmut"
+            } else {
+                "refconst"
+            };
+            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+        }
+
+        HirType::OwnedPointer { inner, .. } => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            let s = format!("own_{}", pool.resolve_string(&inner_suf));
+            pool.intern(&s)
+        }
+
         HirType::Lambda {
             params,
             return_type,
-        } => todo!(),
-        HirType::This => todo!(),
-        HirType::Null => todo!(),
+        } => {
+            let mut buf: SmallVec<u8, 64> = SmallVec::new();
+            buf.extend_from_slice(b"fn");
+            for p in params.iter() {
+                buf.push(b'_');
+                let suf = type_suffix_with_pool(pool.clone(), p);
+                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+            }
+            buf.extend_from_slice(b"_ret_");
+            let ret_suf = type_suffix_with_pool(pool.clone(), return_type);
+            buf.extend_from_slice(pool.resolve_bytes(&*ret_suf));
+            pool.intern_bytes(buf.as_slice())
+        }
+
+        HirType::This => unreachable!(
+            "[type_suffix_with_pool] `this` type reached name mangling unresolved, \
+             should have been substituted with the concrete receiver type first"
+        ),
+
+        HirType::Null => pool.intern("null"),
+
         HirType::Char => pool.intern("char"),
-        HirType::Unknown => todo!(),
-        HirType::Nullable(hir_type) => todo!(),
-        HirType::Dyn { bounds } => todo!(),
-        HirType::Tuple(hir_types) => todo!(),
-        HirType::Array(hir_type, _) => todo!(),
-        HirType::Slice(hir_type) => todo!(),
+
+        HirType::Unknown => unreachable!(
+            "[type_suffix_with_pool] HirType::Unknown reached name mangling, \
+             type checking should have rejected this before monomorphization"
+        ),
+
+        HirType::Nullable(inner) => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            intern_fmt!(pool, "opt_{}", pool.resolve_string(&inner_suf))
+        }
+
+        HirType::Dyn { bounds } => {
+            let mut buf: SmallVec<u8, 64> = SmallVec::new();
+            buf.extend_from_slice(b"dyn");
+            for b in bounds.iter() {
+                buf.push(b'_');
+                let suf = type_suffix_with_pool(pool.clone(), b);
+                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+            }
+            pool.intern_bytes(buf.as_slice())
+        }
+
+        HirType::Tuple(hir_types) => {
+            let mut buf: SmallVec<u8, 64> = SmallVec::new();
+            buf.extend_from_slice(b"tuple");
+            for t in hir_types.iter() {
+                buf.push(b'_');
+                let suf = type_suffix_with_pool(pool.clone(), t);
+                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+            }
+            pool.intern_bytes(buf.as_slice())
+        }
+
+        HirType::Array(inner, len) => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            intern_fmt!(pool, "arr{}_{}", len, pool.resolve_string(&inner_suf))
+        }
+
+        HirType::Slice(inner) => {
+            let inner_suf = type_suffix_with_pool(pool.clone(), inner);
+            intern_fmt!(pool, "slice_{}", pool.resolve_string(&inner_suf))
+        }
+
         HirType::Usize => pool.intern("usize"),
         HirType::Isize => pool.intern("isize"),
-        HirType::DynInterface(str_id, hir_types) => todo!(),
-        HirType::Enum(str_id, hir_types) => todo!(),
+
+        HirType::DynInterface(name, type_args) => {
+            if type_args.is_empty() {
+                **name
+            } else {
+                let mut buf: SmallVec<u8, 64> = SmallVec::new();
+                buf.extend_from_slice(pool.resolve_bytes(&*name));
+                for arg in type_args.iter() {
+                    buf.push(b'_');
+                    let suf = type_suffix_with_pool(pool.clone(), arg);
+                    buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                }
+                pool.intern_bytes(buf.as_slice())
+            }
+        }
+
+        HirType::Enum {
+            name, type_args, ..
+        } => {
+            if type_args.is_empty() {
+                // name is already the fully-resolved/mangled identity of this enum,
+                // same reasoning as the Struct arm above
+                **name
+            } else {
+                let mut buf: SmallVec<u8, 64> = SmallVec::new();
+                buf.extend_from_slice(pool.resolve_bytes(&*name));
+                for arg in type_args.iter() {
+                    buf.push(b'_');
+                    let suf = type_suffix_with_pool(pool.clone(), arg);
+                    buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                }
+                pool.intern_bytes(buf.as_slice())
+            }
+        }
+
         HirType::Never => pool.intern("never"),
-        HirType::Range { elem, inclusive } => todo!(),
+
+        HirType::Range { elem, inclusive } => {
+            let elem_suf = type_suffix_with_pool(pool.clone(), elem);
+            let tag = if *inclusive { "rangeincl" } else { "range" };
+            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&elem_suf))
+        }
     })
 }
