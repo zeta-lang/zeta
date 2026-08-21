@@ -1,8 +1,9 @@
-use ir::hir::{HirStruct, HirType, StrId};
+use ir::hir::{HirEnum, HirStruct, HirType, StrId};
 use ir::hir_utils::type_suffix_with_pool;
-use ir::ir_hasher::HashMap;
+use ir::ir_hasher::{FxHashMap, HashMap};
 use smallvec::SmallVec;
 use std::sync::Arc;
+use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
 pub fn suffix_for_subs(pool: Arc<StringPool>, subs: &HashMap<StrId, HirType>) -> StrId {
@@ -24,6 +25,21 @@ pub fn suffix_for_subs(pool: Arc<StringPool>, subs: &HashMap<StrId, HirType>) ->
     }
     let s = std::str::from_utf8(&buf).expect("Generated string should be valid UTF-8");
     StrId(pool.intern(s))
+}
+
+pub fn instantiate_enum_name<'a, 'bump>(
+    concrete_args: &[HirType<'a, 'bump>],
+    base: &HirEnum<'a, 'bump>,
+    context: Arc<StringPool>,
+) -> StrId {
+    let mut subs = FxHashMap::default();
+    if let Some(generics) = &base.generics {
+        for (param, arg) in generics.iter().zip(concrete_args) {
+            subs.insert(param.name, arg.clone());
+        }
+    }
+    let suffix = suffix_for_subs(context.clone(), &subs);
+    StrId(intern_fmt!(context, "{}_{}", base.name, suffix))
 }
 
 pub fn instantiate_struct_name(

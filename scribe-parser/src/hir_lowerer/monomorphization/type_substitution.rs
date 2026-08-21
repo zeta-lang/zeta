@@ -1,4 +1,4 @@
-use ir::hir::{HirType, StrId};
+use ir::hir::{HirEnumVariant, HirField, HirType, StrId};
 use ir::ir_hasher::HashMap;
 use std::sync::Arc;
 use zetaruntime::arena::GrowableAtomicBump;
@@ -68,12 +68,40 @@ pub fn substitute_type<'a, 'subs, 'bump>(
             HirType::DynInterface(*name, bump.alloc_slice(&new_args))
         }
 
-        HirType::Enum(name, args) => {
-            let new_args: Vec<HirType<'a, 'bump>> = args
+        HirType::Enum {
+            name,
+            variants,
+            type_args,
+        } => {
+            let new_args: Vec<HirType<'a, 'bump>> = type_args
                 .iter()
                 .map(|a| substitute_type(a, subs, bump.clone()))
                 .collect();
-            HirType::Enum(*name, bump.alloc_slice(&new_args))
+
+            let new_variants: Vec<HirEnumVariant<'a, 'bump>> = variants
+                .iter()
+                .map(|v| {
+                    let new_fields: Vec<HirField<'a, 'bump>> = v
+                        .fields
+                        .iter()
+                        .map(|f| HirField {
+                            name: f.name,
+                            visibility: f.visibility,
+                            field_type: substitute_type(&f.field_type, subs, bump.clone()),
+                        })
+                        .collect();
+                    HirEnumVariant {
+                        name: v.name,
+                        fields: bump.alloc_slice(&new_fields),
+                    }
+                })
+                .collect();
+
+            HirType::Enum {
+                name: *name,
+                variants: bump.alloc_slice(&new_variants),
+                type_args: bump.alloc_slice(&new_args),
+            }
         }
 
         HirType::Lambda {
@@ -90,7 +118,38 @@ pub fn substitute_type<'a, 'subs, 'bump>(
                 return_type: bump.alloc_value_immutable(new_return),
             }
         }
-
+        HirType::Array(inner, len) => HirType::Array(
+            bump.alloc_value_immutable(substitute_type(inner, subs, bump.clone())),
+            *len,
+        ),
+        HirType::Nullable(inner) => HirType::Nullable(bump.alloc_value_immutable(substitute_type(
+            inner,
+            subs,
+            bump.clone(),
+        ))),
+        HirType::Tuple(elems) => {
+            let new_elems: Vec<HirType<'a, 'bump>> = elems
+                .iter()
+                .map(|e| substitute_type(e, subs, bump.clone()))
+                .collect();
+            HirType::Tuple(bump.alloc_slice(&new_elems))
+        }
+        HirType::Dyn { bounds } => {
+            let new_bounds: Vec<HirType<'a, 'bump>> = bounds
+                .iter()
+                .map(|b| substitute_type(b, subs, bump.clone()))
+                .collect();
+            HirType::Dyn {
+                bounds: bump.alloc_slice(&new_bounds),
+            }
+        }
+        HirType::Range { elem, .. } => {
+            let mut new_ty = *ty;
+            if let HirType::Range { elem: e, .. } = &mut new_ty {
+                *e = bump.alloc_value_immutable(substitute_type(elem, subs, bump.clone()));
+            }
+            new_ty
+        }
         other => *other,
     }
 }
