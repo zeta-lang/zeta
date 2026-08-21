@@ -1,4 +1,4 @@
-use crate::hir::{HirEnum, HirFunc, HirInterface, HirStruct, HirType, StrId};
+use crate::hir::{HirEnum, HirExpr, HirFunc, HirInterface, HirStruct, HirType, StrId};
 use crate::ir_hasher::FxHashMap;
 use std::{cell::RefCell, rc::Rc};
 
@@ -16,6 +16,7 @@ pub struct ModuleSymbols {
 #[derive(Clone)]
 pub struct GlobalRegistry<'a, 'bump> {
     pub structs: Rc<RefCell<FxHashMap<StrId, HirStruct<'a, 'bump>>>>,
+    pub consts: Rc<RefCell<FxHashMap<StrId, HirExpr<'a, 'bump>>>>,
     pub enums: Rc<RefCell<FxHashMap<StrId, HirEnum<'a, 'bump>>>>,
     pub interfaces: Rc<RefCell<FxHashMap<StrId, HirInterface<'a, 'bump>>>>,
     pub functions: Rc<RefCell<FxHashMap<StrId, HirFunc<'a, 'bump>>>>,
@@ -35,6 +36,10 @@ pub struct GlobalRegistry<'a, 'bump> {
     /// resolution.
     pub instantiated_struct_origins:
         Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
+    pub instantiated_enums: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+    pub instantiated_enum_origins: Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
+    pub struct_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
+    pub enum_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
     owned_by_module: Rc<RefCell<FxHashMap<StrId, ModuleSymbols>>>, // key = module name StrId
 }
 
@@ -42,6 +47,7 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
     pub fn new() -> Self {
         Self {
             structs: Rc::new(RefCell::new(FxHashMap::default())),
+            consts: Rc::new(RefCell::new(FxHashMap::default())),
             enums: Rc::new(RefCell::new(FxHashMap::default())),
             interfaces: Rc::new(RefCell::new(FxHashMap::default())),
             functions: Rc::new(RefCell::new(FxHashMap::default())),
@@ -50,6 +56,10 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
             owned_by_module: Rc::new(RefCell::new(FxHashMap::default())),
             instantiated_struct_origins: Rc::new(RefCell::new(FxHashMap::default())),
             instantiated_structs: Rc::new(RefCell::new(FxHashMap::default())),
+            instantiated_enums: Rc::new(RefCell::new(FxHashMap::default())),
+            instantiated_enum_origins: Rc::new(RefCell::new(FxHashMap::default())),
+            struct_owner_module: Rc::new(RefCell::new(FxHashMap::default())),
+            enum_owner_module: Rc::new(RefCell::new(FxHashMap::default())),
             instantiated_functions: Rc::new(RefCell::new(FxHashMap::default())),
         }
     }
