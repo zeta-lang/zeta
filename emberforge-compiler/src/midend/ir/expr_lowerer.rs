@@ -480,7 +480,6 @@ where
                         }
                     }
                     IntrinsicKind::Unreachable => {
-                        let dest = self.current_block_data.fresh_value();
                         let msg = self.current_block_data.fresh_value();
                         let msg_str = self.context.intern("entered unreachable code");
                         self.emit(Instruction::Const {
@@ -491,8 +490,10 @@ where
                         self.current_block_data
                             .value_types
                             .insert(msg, SsaType::String);
-                        // TODO: lower to a real trap/panic instruction once one exists
-                        // Or preferrably $unreachable() should instead be an unsafe alternative where LLVM or Cranelift assume this path never exists and simply UBs instead.
+
+                        self.emit_debug_panic(msg);
+
+                        let dest = self.current_block_data.fresh_value();
                         self.current_block_data
                             .value_types
                             .insert(dest, SsaType::Void);
@@ -602,7 +603,7 @@ where
                         self.current_block_data
                             .value_types
                             .insert(msg, SsaType::String);
-                        // TODO: panic here
+                        self.emit_debug_panic(msg);
 
                         self.current_block_data.switch_to(cont_bb);
                         let dest = self.current_block_data.fresh_value();
@@ -2424,30 +2425,13 @@ where
                     .insert(dest, SsaType::Pointer(inner.clone()));
 
                 let elem_size = ir::layout::sizeof_ssa(inner, TargetInfo { ptr_bytes: 8 })
-                    .expect("lower_zeroed_value: element type has no known size")
-                    as i64;
-
-                for i in 0..*len {
-                    let zero_v = self.lower_zeroed_value(inner);
-                    let addr_v = self.current_block_data.fresh_value();
-                    self.emit(Instruction::FieldAddr {
-                        dest: addr_v,
-                        base: Operand::Value(dest),
-                        offset: (i as i64 * elem_size) as usize,
-                    });
-                    self.current_block_data
-                        .value_types
-                        .insert(addr_v, SsaType::Pointer(inner.clone()));
-                    self.emit(Instruction::Store {
-                        ptr: Operand::Value(addr_v),
-                        value: Operand::Value(zero_v),
-                    });
-                }
+                    .expect("lower_zeroed_value: array element type has no known size");
+                self.emit_memset(dest, 0, elem_size * len);
 
                 dest
             }
 
-            SsaType::User(_, field_types) => {
+            SsaType::User(_, _) | SsaType::Tuple(_) => {
                 let dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::StackAlloc {
                     dest,
@@ -2458,64 +2442,13 @@ where
                     .value_types
                     .insert(dest, SsaType::Pointer(Box::new(ssa_ty.clone())));
 
-                let mut offset = 0usize;
-                for field_ty in field_types {
-                    let zero_v = self.lower_zeroed_value(field_ty);
-                    let addr_v = self.current_block_data.fresh_value();
-                    self.emit(Instruction::FieldAddr {
-                        dest: addr_v,
-                        base: Operand::Value(dest),
-                        offset,
-                    });
-                    self.current_block_data
-                        .value_types
-                        .insert(addr_v, SsaType::Pointer(Box::new(field_ty.clone())));
-                    self.emit(Instruction::Store {
-                        ptr: Operand::Value(addr_v),
-                        value: Operand::Value(zero_v),
-                    });
-                    offset += ir::layout::sizeof_ssa(field_ty, TargetInfo { ptr_bytes: 8 })
-                        .expect("lower_zeroed_value: field type has no known size");
-                }
+                let size = ir::layout::sizeof_ssa(ssa_ty, TargetInfo { ptr_bytes: 8 })
+                    .expect("lower_zeroed_value: aggregate type has no known size");
+                self.emit_memset(dest, 0, size);
 
                 dest
             }
 
-            SsaType::Tuple(elem_types) => {
-                let dest = self.current_block_data.fresh_value();
-                self.emit(Instruction::StackAlloc {
-                    dest,
-                    ty: ssa_ty.clone(),
-                    count: 1,
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Pointer(Box::new(ssa_ty.clone())));
-
-                let mut offset = 0usize;
-                for elem_ty in elem_types {
-                    let zero_v = self.lower_zeroed_value(elem_ty);
-                    let addr_v = self.current_block_data.fresh_value();
-                    self.emit(Instruction::FieldAddr {
-                        dest: addr_v,
-                        base: Operand::Value(dest),
-                        offset,
-                    });
-                    self.current_block_data
-                        .value_types
-                        .insert(addr_v, SsaType::Pointer(Box::new(elem_ty.clone())));
-                    self.emit(Instruction::Store {
-                        ptr: Operand::Value(addr_v),
-                        value: Operand::Value(zero_v),
-                    });
-                    offset += ir::layout::sizeof_ssa(elem_ty, TargetInfo { ptr_bytes: 8 })
-                        .expect("lower_zeroed_value: tuple element type has no known size");
-                }
-
-                dest
-            }
-
-            // Scalars: I8..F64 etc.
             _ => {
                 let dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::Const {
@@ -2529,6 +2462,51 @@ where
                 dest
             }
         }
+    }
+
+    /// Emits a call to the runtime's `__zeta_memset(ptr, value, size)`.
+    fn emit_memset(&mut self, ptr: Value, value: i64, size: usize) {
+        let memset_fn = StrId(self.context.intern("__zeta_memset"));
+
+        let val_v = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: val_v,
+            ty: SsaType::I32,
+            value: Operand::ConstInt(value),
+        });
+        self.current_block_data
+            .value_types
+            .insert(val_v, SsaType::I32);
+
+        let size_v = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: size_v,
+            ty: SsaType::Usize,
+            value: Operand::ConstInt(size as i64),
+        });
+        self.current_block_data
+            .value_types
+            .insert(size_v, SsaType::Usize);
+
+        self.emit(Instruction::Call {
+            dest: None,
+            func: Operand::FunctionRef(memset_fn),
+            args: smallvec![
+                Operand::Value(ptr),
+                Operand::Value(val_v),
+                Operand::Value(size_v),
+            ],
+        });
+    }
+
+    fn emit_debug_panic(&mut self, msg: Value) {
+        let panic_fn = StrId(self.context.intern("zeta_debug_debug_panic"));
+        self.emit(Instruction::Call {
+            dest: None,
+            func: Operand::FunctionRef(panic_fn),
+            args: smallvec![Operand::Value(msg)],
+        });
+        self.emit(Instruction::Ret { value: None });
     }
 
     fn lower_expr_assignment(
