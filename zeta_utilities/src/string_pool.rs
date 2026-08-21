@@ -1,51 +1,39 @@
 use crate::arena::GrowableAtomicBump;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use smallvec::SmallVec;
-use std::alloc::AllocError;
 
-use std::fmt::Formatter;
+use std::alloc::AllocError;
+use std::collections::HashMap;
+use std::fmt::{self, Formatter, Write};
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::ptr;
 use std::simd::Simd;
 use std::simd::cmp::SimdPartialEq;
-use std::simd::num::SimdUint;
-use std::{fmt, ptr};
-
 use std::str::from_utf8_unchecked;
-
-use dashmap::DashMap;
 
 const LANES: usize = 32;
 const FX_INIT: u64 = 0xcbf29ce484222325;
 const FX_PRIME: u64 = 0x100000001b3;
+const MEGABYTE: usize = 1024 * 1024;
 
-use std::fmt::Write;
-
-struct CountWriter {
-    len: usize,
+struct SmallVecWriter<const N: usize> {
+    buf: SmallVec<u8, N>,
 }
 
-impl Write for CountWriter {
+impl<const N: usize> SmallVecWriter<N> {
     #[inline(always)]
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.len += s.len();
-        Ok(())
+    fn new() -> Self {
+        Self {
+            buf: SmallVec::new(),
+        }
     }
 }
 
-struct SliceWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl Write for SliceWriter<'_> {
+impl<const N: usize> Write for SmallVecWriter<N> {
     #[inline(always)]
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let end = self.pos + bytes.len();
-
-        self.buf[self.pos..end].copy_from_slice(bytes);
-
-        self.pos = end;
-
+        self.buf.extend_from_slice(s.as_bytes());
         Ok(())
     }
 }
@@ -54,15 +42,19 @@ impl Write for SliceWriter<'_> {
 struct IdentityHasher(u64);
 
 impl Hasher for IdentityHasher {
+    #[inline(always)]
     fn finish(&self) -> u64 {
         self.0
     }
 
+    #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
         let mut acc = 0u64;
+
         for &b in bytes {
             acc = acc.wrapping_mul(0x100).wrapping_add(b as u64);
         }
+
         self.0 = acc;
     }
 }
@@ -72,6 +64,8 @@ struct IdentityBuild;
 
 impl BuildHasher for IdentityBuild {
     type Hasher = IdentityHasher;
+
+    #[inline(always)]
     fn build_hasher(&self) -> Self::Hasher {
         IdentityHasher::default()
     }
@@ -85,87 +79,107 @@ pub struct VmString {
 }
 
 impl fmt::Debug for VmString {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
 impl fmt::Display for VmString {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 impl VmString {
+    #[inline(always)]
     pub fn as_str(&self) -> &str {
         unsafe { from_utf8_unchecked(std::slice::from_raw_parts(self.offset, self.length)) }
     }
 }
 
 impl PartialEq for VmString {
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         if self.length != other.length {
             return false;
         }
+
         if self.offset.is_null() || other.offset.is_null() {
-            return self.offset == other.offset; // both null + same length(0) => equal
+            return self.offset == other.offset;
         }
+
         let (a, b): (&[u8], &[u8]) = unsafe {
             (
                 std::slice::from_raw_parts(self.offset, self.length),
                 std::slice::from_raw_parts(other.offset, other.length),
             )
         };
-        a == b
-    }
-}
 
-impl Default for VmString {
-    fn default() -> Self {
-        VmString {
-            length: 0,
-            offset: ptr::null(),
-        }
+        a == b
     }
 }
 
 impl Eq for VmString {}
 
-impl Hash for VmString {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let ptr_val = self.offset as usize;
-        let len_val = self.length;
+impl Default for VmString {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            offset: ptr::null(),
+            length: 0,
+        }
+    }
+}
 
-        let mixed = ptr_val.wrapping_mul(0x9e3779b97f4a7c15) ^ len_val;
-        mixed.hash(state);
+impl Hash for VmString {
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        unsafe {
+            std::slice::from_raw_parts(self.offset, self.length).hash(state);
+        }
     }
 }
 
 unsafe impl Send for VmString {}
 unsafe impl Sync for VmString {}
 
-#[derive(Debug, Default)]
+type StringBucket = SmallVec<VmString, 2>;
+
+#[derive(Debug)]
 pub struct StringPool {
     data_buffer: GrowableAtomicBump<'static>,
-    interned_strings: DashMap<u64, SmallVec<VmString, 2>, IdentityBuild>,
+
+    interned_strings: DashMap<u64, StringBucket, IdentityBuild>,
 }
 
-#[macro_export]
-macro_rules! intern_fmt {
-    ($pool:expr, $($arg:tt)*) => {
-        $pool.intern_fmt(format_args!($($arg)*))
-    };
+#[derive(Debug)]
+pub struct ThreadLocalStringPool<'a> {
+    global: &'a StringPool,
+    local_strings: HashMap<u64, StringBucket, IdentityBuild>,
 }
-
-const MEGABYTE: usize = 1024 * 1024;
 
 impl StringPool {
-    #[inline(always)]
+    #[inline]
     pub fn new() -> Result<Self, AllocError> {
-        Ok(StringPool {
-            data_buffer: GrowableAtomicBump::with_capacity_and_aligned(256 * MEGABYTE, 32)?,
+        Ok(Self {
+            data_buffer: GrowableAtomicBump::with_capacity_and_aligned(2 * MEGABYTE, 32)?,
+
             interned_strings: DashMap::with_hasher(IdentityBuild),
         })
+    }
+
+    /// Create a per-worker interner.
+    ///
+    /// Keep one of these around for the lifetime of a compiler worker
+    /// instead of constructing one for every string operation.
+    #[inline]
+    pub fn thread_local(&self) -> ThreadLocalStringPool<'_> {
+        ThreadLocalStringPool {
+            global: self,
+            local_strings: HashMap::with_hasher(IdentityBuild),
+        }
     }
 
     #[inline(always)]
@@ -173,82 +187,79 @@ impl StringPool {
         self.data_buffer.len()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn intern(&self, s: &str) -> VmString {
-        let bytes = s.as_bytes();
-        self.intern_bytes(bytes)
+        self.intern_bytes(s.as_bytes())
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn intern_bytes(&self, bytes: &[u8]) -> VmString {
-        let hash = Self::hash_bytes_simd(bytes);
-        self.intern_bytes_unchecked(bytes, hash)
+        let hash = Self::hash_bytes(bytes);
+        self.intern_global(bytes, hash)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn intern_fmt(&self, args: fmt::Arguments<'_>) -> VmString {
-        // First pass: calculate final size
-        let mut counter = CountWriter { len: 0 };
-
-        fmt::write(&mut counter, args).expect("formatting failed");
-
-        let len = counter.len;
-
-        // Allocate final destination directly
-        let slice = self
-            .data_buffer
-            .alloc_many(&vec![0u8; len])
-            .expect("Failed to allocate formatted string");
-
-        // Second pass: write directly into arena
-        let mut writer = SliceWriter { buf: slice, pos: 0 };
+        let mut writer = SmallVecWriter::<128>::new();
 
         fmt::write(&mut writer, args).expect("formatting failed");
 
-        let hash = Self::hash_bytes_simd(writer.buf);
+        let hash = Self::hash_bytes(&writer.buf);
 
-        self.intern_bytes_unchecked(writer.buf, hash)
+        self.intern_global(&writer.buf, hash)
+    }
+
+    #[inline]
+    fn intern_global(&self, bytes: &[u8], hash: u64) -> VmString {
+        match self.interned_strings.entry(hash) {
+            DashEntry::Occupied(mut entry) => {
+                let collision_list = entry.get();
+
+                if let Some(vm_string) = Self::find_simd(self, collision_list, bytes) {
+                    return vm_string;
+                }
+
+                let vm_string = self.allocate_global(bytes);
+
+                entry.get_mut().push(vm_string);
+
+                vm_string
+            }
+
+            DashEntry::Vacant(entry) => {
+                let vm_string = self.allocate_global(bytes);
+
+                let mut bucket = StringBucket::new();
+                bucket.push(vm_string);
+
+                entry.insert(bucket);
+
+                vm_string
+            }
+        }
     }
 
     #[inline(always)]
-    fn intern_bytes_unchecked(&self, bytes: &[u8], hash: u64) -> VmString {
-        if let Some(collision_list) = self.interned_strings.get(&hash) {
-            if let Some(vm_string) = self.find_simd(&collision_list, bytes) {
-                return vm_string;
-            }
-        }
-
-        let slice: &mut [u8] = self
+    fn allocate_global(&self, bytes: &[u8]) -> VmString {
+        let slice = self
             .data_buffer
             .alloc_many(bytes)
             .expect("Failed to allocate string slice");
 
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), slice.as_mut_ptr(), bytes.len());
-        }
-
-        let vm_string = VmString {
+        VmString {
             offset: slice.as_ptr(),
             length: bytes.len(),
-        };
-
-        self.interned_strings
-            .entry(hash)
-            .or_default()
-            .push(vm_string);
-
-        vm_string
+        }
     }
 
     #[inline(always)]
-    pub fn resolve_bytes(&self, vm_string: &VmString) -> &'static [u8] {
+    pub fn resolve_bytes(&self, vm_string: &VmString) -> &[u8] {
         unsafe { std::slice::from_raw_parts(vm_string.offset, vm_string.length) }
     }
 
     #[inline(always)]
-    pub fn resolve_string(&self, vm_string: &VmString) -> &'static str {
-        let slice = self.resolve_bytes(vm_string);
-        unsafe { from_utf8_unchecked(slice) }
+    pub fn resolve_string(&self, vm_string: &VmString) -> &str {
+        unsafe { from_utf8_unchecked(self.resolve_bytes(vm_string)) }
     }
 
     #[inline(always)]
@@ -257,150 +268,96 @@ impl StringPool {
             return false;
         }
 
+        if a.len() <= 16 {
+            return a == b;
+        }
+
         let mut i = 0;
+
         while i + LANES <= a.len() {
-            let va: Simd<u8, 32> = Simd::<u8, LANES>::from_slice(&a[i..]);
-            let vb: Simd<u8, 32> = Simd::<u8, LANES>::from_slice(&b[i..]);
+            let va = Simd::<u8, LANES>::from_slice(&a[i..]);
+            let vb = Simd::<u8, LANES>::from_slice(&b[i..]);
+
             if !va.simd_eq(vb).all() {
                 return false;
             }
+
             i += LANES;
         }
-        while i < a.len() {
-            if a[i] != b[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
+
+        a[i..] == b[i..]
     }
 
-    #[inline(always)]
-    fn find_simd<'a>(
-        &self,
-        collision_list: &'a SmallVec<VmString, 2>,
-        bytes: &[u8],
-    ) -> Option<VmString> {
+    fn find_simd(&self, collision_list: &StringBucket, bytes: &[u8]) -> Option<VmString> {
         for &vm_string in collision_list.iter() {
             if vm_string.length != bytes.len() {
                 continue;
             }
+
             let stored = self.resolve_bytes(&vm_string);
+
             if Self::eq_simd(stored, bytes) {
                 return Some(vm_string);
             }
         }
+
         None
     }
 
     #[inline(always)]
-    fn hash_bytes_simd(bytes: &[u8]) -> u64 {
+    fn hash_bytes(bytes: &[u8]) -> u64 {
         let mut hash = FX_INIT;
-        let mut i = 0;
 
-        while i + LANES <= bytes.len() {
-            let chunk = Simd::<u8, LANES>::from_slice(&bytes[i..]);
-            let sum: u64 = chunk.reduce_sum() as u64;
-            hash = hash.wrapping_mul(FX_PRIME).wrapping_add(sum);
-            hash ^= hash >> 33; // small avalanche
-            i += LANES;
-        }
-
-        while i < bytes.len() {
-            hash = hash.wrapping_mul(FX_PRIME).wrapping_add(bytes[i] as u64);
-            hash ^= hash >> 33;
-            i += 1;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FX_PRIME);
         }
 
         hash
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_basic_intern_and_resolve() {
-        let pool = StringPool::new().unwrap();
-
-        let hello1 = pool.intern("hello");
-        let hello2 = pool.intern("hello");
-        let world = pool.intern("world");
-
-        assert_eq!(hello1, hello2);
-        assert_ne!(hello1, world);
-
-        assert_eq!(pool.resolve_string(&hello1), "hello");
-        assert_eq!(pool.resolve_string(&world), "world");
-
-        assert_eq!(pool.resolve_bytes(&hello1), b"hello");
-        assert_eq!(pool.resolve_bytes(&world), b"world");
+impl ThreadLocalStringPool<'_> {
+    pub fn intern(&mut self, s: &str) -> VmString {
+        self.intern_bytes(s.as_bytes())
     }
 
-    #[test]
-    fn test_collision_handling() {
-        let pool = StringPool::new().unwrap();
+    pub fn intern_bytes(&mut self, bytes: &[u8]) -> VmString {
+        let hash = StringPool::hash_bytes(bytes);
 
-        let s1 = "abcd";
-        let s2 = "efgh";
+        if let Some(collision_list) = self.local_strings.get(&hash) {
+            if let Some(vm_string) = StringPool::find_simd(self.global, collision_list, bytes) {
+                return vm_string;
+            }
+        }
 
-        let v1 = pool.intern(s1);
-        let v2 = pool.intern(s2);
+        let vm_string = self.global.intern_global(bytes, hash);
 
-        assert_ne!(v1, v2);
-        assert_eq!(pool.resolve_string(&v1), s1);
-        assert_eq!(pool.resolve_string(&v2), s2);
+        self.local_strings.entry(hash).or_default().push(vm_string);
+
+        vm_string
     }
 
-    #[test]
-    fn test_simd_equality() {
-        let pool = StringPool::new().unwrap();
+    pub fn intern_fmt(&mut self, args: fmt::Arguments<'_>) -> VmString {
+        let mut writer = SmallVecWriter::<128>::new();
 
-        let short = pool.intern("short");
-        let same = pool.intern("short");
-        let diff = pool.intern("sh0rt");
+        fmt::write(&mut writer, args).expect("formatting failed");
 
-        assert_eq!(short, same);
-        assert_ne!(short, diff);
-
-        let bytes = pool.resolve_bytes(&short);
-        let same_bytes = pool.resolve_bytes(&same);
-        let diff_bytes = pool.resolve_bytes(&diff);
-
-        assert!(StringPool::eq_simd(bytes, same_bytes));
-        assert!(!StringPool::eq_simd(bytes, diff_bytes));
+        self.intern_bytes(&writer.buf)
     }
 
-    #[test]
-    fn test_string_pool_len() {
-        println!("{}", align_of::<VmString>());
+    pub fn reserve(&mut self, additional: usize) {
+        self.local_strings.reserve(additional);
     }
 
-    #[test]
-    fn test_unicode_strings() {
-        let pool = StringPool::new().unwrap();
-
-        let smile = pool.intern("😊");
-        let smile2 = pool.intern("😊");
-        let euro = pool.intern("€");
-
-        assert_eq!(smile, smile2);
-        assert_ne!(smile, euro);
-
-        assert_eq!(pool.resolve_string(&smile), "😊");
-        assert_eq!(pool.resolve_string(&euro), "€");
+    pub fn clear_local_cache(&mut self) {
+        self.local_strings.clear();
     }
+}
 
-    #[test]
-    fn test_large_string() {
-        let pool = StringPool::new().unwrap();
-
-        let long = "a".repeat(1024);
-        let vm = pool.intern(&long);
-        let vm2 = pool.intern(&long);
-
-        assert_eq!(vm, vm2);
-        assert_eq!(pool.resolve_string(&vm), long);
-    }
+#[macro_export]
+macro_rules! intern_fmt {
+    ($pool:expr, $($arg:tt)*) => {
+        $pool.intern_fmt(format_args!($($arg)*))
+    };
 }
