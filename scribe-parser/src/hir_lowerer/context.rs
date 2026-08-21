@@ -1,7 +1,7 @@
 use codex_dependency_graph::dep_graph::DepGraph;
 use ir::auto_imports::AutoImportRegistry;
 use ir::errors::reporter::ErrorReporter;
-use ir::hir::{HirEnum, HirFuncProto};
+use ir::hir::{HirEnum, HirExpr, HirFuncProto};
 use ir::hir::{HirFunc, HirInterface, HirStruct, HirType, StrId};
 use ir::ir_hasher::{FxHashBuilder, FxHashMap};
 use ir::registry::global_registry::GlobalRegistry;
@@ -14,15 +14,16 @@ use std::sync::Arc;
 use zetaruntime::arena::GrowableAtomicBump;
 use zetaruntime::string_pool::StringPool;
 
-use crate::optimized_string_buffering::build_module_scoped_name;
-
 pub type FxHashSet<T> = HashSet<T, FxHashBuilder>;
 
 pub struct LoweringCtx<'a, 'bump> {
     pub structs: Rc<RefCell<FxHashMap<StrId, HirStruct<'a, 'bump>>>>,
+    pub consts: Rc<RefCell<FxHashMap<StrId, HirExpr<'a, 'bump>>>>,
     pub interfaces: Rc<RefCell<FxHashMap<StrId, HirInterface<'a, 'bump>>>>,
     pub enums: Rc<RefCell<FxHashMap<StrId, HirEnum<'a, 'bump>>>>,
     pub functions: Rc<RefCell<FxHashMap<StrId, HirFunc<'a, 'bump>>>>,
+    pub struct_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
+    pub enum_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
     pub func_protos: RefCell<FxHashMap<StrId, HirFuncProto<'a, 'bump>>>,
     pub type_bindings: RefCell<FxHashMap<StrId, HirType<'a, 'bump>>>,
     pub variable_types: RefCell<FxHashMap<StrId, HirType<'a, 'bump>>>,
@@ -38,8 +39,6 @@ pub struct LoweringCtx<'a, 'bump> {
     pub instantiated_struct_origins:
         Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
 
-    /// Concrete type of `this` while lowering the current method's
-    /// signature/body. Set/cleared per-method in `lower_impl_decl`.
     pub current_self_type: RefCell<Option<HirType<'a, 'bump>>>,
     pub named_imports: RefCell<FxHashMap<StrId, usize>>,
     pub auto_imports: Rc<RefCell<AutoImportRegistry>>,
@@ -47,20 +46,6 @@ pub struct LoweringCtx<'a, 'bump> {
 }
 
 impl<'a, 'bump> LoweringCtx<'a, 'bump> {
-    pub(super) fn mangle_type_name(&self, name: StrId) -> StrId {
-        let Some(pkg) = self.dep_graph.borrow().get_module_package(self.module_idx) else {
-            return name;
-        };
-
-        let pkg_str = self.context.resolve_string(&pkg);
-        let segments: Vec<StrId> = pkg_str
-            .split("::")
-            .map(|seg| StrId(self.context.intern(seg)))
-            .collect();
-
-        build_module_scoped_name(&segments, name, None, self.context.clone())
-    }
-
     pub(super) fn resolve_type_path_name(
         &self,
         path: &[StrId],
@@ -99,7 +84,7 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
                     continue;
                 };
                 if target_module_idx == self.module_idx {
-                    continue; // already checked above as `own_candidate`
+                    continue;
                 }
                 let candidate = self.mangle_via_module(target_module_idx, name);
                 let exists = self.structs.borrow().contains_key(&candidate)
@@ -170,20 +155,16 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
         name
     }
 
-    fn mangle_via_module(&self, target_module_idx: usize, name: StrId) -> StrId {
-        let Some(pkg) = self
-            .dep_graph
+    pub(super) fn mangle_type_name(&self, name: StrId) -> StrId {
+        self.dep_graph
             .borrow()
-            .get_module_package(target_module_idx)
-        else {
-            return name;
-        };
-        let pkg_str = self.context.resolve_string(&pkg);
-        let segments: Vec<StrId> = pkg_str
-            .split("::")
-            .map(|seg| StrId(self.context.intern(seg)))
-            .collect();
-        build_module_scoped_name(&segments, name, None, self.context.clone())
+            .mangle_type_name(self.module_idx, name, &self.context)
+    }
+
+    fn mangle_via_module(&self, target_module_idx: usize, name: StrId) -> StrId {
+        self.dep_graph
+            .borrow()
+            .mangle_type_name(target_module_idx, name, &self.context)
     }
 
     pub(crate) fn record_error(&self, message: impl Into<String>, span: SourceSpan<'a>) {
@@ -210,6 +191,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         Self {
             ctx: LoweringCtx {
                 structs: registry.structs,
+                consts: registry.consts,
                 enums: registry.enums,
                 functions: registry.functions.clone(),
                 func_protos: RefCell::new(FxHashMap::default()),
@@ -217,6 +199,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 type_bindings: RefCell::new(FxHashMap::default()),
                 variable_types: RefCell::new(FxHashMap::default()),
                 generic_params: RefCell::new(HashSet::default()),
+                enum_owner_module: registry.enum_owner_module,
+                struct_owner_module: registry.struct_owner_module,
                 context: context.clone(),
                 bump: bump.clone(),
                 imported_modules: RefCell::new(FxHashMap::default()),
