@@ -70,6 +70,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             unmangled_name,
             declaring_module_idx: self.ctx.module_idx,
             impl_target: struct_name,
+            span: func.span,
         }
     }
 
@@ -196,7 +197,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             .methods
             .unwrap_or_default()
             .into_iter()
-            .map(|f| self.lower_func_body_from_proto(*f, Some(i.name)))
+            .map(|f| {
+                let mut func = self.lower_func_body_from_proto(*f, Some(i.name));
+
+                func.impl_target = Some(interface_name);
+                func
+            })
             .collect();
         let methods = self.ctx.bump.alloc_slice(&methods_vec);
         let generics: Option<&[HirGeneric]> =
@@ -316,8 +322,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
     }
 
-    /// The `HirType` that `this`/`Self` resolves to while lowering an impl
-    /// block's method bodies.
     fn impl_target_self_type(
         &self,
         target_key: StrId,
@@ -466,6 +470,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             unmangled_name: name, // no one cares if an error function's name is mangled
             declaring_module_idx: self.ctx.module_idx,
             impl_target: None,
+            span: func.span,
         }
     }
 }
