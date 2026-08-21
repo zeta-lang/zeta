@@ -19,7 +19,7 @@ use ir::hir::{
     HirStmt, HirType, InterpolationPart, IntrinsicKind, Operator, ProvenanceAnnotation,
     ProvenancePathSegment, ProvenanceRoot, StrId, ThisPassingKind, Visibility,
 };
-use ir::ir_hasher::{FxHashMap, HashSet};
+use ir::ir_hasher::{FxHashBuilder, FxHashMap, HashSet};
 use ir::nll_cfg::{Cfg, CfgBuilder, PointId};
 use ir::span::SourceSpan;
 use zetaruntime::bump::GrowableBump;
@@ -115,6 +115,7 @@ pub struct TypeChecker<'a, 'bump> {
     stmt_after_points: FxHashMap<usize, PointId>,
     point_locals_used: FxHashMap<PointId, HashSet<StrId>>,
     current_point: PointId,
+    undefined_backfill: FxHashMap<usize, HirType<'a, 'bump>>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -139,6 +140,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             next_symbol_id: 0,
             occurrences: Vec::new(),
             functions_by_module: FxHashMap::default(),
+            undefined_backfill: FxHashMap::default(),
             imports_by_module: FxHashMap::default(),
             enums_by_module: FxHashMap::default(),
             structs_by_module: FxHashMap::default(),
@@ -738,11 +740,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .insert(Self::expr_key(expr), args.to_vec());
     }
 
-    #[allow(dead_code)]
-    fn lookup_instance_args(&self, expr: &HirExpr<'a, 'bump>) -> Option<&[HirType<'a, 'bump>]> {
-        self.generic_instance_args
-            .get(&Self::expr_key(expr))
-            .map(|v| v.as_slice())
+    pub fn undefined_ty(&self, expr: &HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
+        self.undefined_backfill.get(&Self::expr_key(expr)).copied()
     }
 
     pub fn occurrences(
@@ -883,6 +882,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let prev_module_idx = self.context.current_module_idx;
         self.context.current_module_idx = module_idx;
 
+        self.functions_by_module
+            .entry(module_idx)
+            .or_default()
+            .clear();
+        self.structs_by_module
+            .entry(module_idx)
+            .or_default()
+            .clear();
+        self.enums_by_module.entry(module_idx).or_default().clear();
+
         for item in module.items {
             match item {
                 Hir::Struct(s) => {
@@ -896,7 +905,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 Hir::Impl(i) => {
                     let target = i.target.to_string();
                     if let Some(methods) = i.methods {
-                        self.context.add_impl_methods(&target, methods);
+                        let target_as_str = target.to_string();
+                        let table = self.context.type_methods.entry(target_as_str).or_default();
+                        for func in methods {
+                            if table
+                                .methods
+                                .iter()
+                                .any(|(name, _)| name == func.name.as_str())
+                            {
+                                self.current_span = func.span;
+                                if self.suppress_errors {
+                                    return;
+                                }
+                                self.errors.push(TypeErrorKind::Generic(format!(
+                                    "function `{}` is already declared in this module with the same signature",
+                                    func.unmangled_name
+                                )).at(self.current_span));
+                            }
+                            table.insert(func.unmangled_name.to_string(), *func);
+                        }
                     }
                     if let Some(interface) = i.interface {
                         self.context
@@ -918,6 +945,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 Hir::Func(f) => {
                     let mangled_name = f.name.to_string();
                     let unmangled_name = f.unmangled_name.to_string();
+
+                    if self
+                        .functions_by_module
+                        .get(&module_idx)
+                        .is_some_and(|s| s.contains(&f.name))
+                    {
+                        self.set_span(f.span);
+                        self.record(TypeErrorKind::Generic(format!(
+                            "function `{}` is already declared in this module with the same signature",
+                            unmangled_name
+                        )));
+                    }
+
                     self.context
                         .add_function(module_idx, unmangled_name.clone(), **f);
                     if mangled_name != unmangled_name {
@@ -970,9 +1010,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        // Auto-imports: (1) bare item names, (2) module-level short aliases.
-        // Both are checked for ambiguity between different auto-imported
-        // packages, an explicit `import` always wins and needs no check.
         let mut alias_targets: FxHashMap<StrId, usize> = FxHashMap::default();
         for auto_path in self.auto_imports.borrow().paths() {
             let segments: Vec<StrId> = auto_path
@@ -1601,13 +1638,48 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.check_stmt(hir_stmt);
                 None
             }
-            // TODO: Check if they reference valid paths
-            HirStmt::Import(_path, span) => {
+            HirStmt::Import(path, span) => {
                 self.set_span(*span);
+                if self
+                    .context
+                    .dep_graph
+                    .borrow()
+                    .resolve_module_path(&path.path)
+                    .is_none()
+                {
+                    let path_str = path
+                        .path
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    self.record(TypeErrorKind::Generic(format!(
+                        "cannot resolve imported module `{}`",
+                        path_str
+                    )));
+                }
                 None
             }
-            HirStmt::Package(_path, span) => {
+            HirStmt::Package(path, span) => {
                 self.set_span(*span);
+                if self
+                    .context
+                    .dep_graph
+                    .borrow()
+                    .resolve_module_path(&path.path)
+                    .is_none()
+                {
+                    let path_str = path
+                        .path
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    self.record(TypeErrorKind::Generic(format!(
+                        "cannot resolve package path `{}`",
+                        path_str
+                    )));
+                }
                 None
             }
         }
@@ -1658,6 +1730,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirExpr::Decimal(_, span) if matches!(expected, HirType::F32 | HirType::F64) => {
                 self.set_span(*span);
+                *expected
+            }
+            HirExpr::Undefined {
+                span,
+                ty: HirType::Unknown,
+            } => {
+                self.set_span(*span);
+                if !self.is_zeroable(expected) {
+                    self.record(TypeErrorKind::Generic(format!(
+                    "`undefined` cannot be used for type `{}`: it cannot be safely zero-initialized",
+                    self.type_to_string(expected)
+                )));
+                    return HirType::Unknown;
+                }
+                self.undefined_backfill
+                    .insert(Self::expr_key(expr), *expected);
                 *expected
             }
             _ => self.check_expr(expr),
@@ -2617,8 +2705,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                     let mangled_type_name: Option<String> = assoc_type_name.and_then(|t| {
                         let midx = resolved_module_idx?;
-                        let pkg = self.context.dep_graph.borrow().get_module_package(midx)?;
-                        Some(format!("{}_{}", pkg.to_string(), t.to_string()))
+                        Some(
+                            self.context
+                                .dep_graph
+                                .borrow()
+                                .mangle_type_name(midx, t, &self.context.string_pool)
+                                .to_string(),
+                        )
                     });
 
                     let method_func = if free_func.is_none() {
@@ -2744,7 +2837,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             } => {
                 self.set_span(*span);
                 let HirExpr::Ident(struct_name_id, name_span) = name else {
-                    eprintln!("name failed {name:?}");
                     return HirType::Void;
                 };
                 let struct_name_str = self.str_id_to_string(*struct_name_id);
@@ -2824,7 +2916,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         )));
                     }
 
-                    let arg_type = self.check_expr(&field_init.value);
+                    let arg_type = self.check_expr_expected(&field_init.value, &field_type);
                     self.check_and_record_value_use(&field_init.value, &arg_type);
                     let result = self.types_compatible(&field_type, &arg_type);
                     self.recover(result, ());
@@ -3077,7 +3169,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     &[]
                 };
 
-                HirType::Enum(*enum_name, final_type_args)
+                HirType::Enum {
+                    name: *enum_name,
+                    type_args: final_type_args,
+                    variants: enum_def.variants,
+                }
             }
             HirExpr::ExprList { list, span } => {
                 self.set_span(*span);
@@ -3606,7 +3702,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirPattern::EnumVariant {
                 variant, bindings, ..
             } => {
-                let HirType::Enum(enum_name, _) = scrutinee_ty else {
+                let HirType::Enum {
+                    name: enum_name, ..
+                } = scrutinee_ty
+                else {
                     return;
                 };
                 let enum_name_str = self.str_id_to_string(*enum_name);
@@ -3706,7 +3805,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
 
             HirPattern::Struct { name, fields } => match scrutinee_ty {
-                HirType::Enum(enum_name, _) => {
+                HirType::Enum {
+                    name: enum_name, ..
+                } => {
                     let enum_name_str = self.str_id_to_string(*enum_name);
                     let Some(def) = self.context.get_enum(&enum_name_str) else {
                         return;
@@ -3944,7 +4045,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirPattern::EnumVariant {
                 variant, bindings, ..
             } => {
-                let HirType::Enum(enum_name, _) = scrutinee_ty else {
+                let HirType::Enum {
+                    name: enum_name, ..
+                } = scrutinee_ty
+                else {
                     return;
                 };
                 let enum_name_str = self.str_id_to_string(*enum_name);
@@ -3983,7 +4087,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
 
             HirPattern::Struct { name, fields } => match scrutinee_ty {
-                HirType::Enum(enum_name, _) => {
+                HirType::Enum {
+                    name: enum_name, ..
+                } => {
                     let enum_name_str = self.str_id_to_string(*enum_name);
                     let Some(def) = self.context.get_enum(&enum_name_str) else {
                         return;
@@ -4048,7 +4154,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirPattern::EnumVariant {
                 variant, bindings, ..
             } => {
-                let HirType::Enum(enum_name, _) = scrutinee_ty else {
+                let HirType::Enum {
+                    name: enum_name, ..
+                } = scrutinee_ty
+                else {
                     return;
                 };
                 let enum_name_str = self.str_id_to_string(*enum_name);
@@ -4084,7 +4193,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
 
             HirPattern::Struct { name, fields } => match scrutinee_ty {
-                HirType::Enum(enum_name, _) => {
+                HirType::Enum {
+                    name: enum_name, ..
+                } => {
                     let enum_name_str = self.str_id_to_string(*enum_name);
                     let Some(def) = self.context.get_enum(&enum_name_str) else {
                         return;
@@ -4334,7 +4445,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
 
-            HirType::Enum(name, _) => {
+            HirType::Enum { name, .. } => {
                 let name_str = self.str_id_to_string(*name);
                 match self.context.get_enum(&name_str) {
                     Some(def) => def
@@ -4968,7 +5079,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             None => self.move_state.mark_whole_moved(root),
             Some(f) => {
                 let blocks_partial_move = container_ty.is_some_and(|cty| match cty {
-                    HirType::Struct { name, .. } | HirType::Enum(name, _) => {
+                    HirType::Struct { name, .. } | HirType::Enum { name, .. } => {
                         self.copy_analysis.borrow().implements_drop(*name)
                     }
                     _ => false,
@@ -5143,7 +5254,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         .all(|(x, y)| self.types_structurally_equal(x, y))
                     && self.types_structurally_equal(ra, rb)
             }
-            (Enum(na, ta), Enum(nb, tb)) => {
+            (
+                Enum {
+                    name: na,
+                    type_args: ta,
+                    ..
+                },
+                Enum {
+                    name: nb,
+                    type_args: tb,
+                    ..
+                },
+            ) => {
                 na == nb
                     && (ta.is_empty()
                         || tb.is_empty()
@@ -5246,12 +5368,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     type_args: self.context.bump.alloc_slice_copy(&new_args),
                 }
             }
-            HirType::Enum(name, type_args) => {
+            HirType::Enum {
+                name,
+                type_args,
+                variants,
+            } => {
                 let new_args: Vec<_> = type_args
                     .iter()
                     .map(|a| self.substitute_type_local(a, subs))
                     .collect();
-                HirType::Enum(*name, self.context.bump.alloc_slice_copy(&new_args))
+                HirType::Enum {
+                    name: *name,
+                    type_args: self.context.bump.alloc_slice_copy(&new_args),
+                    variants,
+                }
             }
             HirType::Dyn { bounds } => {
                 let new_bounds: Vec<_> = bounds
@@ -5505,7 +5635,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
             HirType::DynInterface(name, _) => format!("interface {}", self.str_id_to_string(*name)),
-            HirType::Enum(name, type_args) => {
+            HirType::Enum {
+                name, type_args, ..
+            } => {
                 if type_args.is_empty() {
                     format!("enum {}", self.str_id_to_string(*name))
                 } else {
@@ -5977,16 +6109,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         match scrutinee_ty {
-            HirType::Enum(enum_name, _) => {
+            HirType::Enum {
+                name: enum_name, ..
+            } => {
                 let enum_name_str = self.str_id_to_string(*enum_name);
                 let Some(def) = self.context.get_enum(&enum_name_str) else {
                     return;
                 };
-                let covered: std::collections::HashSet<StrId> = arms
+                let covered: std::collections::HashSet<StrId, FxHashBuilder> = arms
                     .iter()
                     .filter(|arm| arm.guard.is_none())
                     .filter_map(|arm| match &arm.pattern {
                         HirPattern::EnumVariant { variant, .. } => Some(*variant),
+                        HirPattern::Struct { name, .. } => Some(*name),
                         _ => None,
                     })
                     .collect();

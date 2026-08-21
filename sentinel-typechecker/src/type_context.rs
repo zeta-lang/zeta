@@ -181,13 +181,6 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
         self.enums.get(name).copied()
     }
 
-    pub fn add_impl_methods(&mut self, target: &str, methods: &[HirFunc<'a, 'bump>]) {
-        let table = self.type_methods.entry(target.to_string()).or_default();
-        for func in methods {
-            table.insert(func.unmangled_name.to_string(), *func);
-        }
-    }
-
     pub fn add_struct(
         &mut self,
         module_idx: usize,
