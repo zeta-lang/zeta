@@ -9,23 +9,28 @@ use codex_dependency_graph::dep_graph::{AstModule, DepGraph};
 use engraver_assembly_emit::backend::Backend;
 use engraver_assembly_emit::cranelift::cranelift_backend::CraneliftBackend;
 use ir::analysis_context::CopyAnalysisCtx;
+use ir::ast::Stmt;
 use ir::auto_imports::AutoImportRegistry;
 use ir::errors::reporter::ErrorReporter;
 use ir::errors::type_error::{TypeError, TypeErrorKind};
-use ir::hir::{HirModule, StrId};
+use ir::hir::{Hir, HirEnum, HirModule, HirStruct, StrId};
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::registry::global_registry::GlobalRegistry;
 use scribe_parser::hir_lowerer::HirLowerer;
 use scribe_parser::hir_lowerer::lambda_hoisting::LambdaHoister;
 use scribe_parser::hir_lowerer::monomorphization::Monomorphizer;
 use sentinel_typechecker::TypeChecker;
+use zetaruntime::arena::GrowableAtomicBump;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 pub mod compilation_passes;
 pub mod file_handling;
 pub mod file_loader;
+#[cfg(target_os = "linux")]
 pub mod io_uring_file_loader;
+#[cfg(target_os = "windows")]
+pub mod iocp_file_loader;
 pub mod link;
 pub mod main_structs;
 pub mod std_file_loader;
@@ -53,6 +58,7 @@ pub struct Compiler<'a, 'bump> {
     loaded_sources: HashMap<String, String>,
     #[allow(unused)] // Avoids a UB
     lowerer_bump: Box<GrowableBump<'bump>>,
+    source_roots: Vec<PathBuf>,
 }
 
 impl<'a, 'bump> Compiler<'a, 'bump>
@@ -111,6 +117,7 @@ where
             hir_modules: HashMap::default(),
             codegen_hir_modules: HashMap::default(),
             loaded_sources: HashMap::default(),
+            source_roots: Vec::default(),
         })
     }
 
@@ -145,6 +152,8 @@ where
         dir: &Path,
         is_stdlib: bool,
     ) -> Result<ErrorReporter<'a>, BuildError<'a>> {
+        self.source_roots.push(dir.to_path_buf());
+
         let files = crate::file_handling::collect_zeta_files(dir)?;
         let sources = loader
             .load_files(&files)
@@ -205,7 +214,6 @@ where
             );
         }
 
-        // stdlib <-> user linking, unchanged semantics.
         if is_stdlib {
             for (module_idx, _, _) in &batch {
                 for &existing_idx in self.module_ids.values() {
@@ -256,6 +264,29 @@ where
             reporter.merge(self.lower_and_check_module(module_idx, parsed));
         }
 
+        let mismatches = self
+            .dep_graph
+            .borrow()
+            .check_package_paths(&[dir.to_path_buf()], &self.pool);
+        for m in &mismatches {
+            eprintln!("error: {}", m);
+        }
+
+        let unresolved = self
+            .dep_graph
+            .borrow()
+            .unresolved_import_messages(&self.pool);
+        for msg in &unresolved {
+            eprintln!("error: {}", msg);
+        }
+
+        if !mismatches.is_empty() || !unresolved.is_empty() {
+            return Err(BuildError::InvalidModuleStructure {
+                package_mismatches: mismatches.len(),
+                unresolved_imports: unresolved.len(),
+            });
+        }
+
         Ok(reporter)
     }
 
@@ -297,21 +328,126 @@ where
         }
     }
 
-    fn monomorphize_module(&mut self, module_idx: usize, lowerer: HirLowerer<'a, 'bump>) {
+    fn finalize_monomorphization(&mut self) {
+        let mut emitted: HashSet<StrId> = HashSet::default();
+        let mut by_module: FxHashMap<usize, Vec<Hir<'a, 'bump>>> = FxHashMap::default();
+
+        loop {
+            let before = self.registry.instantiated_functions.borrow().len()
+                + self.registry.instantiated_structs.borrow().len()
+                + self.registry.instantiated_enums.borrow().len();
+
+            self.force_instantiate_drops();
+
+            let after = self.registry.instantiated_functions.borrow().len()
+                + self.registry.instantiated_structs.borrow().len()
+                + self.registry.instantiated_enums.borrow().len();
+            if before == after {
+                break;
+            }
+        }
+
+        for new_name in self.registry.instantiated_functions.borrow().values() {
+            if !emitted.insert(*new_name) {
+                continue;
+            }
+
+            if let Some(func) = self.registry.functions.borrow().get(new_name) {
+                by_module
+                    .entry(func.declaring_module_idx)
+                    .or_default()
+                    .push(Hir::Func(
+                        self.lowerer_bump.alloc_value_immutable(func.clone()),
+                    ));
+            }
+        }
+
+        for new_struct_name in self.registry.instantiated_structs.borrow().values() {
+            if !emitted.insert(*new_struct_name) {
+                continue;
+            }
+            let Some(new_struct) = self.first_ctx_structs_lookup(new_struct_name) else {
+                continue;
+            };
+            let Some((origin_name, _)) = self
+                .registry
+                .instantiated_struct_origins
+                .borrow()
+                .get(new_struct_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(&owner) = self.registry.struct_owner_module.borrow().get(&origin_name) else {
+                continue;
+            };
+            by_module.entry(owner).or_default().push(Hir::Struct(
+                self.lowerer_bump.alloc_value_immutable(new_struct),
+            ));
+        }
+
+        for new_enum_name in self.registry.instantiated_enums.borrow().values() {
+            if !emitted.insert(*new_enum_name) {
+                continue;
+            }
+            let Some(new_enum) = self.first_ctx_enums_lookup(new_enum_name) else {
+                continue;
+            };
+            let Some((origin_name, _)) = self
+                .registry
+                .instantiated_enum_origins
+                .borrow()
+                .get(new_enum_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(&owner) = self.registry.enum_owner_module.borrow().get(&origin_name) else {
+                continue;
+            };
+            by_module
+                .entry(owner)
+                .or_default()
+                .push(Hir::Enum(self.lowerer_bump.alloc_value_immutable(new_enum)));
+        }
+
+        for (module_idx, extra_items) in by_module {
+            let Some(existing) = self.codegen_hir_modules.get(&module_idx) else {
+                continue;
+            };
+            let mut merged: Vec<Hir<'a, 'bump>> = existing.items.to_vec();
+            merged.extend(extra_items);
+            let bump = self
+                .modules
+                .get(&module_idx)
+                .map(|m| m.bump.clone())
+                .expect("Expected module idx to exist");
+            let new_module = HirModule {
+                name: existing.name,
+                imports: existing.imports,
+                items: bump.alloc_slice(&merged),
+            };
+            self.codegen_hir_modules.insert(module_idx, new_module);
+        }
+    }
+
+    fn monomorphize_module(&mut self, module_idx: usize, lowerer: &mut HirLowerer<'a, 'bump>) {
         let checked_hir = self.hir_modules[&module_idx];
         let bump = &self.modules.get(&module_idx).unwrap().bump;
 
         let hoister = LambdaHoister::new(bump.clone(), self.pool.clone(), checked_hir.name);
         let hoisted_module = hoister.run(checked_hir);
 
-        let monomorphizer = Monomorphizer::new(
+        let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
             bump.clone(),
-            lowerer.ctx.functions.clone(),
-            &lowerer.ctx,
+            self.registry.functions.clone(),
+            &mut lowerer.ctx,
             self.registry.instantiated_functions.clone(),
             self.registry.instantiated_structs.clone(),
             self.registry.instantiated_struct_origins.clone(),
+            self.registry.instantiated_enums.clone(),
+            self.registry.instantiated_enum_origins.clone(),
         );
         let monomorphized_module = monomorphizer.run(hoisted_module);
 
@@ -325,6 +461,10 @@ where
         pending: &mut FxHashMap<usize, (StrId, ModuleWithArena<'a, 'bump>)>,
         reporter: &mut ErrorReporter<'a>,
     ) {
+        if pending.is_empty() {
+            return;
+        }
+
         let mut seen: HashSet<usize> = HashSet::default();
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for &module_idx in order {
@@ -338,45 +478,50 @@ where
             groups.push(scc);
         }
 
+        let shared_bump = pending.values().next().unwrap().1.bump.clone();
+        let mut lowerer = HirLowerer::new(
+            self.pool.clone(),
+            shared_bump,
+            self.dep_graph,
+            self.registry.clone(),
+            self.auto_imports.clone(),
+        );
+
+        let module_stmts: FxHashMap<usize, Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>> =
+            pending
+                .iter()
+                .map(|(&idx, (_name, parsed))| (idx, parsed.stmts.clone()))
+                .collect();
+
+        let mut lowered = lowerer.lower_all_modules(&module_stmts, order);
+
+        for err in lowerer.lowering_errors().iter() {
+            reporter.add_type_error(TypeError {
+                kind: TypeErrorKind::Generic(err.0.clone()),
+                span: err.1.clone(),
+            });
+        }
+
+        for (module_idx, (_name, parsed)) in pending.drain() {
+            if let Some(hir) = lowered.remove(&module_idx) {
+                self.hir_modules.insert(module_idx, hir);
+            }
+            self.modules.insert(module_idx, parsed);
+        }
+
         for group in &groups {
-            let mut lowerers: FxHashMap<usize, HirLowerer<'a, 'bump>> = FxHashMap::default();
-            let mut group_parsed: FxHashMap<usize, ModuleWithArena<'a, 'bump>> =
-                FxHashMap::default();
-            for &module_idx in group {
-                if let Some((_name, parsed)) = pending.remove(&module_idx) {
-                    let mut lowerer = self.make_lowerer(&parsed);
-                    lowerer.lower_module_types(&parsed.stmts, module_idx);
-                    lowerers.insert(module_idx, lowerer);
-                    group_parsed.insert(module_idx, parsed);
-                }
-            }
-
-            for &module_idx in group {
-                if let (Some(lowerer), Some(parsed)) =
-                    (lowerers.get_mut(&module_idx), group_parsed.get(&module_idx))
-                {
-                    lowerer.lower_module_prototypes(&parsed.stmts, module_idx);
-                }
-            }
-
-            let mut ready: Vec<(usize, HirLowerer<'a, 'bump>)> = Vec::new();
-            for &module_idx in group {
-                let (Some(lowerer), Some(parsed)) = (
-                    lowerers.remove(&module_idx),
-                    group_parsed.remove(&module_idx),
-                ) else {
-                    continue;
-                };
-                if let Some(lowerer) =
-                    self.lower_module_bodies_phase(module_idx, lowerer, parsed, reporter)
-                {
-                    ready.push((module_idx, lowerer));
-                }
+            let ready: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|m| self.hir_modules.contains_key(m))
+                .collect();
+            if ready.is_empty() {
+                continue;
             }
 
             {
                 let mut checker = self.type_checker.borrow_mut();
-                for &(module_idx, _) in &ready {
+                for &module_idx in &ready {
                     if let Some(hir) = self.hir_modules.get(&module_idx) {
                         checker.register_module(hir, module_idx);
                     }
@@ -385,13 +530,13 @@ where
 
             let updated: Vec<(usize, &HirModule<'a, 'bump>)> = ready
                 .iter()
-                .filter_map(|&(m, _)| self.hir_modules.get(&m).map(|h| (m, h)))
+                .filter_map(|&m| self.hir_modules.get(&m).map(|h| (m, h)))
                 .collect();
             self.cpy_ctx.borrow_mut().recompute(&updated);
 
             {
                 let mut checker = self.type_checker.borrow_mut();
-                for &(module_idx, _) in &ready {
+                for &module_idx in &ready {
                     if let Some(hir) = self.hir_modules.get(&module_idx) {
                         checker.check_module_body(hir, module_idx);
                     }
@@ -401,8 +546,12 @@ where
                 }
             }
 
-            for (module_idx, lowerer) in ready {
-                self.monomorphize_module(module_idx, lowerer);
+            if reporter.has_errors() {
+                continue;
+            }
+
+            for &module_idx in &ready {
+                self.monomorphize_module(module_idx, &mut lowerer);
             }
         }
     }
@@ -416,7 +565,7 @@ where
         let mut lowerer = self.make_lowerer(&parsed);
         lowerer.lower_module_prototypes(&parsed.stmts, module_idx);
 
-        let Some(lowerer) =
+        let Some(mut lowerer) =
             self.lower_module_bodies_phase(module_idx, lowerer, parsed, &mut reporter)
         else {
             return reporter;
@@ -454,7 +603,11 @@ where
             }
         }
 
-        self.monomorphize_module(module_idx, lowerer);
+        if reporter.has_errors() {
+            return reporter;
+        }
+
+        self.monomorphize_module(module_idx, &mut lowerer);
         reporter
     }
 
@@ -465,6 +618,51 @@ where
         verbose: bool,
         emit_obj: bool,
     ) -> Result<PathBuf, BuildError<'a>> {
+        self.finalize_monomorphization();
+        let missing: Vec<PathBuf> = self
+            .hir_modules
+            .keys()
+            .filter(|idx| !self.codegen_hir_modules.contains_key(idx))
+            .filter_map(|idx| self.path_for_module(*idx).map(|p| p.to_path_buf()))
+            .collect();
+        if !missing.is_empty() {
+            return Err(BuildError::CompilationAborted {
+                reason: format!(
+                    "{} module(s) failed type checking and were not compiled:\n  {}",
+                    missing.len(),
+                    missing
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n  "),
+                ),
+            });
+        }
+
+        let mismatches = self
+            .dep_graph
+            .borrow()
+            .check_package_paths(&self.source_roots, &self.pool);
+        if !mismatches.is_empty() {
+            return Err(BuildError::CompilationAborted {
+                reason: mismatches
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
+
+        let unresolved = self
+            .dep_graph
+            .borrow()
+            .unresolved_import_messages(&self.pool);
+        if !unresolved.is_empty() {
+            return Err(BuildError::CompilationAborted {
+                reason: unresolved.join("\n"),
+            });
+        }
+
         let compilation_order = self.dep_graph.borrow().get_module_compilation_order();
 
         let ordered_hir: Vec<HirModule<'a, 'bump>> = (0..self.next_module_idx)
@@ -615,7 +813,7 @@ where
                     checker.check_module_body(hir, m);
                 }
             }
-            for err in checker.errors() {
+            for err in checker.take_errors() {
                 reporter.add_type_error(err.clone());
             }
         }
@@ -626,6 +824,8 @@ where
         &mut self,
         stdlib_path: &Path,
     ) -> Result<ErrorReporter<'a>, BuildError<'a>> {
+        self.source_roots.push(stdlib_path.to_path_buf());
+
         let stdlib_files = crate::file_handling::collect_zeta_files(stdlib_path)?;
         let mut reporter = ErrorReporter::new();
         let mut batch: Vec<(usize, StrId, ModuleWithArena<'a, 'bump>)> = Vec::new();
@@ -691,6 +891,27 @@ where
             reporter.merge(self.lower_and_check_module(module_idx, parsed));
         }
 
+        let mismatches = self
+            .dep_graph
+            .borrow()
+            .check_package_paths(&[stdlib_path.to_path_buf()], &self.pool);
+        for m in &mismatches {
+            eprintln!("error: {}", m);
+        }
+        let unresolved = self
+            .dep_graph
+            .borrow()
+            .unresolved_import_messages(&self.pool);
+        for msg in &unresolved {
+            eprintln!("error: {}", msg);
+        }
+        if !mismatches.is_empty() || !unresolved.is_empty() {
+            return Err(BuildError::InvalidModuleStructure {
+                package_mismatches: mismatches.len(),
+                unresolved_imports: unresolved.len(),
+            });
+        }
+
         Ok(reporter)
     }
 
@@ -711,5 +932,41 @@ where
             self.hir_modules.remove(&idx);
             self.cpy_ctx.borrow_mut().remove_module(idx);
         }
+    }
+
+    fn first_ctx_structs_lookup(&self, name: &StrId) -> Option<HirStruct<'a, 'bump>> {
+        self.registry.structs.borrow().get(name).copied()
+    }
+
+    fn first_ctx_enums_lookup(&self, name: &StrId) -> Option<HirEnum<'a, 'bump>> {
+        self.registry.enums.borrow().get(name).copied()
+    }
+
+    fn force_instantiate_drops(&self) {
+        let Some(scratch_bump) = self.modules.values().next().map(|m| m.bump.clone()) else {
+            return;
+        };
+
+        let mut scratch_lowerer = HirLowerer::new(
+            self.pool.clone(),
+            scratch_bump.clone(),
+            self.dep_graph,
+            self.registry.clone(),
+            self.auto_imports.clone(),
+        );
+
+        let monomorphizer = Monomorphizer::new(
+            self.pool.clone(),
+            scratch_bump,
+            self.registry.functions.clone(),
+            &mut scratch_lowerer.ctx,
+            self.registry.instantiated_functions.clone(),
+            self.registry.instantiated_structs.clone(),
+            self.registry.instantiated_struct_origins.clone(),
+            self.registry.instantiated_enums.clone(),
+            self.registry.instantiated_enum_origins.clone(),
+        );
+
+        monomorphizer.force_instantiate_drops();
     }
 }
