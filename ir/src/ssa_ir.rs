@@ -2,8 +2,7 @@ use crate::hir::{
     HirEnum, HirFunc, HirInterface, HirParam, HirStruct, HirType, StrId, ThisPassingKind,
 };
 use crate::ir_conversion::lower_type_hir;
-use crate::ir_hasher::FxHashBuilder;
-use std::collections::HashMap;
+use crate::ir_hasher::HashMap;
 
 impl SsaType {
     pub fn ptr_to(inner: SsaType) -> Self {
@@ -146,8 +145,11 @@ pub enum SsaType {
     // Composite types
     User(StrId, Vec<SsaType>), // User-defined type with fields
     Interface(StrId),
-    Enum(StrId, Vec<SsaType>), // Tagged union of types
-    Tuple(Vec<SsaType>),       // Fixed-size collection of heterogeneous types
+    Enum {
+        name: StrId,
+        variants: Vec<Vec<SsaType>>,
+    }, // Tagged union of types
+    Tuple(Vec<SsaType>), // Fixed-size collection of heterogeneous types
 
     // Pointer types
     Pointer(Box<SsaType>), // Pointer to another type
@@ -357,7 +359,7 @@ pub struct Function {
     pub params: SmallVec<(Value, SsaType), 8>,
     pub ret_type: SsaType,
     pub blocks: SmallVec<BasicBlock, 3>,
-    pub value_types: HashMap<Value, SsaType, FxHashBuilder>,
+    pub value_types: HashMap<Value, SsaType>,
     pub entry: BlockId,
     pub function_metadata: FuncModifiers,
 }
@@ -365,12 +367,13 @@ pub struct Function {
 impl Function {
     pub fn from_signature(
         hir_fn: &HirFunc,
-        structs: &HashMap<StrId, HirStruct, FxHashBuilder>,
+        structs: &HashMap<StrId, HirStruct>,
+        enums: &HashMap<StrId, HirEnum>,
+        interfaces: &HashMap<StrId, HirInterface>,
         context: &StringPool,
     ) -> Function {
         let mut params: SmallVec<(Value, SsaType), 8> = SmallVec::new();
-        let mut value_types: HashMap<Value, SsaType, FxHashBuilder> =
-            HashMap::with_hasher(FxHashBuilder);
+        let mut value_types: HashMap<Value, SsaType> = HashMap::default();
         let mut next_value = 0usize;
 
         if let Some(hir_params) = hir_fn.params {
@@ -381,7 +384,9 @@ impl Function {
                 let ty = match p {
                     HirParam::This { kind, .. } => {
                         let inner = match hir_fn.impl_target {
-                            Some(target) => Self::this_inner_type(target, structs, context),
+                            Some(target) => {
+                                Self::this_inner_type(target, structs, enums, interfaces, context)
+                            }
                             None => unreachable!(),
                         };
                         match kind {
@@ -389,7 +394,7 @@ impl Function {
                             _ => SsaType::Pointer(Box::new(inner)),
                         }
                     }
-                    HirParam::Normal { param_type, .. } => lower_type_hir(param_type),
+                    HirParam::Normal { param_type, .. } => lower_type_hir(param_type, enums),
                 };
 
                 value_types.insert(v, ty.clone());
@@ -397,7 +402,7 @@ impl Function {
             }
         }
 
-        let ret_type = lower_type_hir(hir_fn.return_type.as_ref().unwrap_or(&HirType::Void));
+        let ret_type = lower_type_hir(hir_fn.return_type.as_ref().unwrap_or(&HirType::Void), enums);
 
         Function {
             name: hir_fn.name,
@@ -435,7 +440,9 @@ impl Function {
 
     fn this_inner_type(
         target: StrId,
-        structs: &HashMap<StrId, HirStruct, FxHashBuilder>,
+        structs: &HashMap<StrId, HirStruct>,
+        enums: &HashMap<StrId, HirEnum>,
+        interfaces: &HashMap<StrId, HirInterface>,
         context: &StringPool,
     ) -> SsaType {
         let name = target.to_string();
@@ -454,7 +461,7 @@ impl Function {
                 let field_types: Vec<SsaType> = elem_struct
                     .fields
                     .iter()
-                    .map(|f| lower_type_hir(&f.field_type))
+                    .map(|f| lower_type_hir(&f.field_type, enums))
                     .collect();
                 return SsaType::Slice(Box::new(SsaType::User(elem_id, field_types)));
             }
@@ -464,6 +471,10 @@ impl Function {
 
         if let Some(ty) = Self::primitive_ssa_type(&name) {
             return ty;
+        }
+
+        if interfaces.contains_key(&target) {
+            return SsaType::Interface(target);
         }
 
         SsaType::User(target, vec![])
@@ -492,15 +503,15 @@ pub struct Module<'a, 'bump>
 where
     'bump: 'a,
 {
-    pub functions: HashMap<StrId, Function, FxHashBuilder>,
-    pub structs: HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-    pub interfaces: HashMap<StrId, HirInterface<'a, 'bump>, FxHashBuilder>,
-    pub enums: HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
-    pub types: HashMap<StrId, SsaType, FxHashBuilder>,
+    pub functions: HashMap<StrId, Function>,
+    pub structs: HashMap<StrId, HirStruct<'a, 'bump>>,
+    pub interfaces: HashMap<StrId, HirInterface<'a, 'bump>>,
+    pub enums: HashMap<StrId, HirEnum<'a, 'bump>>,
+    pub types: HashMap<StrId, SsaType>,
 
-    pub struct_layouts: HashMap<StrId, StructLayout, FxHashBuilder>,
-    pub interface_layouts: HashMap<StrId, InterfaceLayout, FxHashBuilder>,
-    pub struct_interface_vtables: HashMap<(StrId, StrId), VTableInfo, FxHashBuilder>,
+    pub struct_layouts: HashMap<StrId, StructLayout>,
+    pub interface_layouts: HashMap<StrId, InterfaceLayout>,
+    pub struct_interface_vtables: HashMap<(StrId, StrId), VTableInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -579,6 +590,13 @@ pub fn cast_kind(src: &SsaType, dst: &SsaType) -> CastKind {
             } else {
                 ZeroExtend
             }
+        } else if db == sb {
+            // Same width, different SsaType variant (e.g. Usize <-> U64,
+            // Isize <-> I64): no actual narrowing happens at the machine
+            // level, so this must be a Bitcast. `ireduce` requires a
+            // strictly narrower destination and will fail the Cranelift
+            // verifier if src/dst widths are equal.
+            Bitcast
         } else {
             Truncate
         };
