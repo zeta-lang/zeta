@@ -12,6 +12,13 @@ pub fn link<'a>(objects: &[&str], output: &str, link_libc: bool) -> Result<(), C
     let mut cmd = Command::new(driver);
 
     cmd.args(objects);
+
+    if std::path::Path::new("zeta_rt.c").exists() {
+        cmd.arg("zeta_rt.c");
+    } else if std::path::Path::new("/home/flameyosflow/data/zeta-lang/zeta_rt.c").exists() {
+        cmd.arg("/home/flameyosflow/data/zeta-lang/zeta_rt.c");
+    }
+
     cmd.arg("-o").arg(output);
 
     if !link_libc {

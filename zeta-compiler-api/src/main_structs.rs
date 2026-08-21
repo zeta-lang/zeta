@@ -30,6 +30,13 @@ pub enum CompilerError<'a> {
     TypeCheckError,
     FinishError(Box<dyn std::error::Error>),
     LinkFailed,
+    InvalidModuleStructure {
+        package_mismatches: usize,
+        unresolved_imports: usize,
+    },
+    CompilationAborted {
+        reason: String,
+    },
 }
 
 impl<'a> fmt::Display for CompilerError<'a> {
@@ -54,6 +61,16 @@ impl<'a> fmt::Display for CompilerError<'a> {
             CompilerError::FinishError(e) => write!(f, "Backend finish error: {}", e),
             CompilerError::LinkFailed => {
                 write!(f, "Backend could not link the stdlib to the binary.")
+            }
+            CompilerError::InvalidModuleStructure {
+                package_mismatches,
+                unresolved_imports,
+            } => write!(
+                f,
+                "invalid module structure {package_mismatches} {unresolved_imports}"
+            ),
+            CompilerError::CompilationAborted { reason } => {
+                write!(f, "Compilation aborted: {reason}")
             }
         }
     }

@@ -55,7 +55,7 @@ pub fn to_span_coords(source: &str, position: lsp_types::Position) -> (usize, us
     let line_idx = position.line as usize + 1;
     let byte_col = match line_at(source, position.line) {
         Some(line) => byte_offset_from_utf16(line, position.character) + 1,
-        None => position.character as usize + 1, // no source: fall back, ASCII-only
+        None => position.character as usize + 1,
     };
     (line_idx, byte_col)
 }
