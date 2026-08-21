@@ -252,6 +252,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     unmangled_name: synthetic_name, // Not a real function so it just gets any name xD
                     declaring_module_idx: 0,        // Only important for type checking.
                     impl_target: None,
+                    span,
                 };
 
                 self.hoisted
