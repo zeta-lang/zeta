@@ -1,7 +1,3 @@
-/// Package paths implicitly imported into every module, without an
-/// explicit `import`. Plain string segments (not `StrId`) so this can be
-/// constructed without a `StringPool`; paths are interned + resolved
-/// against the `DepGraph` lazily, once per module registration.
 #[derive(Debug, Clone)]
 pub struct AutoImportRegistry {
     paths: Vec<Vec<&'static str>>,
