@@ -6,24 +6,6 @@ use std::ptr;
 use std::sync::Arc;
 use zetaruntime::string_pool::StringPool;
 
-pub fn mangle_method_name(
-    dep_graph: &RefCell<DepGraph>,
-    module_idx: usize,
-    struct_name: StrId,
-    method_name: StrId,
-    context: Arc<StringPool>,
-) -> StrId {
-    let mut segments: Vec<StrId> = Vec::with_capacity(4);
-    segments.push(struct_name);
-
-    if let Some(pkg) = dep_graph.borrow().get_module_package(module_idx) {
-        let pkg_str = context.resolve_string(&pkg);
-        segments.extend(pkg_str.split("::").map(|seg| StrId(context.intern(seg))));
-    }
-
-    build_module_scoped_name(&segments, method_name, None, context)
-}
-
 const VTABLE_LEN: usize = 8;
 
 pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
@@ -63,6 +45,18 @@ pub fn build_module_scoped_name(
     StrId(context.intern(&joined))
 }
 
+pub fn mangle_method_name(
+    dep_graph: &RefCell<DepGraph>,
+    module_idx: usize,
+    struct_name: StrId,
+    method_name: StrId,
+    context: Arc<StringPool>,
+) -> StrId {
+    dep_graph
+        .borrow()
+        .mangle_struct_method(module_idx, struct_name, method_name, &context)
+}
+
 pub fn mangle_function_name(
     dep_graph: &DepGraph,
     module_idx: usize,
@@ -71,29 +65,8 @@ pub fn mangle_function_name(
     is_extern_c: bool,
     context: Arc<StringPool>,
 ) -> StrId {
-    if is_extern_c {
-        return match struct_name {
-            Some(cls) => build_module_scoped_name(&[cls], func_name, None, context),
-            None => func_name,
-        };
+    match struct_name {
+        Some(cls) => dep_graph.mangle_struct_method(module_idx, cls, func_name, &context),
+        None => dep_graph.mangle_free_function(module_idx, func_name, is_extern_c, &context),
     }
-
-    let pkg_segments: Vec<StrId> = match dep_graph.get_module_package(module_idx) {
-        Some(pkg) => {
-            let pkg_str = context.resolve_string(&pkg);
-            pkg_str
-                .split("::")
-                .map(|seg| StrId(context.intern(seg)))
-                .collect()
-        }
-        None => Vec::new(),
-    };
-
-    let mut segments: Vec<StrId> = Vec::with_capacity(pkg_segments.len() + 1);
-    if let Some(cls) = struct_name {
-        segments.push(cls);
-    }
-    segments.extend(pkg_segments);
-
-    build_module_scoped_name(&segments, func_name, None, context)
 }

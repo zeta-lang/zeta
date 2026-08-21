@@ -2,13 +2,13 @@ use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry}
 use crate::midend::ir::lowerer::FunctionLowerer;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
-    Hir, HirEnum, HirFunc, HirInterface, HirModule, HirParam, HirStruct, StrId, ThisPassingKind,
+    Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, StrId,
+    ThisPassingKind,
 };
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::{FxHashBuilder, HashSet};
+use ir::ir_hasher::{HashMap, HashSet};
 use ir::ssa_ir::{AllocatorKind, Function, Module, SsaType};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,31 +24,33 @@ where
 {
     pub module: Module<'a, 'bump>,
 
-    interface_methods: HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
-    interface_id_map: HashMap<StrId, usize, FxHashBuilder>,
-    interface_method_slots: HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
+    interface_methods: HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+    interface_id_map: HashMap<StrId, usize>,
+    interface_method_slots: HashMap<StrId, HashMap<StrId, usize>>,
 
-    struct_mangled_map: HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-    struct_vtable_slots: HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-    struct_method_slots: HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    struct_field_offsets: HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
+    struct_mangled_map: HashMap<StrId, HashMap<StrId, StrId>>,
+    struct_vtable_slots: HashMap<StrId, Vec<StrId>>,
+    struct_method_slots: HashMap<StrId, HashMap<StrId, usize>>,
+    struct_field_offsets: HashMap<StrId, HashMap<StrId, usize>>,
 
     phantom_data: PhantomData<&'cx ()>,
 
     context: Arc<StringPool>,
     extern_c_names: Rc<HashSet<StrId>>,
-    enums: HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+    enums: HashMap<StrId, HirEnum<'a, 'bump>>,
 
-    enum_variant_tags: HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    struct_interfaces: HashMap<StrId, Vec<StrId>, FxHashBuilder>,
+    enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>>,
+    struct_interfaces: HashMap<StrId, Vec<StrId>>,
     pub dep_graph: &'a RefCell<DepGraph>,
     pub module_idx: usize,
     g_phantom_data: PhantomData<&'g ()>,
     glue_registry: &'a DropGlueRegistry,
-    allocator_kind: HashMap<StrId, AllocatorKind, FxHashBuilder>,
+    allocator_kind: HashMap<StrId, AllocatorKind>,
     bump: GrowableBump<'bump>,
-    interface_default_methods:
-        HashMap<StrId, HashMap<StrId, HirFunc<'a, 'bump>, FxHashBuilder>, FxHashBuilder>,
+    interface_default_methods: HashMap<StrId, HashMap<StrId, HirFunc<'a, 'bump>>>,
+    module_import_aliases: HashMap<usize, HashMap<StrId, usize>>,
+    module_named_imports: HashMap<usize, HashMap<StrId, usize>>,
+    constants: HashMap<StrId, HirExpr<'a, 'bump>>,
 }
 
 impl<'a, 'cx, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'bump, 'g>
@@ -64,36 +66,35 @@ where
         module_idx: usize,
         glue_registry: &'a DropGlueRegistry,
     ) -> Self {
-        let mut enum_variant_tags: HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        > = HashMap::with_hasher(FxHashBuilder);
+        let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
         let nullable_enum_name = StrId(context.intern("__nullable"));
-        let mut nullable_tags = HashMap::with_hasher(FxHashBuilder);
+        let mut nullable_tags = HashMap::default();
         nullable_tags.insert(StrId(context.intern("null")), 0usize);
         nullable_tags.insert(StrId(context.intern("some")), 1usize);
         enum_variant_tags.insert(nullable_enum_name, nullable_tags);
 
         let throws_enum_name = StrId(context.intern("__throws"));
-        let mut throws_tags = HashMap::with_hasher(FxHashBuilder);
+        let mut throws_tags = HashMap::default();
         throws_tags.insert(StrId(context.intern("__success")), 0usize);
         enum_variant_tags.insert(throws_enum_name, throws_tags);
 
         Self {
             module: Module::new(),
-            interface_methods: HashMap::with_hasher(FxHashBuilder),
-            interface_id_map: HashMap::with_hasher(FxHashBuilder),
-            interface_method_slots: HashMap::with_hasher(FxHashBuilder),
-            struct_mangled_map: HashMap::with_hasher(FxHashBuilder),
-            struct_vtable_slots: HashMap::with_hasher(FxHashBuilder),
-            struct_method_slots: HashMap::with_hasher(FxHashBuilder),
-            struct_field_offsets: HashMap::with_hasher(FxHashBuilder),
-            interface_default_methods: HashMap::with_hasher(FxHashBuilder),
+            interface_methods: HashMap::default(),
+            interface_id_map: HashMap::default(),
+            interface_method_slots: HashMap::default(),
+            struct_mangled_map: HashMap::default(),
+            struct_vtable_slots: HashMap::default(),
+            struct_method_slots: HashMap::default(),
+            struct_field_offsets: HashMap::default(),
+            interface_default_methods: HashMap::default(),
+            module_import_aliases: HashMap::default(),
+            module_named_imports: HashMap::default(),
+            constants: HashMap::default(),
             enum_variant_tags,
-            struct_interfaces: HashMap::with_hasher(FxHashBuilder),
-            enums: HashMap::with_hasher(FxHashBuilder),
+            struct_interfaces: HashMap::default(),
+            enums: HashMap::default(),
             phantom_data: PhantomData,
             context,
             extern_c_names,
@@ -101,7 +102,7 @@ where
             dep_graph,
             module_idx,
             g_phantom_data: PhantomData,
-            allocator_kind: HashMap::with_hasher(FxHashBuilder),
+            allocator_kind: HashMap::default(),
             glue_registry,
             bump: GrowableBump::new(4096, 8),
         }
@@ -109,7 +110,8 @@ where
 
     fn register_enum(&mut self, hir_enum: &ir::hir::HirEnum<'a, 'bump>) {
         self.enums.insert(hir_enum.name, *hir_enum);
-        let mut tags = HashMap::with_hasher(FxHashBuilder);
+        self.module.enums.insert(hir_enum.name, hir_enum.clone());
+        let mut tags = HashMap::default();
         for (i, variant) in hir_enum.variants.iter().enumerate() {
             tags.insert(variant.name, i);
         }
@@ -121,10 +123,17 @@ where
         hir_modules: &[HirModule<'a, 'bump>],
         compilation_order: &[usize],
     ) -> Module<'a, 'bump> {
+        for hir_module in hir_modules {
+            for item in hir_module.items {
+                if let Hir::Enum(hir_enum) = item {
+                    self.register_enum(*hir_enum);
+                }
+            }
+        }
+
         for &idx in compilation_order {
             for item in hir_modules[idx].items {
                 match item {
-                    Hir::Enum(hir_enum) => self.register_enum(*hir_enum),
                     Hir::Interface(iface) => self.lower_interface(*iface),
                     Hir::Impl(impl_block) => {
                         if let Some(iface) = impl_block.interface {
@@ -150,13 +159,39 @@ where
         }
 
         for &idx in compilation_order {
+            let mut aliases = HashMap::default();
+            let mut named = HashMap::default();
+            for import_path in hir_modules[idx].imports {
+                let Some(target_idx) = self
+                    .dep_graph
+                    .borrow()
+                    .resolve_module_path(import_path.path)
+                else {
+                    continue;
+                };
+                match import_path.member {
+                    None => {
+                        if let Some(&last) = import_path.path.last() {
+                            aliases.insert(last, target_idx);
+                        }
+                    }
+                    Some(member) => {
+                        named.insert(member, target_idx);
+                    }
+                }
+            }
+            self.module_import_aliases.insert(idx, aliases);
+            self.module_named_imports.insert(idx, named);
+        }
+
+        for &idx in compilation_order {
             for item in hir_modules[idx].items {
                 match item {
                     Hir::Func(func) => match func.impl_target {
                         Some(struct_name) => {
                             self.struct_mangled_map
                                 .entry(struct_name)
-                                .or_insert_with(|| HashMap::with_hasher(FxHashBuilder))
+                                .or_insert_with(|| HashMap::default())
                                 .insert(func.unmangled_name, func.name);
                             if func.generics.is_none() {
                                 self.register_method_signature(func);
@@ -167,6 +202,8 @@ where
                                 let f = Function::from_signature(
                                     func,
                                     &self.module.structs,
+                                    &self.module.enums,
+                                    &self.module.interfaces,
                                     &self.context,
                                 );
                                 self.module.functions.insert(f.name, f);
@@ -178,13 +215,16 @@ where
                             for method in methods {
                                 self.struct_mangled_map
                                     .entry(impl_block.target)
-                                    .or_insert_with(|| HashMap::with_hasher(FxHashBuilder))
+                                    .or_insert_with(|| HashMap::default())
                                     .insert(method.unmangled_name, method.name);
-                                if method.generics.is_none() {
+                                if method.generics.is_none() && impl_block.generics.is_none() {
                                     self.register_method_signature(method);
                                 }
                             }
                         }
+                    }
+                    Hir::Const(c) => {
+                        self.constants.insert(c.name, c.value.clone());
                     }
                     _ => {}
                 }
@@ -211,6 +251,7 @@ where
         for (name, func) in DropGlueBuilder::build_all(
             self.glue_registry,
             &self.module.structs,
+            &self.module.enums,
             &self.struct_mangled_map,
             &self.struct_field_offsets,
             &self.allocator_kind,
@@ -239,10 +280,12 @@ where
                         }
                     }
                     Hir::Impl(impl_block) => {
-                        if let Some(methods) = impl_block.methods {
-                            for method in methods {
-                                if method.generics.is_none() {
-                                    self.lower_function_body(method);
+                        if impl_block.generics.is_none() {
+                            if let Some(methods) = impl_block.methods {
+                                for method in methods {
+                                    if method.generics.is_none() {
+                                        self.lower_function_body(method);
+                                    }
                                 }
                             }
                         }
@@ -271,16 +314,26 @@ where
     }
 
     fn register_method_signature(&mut self, hir_method: &HirFunc<'a, 'bump>) {
-        let func = Function::from_signature(hir_method, &self.module.structs, &self.context);
+        let func = Function::from_signature(
+            hir_method,
+            &self.module.structs,
+            &self.module.enums,
+            &self.module.interfaces,
+            &self.context,
+        );
         self.module.functions.insert(func.name, func);
     }
 
     fn register_struct(&mut self, hir_struct: &HirStruct<'a, 'bump>) {
+        if hir_struct.generics.is_some() {
+            return;
+        }
+
         self.compute_field_offsets(hir_struct);
 
         self.struct_mangled_map
             .entry(hir_struct.name)
-            .or_insert_with(|| HashMap::with_hasher(FxHashBuilder));
+            .or_insert_with(|| HashMap::default());
 
         self.module
             .structs
@@ -290,9 +343,14 @@ where
     fn lower_interface(&mut self, hir_iface: &HirInterface<'a, 'bump>) {
         let iface_id = self.interface_id_map.len();
         self.interface_id_map.insert(hir_iface.name, iface_id);
+
+        self.module
+            .interfaces
+            .insert(hir_iface.name, hir_iface.clone());
+
         let mut methods = Vec::new();
-        let mut slot_map = HashMap::with_hasher(FxHashBuilder);
-        let mut defaults = HashMap::with_hasher(FxHashBuilder);
+        let mut slot_map = HashMap::default();
+        let mut defaults = HashMap::default();
         if let Some(hir_methods) = hir_iface.methods {
             for m in hir_methods.iter() {
                 if m.generics.is_some() {
@@ -308,7 +366,7 @@ where
                             name: _,
                             param_type,
                             span: _,
-                        } => lower_type_hir(&param_type),
+                        } => lower_type_hir(&param_type, &self.enums),
                         HirParam::This { kind, span: _ } => match kind {
                             ThisPassingKind::Move | ThisPassingKind::MoveMut => SsaType::Dyn,
                             _ => SsaType::Pointer(Box::new(SsaType::Dyn)),
@@ -318,13 +376,20 @@ where
                 let ret = m
                     .return_type
                     .as_ref()
-                    .map(|t| lower_type_hir(t))
+                    .map(|t| lower_type_hir(t, &self.enums))
                     .unwrap_or(SsaType::Void);
-                methods.push((m.name.clone(), param_types, ret));
+                methods.push((m.unmangled_name.clone(), param_types, ret));
+                slot_map.insert(m.unmangled_name.clone(), slot);
                 slot_map.insert(m.name.clone(), slot);
 
                 if m.body.is_some() {
-                    let func = Function::from_signature(m, &self.module.structs, &self.context);
+                    let func = Function::from_signature(
+                        m,
+                        &self.module.structs,
+                        &self.module.enums,
+                        &self.module.interfaces,
+                        &self.context,
+                    );
                     self.module.functions.insert(func.name, func);
                     defaults.insert(m.unmangled_name, *m);
                 }
@@ -336,17 +401,14 @@ where
         self.interface_method_slots.insert(hir_iface.name, slot_map);
         self.interface_default_methods
             .insert(hir_iface.name, defaults);
-        self.module
-            .interfaces
-            .insert(hir_iface.name, hir_iface.clone());
     }
 
     fn compute_field_offsets(&mut self, hir_struct: &HirStruct<'a, 'bump>) {
-        let mut offsets = HashMap::with_hasher(FxHashBuilder);
+        let mut offsets = HashMap::default();
         let mut current_offset = 0usize;
 
         for f in hir_struct.fields.iter() {
-            let field_ssa_ty = lower_type_hir(&f.field_type);
+            let field_ssa_ty = lower_type_hir(&f.field_type, &self.enums);
             let layout =
                 ir::layout::layout_of_ssa(&field_ssa_ty, ir::layout::TargetInfo { ptr_bytes: 8 })
                     .unwrap_or_else(|e| {
@@ -396,7 +458,7 @@ where
                 .collect();
 
             let mut vtable_slots = Vec::new();
-            let mut slot_map = HashMap::with_hasher(FxHashBuilder);
+            let mut slot_map = HashMap::default();
             for (slot, (method_name, _, _)) in iface_methods.iter().enumerate() {
                 let unmangled_name = unmangled_names.get(slot).copied().unwrap_or(*method_name);
                 let mangled = target_methods
@@ -409,15 +471,6 @@ where
                             .map(|f| f.name)
                     })
                     .unwrap_or_else(|| {
-                        println!(
-                            "interface default methods {:#?}",
-                            self.interface_default_methods
-                        );
-                        println!();
-                        println!(
-                            "interface default methods for {iface_name}: {:#?}",
-                            self.interface_default_methods.get(iface_name)
-                        );
                         panic!(
                             "Target {} implements interface {} but does not provide method {}, \
                              and the interface has no default body for it",
@@ -425,16 +478,11 @@ where
                         )
                     });
                 vtable_slots.push(mangled);
-                slot_map.insert(method_name.clone(), slot);
+                slot_map.insert(unmangled_name, slot);
             }
 
             self.struct_vtable_slots.insert(
-                StrId(intern_fmt!(
-                    self.context,
-                    "{}_{}",
-                    self.context.resolve_string(&target_name),
-                    self.context.resolve_string(iface_name)
-                )),
+                StrId(intern_fmt!(self.context, "{}_{}", target_name, iface_name)),
                 vtable_slots,
             );
             self.struct_method_slots.insert(target_name, slot_map);
@@ -470,6 +518,9 @@ where
             &self.interface_methods,
             &self.bump,
             &self.enums,
+            &self.module_import_aliases,
+            &self.module_named_imports,
+            &self.constants,
         )
         .unwrap();
         fl.lower_body(hir_fn.body);

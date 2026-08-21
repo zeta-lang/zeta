@@ -9,14 +9,13 @@ use ir::hir::{
     HirStruct, HirType, IntrinsicKind, ProvenanceAnnotation, StrId,
 };
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::{FxHashBuilder, HashSet};
-use ir::layout::{TargetInfo, alignof_ssa, layout_of_ssa, round_up_to_align};
+use ir::ir_hasher::{HashMap, HashSet};
+use ir::layout::{TargetInfo, alignof_ssa, round_up_to_align};
 use ir::ssa_ir::{
     AllocatorKind, BasicBlock, BinOp, BlockId, Function, Instruction, Operand, SsaType, Value,
 };
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use zetaruntime::bump::GrowableBump;
@@ -45,31 +44,34 @@ struct LoopCtx {
 
 pub struct FunctionLowerer<'f, 'a, 'bump> {
     current_block_data: CurrentBlockData<'f>,
-    var_map: HashMap<StrId, Value, FxHashBuilder>,
+    var_map: HashMap<StrId, Value>,
     phantom_data: PhantomData<&'bump ()>,
     loop_stack: Vec<LoopCtx>,
-    funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-    struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-    struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-    interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-    interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    structs: &'a HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-    enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
-    enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+    funcs: &'a HashMap<StrId, Function>,
+    struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+    struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+    interface_id_map: &'a HashMap<StrId, usize>,
+    interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
+    enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
+    enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
     context: Arc<StringPool>,
     extern_c_names: &'a HashSet<StrId>,
     pub dep_graph: &'a RefCell<DepGraph>,
     pub module_idx: usize,
     return_type: Option<HirType<'a, 'bump>>,
-    global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
+    global_funcs: &'a HashMap<StrId, Function>,
     scope_stack: Vec<DropScope<'a, 'bump>>,
     drop_state: DropMoveState<'a, 'bump>,
     glue_registry: &'a DropGlueRegistry,
-    allocator_kind: &'a HashMap<StrId, AllocatorKind, FxHashBuilder>,
-    pub interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
+    allocator_kind: &'a HashMap<StrId, AllocatorKind>,
+    pub interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
     bump: &'bump GrowableBump<'bump>,
+    module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+    module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+    constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
 }
 
 impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump>
@@ -79,37 +81,28 @@ where
     pub fn new(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        struct_field_offsets: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-        interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-        interface_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
+        funcs: &'a HashMap<StrId, Function>,
+        global_funcs: &'a HashMap<StrId, Function>,
+        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'a HashMap<StrId, usize>,
+        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'a HashSet<StrId>,
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
         glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind, FxHashBuilder>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
+        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
+        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
         bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -133,43 +126,37 @@ where
             interface_methods,
             bump,
             enums,
+            module_import_aliases,
+            module_named_imports,
+            constants,
         )
     }
 
     pub fn new_with_struct(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        struct_field_offsets: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-        interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-        interface_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
+        funcs: &'a HashMap<StrId, Function>,
+        global_funcs: &'a HashMap<StrId, Function>,
+        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'a HashMap<StrId, usize>,
+        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'a HashSet<StrId>,
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
         glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind, FxHashBuilder>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
+        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
+        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
         bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -193,46 +180,40 @@ where
             interface_methods,
             bump,
             enums,
+            module_import_aliases,
+            module_named_imports,
+            constants,
         )
     }
 
     fn new_internal(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        global_funcs: &'a HashMap<StrId, Function, FxHashBuilder>,
-        struct_field_offsets: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId, FxHashBuilder>, FxHashBuilder>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>, FxHashBuilder>,
-        interface_id_map: &'a HashMap<StrId, usize, FxHashBuilder>,
-        interface_method_slots: &'a HashMap<
-            StrId,
-            HashMap<StrId, usize, FxHashBuilder>,
-            FxHashBuilder,
-        >,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>, FxHashBuilder>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize, FxHashBuilder>, FxHashBuilder>,
+        funcs: &'a HashMap<StrId, Function>,
+        global_funcs: &'a HashMap<StrId, Function>,
+        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'a HashMap<StrId, usize>,
+        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'a HashSet<StrId>,
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
         glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind, FxHashBuilder>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>, FxHashBuilder>,
+        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
+        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
         bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>, FxHashBuilder>,
+        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
-        let mut var_map = HashMap::with_hasher(FxHashBuilder);
-        let mut value_types = HashMap::with_hasher(FxHashBuilder);
+        let mut var_map = HashMap::default();
+        let mut value_types = HashMap::default();
 
         if let Some(params) = hir_fn.params {
             assert_eq!(
@@ -300,6 +281,9 @@ where
             interface_methods,
             bump,
             enums,
+            module_import_aliases,
+            module_named_imports,
+            constants,
         })
     }
 
@@ -446,9 +430,9 @@ where
                 let break_target = ctx.break_target;
                 let phis = ctx.break_join_phis.clone();
                 let depth = ctx.scope_depth_at_entry;
-                let from_bb = self.current_block_data.current_block;
                 let vars = self.var_map.clone();
                 self.emit_drops_for_loop_exit(depth);
+                let from_bb = self.current_block_data.current_block;
                 self.contribute_join_edge(break_target, from_bb, &vars, &phis);
                 self.emit(Instruction::Jump {
                     target: break_target,
@@ -462,13 +446,24 @@ where
                 let join_bb = ctx.continue_join_bb;
                 let phis = ctx.continue_join_phis.clone();
                 let depth = ctx.scope_depth_at_entry;
-                let from_bb = self.current_block_data.current_block;
                 let vars = self.var_map.clone();
                 self.emit_drops_for_loop_exit(depth);
+                let from_bb = self.current_block_data.current_block;
                 self.contribute_join_edge(join_bb, from_bb, &vars, &phis);
                 self.emit(Instruction::Jump {
                     target: continue_target,
                 });
+            }
+            HirStmt::Match { expr, arms } => {
+                let match_expr = HirExpr::Match {
+                    expr,
+                    arms,
+                    span: Default::default(),
+                };
+                let _ = self.allow_lowering_expr(&match_expr);
+            }
+            HirStmt::Defer(_) => {
+                // TODO: handle defers
             }
             _ => unimplemented!("Statement {:?} not yet lowered", stmt),
         }
@@ -609,13 +604,6 @@ where
         }
     }
 
-    /// Creates a placeholder phi (with no incoming edges yet) in the
-    /// *current* block for every currently-live local, and rewrites
-    /// `var_map` to route future reads through those phis. Must be called
-    /// immediately after switching into an otherwise-empty join block
-    /// (phis must be the leading instructions of a block, see the
-    /// cranelift backend's predecessor-scanning convention). Each block that
-    /// can jump into this join point must later call `contribute_join_edge`.
     fn open_join(&mut self) -> Vec<(StrId, usize, Value)> {
         let names: Vec<StrId> = self.var_map.keys().copied().collect();
         let mut phis = Vec::with_capacity(names.len());
@@ -644,18 +632,33 @@ where
         phis
     }
 
-    /// Records that control can reach the join block owning `phis` from
-    /// `from_bb`, carrying the values captured in `vars` (a snapshot of
-    /// `var_map` taken in `from_bb` right before the jump).
     fn contribute_join_edge(
         &mut self,
         join_bb: BlockId,
         from_bb: BlockId,
-        vars: &HashMap<StrId, Value, FxHashBuilder>,
+        vars: &HashMap<StrId, Value>,
         phis: &[(StrId, usize, Value)],
     ) {
         if phis.is_empty() {
             return;
+        }
+        for (name, _idx, dest) in phis {
+            if let Some(val) = vars.get(name).copied() {
+                let phi_ty = self.current_block_data.value_type(*dest).cloned();
+                let val_ty = self.current_block_data.value_type(val).cloned();
+                if let (Some(pt), Some(vt)) = (&phi_ty, &val_ty) {
+                    if pt != vt {
+                        panic!(
+                            "phi type mismatch: joining into block {:?} from block {:?}, \
+                             variable `{}` was typed {:?} when this join point was opened \
+                             (phi dest {:?}), but the value now bound to it here ({:?}) has \
+                             type {:?} instead, `{}` was rebound to a differently-typed \
+                             value somewhere between the join point and this edge",
+                            join_bb, from_bb, name, pt, dest, val, vt, name
+                        );
+                    }
+                }
+            }
         }
         let block = self
             .current_block_data
@@ -664,7 +667,7 @@ where
             .iter_mut()
             .find(|b| b.id == join_bb)
             .expect("join block missing");
-        for (name, idx, _) in phis {
+        for (name, idx, _dest) in phis {
             if let Some(val) = vars.get(name).copied() {
                 if let Instruction::Phi { incoming, .. } = &mut block.instructions[*idx] {
                     incoming.push((from_bb, val));
@@ -673,18 +676,10 @@ where
         }
     }
 
-    /// Merges the local-variable state of every *live* (non-terminated)
-    /// incoming branch into the current block (a merge point that's already
-    /// active, e.g. an if/else join). Unlike `open_join`, this decides
-    /// per-variable whether a phi is actually needed (only when branches
-    /// disagree), since for a simple two-way merge we know every
-    /// contributing branch's final value up front and don't have the
-    /// loop-style chicken-and-egg problem that forces placeholders.
-    fn merge_var_maps(&mut self, branches: Vec<(BlockId, HashMap<StrId, Value, FxHashBuilder>)>) {
+    fn merge_var_maps(&mut self, branches: Vec<(BlockId, HashMap<StrId, Value>)>) {
         match branches.len() {
             0 => {
-                // Join point is unreachable (every incoming branch diverged)
-                // nothing will ever read it here.
+                // every incoming branch diverged
             }
             1 => {
                 self.var_map = branches.into_iter().next().unwrap().1;
@@ -696,7 +691,7 @@ where
                     all_names.extend(vars.keys().copied());
                 }
 
-                let mut merged = HashMap::with_hasher(FxHashBuilder);
+                let mut merged = HashMap::default();
                 for name in all_names {
                     let mut entries: Vec<(BlockId, Value)> = Vec::new();
                     for (bb, vars) in &branches {
@@ -715,6 +710,11 @@ where
                             .value_type(first_val)
                             .unwrap()
                             .clone();
+
+                        if first_ty == SsaType::Void {
+                            merged.insert(name, first_val);
+                            continue;
+                        }
 
                         let dest = self.current_block_data.fresh_value();
                         self.current_block_data.value_types.insert(dest, first_ty);
@@ -783,9 +783,6 @@ where
                 Some((tail, vars))
             }
         } else {
-            // Implicit empty else: falls straight from `pre_if_bb` into
-            // `merge_bb` (the `Branch` above already wired `else_bb ==
-            // merge_bb` directly, there's no separate block/jump for it).
             Some((pre_if_bb, vars_before))
         };
 
@@ -834,9 +831,6 @@ where
             scope_depth_at_entry: self.scope_stack.len(),
         });
 
-        // `open_join` above (for `after_bb`) clobbered `var_map` to point at
-        // its own placeholders; restore the header's values before lowering
-        // the body, which runs right after the condition is checked true.
         self.var_map = header_vars;
         self.current_block_data.switch_to(body_bb);
         self.lower_stmt(body);
@@ -984,23 +978,22 @@ where
             .value_type(raw_val)
             .expect("catch target must have a known SsaType")
             .clone();
-        let SsaType::Enum(_, variant_types) = &enum_ty else {
+        let SsaType::Enum {
+            variants: variant_types,
+            ..
+        } = &enum_ty
+        else {
             panic!(
                 "`catch` used on non-enum SsaType {:?}, thrown values must be SsaType::Enum",
                 enum_ty
             );
         };
 
-        let mut max_variant = ir::layout::Layout { size: 0, align: 1 };
-        for vty in variant_types {
-            let l = layout_of_ssa(&vty, TargetInfo { ptr_bytes: 8 })
-                .unwrap_or_else(|e| panic!("failed to compute layout for error variant: {:?}", e));
-            max_variant.size = max_variant.size.max(l.size);
-            max_variant.align = max_variant.align.max(l.align);
-        }
-        let union_size = round_up_to_align(max_variant.size, max_variant.align);
-        let tag_offset = round_up_to_align(union_size, 1);
-        let payload_offset = 0usize; // union fields all start at 0
+        let enum_layout =
+            ir::layout::enum_layout_of_ssa(variant_types, TargetInfo { ptr_bytes: 8 })
+                .unwrap_or_else(|e| panic!("failed to compute layout for error enum: {:?}", e));
+        let tag_offset = enum_layout.tag_offset;
+        let payload_offset = enum_layout.payload_offset;
 
         let tag_val = self.current_block_data.fresh_value();
         self.emit(Instruction::LoadField {
@@ -1013,7 +1006,7 @@ where
 
         for (i, (error_type, binding, body)) in branches.iter().enumerate() {
             let error_name = match error_type {
-                HirType::Struct { name, .. } | HirType::Enum(name, _) => *name,
+                HirType::Struct { name, .. } | HirType::Enum { name, .. } => *name,
                 other => panic!("catch branch type {:?} is not a nominal error type", other),
             };
             let arm_tag = *tags.get(&error_name).unwrap_or_else(|| {
@@ -1052,7 +1045,7 @@ where
                     self.emit(Instruction::Branch {
                         cond: Operand::Value(cond),
                         then_bb: arm_body_bb,
-                        else_bb: arm_body_bb, // last arm: assumes exhaustiveness was enforced earlier
+                        else_bb: arm_body_bb,
                     });
                 }
             }
@@ -1084,7 +1077,7 @@ where
 
         match expected {
             Some(HirType::Nullable(inner)) => {
-                let inner_ssa = lower_type_hir(inner);
+                let inner_ssa = lower_type_hir(inner, self.enums);
 
                 if inner_ssa.is_pointer() {
                     // Pointer-optimized nullable: null is just 0.
@@ -1097,7 +1090,6 @@ where
                         .value_types
                         .insert(v, SsaType::Nullable(Box::new(inner_ssa)));
                 } else {
-                    // Tagged-union nullable: StackAlloc + Store(tag=0) at offset 0.
                     let _payload_align =
                         alignof_ssa(&inner_ssa, TargetInfo { ptr_bytes: 8 }).unwrap_or(1);
                     let tag_offset = 0usize; // tag at offset 0 per layout_of_ssa for Nullable
@@ -1256,6 +1248,9 @@ where
             &mut self.drop_state,
             self.interface_methods,
             self.enums,
+            self.module_import_aliases,
+            self.module_named_imports,
+            self.constants,
         );
         el.lower_expr(value)
     }
@@ -1277,10 +1272,6 @@ where
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 if let HirExpr::Ident(root, _) = &**object {
-                    // Only Struct locals have fields to partially move out of.
-                    // `p.field` where `p: ^T` is a move through the pointer
-                    // (of the pointee's field), not a move of the pointer
-                    // binding
                     if let Some(_) = self.local_is_droppable(*root) {
                         self.drop_state.mark_field_moved(*root, *field);
                     }
@@ -1337,6 +1328,7 @@ where
                         self.struct_mangled_map,
                         self.struct_field_offsets,
                         self.structs,
+                        self.enums,
                         self.allocator_kind,
                         self.glue_registry,
                     );
@@ -1382,6 +1374,7 @@ where
                     self.struct_mangled_map,
                     self.struct_field_offsets,
                     self.structs,
+                    self.enums,
                     self.allocator_kind,
                     self.glue_registry,
                 );
@@ -1418,7 +1411,7 @@ where
             return;
         }
 
-        let elem_ssa_ty = lower_type_hir(&element_ty);
+        let elem_ssa_ty = lower_type_hir(&element_ty, self.enums);
 
         let ptr_v = self.current_block_data.fresh_value();
         self.emit(Instruction::LoadField {
@@ -1457,7 +1450,6 @@ where
 
         self.emit(Instruction::Jump { target: cond_bb });
 
-        // Header: phi merges the initial index and the back-edge from the body.
         self.current_block_data.switch_to(cond_bb);
         let idx_phi = self.current_block_data.fresh_value();
         self.current_block_data
@@ -1490,7 +1482,6 @@ where
             else_bb: after_bb,
         });
 
-        // Body: load element[idx], drop it, increment, loop.
         self.current_block_data.switch_to(body_bb);
         let elem_size =
             ir::layout::sizeof_ssa(&elem_ssa_ty, ir::layout::TargetInfo { ptr_bytes: 8 })
@@ -1574,7 +1565,6 @@ where
         self.current_block_data.switch_to(after_bb);
     }
 
-    /// `Return` unwinds every enclosing scope, innermost first.
     fn emit_drops_for_return(&mut self) {
         for scope in self.scope_stack.clone().iter().rev() {
             self.emit_scope_drops(scope);
