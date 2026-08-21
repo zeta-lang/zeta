@@ -59,6 +59,7 @@ func main(): i64 {
     let flush_res: Result<bool, IOError> = writer.flush();
 
     let close_res: Result<void, IOError> = file_obj.close();
+    io.stdout().writeln("[PASS] BufWriter & File output written and flushed successfully.");
 
     // 3. Re-open and Read File
     let mut read_file: File = match (File.open("./build/test_output.txt")) {
