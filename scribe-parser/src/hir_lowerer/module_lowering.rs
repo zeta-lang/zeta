@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::context::HirLowerer;
-use crate::optimized_string_buffering::build_module_scoped_name;
 use ir::ast::Stmt;
 use ir::ast::{FuncDecl, Path};
 use ir::hir::HirFunc;
@@ -132,6 +131,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         self.resolve_imports(stmts);
         self.register_auto_import_aliases(module_idx);
         self.collect_type_declarations(stmts);
+        self.collect_const_declarations(stmts);
     }
 
     pub fn lower_module_prototypes(
@@ -143,6 +143,18 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         self.resolve_imports(stmts);
         self.register_auto_import_aliases(module_idx);
         self.collect_function_prototypes(stmts);
+    }
+
+    pub fn collect_const_declarations(&mut self, stmts: &[Stmt<'a, 'bump>]) {
+        for stmt in stmts {
+            if let Stmt::Const(const_stmt) = stmt {
+                let value = self.lower_expr(&const_stmt.value);
+                self.ctx.consts.borrow_mut().insert(const_stmt.ident, value);
+            }
+            if let Stmt::Module(module_decl) = stmt {
+                self.collect_const_declarations(module_decl.body);
+            }
+        }
     }
 
     pub fn lower_module_bodies(
@@ -189,6 +201,14 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 seen.insert(m);
             }
             groups.push(scc);
+        }
+
+        for group in &groups {
+            for &module_idx in group {
+                if let Some(stmts) = module_stmts.get(&module_idx) {
+                    self.lower_module_types(stmts, module_idx);
+                }
+            }
         }
 
         for group in &groups {
@@ -256,12 +276,20 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             if let Stmt::StructDecl(struct_decl) = stmt {
                 let ty_struct = self.lower_struct_decl(**struct_decl);
                 self.ctx
+                    .struct_owner_module
+                    .borrow_mut()
+                    .insert(ty_struct.name, self.ctx.module_idx);
+                self.ctx
                     .structs
                     .borrow_mut()
                     .insert(ty_struct.name, ty_struct);
             }
             if let Stmt::EnumDecl(enum_decl) = stmt {
                 let ty_enum = self.lower_enum_decl(**enum_decl);
+                self.ctx
+                    .enum_owner_module
+                    .borrow_mut()
+                    .insert(ty_enum.name, self.ctx.module_idx);
                 self.ctx.enums.borrow_mut().insert(ty_enum.name, ty_enum);
             }
             if let Stmt::Module(module_decl) = stmt {
@@ -375,7 +403,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         let mut proto: HirFuncProto = self.lower_func_proto(f);
         let is_extern = matches!(
             proto.function_metadata.extern_modifier,
-            ir::ast::ExternModifier::Abi(_)
+            ir::ast::ExternModifier::Abi(interned) if self.ctx.context.resolve_string(&interned) == "C"
         );
         let is_main = self.ctx.context.resolve_string(&proto.name) == "main";
         if !is_extern && !is_main {
@@ -392,6 +420,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             unmangled_name: proto.unmangled_name,
             declaring_module_idx: self.ctx.module_idx,
             impl_target: struct_name,
+            span: proto.span,
         };
 
         self.ctx.functions.borrow_mut().insert(proto.name, hir_func);
@@ -404,53 +433,24 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         struct_name: Option<StrId>,
         name: StrId,
     ) -> StrId {
-        let Some(pkg) = self
-            .ctx
-            .dep_graph
-            .borrow()
-            .get_module_package(declaring_module_idx)
-        else {
-            return match struct_name {
-                Some(cls) => build_module_scoped_name(&[cls], name, None, self.ctx.context.clone()),
-                None => name,
-            };
-        };
-
-        let pkg_str = self.ctx.context.resolve_string(&pkg);
-
-        let mut segments = Vec::new();
-
-        if let Some(cls) = struct_name {
-            segments.push(cls);
+        match struct_name {
+            Some(cls) => self.ctx.dep_graph.borrow().mangle_struct_method(
+                declaring_module_idx,
+                cls,
+                name,
+                &self.ctx.context,
+            ),
+            None => self.ctx.dep_graph.borrow().mangle_free_function(
+                declaring_module_idx,
+                name,
+                false,
+                &self.ctx.context,
+            ),
         }
-
-        segments.extend(
-            pkg_str
-                .split("::")
-                .map(|seg| StrId(self.ctx.context.intern(seg))),
-        );
-
-        build_module_scoped_name(&segments, name, None, self.ctx.context.clone())
     }
 
     pub(super) fn mangle_with_module_path(&self, name: StrId) -> StrId {
-        let Some(pkg) = self
-            .ctx
-            .dep_graph
-            .borrow()
-            .get_module_package(self.ctx.module_idx)
-        else {
-            // No package declaration for this module
-            return name;
-        };
-
-        let pkg_str = self.ctx.context.resolve_string(&pkg);
-        let segments: Vec<StrId> = pkg_str
-            .split("_")
-            .map(|seg| StrId(self.ctx.context.intern(seg)))
-            .collect();
-
-        build_module_scoped_name(&segments, name, None, self.ctx.context.clone())
+        self.mangle_function_name(self.ctx.module_idx, None, name)
     }
 
     pub fn lower_function_bodies(
@@ -555,6 +555,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             function_metadata: f.function_metadata,
             generics,
             unmangled_name: f.name,
+            span: f.span,
         }
     }
 

@@ -68,7 +68,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             Expr::Boolean { value, span } => HirExpr::Boolean(*value, *span),
 
             Expr::Ident { name, span } => {
-                if self.ctx.imported_modules.borrow().contains_key(&name)
+                if self.ctx.variable_types.borrow().contains_key(&name) {
+                    HirExpr::Ident(*name, *span)
+                } else if self.ctx.imported_modules.borrow().contains_key(&name)
                     || self.ctx.named_imports.borrow().contains_key(&name)
                 {
                     let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
@@ -77,6 +79,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         span: *span,
                     });
                     HirExpr::ModuleAccess(access)
+                } else if let Some(const_value) = self.ctx.consts.borrow().get(name) {
+                    *const_value
                 } else {
                     HirExpr::Ident(*name, *span)
                 }
@@ -90,11 +94,50 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let lowered_object = self.lower_expr(object);
                 match lowered_object {
                     HirExpr::ModuleAccess(acc) => {
-                        // `foo::bar.baz`, the field is the member on the module.
-                        // If acc.member is empty this is the first `.` after the path.
-                        // If acc.member is non-empty, this is a chained `.` meaning
-                        // we are accessing a member of a type inside the module:
-                        // `std::io.File.new`, keep extending as a field access on top.
+                        let resolved_enum_opt = if acc.member.is_empty() {
+                            if acc.path.len() == 1 {
+                                let res =
+                                    self.ctx.resolve_type_path_name(&[], acc.path[0], acc.span);
+                                if self.ctx.enums.borrow().contains_key(&res) {
+                                    Some(res)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                let (prefix, last) = acc.path.split_at(acc.path.len() - 1);
+                                let res =
+                                    self.ctx.resolve_type_path_name(prefix, last[0], acc.span);
+                                if self.ctx.enums.borrow().contains_key(&res) {
+                                    Some(res)
+                                } else {
+                                    None
+                                }
+                            }
+                        } else {
+                            let res = self
+                                .ctx
+                                .resolve_type_path_name(acc.path, acc.member, acc.span);
+                            if self.ctx.enums.borrow().contains_key(&res) {
+                                Some(res)
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(enum_name) = resolved_enum_opt {
+                            if let Some(hir_enum) = self.ctx.enums.borrow().get(&enum_name) {
+                                if hir_enum.variants.iter().any(|v| v.name == *field) {
+                                    return HirExpr::EnumInit {
+                                        enum_name,
+                                        variant: *field,
+                                        type_args: None,
+                                        args: &[],
+                                        span: *span,
+                                    };
+                                }
+                            }
+                        }
+
                         if acc.member.is_empty() {
                             let new_acc = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
                                 path: acc.path,
@@ -103,8 +146,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             });
                             HirExpr::ModuleAccess(new_acc)
                         } else {
-                            // Further chained: `mod.Type.method`, lower as a normal
-                            // FieldAccess on top of the resolved ModuleAccess.
                             HirExpr::FieldAccess {
                                 object: self.ctx.bump.alloc_value_immutable(lowered_object),
                                 field: *field,
@@ -113,17 +154,29 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
                     }
                     other => {
-                        if let HirExpr::Ident(name, _) = other {
-                            let resolved = self.ctx.resolve_type_path_name(&[], name, *span);
+                        let resolved_enum_opt = match &other {
+                            HirExpr::Ident(name, _) => {
+                                let res = self.ctx.resolve_type_path_name(&[], *name, *span);
+                                if self.ctx.enums.borrow().contains_key(&res) {
+                                    Some(res)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
 
-                            if self.ctx.enums.borrow().contains_key(&resolved) {
-                                return HirExpr::EnumInit {
-                                    enum_name: resolved,
-                                    variant: *field,
-                                    type_args: None,
-                                    args: &[], // FieldAccess means it has no fields
-                                    span: *span,
-                                };
+                        if let Some(enum_name) = resolved_enum_opt {
+                            if let Some(hir_enum) = self.ctx.enums.borrow().get(&enum_name) {
+                                if hir_enum.variants.iter().any(|v| v.name == *field) {
+                                    return HirExpr::EnumInit {
+                                        enum_name,
+                                        variant: *field,
+                                        type_args: None,
+                                        args: &[],
+                                        span: *span,
+                                    };
+                                }
                             }
                         }
 
@@ -201,7 +254,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                                 self.ctx.resolve_type_path_name(&[], enum_name, *span);
                             let args_vec: Vec<HirFieldInit<'a, 'bump>> = arguments
                                 .iter()
-                                .map(|a| self.lower_field_init(*a))
+                                .map(|a| {
+                                    let expected =
+                                        self.enum_variant_field_type(resolved_enum, *field, a.name);
+                                    self.lower_field_init(*a, expected)
+                                })
                                 .collect();
                             let args = self.ctx.bump.alloc_slice(&args_vec);
                             let type_args_vec: Vec<HirType<'a, 'bump>> = type_args
@@ -233,7 +290,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         ident_span,
                     ),
                     HirExpr::ModuleAccess(acc) if acc.member.is_empty() && acc.path.len() == 1 => {
-                        // bare imported-name struct reference, e.g. `RawMallocator {}`
                         let resolved = self.ctx.resolve_type_path_name(&[], acc.path[0], acc.span);
                         HirExpr::Ident(resolved, acc.span)
                     }
@@ -247,9 +303,17 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     other => other,
                 };
 
+                let struct_name_id = match name {
+                    HirExpr::Ident(id, _) => Some(id),
+                    _ => None,
+                };
                 let args_vec: Vec<HirFieldInit<'a, 'bump>> = arguments
                     .iter()
-                    .map(|a| self.lower_field_init(*a))
+                    .map(|a| {
+                        let expected =
+                            struct_name_id.and_then(|sid| self.struct_field_type(sid, a.name));
+                        self.lower_field_init(*a, expected)
+                    })
                     .collect();
                 let args = self.ctx.bump.alloc_slice(&args_vec);
                 let type_args_vec: Vec<HirType<'a, 'bump>> = type_args
@@ -613,8 +677,42 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        let args_vec: Vec<HirExpr<'a, 'bump>> =
-            arguments.iter().map(|a| self.lower_expr(a)).collect();
+        let param_types: Option<Vec<Option<HirType<'a, 'bump>>>> =
+            if let HirExpr::Ident(func_name, _) = &lowered_callee {
+                self.resolve_function(*func_name).map(|func| {
+                    func.params
+                        .map(|params| {
+                            params
+                                .iter()
+                                .filter_map(|p| match p {
+                                    ir::hir::HirParam::Normal { param_type, .. } => {
+                                        Some(Some(*param_type))
+                                    }
+                                    ir::hir::HirParam::This { .. } => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+            } else {
+                None
+            };
+
+        let args_vec: Vec<HirExpr<'a, 'bump>> = arguments
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                match param_types
+                    .as_ref()
+                    .and_then(|pts| pts.get(i))
+                    .copied()
+                    .flatten()
+                {
+                    Some(expected) => self.lower_expr_expected(a, expected),
+                    None => self.lower_expr(a),
+                }
+            })
+            .collect();
         let args = self.ctx.bump.alloc_slice(&args_vec);
 
         HirExpr::Call {
@@ -707,7 +805,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        // Try current module.
         let mangled = self.mangle_function_name(self.ctx.module_idx, None, name);
         {
             let funcs = self.ctx.functions.borrow();
@@ -716,7 +813,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        // Try imported modules.
         let imports = self.ctx.imported_modules.borrow();
 
         for module_idx in imports.values().copied() {
@@ -950,7 +1046,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .unwrap()
             }
 
-            HirType::Enum(name, args) => HirType::Enum(name, args),
+            HirType::Enum {
+                name,
+                variants,
+                type_args,
+            } => HirType::Enum {
+                name,
+                variants,
+                type_args,
+            },
 
             HirType::DynInterface(_, _) => {
                 panic!("field access on interface")
@@ -1316,8 +1420,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     return HirType::DynInterface(resolved_name, type_args_slice);
                 }
 
-                if self.ctx.enums.borrow().contains_key(&resolved_name) {
-                    return HirType::Enum(resolved_name, type_args_slice);
+                if let Some(ty_enum) = self.ctx.enums.borrow().get(&resolved_name) {
+                    return HirType::Enum {
+                        name: resolved_name,
+                        variants: ty_enum.variants,
+                        type_args: type_args_slice,
+                    };
                 }
 
                 self.ctx.record_error(
@@ -1490,11 +1598,46 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         })
     }
 
-    pub(crate) fn lower_field_init(&self, a: FieldInit<'a, 'bump>) -> HirFieldInit<'a, 'bump> {
+    pub(crate) fn lower_field_init(
+        &self,
+        a: FieldInit<'a, 'bump>,
+        expected_ty: Option<HirType<'a, 'bump>>,
+    ) -> HirFieldInit<'a, 'bump> {
         HirFieldInit {
             name: a.name,
             name_span: a.name_span,
-            value: self.lower_expr(&a.value),
+            value: match expected_ty {
+                Some(ty) => self.lower_expr_expected(&a.value, ty),
+                None => self.lower_expr(&a.value),
+            },
         }
+    }
+
+    fn struct_field_type(
+        &self,
+        struct_name: StrId,
+        field_name: StrId,
+    ) -> Option<HirType<'a, 'bump>> {
+        self.ctx
+            .structs
+            .borrow()
+            .get(&struct_name)
+            .and_then(|s| s.fields.iter().find(|f| f.name == field_name))
+            .map(|f| f.field_type)
+    }
+
+    fn enum_variant_field_type(
+        &self,
+        enum_name: StrId,
+        variant_name: StrId,
+        field_name: StrId,
+    ) -> Option<HirType<'a, 'bump>> {
+        self.ctx
+            .enums
+            .borrow()
+            .get(&enum_name)
+            .and_then(|e| e.variants.iter().find(|v| v.name == variant_name))
+            .and_then(|v| v.fields.iter().find(|f| f.name == field_name))
+            .map(|f| f.field_type)
     }
 }
