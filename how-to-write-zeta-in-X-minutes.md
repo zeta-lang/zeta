@@ -1,3 +1,4 @@
+```rs
 // Single line comment
 // A package clause starts every source file.
 package my::app;
@@ -287,3 +288,5 @@ func error_with_borrow_checking_and_move_semantics() {
     let moved_pair: Pair = pair3;
     borrow2.set_x(10);
 }
+
+```
