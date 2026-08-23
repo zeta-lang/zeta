@@ -72,6 +72,7 @@ pub struct FunctionLowerer<'f, 'a, 'bump> {
     module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
     module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
     constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+    promoted_to_stack: HashSet<StrId>,
 }
 
 impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump>
@@ -284,6 +285,7 @@ where
             module_import_aliases,
             module_named_imports,
             constants,
+            promoted_to_stack: HashSet::default(),
         })
     }
 
@@ -1251,6 +1253,7 @@ where
             self.module_import_aliases,
             self.module_named_imports,
             self.constants,
+            &mut self.promoted_to_stack,
         );
         el.lower_expr(value)
     }

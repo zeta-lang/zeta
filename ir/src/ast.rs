@@ -303,7 +303,14 @@ where
     'bump: 'a,
 {
     Normal(&'bump NormalParam<'a, 'bump>),
-    This(&'bump ThisParam<'a>),
+    This(&'bump ThisParam<'a, 'bump>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThisParam<'a, 'bump> {
+    pub passing_kind: ParamPassingKind,
+    pub multi_place: Option<&'bump [EffectAccess<'a, 'bump>]>,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -316,12 +323,7 @@ where
     pub type_annotation: Type<'a, 'bump>,
     pub visibility: Visibility,
     pub default_value: Option<Expr<'a, 'bump>>,
-    pub span: SourceSpan<'a>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ThisParam<'a> {
-    pub passing_kind: ParamPassingKind,
+    pub multi_place: Option<&'bump [EffectAccess<'a, 'bump>]>,
     pub span: SourceSpan<'a>,
 }
 
@@ -508,6 +510,10 @@ where
         body: &'bump Block<'a, 'bump>,
         span: SourceSpan<'a>,
     },
+    Tuple {
+        values: &'bump [Expr<'a, 'bump>],
+        span: SourceSpan<'a>,
+    },
     ModulePath {
         segments: &'bump [StrId],
         span: SourceSpan<'a>,
@@ -522,6 +528,9 @@ where
         span: SourceSpan<'a>,
     },
     Undefined {
+        span: SourceSpan<'a>,
+    },
+    Uninit {
         span: SourceSpan<'a>,
     },
     Block(&'bump Block<'a, 'bump>),
@@ -691,6 +700,9 @@ where
         inner: &'a Type<'a, 'bump>,
         length: usize,
     },
+    Tuple {
+        values: &'bump [Type<'a, 'bump>],
+    },
     Slice {
         inner: &'a Type<'a, 'bump>,
     },
@@ -798,6 +810,7 @@ pub enum ParamPassingKind {
     ConstUnsafePtr,
     MutSafePtr,
     MutUnsafePtr,
+    MultiPlace,
 }
 
 impl fmt::Display for MutabilityState {
@@ -1271,6 +1284,7 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                 allocator: _, // TODO: unignore
             } => write!(f, "^{}", inner),
             TypeKind::Never => f.write_str("never"),
+            TypeKind::Tuple { values } => todo!(),
         }?;
 
         if self.nullable {
@@ -1279,4 +1293,17 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectAccess<'a, 'bump> {
+    pub mutable: bool, // &mut vs &
+    pub path: &'bump [EffectSegment<'a, 'bump>],
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EffectSegment<'a, 'bump> {
+    Field(StrId),
+    Index(&'bump Expr<'a, 'bump>),
 }

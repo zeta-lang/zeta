@@ -1840,6 +1840,7 @@ dependencies = [
  "scribe-parser",
  "sentinel-typechecker",
  "walkdir",
+ "windows-sys 0.61.2",
  "zetaruntime",
 ]
 

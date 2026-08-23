@@ -749,10 +749,7 @@ impl CraneliftBackend {
                 let elem_size = sizeof_ssa(ty, self.target)
                     .unwrap_or_else(|_| panic!("StackAlloc: unknown size for {:?}", ty));
 
-                let size_bytes = match ty {
-                    SsaType::Array(_, _) => elem_size * count,
-                    _ => elem_size,
-                };
+                let size_bytes = elem_size * (*count).max(1);
 
                 let ptr = cranelift_intrinsics::stack_alloc(builder, &mut self.module, size_bytes);
 
@@ -900,10 +897,97 @@ impl CraneliftBackend {
                 dest,
                 func: called_func,
                 args,
+            } if matches!(called_func, Operand::Value(_)) => {
+                let fn_val = match called_func {
+                    Operand::Value(v) => v,
+                    _ => unreachable!(),
+                };
+
+                let (param_tys, ret_ty) = match func.value_types.get(fn_val) {
+                    Some(SsaType::FuncPointer {
+                        params,
+                        return_type,
+                    }) => (params.clone(), (**return_type).clone()),
+                    other => panic!(
+                        "Call: indirect call target `{:?}` has non-function-pointer type: {:?}",
+                        fn_val, other
+                    ),
+                };
+
+                let fn_ptr_var = var_map
+                    .get(fn_val)
+                    .expect("Call: function pointer value undefined");
+                let fn_ptr = builder.use_var(*fn_ptr_var);
+
+                let mut sig = self.module.make_signature();
+                for pty in &param_tys {
+                    sig.params.push(AbiParam::new(clif_type(pty)));
+                }
+                let ret_is_void = ret_ty == SsaType::Void;
+                if !ret_is_void {
+                    sig.returns.push(AbiParam::new(clif_type(&ret_ty)));
+                }
+                let sig_ref = builder.func.import_signature(sig);
+
+                let mut arg_vals = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    let raw_val = match a {
+                        Operand::Value(v) => {
+                            let var = var_map
+                                .get(v)
+                                .unwrap_or_else(|| panic!("undefined indirect call arg"));
+                            builder.use_var(*var)
+                        }
+                        Operand::ConstInt(i) => builder.ins().iconst(types::I64, *i),
+                        _ => unimplemented!("indirect call arg type not supported"),
+                    };
+                    let expected_ty = param_tys.get(i).map(clif_type).unwrap_or(types::I64);
+                    let raw_ty = builder.func.dfg.value_type(raw_val);
+                    let coerced = if raw_ty == expected_ty {
+                        raw_val
+                    } else if raw_ty.bits() < expected_ty.bits() {
+                        builder.ins().uextend(expected_ty, raw_val)
+                    } else if raw_ty.bits() > expected_ty.bits() {
+                        builder.ins().ireduce(expected_ty, raw_val)
+                    } else {
+                        raw_val
+                    };
+                    arg_vals.push(coerced);
+                }
+
+                let call_inst = builder.ins().call_indirect(sig_ref, fn_ptr, &arg_vals);
+                let results = builder.inst_results(call_inst);
+
+                if let Some(d) = dest {
+                    if results.is_empty() {
+                        let var = builder.declare_var(types::I64);
+                        let dummy_val = builder.ins().iconst(types::I64, 0);
+                        builder.def_var(var, dummy_val);
+                        var_map.insert(*d, var);
+                    } else {
+                        let res_val = results[0];
+                        let expected_ty = func.value_types.get(d).map(clif_type);
+                        let var = self.def_fresh_var(
+                            builder,
+                            res_val,
+                            expected_ty,
+                            "Call(indirect result)",
+                        );
+                        var_map.insert(*d, var);
+                    }
+                }
+            }
+
+            Instruction::Call {
+                dest,
+                func: called_func,
+                args,
             } => {
                 let (func_name_id, func_name): (Option<&StrId>, &str) = match called_func {
                     Operand::FunctionRef(s) => (Some(s), self.context.resolve_string(&*s)),
-                    _ => panic!("Call target must be a FunctionRef in current lowering"),
+                    _ => panic!(
+                        "Call target must be a FunctionRef in current lowering but got {called_func:?}"
+                    ),
                 };
                 let func_name_id = func_name_id.unwrap();
 
@@ -915,7 +999,7 @@ impl CraneliftBackend {
 
                 let sret_alloc = if ret_is_aggregate {
                     let size = ir::layout::sizeof_ssa(ret_ty.as_ref().unwrap(), self.target)
-                        .expect("Call: aggregate return type has unknown size");
+                        .expect("[Call] aggregate return type has unknown size");
                     let addr = cranelift_intrinsics::stack_alloc(builder, &mut self.module, size);
                     arg_vals.push(addr);
                     Some(addr)
@@ -1352,7 +1436,7 @@ impl CraneliftBackend {
                     }
 
                     IntrinsicOp::TypeName => {
-                        let ty = query_ty.as_ref().expect("TypeName requires query_ty");
+                        let ty: &SsaType = query_ty.as_ref().expect("TypeName requires query_ty");
                         let name = format!("{:?}", ty); // TODO: SsaType has no Display
                         let interned = self.context.intern(&name);
                         let did = self.get_or_create_string(&StrId(interned));

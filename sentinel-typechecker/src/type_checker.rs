@@ -15,9 +15,10 @@ use ir::borrow_checker::{
 };
 use ir::errors::type_error::{TypeCheckResult, TypeError, TypeErrorKind};
 use ir::hir::{
-    Hir, HirErrorHandlerPattern, HirExpr, HirFunc, HirMatchArm, HirModule, HirParam, HirPattern,
-    HirStmt, HirType, InterpolationPart, IntrinsicKind, Operator, ProvenanceAnnotation,
-    ProvenancePathSegment, ProvenanceRoot, StrId, ThisPassingKind, Visibility,
+    AssignmentOperator, Hir, HirEffectAccess, HirEffectSegment, HirErrorHandlerPattern, HirExpr,
+    HirFunc, HirMatchArm, HirModule, HirParam, HirPattern, HirStmt, HirType, InterpolationPart,
+    IntrinsicKind, Operator, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, StrId,
+    ThisPassingKind, Visibility,
 };
 use ir::ir_hasher::{FxHashBuilder, FxHashMap, HashSet};
 use ir::nll_cfg::{Cfg, CfgBuilder, PointId};
@@ -54,6 +55,8 @@ pub enum SymbolId {
     },
 }
 
+type EffectUsage = (Vec<StrId>, Option<(i64, i64)>);
+
 #[derive(Clone, Copy)]
 enum BareImportKind {
     Struct,
@@ -77,6 +80,83 @@ struct ModuleImports {
     modules: std::collections::HashSet<usize>,
     module_aliases: FxHashMap<StrId, usize>,
     wildcard: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitStatus {
+    Uninitialized,
+    Initialized,
+    Maybe,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InitNode {
+    Whole(InitStatus),
+    Struct(FxHashMap<StrId, InitNode>),
+    Array {
+        ranges: IntervalSet,
+        len: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntervalSet {
+    // sorted, non-overlapping, non-adjacent ranges [start, end)
+    ranges: Vec<(i64, i64)>,
+}
+
+impl IntervalSet {
+    fn insert(&mut self, start: i64, end: i64) {
+        if start >= end {
+            return;
+        }
+        let mut new_start = start;
+        let mut new_end = end;
+        let mut result = Vec::with_capacity(self.ranges.len() + 1);
+        let mut inserted = false;
+        for &(s, e) in &self.ranges {
+            if e < new_start {
+                result.push((s, e));
+            } else if s > new_end {
+                if !inserted {
+                    result.push((new_start, new_end));
+                    inserted = true;
+                }
+                result.push((s, e));
+            } else {
+                new_start = new_start.min(s);
+                new_end = new_end.max(e);
+            }
+        }
+        if !inserted {
+            result.push((new_start, new_end));
+        }
+        self.ranges = result;
+    }
+
+    fn contains_range(&self, start: i64, end: i64) -> bool {
+        self.ranges.iter().any(|&(s, e)| s <= start && end <= e)
+    }
+
+    fn covers_full(&self, len: i64) -> bool {
+        self.contains_range(0, len)
+    }
+
+    /// Intersection, used for CFG-join: a range is only "known initialized"
+    /// on the merged path if it was initialized on *both* incoming paths.
+    fn intersect(&self, other: &IntervalSet) -> IntervalSet {
+        let mut result = IntervalSet::default();
+        for &(s1, e1) in &self.ranges {
+            for &(s2, e2) in &other.ranges {
+                let s = s1.max(s2);
+                let e = e1.min(e2);
+                if s < e {
+                    result.insert(s, e);
+                }
+            }
+        }
+        result
+    }
 }
 
 pub struct TypeChecker<'a, 'bump> {
@@ -116,6 +196,9 @@ pub struct TypeChecker<'a, 'bump> {
     point_locals_used: FxHashMap<PointId, HashSet<StrId>>,
     current_point: PointId,
     undefined_backfill: FxHashMap<usize, HirType<'a, 'bump>>,
+    uninit_backfill: FxHashMap<usize, HirType<'a, 'bump>>,
+    init_state: FxHashMap<StrId, InitNode>,
+    suppress_init_read: bool,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -156,7 +239,716 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             stmt_after_points: HashMap::default(),
             point_locals_used: HashMap::default(),
             current_point: PointId::default(),
+            uninit_backfill: FxHashMap::default(),
+            init_state: FxHashMap::default(),
+            suppress_init_read: false,
         }
+    }
+
+    fn optimistically_mark_mut_target_init(&mut self, expr: &HirExpr<'a, 'bump>) {
+        match expr {
+            HirExpr::Ident(_, _) | HirExpr::FieldAccess { .. } | HirExpr::Get { .. } => {
+                if let Some((root, path)) = self.static_field_path(expr) {
+                    self.mark_field_init(root, &path);
+                }
+            }
+            HirExpr::Index { object, index, .. } => {
+                if let Some((root, path)) = self.static_field_path(object) {
+                    match index {
+                        HirExpr::Number(i, _) => {
+                            let len = match self.peek_type(object) {
+                                HirType::Array(_, l) => Some(l),
+                                _ => None,
+                            };
+                            self.mark_array_range(root, &path, *i, *i + 1, len);
+                        }
+                        _ => {
+                            let node = self
+                                .init_state
+                                .entry(root)
+                                .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+                            *Self::node_at_path_mut(node, &path) =
+                                InitNode::Whole(InitStatus::Initialized);
+                        }
+                    }
+                }
+            }
+            HirExpr::Slice {
+                object, start, end, ..
+            } => {
+                if let Some((root, path)) = self.static_field_path(object) {
+                    if let (HirExpr::Number(s, _), HirExpr::Number(e, _)) = (start, end) {
+                        let len = match self.peek_type(object) {
+                            HirType::Array(_, l) => Some(l),
+                            _ => None,
+                        };
+                        self.mark_array_range(root, &path, *s, *e, len);
+                    } else {
+                        let node = self
+                            .init_state
+                            .entry(root)
+                            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+                        *Self::node_at_path_mut(node, &path) =
+                            InitNode::Whole(InitStatus::Initialized);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_expr_suppressed(&mut self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
+        let prev = self.suppress_init_read;
+        self.suppress_init_read = true;
+        let ty = self.check_expr(expr);
+        self.suppress_init_read = prev;
+        ty
+    }
+
+    fn check_read_for_compound_target(
+        &mut self,
+        target: &HirExpr<'a, 'bump>,
+        ty: &HirType<'a, 'bump>,
+    ) {
+        match target {
+            HirExpr::Ident(name, _) => {
+                let var_name = self.str_id_to_string(*name);
+                self.check_ident_init_read(*name, &var_name, ty);
+            }
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                if let Some((root, mut path)) = self.static_field_path(object) {
+                    path.push(*field);
+                    let root_str = self.str_id_to_string(root);
+                    self.check_init_read_path(root, &path, &root_str);
+                }
+            }
+            HirExpr::Index { object, index, .. } => {
+                if let (Some((root, path)), HirExpr::Number(i, _)) =
+                    (self.static_field_path(object), index)
+                {
+                    if let Some(node) = self.init_state.get(&root).cloned() {
+                        let target_node = Self::node_at_path_ref(&node, &path);
+                        let covered = match target_node {
+                            InitNode::Array { ranges, .. } => ranges.contains_range(*i, *i + 1),
+                            InitNode::Whole(InitStatus::Initialized) => true,
+                            _ => false,
+                        };
+                        if !covered {
+                            let root_str = self.str_id_to_string(root);
+                            self.record(TypeErrorKind::Generic(format!(
+                                "use of uninitialized value `{}[{}]`: a compound assignment reads the current value first",
+                                root_str, i
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_whole_uninit(&mut self, root: StrId) {
+        self.init_state
+            .insert(root, InitNode::Whole(InitStatus::Uninitialized));
+    }
+
+    fn mark_whole_init(&mut self, root: StrId) {
+        self.init_state
+            .insert(root, InitNode::Whole(InitStatus::Initialized));
+    }
+
+    fn mark_field_init(&mut self, root: StrId, path: &[StrId]) {
+        let node = self
+            .init_state
+            .entry(root)
+            .or_insert(InitNode::Whole(InitStatus::Initialized));
+        Self::mark_field_init_node(node, path);
+    }
+
+    fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
+        let node = self
+            .init_state
+            .entry(root)
+            .or_insert(InitNode::Whole(InitStatus::Initialized));
+        let target = Self::node_at_path_mut(node, path);
+        *target = InitNode::Whole(InitStatus::Uninitialized);
+    }
+
+    fn mark_field_init_node(node: &mut InitNode, path: &[StrId]) {
+        let Some((head, rest)) = path.split_first() else {
+            *node = InitNode::Whole(InitStatus::Initialized);
+            return;
+        };
+        let map = match node {
+            InitNode::Struct(m) => m,
+            InitNode::Whole(InitStatus::Initialized) => return,
+            _ => {
+                *node = InitNode::Struct(FxHashMap::default());
+                let InitNode::Struct(m) = node else {
+                    unreachable!()
+                };
+                m
+            }
+        };
+        let child = map
+            .entry(*head)
+            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+        Self::mark_field_init_node(child, rest);
+    }
+
+    fn mark_array_range(
+        &mut self,
+        root: StrId,
+        path: &[StrId],
+        start: i64,
+        end: i64,
+        len: Option<usize>,
+    ) {
+        let node = self
+            .init_state
+            .entry(root)
+            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+        Self::mark_array_range_node(node, path, start, end, len);
+    }
+
+    fn mark_array_range_node(
+        node: &mut InitNode,
+        path: &[StrId],
+        start: i64,
+        end: i64,
+        len: Option<usize>,
+    ) {
+        if let Some((head, rest)) = path.split_first() {
+            let map = match node {
+                InitNode::Struct(m) => m,
+                _ => {
+                    *node = InitNode::Struct(FxHashMap::default());
+                    let InitNode::Struct(m) = node else {
+                        unreachable!()
+                    };
+                    m
+                }
+            };
+            let child = map
+                .entry(*head)
+                .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+            return Self::mark_array_range_node(child, rest, start, end, len);
+        }
+        match node {
+            InitNode::Array { ranges, .. } => ranges.insert(start, end),
+            InitNode::Whole(InitStatus::Initialized) => {}
+            _ => {
+                let mut ranges = IntervalSet::default();
+                ranges.insert(start, end);
+                *node = InitNode::Array { ranges, len };
+            }
+        }
+    }
+
+    fn static_field_path(&self, expr: &HirExpr<'a, 'bump>) -> Option<(StrId, Vec<StrId>)> {
+        match expr {
+            HirExpr::Ident(name, _) => Some((*name, Vec::new())),
+            HirExpr::This { .. } => Some((self.this_id, Vec::new())),
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                let (root, mut path) = self.static_field_path(object)?;
+                path.push(*field);
+                Some((root, path))
+            }
+            _ => None,
+        }
+    }
+
+    fn effect_place_of(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+    ) -> Option<(StrId, Vec<StrId>, Option<(i64, i64)>)> {
+        match expr {
+            HirExpr::Index { object, index, .. } => {
+                let (root, path) = self.static_field_path(object)?;
+                let range = match index {
+                    HirExpr::Number(i, _) => Some((*i, *i + 1)),
+                    _ => None,
+                };
+                Some((root, path, range))
+            }
+            _ => self.static_field_path(expr).map(|(r, p)| (r, p, None)),
+        }
+    }
+
+    fn collect_root_accesses_expr(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+        root: StrId,
+        writes: &mut Vec<EffectUsage>,
+        reads: &mut Vec<EffectUsage>,
+    ) {
+        match expr {
+            HirExpr::Assignment {
+                target, op, value, ..
+            } => {
+                self.collect_root_accesses_expr(value, root, writes, reads);
+                if let Some((r, path, range)) = self.effect_place_of(target) {
+                    if r == root {
+                        writes.push((path.clone(), range));
+                        if !matches!(op, AssignmentOperator::Assign) {
+                            reads.push((path, range)); // compound assign reads-then-writes
+                        }
+                        return;
+                    }
+                }
+                self.collect_root_accesses_expr(target, root, writes, reads);
+            }
+            HirExpr::Ref {
+                expr: inner,
+                mutable,
+                ..
+            } => {
+                if let Some((r, path, range)) = self.effect_place_of(inner) {
+                    if r == root {
+                        if *mutable {
+                            writes.push((path.clone(), range));
+                        }
+                        reads.push((path, range));
+                        return;
+                    }
+                }
+                self.collect_root_accesses_expr(inner, root, writes, reads);
+            }
+            HirExpr::Ident(name, _) if *name == root => reads.push((Vec::new(), None)),
+            HirExpr::This { .. } if root == self.this_id => reads.push((Vec::new(), None)),
+            HirExpr::Ident(_, _) | HirExpr::This { .. } => {}
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                if let Some((r, mut path)) = self.static_field_path(object) {
+                    if r == root {
+                        path.push(*field);
+                        reads.push((path, None));
+                        return;
+                    }
+                }
+                self.collect_root_accesses_expr(object, root, writes, reads);
+            }
+            HirExpr::Index { object, index, .. } => {
+                if let Some((r, path, range)) = self.effect_place_of(expr) {
+                    if r == root {
+                        reads.push((path, range));
+                        self.collect_root_accesses_expr(index, root, writes, reads);
+                        return;
+                    }
+                }
+                self.collect_root_accesses_expr(object, root, writes, reads);
+                self.collect_root_accesses_expr(index, root, writes, reads);
+            }
+            HirExpr::Slice {
+                object, start, end, ..
+            } => {
+                if let Some((r, path)) = self.static_field_path(object) {
+                    if r == root {
+                        reads.push((path, None));
+                        self.collect_root_accesses_expr(start, root, writes, reads);
+                        self.collect_root_accesses_expr(end, root, writes, reads);
+                        return;
+                    }
+                }
+                self.collect_root_accesses_expr(object, root, writes, reads);
+                self.collect_root_accesses_expr(start, root, writes, reads);
+                self.collect_root_accesses_expr(end, root, writes, reads);
+            }
+            HirExpr::Deref { expr: inner, .. } => {
+                self.collect_root_accesses_expr(inner, root, writes, reads);
+            }
+            HirExpr::Range { start, end, .. } => {
+                self.collect_root_accesses_expr(start, root, writes, reads);
+                self.collect_root_accesses_expr(end, root, writes, reads);
+            }
+            HirExpr::Tuple(exprs, _)
+            | HirExpr::ArrayLiteral {
+                elements: exprs, ..
+            }
+            | HirExpr::ExprList { list: exprs, .. } => {
+                for e in exprs.iter() {
+                    self.collect_root_accesses_expr(e, root, writes, reads);
+                }
+            }
+            HirExpr::Binary { left, right, .. } | HirExpr::Comparison { left, right, .. } => {
+                self.collect_root_accesses_expr(left, root, writes, reads);
+                self.collect_root_accesses_expr(right, root, writes, reads);
+            }
+            HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
+                self.collect_root_accesses_expr(callee, root, writes, reads);
+                for a in args.iter() {
+                    self.collect_root_accesses_expr(a, root, writes, reads);
+                }
+            }
+            HirExpr::StructInit { args, .. } => {
+                for f in args.iter() {
+                    self.collect_root_accesses_expr(&f.value, root, writes, reads);
+                }
+            }
+            HirExpr::EnumInit { args, .. } => {
+                for a in args.iter() {
+                    self.collect_root_accesses_expr(a, root, writes, reads);
+                }
+            }
+            HirExpr::InterpolatedString(parts) => {
+                for p in parts.iter() {
+                    if let InterpolationPart::Expr(e) = p {
+                        self.collect_root_accesses_expr(e, root, writes, reads);
+                    }
+                }
+            }
+            HirExpr::Cast { expr: inner, .. } => {
+                self.collect_root_accesses_expr(inner, root, writes, reads);
+            }
+            HirExpr::Intrinsic { args, .. } => {
+                for a in args.iter() {
+                    self.collect_root_accesses_expr(a, root, writes, reads);
+                }
+            }
+            HirExpr::If { if_stmt, .. } => {
+                self.collect_root_accesses_stmt(if_stmt, root, writes, reads);
+            }
+            HirExpr::Match {
+                expr: scrutinee,
+                arms,
+                ..
+            } => {
+                self.collect_root_accesses_expr(scrutinee, root, writes, reads);
+                for arm in arms.iter() {
+                    if let Some(guard) = arm.guard {
+                        self.collect_root_accesses_expr(guard, root, writes, reads);
+                    }
+                    self.collect_root_accesses_stmt(arm.body, root, writes, reads);
+                }
+            }
+            HirExpr::Block { body, .. } => {
+                for s in body.iter() {
+                    self.collect_root_accesses_stmt(s, root, writes, reads);
+                }
+            }
+            HirExpr::Lambda { params, body, .. } => {
+                let shadowed = params.iter().any(|p| p.name == root);
+                if !shadowed {
+                    self.collect_root_accesses_stmt(body, root, writes, reads);
+                }
+            }
+            HirExpr::Null(_)
+            | HirExpr::Number(_, _)
+            | HirExpr::Char(_, _)
+            | HirExpr::String(_, _)
+            | HirExpr::Boolean(_, _)
+            | HirExpr::Decimal(_, _)
+            | HirExpr::Undefined { .. }
+            | HirExpr::Uninit { .. }
+            | HirExpr::GenericIdent(..)
+            | HirExpr::ModuleAccess(_)
+            | HirExpr::UnknownIntrinsic { .. } => {}
+        }
+    }
+
+    fn collect_root_accesses_stmt(
+        &self,
+        stmt: &HirStmt<'a, 'bump>,
+        root: StrId,
+        writes: &mut Vec<EffectUsage>,
+        reads: &mut Vec<EffectUsage>,
+    ) {
+        match stmt {
+            HirStmt::Let {
+                value,
+                else_block,
+                catch_pattern,
+                ..
+            } => {
+                self.collect_root_accesses_expr(value, root, writes, reads);
+                if let Some(b) = else_block {
+                    self.collect_root_accesses_stmt(b, root, writes, reads);
+                }
+                if let Some(pattern) = catch_pattern {
+                    match pattern {
+                        HirErrorHandlerPattern::Single { body, .. } => {
+                            for s in body.iter() {
+                                self.collect_root_accesses_stmt(s, root, writes, reads);
+                            }
+                        }
+                        HirErrorHandlerPattern::Multiple { branches } => {
+                            for branch in branches.iter() {
+                                for s in branch.body.iter() {
+                                    self.collect_root_accesses_stmt(s, root, writes, reads);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HirStmt::Const(c) => self.collect_root_accesses_expr(&c.value, root, writes, reads),
+            HirStmt::Return(Some(e)) | HirStmt::Break(Some(e), _) => {
+                self.collect_root_accesses_expr(e, root, writes, reads)
+            }
+            HirStmt::Return(None)
+            | HirStmt::Break(None, _)
+            | HirStmt::Continue(_)
+            | HirStmt::Import(..)
+            | HirStmt::Package(..) => {}
+            HirStmt::Expr(e) => self.collect_root_accesses_expr(e, root, writes, reads),
+            HirStmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.collect_root_accesses_expr(cond, root, writes, reads);
+                for s in then_block.iter() {
+                    self.collect_root_accesses_stmt(s, root, writes, reads);
+                }
+                if let Some(e) = else_block {
+                    self.collect_root_accesses_stmt(e, root, writes, reads);
+                }
+            }
+            HirStmt::While { cond, body } => {
+                self.collect_root_accesses_expr(cond, root, writes, reads);
+                self.collect_root_accesses_stmt(body, root, writes, reads);
+            }
+            HirStmt::For {
+                init,
+                condition,
+                increment,
+                body,
+            } => {
+                if let Some(i) = init {
+                    self.collect_root_accesses_stmt(i, root, writes, reads);
+                }
+                if let Some(c) = condition {
+                    self.collect_root_accesses_expr(c, root, writes, reads);
+                }
+                if let Some(inc) = increment {
+                    self.collect_root_accesses_expr(inc, root, writes, reads);
+                }
+                self.collect_root_accesses_stmt(body, root, writes, reads);
+            }
+            HirStmt::Block { body } => {
+                for s in body.iter() {
+                    self.collect_root_accesses_stmt(s, root, writes, reads);
+                }
+            }
+            HirStmt::Match { expr, arms } => {
+                self.collect_root_accesses_expr(expr, root, writes, reads);
+                for arm in arms.iter() {
+                    if let Some(g) = arm.guard {
+                        self.collect_root_accesses_expr(g, root, writes, reads);
+                    }
+                    self.collect_root_accesses_stmt(arm.body, root, writes, reads);
+                }
+            }
+            HirStmt::UnsafeBlock { body } | HirStmt::Defer(body) => {
+                self.collect_root_accesses_stmt(body, root, writes, reads)
+            }
+        }
+    }
+
+    fn declared_access_covers(
+        declared_path: &[HirEffectSegment],
+        used_fields: &[StrId],
+        used_index: Option<(i64, i64)>,
+    ) -> bool {
+        let mut d_fields = Vec::new();
+        let mut d_index: Option<&HirEffectSegment> = None;
+        for seg in declared_path {
+            match seg {
+                HirEffectSegment::Field(f) => d_fields.push(*f),
+                other => d_index = Some(other),
+            }
+        }
+        if d_fields != used_fields {
+            return false;
+        }
+        match (d_index, used_index) {
+            (None, _) => true,
+            (Some(HirEffectSegment::IndexOpaque), _) => true,
+            (Some(HirEffectSegment::IndexConst(d_i)), Some((u_s, u_e))) => {
+                *d_i <= u_s && u_e <= *d_i + 1
+            }
+            (Some(HirEffectSegment::IndexConst(_)), None) => false,
+            (Some(HirEffectSegment::Field(_)), _) => unreachable!(),
+        }
+    }
+
+    fn validate_multi_place_declaration(
+        &mut self,
+        root: StrId,
+        declared: &[HirEffectAccess<'bump>],
+        body: &HirStmt<'a, 'bump>,
+    ) {
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        self.collect_root_accesses_stmt(body, root, &mut writes, &mut reads);
+
+        for (path, range) in &writes {
+            let covered = declared
+                .iter()
+                .any(|d| d.mutable && Self::declared_access_covers(d.path, path, *range));
+            if !covered {
+                self.record(TypeErrorKind::Generic(format!(
+                    "writes to `{}{}` but the declared effects don't grant `&mut` access there",
+                    self.str_id_to_string(root),
+                    Self::path_display(path, *range),
+                )));
+            }
+        }
+        for (path, range) in &reads {
+            let covered = declared
+                .iter()
+                .any(|d| Self::declared_access_covers(d.path, path, *range));
+            if !covered {
+                self.record(TypeErrorKind::Generic(format!(
+                    "reads `{}{}` but it isn't listed in the declared effects",
+                    self.str_id_to_string(root),
+                    Self::path_display(path, *range),
+                )));
+            }
+        }
+    }
+
+    fn validate_multi_place_signature(
+        &mut self,
+        param_type: Option<&HirType<'a, 'bump>>,
+        accesses: &[HirEffectAccess<'bump>],
+    ) {
+        let outer_mut = match param_type {
+            Some(HirType::Ref {
+                mutability_state, ..
+            })
+            | Some(HirType::SafePointer {
+                mutability_state, ..
+            })
+            | Some(HirType::UnsafePointer {
+                mutability_state, ..
+            }) => *mutability_state == MutabilityState::Mut,
+            Some(HirType::This) => true,
+            None => true,
+            _ => {
+                self.record(TypeErrorKind::Generic(
+                    "`.{...}` access lists are only valid on reference or pointer parameters"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        if !outer_mut && accesses.iter().any(|a| a.mutable) {
+            self.record(TypeErrorKind::Generic(
+                "declares `&mut` access through a parameter that isn't itself `&mut`".to_string(),
+            ));
+        }
+    }
+
+    fn check_init_read_path(&mut self, root: StrId, path: &[StrId], root_str: &str) {
+        if self.suppress_init_read {
+            return;
+        }
+        let Some(node) = self.init_state.get(&root) else {
+            return;
+        };
+        match Self::status_at_path(node, path) {
+            InitStatus::Initialized => {}
+            InitStatus::Uninitialized => self.record(TypeErrorKind::Generic(format!(
+                "use of uninitialized value `{}{}`: not assigned since `uninit`",
+                root_str,
+                path.iter().map(|s| format!(".{}", s)).collect::<String>()
+            ))),
+            InitStatus::Maybe => self.record(TypeErrorKind::Generic(format!(
+                "use of possibly uninitialized value `{}{}`: not initialized on all control-flow paths",
+                root_str,
+                path.iter().map(|s| format!(".{}", s)).collect::<String>()
+            ))),
+        }
+    }
+
+    fn status_at_path(node: &InitNode, path: &[StrId]) -> InitStatus {
+        match (node, path.split_first()) {
+            (InitNode::Whole(s), None) => s.clone(),
+            (InitNode::Whole(InitStatus::Initialized), Some(_)) => InitStatus::Initialized,
+            (InitNode::Whole(s), Some(_)) => s.clone(),
+            (InitNode::Struct(map), Some((head, rest))) => match map.get(head) {
+                Some(child) => Self::status_at_path(child, rest),
+                None => InitStatus::Uninitialized, // never touched
+            },
+            (InitNode::Struct(map), None) => {
+                if map
+                    .values()
+                    .all(|v| matches!(v, InitNode::Whole(InitStatus::Initialized)))
+                {
+                    InitStatus::Initialized
+                } else {
+                    InitStatus::Maybe
+                }
+            }
+            (InitNode::Array { .. }, _) => InitStatus::Initialized,
+        }
+    }
+
+    fn join_init_states(
+        a: &FxHashMap<StrId, InitNode>,
+        b: &FxHashMap<StrId, InitNode>,
+    ) -> FxHashMap<StrId, InitNode> {
+        let mut result = FxHashMap::default();
+        for key in a.keys().chain(b.keys()).copied().collect::<HashSet<_>>() {
+            let na = a
+                .get(&key)
+                .cloned()
+                .unwrap_or(InitNode::Whole(InitStatus::Initialized));
+            let nb = b
+                .get(&key)
+                .cloned()
+                .unwrap_or(InitNode::Whole(InitStatus::Initialized));
+            result.insert(key, Self::join_nodes(na, nb));
+        }
+        result
+    }
+
+    fn join_nodes(a: InitNode, b: InitNode) -> InitNode {
+        match (a, b) {
+            (InitNode::Whole(sa), InitNode::Whole(sb)) => InitNode::Whole(match (sa, sb) {
+                (InitStatus::Initialized, InitStatus::Initialized) => InitStatus::Initialized,
+                (InitStatus::Uninitialized, InitStatus::Uninitialized) => InitStatus::Uninitialized,
+                _ => InitStatus::Maybe,
+            }),
+            (InitNode::Array { ranges: ra, len }, InitNode::Array { ranges: rb, .. }) => {
+                InitNode::Array {
+                    ranges: ra.intersect(&rb),
+                    len,
+                }
+            }
+            (InitNode::Array { ranges, len }, InitNode::Whole(InitStatus::Initialized))
+            | (InitNode::Whole(InitStatus::Initialized), InitNode::Array { ranges, len }) => {
+                InitNode::Array { ranges, len }
+            }
+            (InitNode::Struct(ma), InitNode::Struct(mb)) => {
+                let mut out = FxHashMap::default();
+                for key in ma.keys().chain(mb.keys()).copied().collect::<HashSet<_>>() {
+                    let fa = ma
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
+                    let fb = mb
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
+                    out.insert(key, Self::join_nodes(fa, fb));
+                }
+                InitNode::Struct(out)
+            }
+            (InitNode::Struct(ma), InitNode::Whole(InitStatus::Initialized))
+            | (InitNode::Whole(InitStatus::Initialized), InitNode::Struct(ma)) => {
+                InitNode::Struct(ma)
+            }
+            _ => InitNode::Whole(InitStatus::Maybe),
+        }
+    }
+
+    pub fn scope_end_init_snapshot(&self, name: StrId) -> Option<&InitNode> {
+        self.init_state.get(&name)
+    }
+
+    pub fn uninit_ty(&self, expr: &HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
+        self.uninit_backfill.get(&Self::expr_key(expr)).copied()
     }
 
     fn check_unsafe_call(&mut self, func: &HirFunc<'a, 'bump>, display_name: &str) {
@@ -208,7 +1000,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         templates: &mut [ReadTemplate],
     ) {
         let TemplateBase::Param(i) = base else {
-            return; // TemplateBase::This: nothing to do for parameter tracking
+            return;
         };
         let Some(slot) = templates.get_mut(i) else {
             return;
@@ -218,7 +1010,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         } else if let ReadTemplate::Paths(paths) = slot {
             paths.push(projections);
         }
-        // already Opaque: stays Opaque
     }
 
     fn collect_param_reads_expr(
@@ -471,10 +1262,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         place
     }
 
-    /// Checks a `&expr` argument being passed to a parameter with the given
-    /// read-template against whatever loans the caller currently holds on
-    /// the same root. See param_read_templates.md for the two branches'
-    /// rationale.
     fn check_call_arg_read_effects(
         &mut self,
         inner: &HirExpr<'a, 'bump>,
@@ -556,6 +1343,26 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             let msg = self.describe_borrow_error(&e, provenance.as_ref());
             self.record(TypeErrorKind::Generic(msg));
         }
+    }
+
+    fn node_at_path_mut<'n>(node: &'n mut InitNode, path: &[StrId]) -> &'n mut InitNode {
+        let Some((head, rest)) = path.split_first() else {
+            return node;
+        };
+        let map = match node {
+            InitNode::Struct(m) => m,
+            _ => {
+                *node = InitNode::Struct(FxHashMap::default());
+                let InitNode::Struct(m) = node else {
+                    unreachable!()
+                };
+                m
+            }
+        };
+        let child = map
+            .entry(*head)
+            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+        Self::node_at_path_mut(child, rest)
     }
 
     fn record_item_occurrence(
@@ -658,7 +1465,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }),
             HirExpr::This { .. } | HirExpr::ModuleAccess(_) | HirExpr::GenericIdent(..)
             | HirExpr::Number(..) | HirExpr::Decimal(..) | HirExpr::String(..)
-            | HirExpr::Boolean(..) | HirExpr::Null(_) | HirExpr::Undefined { .. } | HirExpr::Char(_, _) => false,
+            | HirExpr::Boolean(..) | HirExpr::Null(_) | HirExpr::Undefined { .. } | HirExpr::Uninit { .. } | HirExpr::Char(_, _) => false,
             HirExpr::Intrinsic { args, .. } => {
                 args.iter().any(|a| self.expr_references_local(a, local))
             }
@@ -803,31 +1610,83 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.suppress_errors = prev;
     }
 
-    fn converge_loop_move_state(
+    fn status_for_whole_struct(&self, node: &InitNode, struct_name: StrId) -> InitStatus {
+        let InitNode::Struct(map) = node else {
+            return match node {
+                InitNode::Whole(s) => s.clone(),
+                _ => InitStatus::Initialized,
+            };
+        };
+        let struct_name_str = self.str_id_to_string(struct_name);
+        let Some(def) = self.context.get_struct(&struct_name_str) else {
+            return InitStatus::Maybe;
+        };
+        let mut any_uninit = false;
+        let mut any_init = false;
+        for field in def.fields.iter() {
+            let status = map
+                .get(&field.name)
+                .map(|n| Self::status_at_path(n, &[]))
+                .unwrap_or(InitStatus::Uninitialized);
+            match status {
+                InitStatus::Initialized => any_init = true,
+                _ => any_uninit = true,
+            }
+        }
+        if any_uninit && any_init {
+            InitStatus::Maybe
+        } else if any_uninit {
+            InitStatus::Uninitialized
+        } else {
+            InitStatus::Initialized
+        }
+    }
+
+    fn node_at_path_ref<'n>(node: &'n InitNode, path: &[StrId]) -> &'n InitNode {
+        let Some((head, rest)) = path.split_first() else {
+            return node;
+        };
+        match node {
+            InitNode::Struct(m) => match m.get(head) {
+                Some(child) => Self::node_at_path_ref(child, rest),
+                None => node,
+            },
+            _ => node,
+        }
+    }
+
+    fn converge_loop_states(
         &mut self,
         body: &HirStmt<'a, 'bump>,
-        entry_state: MoveState,
-    ) -> MoveState {
+        move_entry: MoveState,
+        init_entry: FxHashMap<StrId, InitNode>,
+    ) -> (MoveState, FxHashMap<StrId, InitNode>) {
         let saved_move_state = self.move_state.clone();
+        let saved_init_state = self.init_state.clone();
         let saved_context = self.context.clone();
 
-        let mut converged = entry_state;
+        let mut converged_move = move_entry;
+        let mut converged_init = init_entry;
 
         self.with_suppressed_errors(|this| loop {
-            this.move_state = converged.clone();
+            this.move_state = converged_move.clone();
+            this.init_state = converged_init.clone();
             this.check_stmt(body);
-            let next = MoveState::join(&converged, &this.move_state);
+            let next_move = MoveState::join(&converged_move, &this.move_state);
+            let next_init = Self::join_init_states(&converged_init, &this.init_state);
 
-            let stable = converged.is_superset_of(&next);
-            converged = next;
+            let stable = converged_move.is_superset_of(&next_move) && converged_init == next_init;
+            converged_move = next_move;
+            converged_init = next_init;
             if stable {
                 break;
             }
         });
 
         self.move_state = saved_move_state;
+        self.init_state = saved_init_state;
         self.context = saved_context;
-        converged
+        (converged_move, converged_init)
     }
 
     fn is_zeroable(&self, ty: &HirType<'a, 'bump>) -> bool {
@@ -853,7 +1712,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 let name_str = self.str_id_to_string(*name);
                 match self.context.get_struct(&name_str) {
                     Some(def) => def.fields.iter().all(|f| self.is_zeroable(&f.field_type)),
-                    None => false, // unresolved struct
+                    None => false,
                 }
             }
 
@@ -875,6 +1734,30 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             // discriminants), a dangling/null reference where one shouldn't
             // silently appear (pointers), or is simply meaningless (lambda, dyn).
             _ => false,
+        }
+    }
+
+    fn check_ident_init_read(&mut self, name: StrId, var_name: &str, ty: &HirType<'a, 'bump>) {
+        if self.suppress_init_read {
+            return;
+        }
+        let Some(node) = self.init_state.get(&name).cloned() else {
+            return;
+        };
+        let status = match ty {
+            HirType::Struct { name: sname, .. } => self.status_for_whole_struct(&node, *sname),
+            _ => Self::status_at_path(&node, &[]),
+        };
+        match status {
+            InitStatus::Initialized => {}
+            InitStatus::Uninitialized => self.record(TypeErrorKind::Generic(format!(
+                "use of uninitialized value `{}`",
+                var_name
+            ))),
+            InitStatus::Maybe => self.record(TypeErrorKind::Generic(format!(
+                "use of possibly uninitialized value `{}`",
+                var_name
+            ))),
         }
     }
 
@@ -1157,8 +2040,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         )));
     }
 
-    /// Qualified-path visibility: `foo::bar::baz()` needs `import foo::bar;`
-    /// (or the current module IS foo::bar) even though the path is fully written out.
     fn check_module_path_imported(&mut self, path_segments: &[StrId]) {
         let current = self.context.current_module_idx;
         let Some(target) = self
@@ -1167,7 +2048,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .borrow()
             .resolve_module_path(path_segments)
         else {
-            return; // unresolved path already reported elsewhere (UndefinedFunctionWithSuggestion etc.)
+            return;
         };
         if target == current {
             return;
@@ -1197,29 +2078,27 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.borrow_checker.begin_scope();
 
         if let Some(params) = func.params {
-            for param in params {
-                match param {
+            for param in params.iter() {
+                let (root, multi_place, param_type) = match param {
+                    HirParam::This {
+                        kind: ThisPassingKind::MultiPlace,
+                        multi_place,
+                        ..
+                    } => (self.this_id, *multi_place, None),
                     HirParam::Normal {
                         name,
                         param_type,
-                        span,
-                    } => {
-                        let param_name = self.str_id_to_string(*name);
-                        let symbol_id = self.mint_symbol_id();
-                        func_context.add_variable(param_name, *param_type, symbol_id);
-                        self.borrow_checker.declare_local(*name);
-                        self.occurrences.push((
-                            *span,
-                            *name,
-                            *param_type,
-                            self.context.current_module_idx,
-                            symbol_id,
-                            true,
-                        ));
-                    }
-                    HirParam::This { .. } => {
-                        self.borrow_checker.declare_local(self.this_id);
-                    }
+                        multi_place,
+                        ..
+                    } => (*name, *multi_place, Some(param_type)),
+                    _ => continue,
+                };
+                let Some(accesses) = multi_place else {
+                    continue;
+                };
+                self.validate_multi_place_signature(param_type, accesses);
+                if let Some(body) = func.body {
+                    self.validate_multi_place_declaration(root, accesses, &body);
                 }
             }
         }
@@ -1232,6 +2111,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.stmt_points = points.stmt_points;
             self.stmt_after_points = points.stmt_after_points;
             self.point_locals_used = FxHashMap::default();
+
+            self.current_point = self.cfg.entry.unwrap_or_default();
+            self.collect_locals_used_stmt(&body);
+
             self.current_point = self.cfg.entry.unwrap_or_default();
 
             let old_context = std::mem::replace(&mut self.context, func_context);
@@ -1242,6 +2125,263 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.check_return_provenance(func);
 
         self.borrow_checker.end_scope();
+    }
+
+    fn register_multi_place_loans(
+        &mut self,
+        base_expr: &HirExpr<'a, 'bump>,
+        accesses: &[HirEffectAccess<'bump>],
+        call_args: &[HirExpr<'a, 'bump>],
+    ) -> Vec<LoanId> {
+        let mut loans = Vec::new();
+        let Some(base_place) = self.resolve_place(base_expr) else {
+            return loans;
+        };
+        for access in accesses.iter() {
+            let mut pid = base_place;
+            for seg in access.path.iter() {
+                pid = match seg {
+                    HirEffectSegment::Field(f) => self.borrow_checker.project_field(pid, *f),
+                    HirEffectSegment::IndexConst(i) => {
+                        let interval = Interval {
+                            lower: Bound::Const(*i),
+                            upper: Bound::Const(*i),
+                        };
+                        self.borrow_checker
+                            .project_index(pid, interval, IndexContainer::Primitive)
+                    }
+                    HirEffectSegment::IndexOpaque => {
+                        let interval = Interval {
+                            lower: Bound::Opaque(0),
+                            upper: Bound::Opaque(0),
+                        };
+                        self.borrow_checker
+                            .project_index(pid, interval, IndexContainer::Primitive)
+                    }
+                };
+            }
+            let result = if access.mutable {
+                self.borrow_checker.borrow_mut(pid)
+            } else {
+                self.borrow_checker.borrow_shared(pid)
+            };
+            match result {
+                Ok(loan_id) => loans.push(loan_id),
+                Err(e) => self.record(TypeErrorKind::Generic(self.describe_borrow_error(&e, None))),
+            }
+        }
+        loans
+    }
+
+    fn collect_locals_used_stmt(&mut self, stmt: &HirStmt<'a, 'bump>) {
+        if let Some(&point) = self.stmt_points.get(&Self::stmt_key(stmt)) {
+            self.current_point = point;
+        }
+        match stmt {
+            HirStmt::Let {
+                value,
+                else_block,
+                catch_pattern,
+                ..
+            } => {
+                self.collect_locals_used_expr(value);
+                if let Some(b) = else_block {
+                    self.collect_locals_used_stmt(b);
+                }
+                if let Some(pattern) = catch_pattern {
+                    match pattern {
+                        HirErrorHandlerPattern::Single { body, .. } => {
+                            for s in body.iter() {
+                                self.collect_locals_used_stmt(s);
+                            }
+                        }
+                        HirErrorHandlerPattern::Multiple { branches } => {
+                            for branch in branches.iter() {
+                                for s in branch.body.iter() {
+                                    self.collect_locals_used_stmt(s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HirStmt::Return(Some(e)) | HirStmt::Break(Some(e), _) => {
+                self.collect_locals_used_expr(e);
+            }
+            HirStmt::Return(None)
+            | HirStmt::Break(None, _)
+            | HirStmt::Continue(_)
+            | HirStmt::Import(..)
+            | HirStmt::Package(..) => {}
+            HirStmt::Expr(e) => self.collect_locals_used_expr(e),
+            HirStmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.collect_locals_used_expr(cond);
+                for s in then_block.iter() {
+                    self.collect_locals_used_stmt(s);
+                }
+                if let Some(e) = else_block {
+                    self.collect_locals_used_stmt(e);
+                }
+            }
+            HirStmt::While { cond, body } => {
+                self.collect_locals_used_expr(cond);
+                self.collect_locals_used_stmt(body);
+            }
+            HirStmt::For {
+                init,
+                condition,
+                increment,
+                body,
+            } => {
+                if let Some(i) = init {
+                    self.collect_locals_used_stmt(i);
+                }
+                if let Some(c) = condition {
+                    self.collect_locals_used_expr(c);
+                }
+                if let Some(inc) = increment {
+                    self.collect_locals_used_expr(inc);
+                }
+                self.collect_locals_used_stmt(body);
+            }
+            HirStmt::Block { body } => {
+                for s in body.iter() {
+                    self.collect_locals_used_stmt(s);
+                }
+            }
+            HirStmt::Const(c) => self.collect_locals_used_expr(&c.value),
+            HirStmt::Match { expr, arms } => {
+                self.collect_locals_used_expr(expr);
+                for arm in arms.iter() {
+                    if let Some(g) = arm.guard {
+                        self.collect_locals_used_expr(g);
+                    }
+                    self.collect_locals_used_stmt(arm.body);
+                }
+            }
+            HirStmt::UnsafeBlock { body } | HirStmt::Defer(body) => {
+                self.collect_locals_used_stmt(body);
+            }
+        }
+    }
+
+    fn collect_locals_used_expr(&mut self, expr: &HirExpr<'a, 'bump>) {
+        match expr {
+            HirExpr::Ident(name, _) => {
+                self.point_locals_used
+                    .entry(self.current_point)
+                    .or_default()
+                    .insert(*name);
+            }
+            HirExpr::Match { expr, arms, .. } => {
+                self.collect_locals_used_expr(expr);
+                for arm in arms.iter() {
+                    if let Some(g) = arm.guard {
+                        self.collect_locals_used_expr(g);
+                    }
+                    self.collect_locals_used_stmt(arm.body);
+                }
+            }
+            HirExpr::Block { body, .. } => {
+                for s in body.iter() {
+                    self.collect_locals_used_stmt(s);
+                }
+            }
+            HirExpr::Range { start, end, .. } => {
+                self.collect_locals_used_expr(start);
+                self.collect_locals_used_expr(end);
+            }
+            HirExpr::Slice {
+                object, start, end, ..
+            } => {
+                self.collect_locals_used_expr(object);
+                self.collect_locals_used_expr(start);
+                self.collect_locals_used_expr(end);
+            }
+            HirExpr::Tuple(exprs, _)
+            | HirExpr::ArrayLiteral {
+                elements: exprs, ..
+            } => {
+                for e in exprs.iter() {
+                    self.collect_locals_used_expr(e);
+                }
+            }
+            HirExpr::Binary { left, right, .. } | HirExpr::Comparison { left, right, .. } => {
+                self.collect_locals_used_expr(left);
+                self.collect_locals_used_expr(right);
+            }
+            HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
+                self.collect_locals_used_expr(callee);
+                for a in args.iter() {
+                    self.collect_locals_used_expr(a);
+                }
+            }
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                self.collect_locals_used_expr(object);
+            }
+            HirExpr::Assignment { target, value, .. } => {
+                self.collect_locals_used_expr(target);
+                self.collect_locals_used_expr(value);
+            }
+            HirExpr::StructInit { args, .. } => {
+                for f in args.iter() {
+                    self.collect_locals_used_expr(&f.value);
+                }
+            }
+            HirExpr::EnumInit { args, .. } => {
+                for a in args.iter() {
+                    self.collect_locals_used_expr(a);
+                }
+            }
+            HirExpr::ExprList { list, .. } => {
+                for e in list.iter() {
+                    self.collect_locals_used_expr(e);
+                }
+            }
+            HirExpr::Deref { expr, .. }
+            | HirExpr::Cast { expr, .. }
+            | HirExpr::Ref { expr, .. } => {
+                self.collect_locals_used_expr(expr);
+            }
+            HirExpr::Index { object, index, .. } => {
+                self.collect_locals_used_expr(object);
+                self.collect_locals_used_expr(index);
+            }
+            HirExpr::InterpolatedString(parts) => {
+                for p in parts.iter() {
+                    if let InterpolationPart::Expr(e) = p {
+                        self.collect_locals_used_expr(e);
+                    }
+                }
+            }
+            HirExpr::If { if_stmt, .. } => {
+                self.collect_locals_used_stmt(if_stmt);
+            }
+            HirExpr::Intrinsic { args, .. } => {
+                for a in args.iter() {
+                    self.collect_locals_used_expr(a);
+                }
+            }
+            HirExpr::Lambda { body, .. } => {
+                self.collect_locals_used_stmt(body);
+            }
+            HirExpr::This { .. }
+            | HirExpr::ModuleAccess(_)
+            | HirExpr::GenericIdent(..)
+            | HirExpr::Number(..)
+            | HirExpr::Decimal(..)
+            | HirExpr::String(..)
+            | HirExpr::Boolean(..)
+            | HirExpr::Null(_)
+            | HirExpr::Undefined { .. }
+            | HirExpr::Uninit { .. }
+            | HirExpr::Char(_, _) => {}
+            HirExpr::UnknownIntrinsic { .. } => {}
+        }
     }
 
     fn stmt_key(stmt: &HirStmt<'a, 'bump>) -> usize {
@@ -1278,7 +2418,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 let value_type = self.check_expr_expected(value, ty);
 
-                self.check_and_record_value_use(value, &value_type);
+                let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
+                if !is_uninit_value {
+                    self.check_and_record_value_use(value, &value_type);
+                }
 
                 if let Some(else_block) = else_block {
                     match &value_type {
@@ -1320,6 +2463,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     symbol_id,
                     true,
                 ));
+
+                if is_uninit_value {
+                    self.mark_whole_uninit(*name);
+                } else {
+                    self.mark_whole_init(*name);
+                    if let HirExpr::StructInit { args, .. } = value {
+                        for fi in args.iter() {
+                            if matches!(fi.value, HirExpr::Uninit { .. }) {
+                                self.mark_field_uninit(*name, &[fi.name]);
+                            }
+                        }
+                    }
+                }
 
                 if matches!(
                     ty,
@@ -1463,9 +2619,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.context.enter_loop();
 
                 let entry_state = self.move_state.clone();
-                let converged_entry = self.converge_loop_move_state(body, entry_state);
-
+                let init_entry = self.init_state.clone();
+                let (converged_entry, converged_init) =
+                    self.converge_loop_states(body, entry_state, init_entry);
                 self.move_state = converged_entry;
+                self.init_state = converged_init;
                 self.check_stmt(body);
 
                 self.context.exit_loop();
@@ -1495,9 +2653,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.context.enter_loop();
 
                 let entry_state = self.move_state.clone();
-                let converged_entry = self.converge_loop_move_state(body, entry_state);
-
+                let init_entry = self.init_state.clone();
+                let (converged_entry, converged_init) =
+                    self.converge_loop_states(body, entry_state, init_entry);
                 self.move_state = converged_entry;
+                self.init_state = converged_init;
                 self.check_stmt(body);
 
                 self.context.exit_loop();
@@ -1748,8 +2908,185 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     .insert(Self::expr_key(expr), *expected);
                 *expected
             }
+            HirExpr::Uninit {
+                span,
+                ty: HirType::Unknown,
+            } => {
+                self.set_span(*span);
+                self.uninit_backfill.insert(Self::expr_key(expr), *expected);
+                *expected
+            }
             _ => self.check_expr(expr),
         }
+    }
+
+    fn check_expr_as_place(&mut self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
+        match expr {
+            HirExpr::Ident(name, span) => {
+                let var_name = self.str_id_to_string(*name);
+                let (symbol_id, ty) = match self.context.get_variable(&var_name) {
+                    Some(ty) => ty,
+                    None => {
+                        self.record(TypeErrorKind::UndefinedVariable(var_name));
+                        (SymbolId::Local(LocalSymbolId(u32::MAX)), HirType::Unknown)
+                    }
+                };
+                self.point_locals_used
+                    .entry(self.current_point)
+                    .or_default()
+                    .insert(*name);
+                self.occurrences.push((
+                    *span,
+                    *name,
+                    ty,
+                    self.context.current_module_idx,
+                    symbol_id,
+                    false,
+                ));
+                ty
+            }
+            HirExpr::FieldAccess {
+                object,
+                field,
+                span,
+            }
+            | HirExpr::Get {
+                object,
+                field,
+                span,
+            } => {
+                self.set_span(*span);
+                self.check_field_access_no_init_check(object, *field)
+            }
+            HirExpr::Index {
+                object,
+                index,
+                span,
+            } => {
+                self.set_span(*span);
+                let object_ty = self.check_expr_suppressed(object);
+                let index_ty = self.check_expr(index);
+                self.recover(self.types_compatible(&HirType::I64, &index_ty), ());
+                match object_ty {
+                    HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. } => {
+                        if !self.in_unsafe() {
+                            self.record(TypeErrorKind::Generic(
+                                "indexing a raw/unsafe pointer requires an unsafe block"
+                                    .to_string(),
+                            ));
+                        }
+                        *inner
+                    }
+                    _ => match *Self::strip_ref(&object_ty) {
+                        HirType::Array(inner, _) => *inner,
+                        HirType::Slice(inner) => *inner,
+                        _ => {
+                            self.record(TypeErrorKind::Generic(format!(
+                                "cannot index type `{}`",
+                                self.type_to_string(&object_ty)
+                            )));
+                            HirType::Unknown
+                        }
+                    },
+                }
+            }
+            HirExpr::Slice {
+                object,
+                start,
+                end,
+                inclusive: _,
+                span,
+            } => {
+                self.set_span(*span);
+                let object_ty = self.check_expr_suppressed(object);
+                let start_ty = self.check_expr(start);
+                let end_ty = self.check_expr(end);
+                if !self.is_integer(&start_ty) || !self.is_integer(&end_ty) {
+                    self.record(TypeErrorKind::Generic(
+                        "slice bounds must be integers".to_string(),
+                    ));
+                }
+                match *Self::strip_ref(&object_ty) {
+                    HirType::Array(inner, _) | HirType::Slice(inner) => HirType::Slice(inner),
+                    _ => {
+                        self.record(TypeErrorKind::Generic(format!(
+                            "cannot slice type `{}`",
+                            self.type_to_string(&object_ty)
+                        )));
+                        HirType::Unknown
+                    }
+                }
+            }
+            _ => self.check_expr(expr),
+        }
+    }
+
+    fn check_field_access_no_init_check(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        field: StrId,
+    ) -> HirType<'a, 'bump> {
+        let obj_type = self.check_expr_suppressed(object);
+        let stripped = *Self::strip_ref(&obj_type);
+
+        let HirType::Struct {
+            name: struct_name,
+            type_args,
+            ..
+        } = stripped
+        else {
+            self.record(TypeErrorKind::Generic(format!(
+                "Cannot access field on non-struct type: {}",
+                self.type_to_string(&obj_type)
+            )));
+            return HirType::Unknown;
+        };
+
+        let struct_name_str = self.str_id_to_string(struct_name);
+        let Some(struct_def) = self.context.get_struct(&struct_name_str) else {
+            self.record(TypeErrorKind::UndefinedType(struct_name_str));
+            return HirType::Unknown;
+        };
+        self.check_bare_name_import(
+            self.context.struct_owner(&struct_name_str),
+            struct_name,
+            &struct_name_str,
+            BareImportKind::Struct,
+        );
+
+        let field_name = self.str_id_to_string(field);
+        let Some(field_idx) = struct_def
+            .fields
+            .iter()
+            .position(|f| self.str_id_to_string(f.name) == field_name)
+        else {
+            self.record(TypeErrorKind::FieldNotFound {
+                struct_name: struct_name_str,
+                field: field_name,
+            });
+            return HirType::Unknown;
+        };
+
+        let ty = if type_args.is_empty() {
+            struct_def.fields[field_idx].field_type
+        } else {
+            self.instantiate_struct(struct_name, type_args)
+                .map(|fields| fields[field_idx])
+                .unwrap_or(struct_def.fields[field_idx].field_type)
+        };
+
+        self.occurrences.push((
+            self.current_span,
+            field,
+            ty,
+            self.context.current_module_idx,
+            SymbolId::Field {
+                struct_name,
+                field_name: field,
+            },
+            false,
+        ));
+        ty
     }
 
     fn check_expr(&mut self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
@@ -1762,6 +3099,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::Decimal(_, _) => HirType::F64,
             HirExpr::Boolean(_, _) => HirType::Boolean,
             HirExpr::String(_, _) => HirType::String,
+            HirExpr::Uninit { span, ty } => {
+                self.set_span(*span);
+                match ty {
+                    HirType::Unknown => {
+                        self.record(TypeErrorKind::TypeCannotBeInferred);
+                        HirType::Unknown
+                    }
+                    other_type => *other_type,
+                }
+            }
             HirExpr::Undefined { span, ty } => {
                 self.set_span(*span);
                 match ty {
@@ -1781,15 +3128,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                 }
             }
+
             HirExpr::Ident(name, span) => {
                 let var_name = self.str_id_to_string(*name);
                 let (symbol_id, ty) = match self.context.get_variable(&var_name) {
                     Some(ty) => ty,
                     None => {
-                        self.record(TypeErrorKind::UndefinedVariable(var_name));
+                        self.record(TypeErrorKind::UndefinedVariable(var_name.clone()));
                         (SymbolId::Local(LocalSymbolId(u32::MAX)), HirType::Unknown)
                     }
                 };
+                self.check_ident_init_read(*name, &var_name, &ty);
                 self.point_locals_used
                     .entry(self.current_point)
                     .or_default()
@@ -2013,11 +3362,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             }
                             HirType::Slice(self.context.bump.alloc_value(pointee))
                         } else if let Some(len_expr) = len_arg {
-                            // Old 3-arg / 2-arg count-only shape with no cap: reject for
-                            // slice pointees now, since there's no way to recover a correct
-                            // cap. Non-slice owned pointers never take this branch (pointee
-                            // wouldn't be wrapped in Slice), so this only fires for the
-                            // ambiguous case this change intentionally closes off.
                             let len_ty = self.check_expr(len_expr);
                             self.check_and_record_value_use(len_expr, &len_ty);
                             if !self.is_integer(&len_ty) {
@@ -2315,7 +3659,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
             } => {
                 self.set_span(*span);
-                let object_ty = self.check_expr(object);
+                let object_ty = self.check_expr_suppressed(object);
                 let start_ty = self.check_expr(start);
                 let end_ty = self.check_expr(end);
                 if !self.is_integer(&start_ty) || !self.is_integer(&end_ty) {
@@ -2343,6 +3687,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 HirExpr::Ident(func_name, ident_span) => {
                     self.set_span(*ident_span);
                     let lookup_name = self.str_id_to_string(*func_name);
+
+                    if self.context.is_local_binding(&lookup_name) {
+                        let callee_type = self.check_expr(callee);
+                        return match callee_type {
+                            HirType::Lambda { return_type, .. } => *return_type,
+                            _ => {
+                                self.record(TypeErrorKind::Generic(format!(
+                                    "Expression of type `{}` is not callable",
+                                    self.type_to_string(&callee_type)
+                                )));
+                                HirType::Unknown
+                            }
+                        };
+                    }
+
                     let func = match self.context.get_function(&lookup_name) {
                         Some(f) => f,
                         None => {
@@ -2576,35 +3935,55 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     };
 
                     if let Some(params) = func.params {
-                        if let Some(HirParam::This { kind, span: _ }) = params.first() {
-                            let requires_mut = matches!(
-                                kind,
+                        let mut receiver_multi_place_loans: Vec<LoanId> = Vec::new();
+
+                        if let Some(HirParam::This {
+                            kind,
+                            multi_place,
+                            span: _,
+                        }) = params.first()
+                        {
+                            let requires_mut = match kind {
                                 ThisPassingKind::RefMut
-                                    | ThisPassingKind::MutSafePtr
-                                    | ThisPassingKind::MoveMut
-                            );
+                                | ThisPassingKind::MutSafePtr
+                                | ThisPassingKind::MoveMut => true,
+                                ThisPassingKind::MultiPlace => {
+                                    multi_place.is_some_and(|a| a.iter().any(|x| x.mutable))
+                                }
+                                _ => false,
+                            };
                             if requires_mut {
-                                let result = self.check_receiver_is_mutable(object, field.as_str());
-                                self.recover(result, ());
+                                self.recover(
+                                    self.check_receiver_is_mutable(object, field.as_str()),
+                                    (),
+                                );
                             }
 
-                            let has_precise_template =
-                                matches!(template, Some(RefTemplate::Path { .. }));
+                            if let (ThisPassingKind::MultiPlace, Some(accesses)) =
+                                (kind, multi_place)
+                            {
+                                receiver_multi_place_loans =
+                                    self.register_multi_place_loans(object, accesses, args);
+                            } else {
+                                let has_precise_template =
+                                    matches!(template, Some(RefTemplate::Path { .. }));
 
-                            if matches!(kind, ThisPassingKind::Move | ThisPassingKind::MoveMut) {
-                                self.check_and_record_value_use(object, &obj_type);
-                            } else if !has_precise_template {
-                                if let Some(place) = self.resolve_place(object) {
-                                    let borrow_kind = if requires_mut {
-                                        BorrowKind::Mutable
-                                    } else {
-                                        BorrowKind::Shared
-                                    };
+                                if matches!(kind, ThisPassingKind::Move | ThisPassingKind::MoveMut)
+                                {
+                                    self.check_and_record_value_use(object, &obj_type);
+                                } else if !has_precise_template {
+                                    if let Some(place) = self.resolve_place(object) {
+                                        let borrow_kind = if requires_mut {
+                                            BorrowKind::Mutable
+                                        } else {
+                                            BorrowKind::Shared
+                                        };
 
-                                    if !requires_mut && !self.return_type_may_alias(&ret_ty) {
-                                        self.check_borrow_use_shell(expr, place, borrow_kind);
-                                    } else {
-                                        self.check_borrow_use(expr, place, borrow_kind);
+                                        if !requires_mut && !self.return_type_may_alias(&ret_ty) {
+                                            self.check_borrow_use_shell(expr, place, borrow_kind);
+                                        } else {
+                                            self.check_borrow_use(expr, place, borrow_kind);
+                                        }
                                     }
                                 }
                             }
@@ -2635,6 +4014,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             template,
                         ) {
                             self.call_loans.insert(Self::expr_key(expr), loan_id);
+                            for loan in receiver_multi_place_loans {
+                                self.borrow_checker.end_loan_now(loan);
+                            }
                         }
                     }
 
@@ -2644,9 +4026,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.set_span(access.span);
                     let member_name = access.member.to_string();
 
-                    // First: is access.path a single-segment local alias registered via
-                    // `import foo::bar.Alias;`? Check that before treating path as a
-                    // literal package path.
                     let is_named_import = if access.path.len() == 1 {
                         self.imports_by_module
                             .get(&self.context.current_module_idx)
@@ -2698,8 +4077,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             }
                         };
 
-                    // free_func now needs to try BOTH interpretations when alias-resolved,
-                    // since a named import could name either a type or a free function.
                     let free_func = resolved_module_idx
                         .and_then(|midx| self.context.get_module_function(midx, &member_name));
 
@@ -2991,11 +4368,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             } => {
                 self.set_span(*span);
                 let value_type = self.check_expr(value);
-                let target_type = self.check_expr(target);
+                let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
 
-                // Borrow-check the write target uniformly: *p = .., obj.field = ..,
-                // arr[i] = .. all need the same overlap check, Special-casing only
-                // Deref here
+                let target_type = self.check_expr_as_place(target);
+
                 if let Some(place) = self.resolve_place(target) {
                     self.check_borrow_use(target, place, BorrowKind::Mutable);
                 }
@@ -3010,6 +4386,82 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             var_name
                         )));
                     }
+                }
+
+                if !matches!(op, AssignmentOperator::Assign) {
+                    self.check_read_for_compound_target(target, &target_type);
+                }
+
+                match target {
+                    HirExpr::Ident(name, _) => {
+                        if is_uninit_value {
+                            self.mark_whole_uninit(*name);
+                        } else {
+                            self.mark_field_init(*name, &[]);
+                        }
+                    }
+                    HirExpr::FieldAccess { object, field, .. }
+                    | HirExpr::Get { object, field, .. } => {
+                        if let Some((root, mut path)) = self.static_field_path(object) {
+                            path.push(*field);
+                            if is_uninit_value {
+                                self.mark_field_uninit(root, &path);
+                            } else {
+                                self.mark_field_init(root, &path);
+                            }
+                        }
+                    }
+                    HirExpr::Index { object, index, .. } => {
+                        if let Some((root, path)) = self.static_field_path(object) {
+                            let len = match self.peek_type(object) {
+                                HirType::Array(_, l) => Some(l),
+                                _ => None,
+                            };
+                            match index {
+                                HirExpr::Number(i, _) if !is_uninit_value => {
+                                    self.mark_array_range(root, &path, *i, *i + 1, len);
+                                }
+                                HirExpr::Number(i, _) => {
+                                    let root_node = self
+                                        .init_state
+                                        .entry(root)
+                                        .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+                                    if let InitNode::Array { ranges, .. } =
+                                        Self::node_at_path_mut(root_node, &path)
+                                    {
+                                        let mut kept = IntervalSet::default();
+                                        for &(s, e) in &ranges.ranges {
+                                            if e <= *i || s >= *i + 1 {
+                                                kept.insert(s, e);
+                                            } else {
+                                                if s < *i {
+                                                    kept.insert(s, *i);
+                                                }
+                                                if *i + 1 < e {
+                                                    kept.insert(*i + 1, e);
+                                                }
+                                            }
+                                        }
+                                        *ranges = kept;
+                                    }
+                                }
+                                _ => {
+                                    let root_node = self
+                                        .init_state
+                                        .entry(root)
+                                        .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+                                    let target_node = Self::node_at_path_mut(root_node, &path);
+                                    if !matches!(
+                                        target_node,
+                                        InitNode::Whole(InitStatus::Initialized)
+                                    ) {
+                                        *target_node = InitNode::Whole(InitStatus::Maybe);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
                 use ir::hir::AssignmentOperator::*;
@@ -3265,9 +4717,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::ModuleAccess(access) => {
                 let member_name = access.member.to_string();
 
-                // is access.path a single-segment local alias registered via
-                // `import foo::bar.Alias;`? Check that before treating path as a
-                // literal package path.
                 let is_named_import = if access.path.len() == 1 {
                     self.imports_by_module
                         .get(&self.context.current_module_idx)
@@ -3426,10 +4875,52 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             } => {
                 self.set_span(*span);
 
-                let object_ty = self.check_expr(object);
+                let object_ty = self.check_expr_suppressed(object);
                 let index_ty = self.check_expr(index);
 
                 self.recover(self.types_compatible(&HirType::I64, &index_ty), ());
+
+                if let Some((root, path)) = self.static_field_path(object) {
+                    if let Some(node) = self.init_state.get(&root).cloned() {
+                        let target = Self::node_at_path_ref(&node, &path);
+                        match index {
+                            HirExpr::Number(i, _) => {
+                                let covered = match target {
+                                    InitNode::Array { ranges, .. } => {
+                                        ranges.contains_range(*i, *i + 1)
+                                    }
+                                    InitNode::Whole(InitStatus::Initialized) => true,
+                                    _ => false,
+                                };
+                                if !covered {
+                                    let root_str = self.str_id_to_string(root);
+                                    self.record(TypeErrorKind::Generic(format!(
+                                        "use of uninitialized value `{}[{}]`",
+                                        root_str, i
+                                    )));
+                                }
+                            }
+                            _ => {
+                                let whole_ok = match target {
+                                    InitNode::Whole(InitStatus::Initialized) => true,
+                                    InitNode::Array {
+                                        ranges,
+                                        len: Some(l),
+                                    } => ranges.covers_full((*l) as i64),
+                                    _ => false,
+                                };
+                                if !whole_ok {
+                                    let root_str = self.str_id_to_string(root);
+                                    self.record(TypeErrorKind::Generic(format!(
+                                        "indexing `{}` with a non-constant index requires the whole array to be initialized \
+                                         (the compiler can't prove which element you're reading)",
+                                        root_str
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
 
                 match object_ty {
                     HirType::SafePointer { inner, .. } => {
@@ -3522,7 +5013,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
         }
-        result.unwrap_or(HirType::Never) // every branch diverged
+        result.unwrap_or(HirType::Never)
     }
 
     fn check_cast_legality(
@@ -3631,10 +5122,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.infer_provenance_root(inner, segments)
             }
 
-            // Indexing loses static field-path precision (the index is runtime
-            // data), but the borrowed region is still rooted in `object`, keep
-            // the root so diagnostics can still say "derived from `x`" instead
-            // of dropping to nothing
             HirExpr::Index { object, .. } => self.infer_provenance_root(object, segments),
 
             HirExpr::ModuleAccess(access) => {
@@ -3665,7 +5152,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         register_loan: bool,
     ) -> HirType<'a, 'bump> {
         self.set_span(span);
-        let inner_ty = self.check_expr(expr);
+
+        let inner_ty = if mutable {
+            self.check_expr_as_place(expr)
+        } else {
+            self.check_expr(expr)
+        };
+
+        if mutable {
+            self.optimistically_mark_mut_target_init(expr);
+        }
+
         let provenance = self.infer_provenance(expr);
 
         if register_loan {
@@ -3860,7 +5357,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                 }
 
-                // A real struct scrutinee matched by field name.
                 HirType::Struct {
                     name: struct_name,
                     field_types,
@@ -4136,7 +5632,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
 
-            _ => {} // Wildcard, Number, String, Boolean bind nothing
+            _ => {}
         }
     }
 
@@ -4237,10 +5733,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
 
             HirPattern::Or(patterns) => {
-                // Nested or-pattern: consistency across its own alternatives is
-                // enforced separately wherever *this* pattern is itself checked
-                // via check_pattern_against_type. Any one alternative gives the
-                // right binding set here.
                 if let Some(first) = patterns.first() {
                     self.collect_pattern_bindings(first, scrutinee_ty, out);
                 }
@@ -4253,8 +5745,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    /// Order-independent comparison of two binding sets: same names, same
-    /// types, regardless of the order each pattern happened to declare them in.
     fn bindings_match(
         &self,
         a: &[(StrId, HirType<'a, 'bump>)],
@@ -4369,6 +5859,26 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         for (i, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
             let param_type = param.get_type();
+            if let (
+                HirParam::Normal {
+                    multi_place: Some(accesses),
+                    ..
+                },
+                HirExpr::Ref {
+                    expr,
+                    mutable,
+                    span,
+                },
+            ) = (param, arg)
+            {
+                let arg_type = self.check_ref_expr(expr, *mutable, *span, false);
+                if let Some(pt) = param_type {
+                    self.recover(self.types_compatible(pt, &arg_type), ());
+                }
+                arg_loans.extend(self.register_multi_place_loans(expr, accesses, args));
+                continue;
+            }
+
             if Some(i) == templated_base_param {
                 if let HirExpr::Ref {
                     expr,
@@ -4414,15 +5924,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         arg_loans
     }
 
-    /// True if a value of this type could itself hold or be a borrowed
-    /// reference, i.e. calling a function returning this type might hand
-    /// back something that aliases one of its ref-typed arguments.
-    /// struct/enum/tuple types that might *contain* a
-    /// reference field also count, since e.g. `struct Pair { r: &mut i64 }`
-    /// returned by value still carries the alias forward.
     fn return_type_may_alias(&self, ty: &HirType<'a, 'bump>) -> bool {
         match ty {
-            // Direct reference-like types.
             HirType::Ref { .. }
             | HirType::SafePointer { .. }
             | HirType::UnsafePointer { .. }
@@ -4441,7 +5944,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         .fields
                         .iter()
                         .any(|f| self.return_type_may_alias(&f.field_type)),
-                    None => true, // unresolved
+                    None => true,
                 }
             }
 
@@ -4453,13 +5956,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         .iter()
                         .flat_map(|v| v.fields.iter())
                         .any(|f| self.return_type_may_alias(&f.field_type)),
-                    None => true, // unresolved
+                    None => true,
                 }
             }
 
             HirType::Dyn { .. } | HirType::DynInterface(..) => true,
 
-            // Primitive/value-only types.
             _ => false,
         }
     }
@@ -4978,7 +6480,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         object: &HirExpr<'a, 'bump>,
         field: StrId,
     ) -> HirType<'a, 'bump> {
-        let obj_type = self.check_expr(object);
+        let obj_type = self.check_expr_suppressed(object);
         let stripped = *Self::strip_ref(&obj_type);
 
         let HirType::Struct {
@@ -5041,6 +6543,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
             false,
         ));
+
+        if let Some((root, mut path)) = self.static_field_path(object) {
+            path.push(field);
+            let root_str = self.str_id_to_string(root);
+            self.check_init_read_path(root, &path, &root_str);
+        }
 
         ty
     }
@@ -5985,9 +7493,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    /// If `expr` is a local currently holding a live loan (i.e. a `&`/`&mut`
-    /// this-code created earlier), returns the place that loan actually
-    /// covers.
     fn loan_referent_place(&self, expr: &HirExpr<'a, 'bump>) -> Option<PlaceId> {
         let HirExpr::Ident(name, _) = expr else {
             return None;
@@ -6097,7 +7602,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         arms: &[HirMatchArm<'a, 'bump>],
     ) {
         if matches!(scrutinee_ty, HirType::Unknown) {
-            return; // already errored elsewhere; don't cascade
+            return;
         }
 
         let has_catch_all = arms.iter().any(|arm| {

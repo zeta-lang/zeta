@@ -496,7 +496,10 @@ where
                 self.cursor.advance();
                 Ok(Expr::Undefined { span: tok.span })
             }
-
+            TokenKind::Uninit => {
+                self.cursor.advance();
+                Ok(Expr::Uninit { span: tok.span })
+            }
             TokenKind::LBracket => {
                 self.cursor.advance();
 

@@ -36,5 +36,6 @@ fn clif_type(ty: &SsaType) -> Type {
         SsaType::Nullable(_ssa_type) => types::I64, // pointer
         SsaType::Array(_, _) => types::I64,         // pointer
         SsaType::Owned(_) => types::I64,            // Pointers are 64-bit
+        SsaType::FuncPointer { .. } => types::I64,
     }
 }

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
-    Block, Generic, MatchArm, MutabilityState, NormalParam, Param, ParamPassingKind,
-    ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, ThisParam, Type, TypeKind,
-    Visibility,
+    Block, EffectAccess, EffectSegment, Generic, MatchArm, MutabilityState, NormalParam, Param,
+    ParamPassingKind, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, ThisParam, Type,
+    TypeKind, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::tokens::TokenKind::LBracket;
@@ -15,6 +15,57 @@ impl<'a, 'bump> DescentParser<'a, 'bump>
 where
     'bump: 'a,
 {
+    fn parse_multi_place(
+        &mut self,
+    ) -> Result<Option<&'bump [EffectAccess<'a, 'bump>]>, DiagnosticError<'a>> {
+        if self.cursor.peek() != TokenKind::Dot {
+            return Ok(None);
+        }
+        let checkpoint = self.cursor.pos();
+        self.cursor.advance(); // '.'
+        if self.cursor.peek() != TokenKind::LBrace {
+            self.cursor.reset(checkpoint);
+            return Ok(None);
+        }
+        self.cursor.advance(); // '{'
+
+        let mut accesses = Vec::new();
+        while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
+            let amp_span = self.cursor.peek_token().span;
+            self.cursor.expect(TokenKind::BitAnd)?;
+            let mutable = self.cursor.consume(TokenKind::Mut);
+
+            let mut path = Vec::new();
+            let (first, _) = self.cursor.expect_ident()?;
+            path.push(EffectSegment::Field(first));
+            loop {
+                if self.cursor.consume(TokenKind::Dot) {
+                    let (f, _) = self.cursor.expect_ident()?;
+                    path.push(EffectSegment::Field(f));
+                } else if self.cursor.consume(TokenKind::LBracket) {
+                    let idx_expr = self.parse_expr_inner(0, true)?;
+                    self.cursor.expect(TokenKind::RBracket)?;
+                    path.push(EffectSegment::Index(
+                        self.bump.alloc_value_immutable(idx_expr),
+                    ));
+                } else {
+                    break;
+                }
+            }
+            accesses.push(EffectAccess {
+                mutable,
+                path: self.bump.alloc_slice_immutable(&path),
+                span: amp_span,
+            });
+            if !self.cursor.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.cursor.expect(TokenKind::RBrace)?;
+
+        Ok(Some(self.bump.alloc_slice_immutable(&accesses)))
+    }
+
     pub fn parse_generics(
         &mut self,
     ) -> Result<Option<&'bump [Generic<'a, 'bump>]>, DiagnosticError<'a>> {
@@ -148,8 +199,15 @@ where
                 }))
             } else if self.cursor.peek() == TokenKind::This {
                 let token = self.cursor.expect(TokenKind::This)?;
+                let multi_place = self.parse_multi_place()?;
+                let passing_kind = if multi_place.is_some() {
+                    ParamPassingKind::MultiPlace
+                } else {
+                    ParamPassingKind::Move
+                };
                 Param::This(self.bump.alloc_value_immutable(ThisParam {
-                    passing_kind: ParamPassingKind::Move,
+                    passing_kind,
+                    multi_place,
                     span: token.span,
                 }))
             } else if self.cursor.peek() == TokenKind::Mut
@@ -174,6 +232,8 @@ where
                     ));
                 };
 
+                let multi_place = self.parse_multi_place()?;
+
                 let default_value = if self.cursor.consume(TokenKind::Eq) {
                     Some(self.parse_expr_inner(0, true)?)
                 } else {
@@ -186,6 +246,7 @@ where
                     type_annotation: param_type,
                     visibility: Visibility::Public,
                     default_value,
+                    multi_place,
                     span,
                 }))
             };

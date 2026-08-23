@@ -210,6 +210,165 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
 
     fn rewrite_expr(&mut self, expr: HirExpr<'a, 'bump>) -> HirExpr<'a, 'bump> {
         match expr {
+            HirExpr::Tuple(exprs, span) => {
+                let new_exprs: Vec<HirExpr<'a, 'bump>> =
+                    exprs.iter().map(|e| self.rewrite_expr(*e)).collect();
+                HirExpr::Tuple(self.bump.alloc_slice(&new_exprs), span)
+            }
+            HirExpr::ArrayLiteral { elements, span } => {
+                let new_elements: Vec<HirExpr<'a, 'bump>> =
+                    elements.iter().map(|e| self.rewrite_expr(*e)).collect();
+                HirExpr::ArrayLiteral {
+                    elements: self.bump.alloc_slice(&new_elements),
+                    span,
+                }
+            }
+            HirExpr::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                let new_start = self.rewrite_expr(*start);
+                let new_end = self.rewrite_expr(*end);
+                HirExpr::Range {
+                    start: self.bump.alloc_value(new_start),
+                    end: self.bump.alloc_value(new_end),
+                    inclusive,
+                    span,
+                }
+            }
+            HirExpr::Slice {
+                object,
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                let new_object = self.rewrite_expr(*object);
+                let new_start = self.rewrite_expr(*start);
+                let new_end = self.rewrite_expr(*end);
+                HirExpr::Slice {
+                    object: self.bump.alloc_value(new_object),
+                    start: self.bump.alloc_value(new_start),
+                    end: self.bump.alloc_value(new_end),
+                    inclusive,
+                    span,
+                }
+            }
+            HirExpr::Index {
+                object,
+                index,
+                span,
+            } => {
+                let new_object = self.rewrite_expr(*object);
+                let new_index = self.rewrite_expr(*index);
+                HirExpr::Index {
+                    object: self.bump.alloc_value(new_object),
+                    index: self.bump.alloc_value(new_index),
+                    span,
+                }
+            }
+            HirExpr::Cast {
+                expr,
+                target_type,
+                span,
+            } => {
+                let new_expr = self.rewrite_expr(*expr);
+                HirExpr::Cast {
+                    expr: self.bump.alloc_value(new_expr),
+                    target_type,
+                    span,
+                }
+            }
+            HirExpr::Intrinsic {
+                kind,
+                type_args,
+                args,
+                span,
+            } => {
+                let new_args: Vec<HirExpr<'a, 'bump>> =
+                    args.iter().map(|a| self.rewrite_expr(*a)).collect();
+                HirExpr::Intrinsic {
+                    kind,
+                    type_args,
+                    args: self.bump.alloc_slice(&new_args),
+                    span,
+                }
+            }
+            HirExpr::EnumInit {
+                enum_name,
+                variant,
+                args,
+                type_args,
+                span,
+            } => {
+                let new_args: Vec<HirExpr<'a, 'bump>> =
+                    args.iter().map(|a| self.rewrite_expr(*a)).collect();
+                HirExpr::EnumInit {
+                    enum_name,
+                    variant,
+                    args: self.bump.alloc_slice(&new_args),
+                    type_args,
+                    span,
+                }
+            }
+            HirExpr::InterpolatedString(parts) => {
+                let new_parts: Vec<ir::hir::InterpolationPart<'a, 'bump>> = parts
+                    .iter()
+                    .map(|p| match p {
+                        ir::hir::InterpolationPart::Expr(e) => {
+                            let new_e = self.rewrite_expr(**e);
+                            ir::hir::InterpolationPart::Expr(self.bump.alloc_value_immutable(new_e))
+                        }
+                        other => *other,
+                    })
+                    .collect();
+                HirExpr::InterpolatedString(self.bump.alloc_slice(&new_parts))
+            }
+            HirExpr::If { if_stmt, span } => {
+                let new_if_stmt = self.rewrite_stmt(*if_stmt);
+                HirExpr::If {
+                    if_stmt: self.bump.alloc_value_immutable(new_if_stmt),
+                    span,
+                }
+            }
+            HirExpr::Match { expr, arms, span } => {
+                let new_expr = self.rewrite_expr(*expr);
+                let new_arms: Vec<ir::hir::HirMatchArm<'a, 'bump>> = arms
+                    .iter()
+                    .map(|arm| {
+                        let new_guard = arm.guard.map(|g| {
+                            let r = self.rewrite_expr(*g);
+                            self.bump.alloc_value_immutable(r)
+                        });
+                        let new_body = self.rewrite_stmt(*arm.body);
+                        ir::hir::HirMatchArm {
+                            pattern: arm.pattern,
+                            guard: new_guard,
+                            body: self.bump.alloc_value_immutable(new_body),
+                        }
+                    })
+                    .collect();
+                HirExpr::Match {
+                    expr: self.bump.alloc_value(new_expr),
+                    arms: self.bump.alloc_slice(&new_arms),
+                    span,
+                }
+            }
+            HirExpr::Block {
+                body,
+                is_unsafe,
+                span,
+            } => {
+                let new_body: Vec<HirStmt<'a, 'bump>> =
+                    body.iter().map(|s| self.rewrite_stmt(*s)).collect();
+                HirExpr::Block {
+                    body: self.bump.alloc_slice(&new_body),
+                    is_unsafe,
+                    span,
+                }
+            }
             HirExpr::Lambda {
                 modifier: _,
                 params,

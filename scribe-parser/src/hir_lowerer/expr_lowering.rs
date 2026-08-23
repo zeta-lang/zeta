@@ -40,6 +40,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ty: expected_ty,
             };
         }
+        if let Expr::Uninit { span } = expr {
+            return HirExpr::Uninit {
+                span: *span,
+                ty: expected_ty,
+            };
+        }
 
         self.lower_expr(expr)
     }
@@ -624,6 +630,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 span: *span,
                 ty: HirType::Unknown,
             },
+            Expr::Uninit { span } => HirExpr::Uninit {
+                span: *span,
+                ty: HirType::Unknown,
+            },
             Expr::Block(block) => {
                 let HirStmt::Block { body } = self.lower_block(block) else {
                     unreachable!()
@@ -644,6 +654,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     span: ub.span,
                 }
             }
+            Expr::Tuple { values, span } => HirExpr::Tuple(
+                self.ctx.bump.alloc_slice(
+                    values
+                        .iter()
+                        .map(|a| self.lower_expr(a))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+                *span,
+            ),
         }
     }
 
@@ -1557,6 +1577,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             TypeKind::Isize => HirType::Isize,
             TypeKind::Never => HirType::Never,
             TypeKind::AnySlice => unimplemented!(),
+            TypeKind::Tuple { values } => HirType::Tuple(
+                self.ctx.bump.alloc_slice(
+                    values
+                        .iter()
+                        .map(|v| self.lower_type(v, span))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+            ),
         }
     }
 

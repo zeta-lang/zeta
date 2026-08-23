@@ -12,7 +12,6 @@ pub mod ir_conversion;
 pub mod ir_hasher;
 pub mod layout;
 pub mod nll_cfg;
-pub mod pretty;
 pub mod registry;
 pub mod span;
 pub mod ssa_ir;

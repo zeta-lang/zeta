@@ -102,9 +102,13 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
         HirType::OwnedPointer { inner, .. } => {
             SsaType::Owned(Box::new(lower_type_hir(inner, enums)))
         }
-        HirType::Lambda { .. } => {
-            unreachable!()
-        }
+        HirType::Lambda {
+            params,
+            return_type,
+        } => SsaType::FuncPointer {
+            params: params.iter().map(|p| lower_type_hir(p, enums)).collect(),
+            return_type: Box::new(lower_type_hir(return_type, enums)),
+        },
         HirType::Generic(name) => panic!(
             "[lower_type_hir] unsubstituted generic parameter `{}` reached MIR lowering; \
              monomorphization should have resolved every HirType::Generic before this point",

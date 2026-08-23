@@ -122,6 +122,11 @@ where
                 }
             }
 
+            TokenKind::LBrace => {
+                let block = self.parse_block()?;
+                Ok(Stmt::Block(self.bump.alloc_value_immutable(block)))
+            }
+
             TokenKind::Inline | TokenKind::Noinline | TokenKind::Extern => {
                 self.parse_function_with_visibility(visibility)
             }

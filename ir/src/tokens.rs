@@ -375,6 +375,7 @@ pub enum TokenKind {
     Reified,
     Undefined,
     As,
+    Uninit,
 
     // ===== Types =====
     U8,
@@ -511,6 +512,7 @@ impl fmt::Display for TokenKind {
             Null => "null",
 
             If => "if",
+            Uninit => "uninit",
             Else => "else",
             While => "while",
             For => "for",

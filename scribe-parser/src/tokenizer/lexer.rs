@@ -694,6 +694,7 @@ fn keyword_or_ident(text: &str) -> TokenKind {
         "false" => TokenKind::BooleanFalse,
         "null" => TokenKind::Null,
         "if" => TokenKind::If,
+        "uninit" => TokenKind::Uninit,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "for" => TokenKind::For,

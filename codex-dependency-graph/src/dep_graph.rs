@@ -1439,7 +1439,7 @@ impl DepGraph {
                     self.walk_expr(element, from_node, module_idx, pool);
                 }
             }
-            Expr::Undefined { .. } => {
+            Expr::Undefined { .. } | Expr::Uninit { .. } => {
                 // Nothing to do.
             }
             Expr::Cast {
@@ -1476,6 +1476,11 @@ impl DepGraph {
             }
             Expr::UnsafeBlock(unsafe_block) => {
                 self.walk_block(unsafe_block.block, from_node, module_idx, pool);
+            }
+            Expr::Tuple { values, .. } => {
+                for value in *values {
+                    self.walk_expr(&value, from_node, module_idx, pool);
+                }
             }
         }
     }

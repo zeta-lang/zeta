@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::hir::{
     HirEnum, HirFunc, HirInterface, HirParam, HirStruct, HirType, StrId, ThisPassingKind,
 };
@@ -162,6 +164,50 @@ pub enum SsaType {
     Char,
 
     Nullable(Box<SsaType>),
+    FuncPointer {
+        params: Vec<SsaType>,
+        return_type: Box<SsaType>,
+    },
+}
+
+impl fmt::Display for SsaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SsaType::I8 => todo!(),
+            SsaType::U8 => todo!(),
+            SsaType::I16 => todo!(),
+            SsaType::U16 => todo!(),
+            SsaType::I32 => todo!(),
+            SsaType::U32 => todo!(),
+            SsaType::I64 => todo!(),
+            SsaType::U64 => todo!(),
+            SsaType::I128 => todo!(),
+            SsaType::U128 => todo!(),
+            SsaType::F32 => todo!(),
+            SsaType::F64 => todo!(),
+            SsaType::Isize => todo!(),
+            SsaType::Usize => todo!(),
+            SsaType::Null => todo!(),
+            SsaType::Bool => todo!(),
+            SsaType::String => todo!(),
+            SsaType::Void => todo!(),
+            SsaType::User(str_id, ssa_types) => todo!(),
+            SsaType::Interface(str_id) => todo!(),
+            SsaType::Enum { name, variants } => todo!(),
+            SsaType::Tuple(ssa_types) => todo!(),
+            SsaType::Pointer(ssa_type) => todo!(),
+            SsaType::Owned(ssa_type) => todo!(),
+            SsaType::Dyn => todo!(),
+            SsaType::Slice(ssa_type) => todo!(),
+            SsaType::Array(ssa_type, _) => todo!(),
+            SsaType::Char => todo!(),
+            SsaType::Nullable(ssa_type) => todo!(),
+            SsaType::FuncPointer {
+                params,
+                return_type,
+            } => todo!(),
+        });
+    }
 }
 
 use crate::ast::FuncModifiers;

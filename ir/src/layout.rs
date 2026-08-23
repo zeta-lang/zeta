@@ -170,6 +170,10 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
                 align: target.ptr_bytes as usize,
             }),
         },
+        SsaType::FuncPointer { .. } => Ok(Layout {
+            size: target.ptr_bytes as usize,
+            align: target.ptr_bytes as usize,
+        }),
     }
 }
 

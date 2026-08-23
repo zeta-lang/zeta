@@ -288,6 +288,7 @@ pub enum ThisPassingKind {
     Move,
     /// `mut this`
     MoveMut,
+    MultiPlace,
 }
 
 impl Display for ThisPassingKind {
@@ -301,6 +302,7 @@ impl Display for ThisPassingKind {
             ThisPassingKind::ConstUnsafePtr => write!(f, "[*]const this"),
             ThisPassingKind::Move => write!(f, "this"),
             ThisPassingKind::MoveMut => write!(f, "mut this"),
+            ThisPassingKind::MultiPlace => write!(f, "this.{{..}}"),
         }
     }
 }
@@ -313,10 +315,12 @@ where
     Normal {
         name: StrId,
         param_type: HirType<'a, 'bump>,
+        multi_place: Option<&'bump [HirEffectAccess<'bump>]>,
         span: SourceSpan<'a>,
     },
     This {
         kind: ThisPassingKind,
+        multi_place: Option<&'bump [HirEffectAccess<'bump>]>,
         span: SourceSpan<'a>,
     },
 }
@@ -339,7 +343,8 @@ impl<'a, 'bump> HirParam<'a, 'bump> {
                     | ThisPassingKind::MutSafePtr
                     | ThisPassingKind::ConstSafePtr
                     | ThisPassingKind::MutUnsafePtr
-                    | ThisPassingKind::ConstUnsafePtr,
+                    | ThisPassingKind::ConstUnsafePtr
+                    | ThisPassingKind::MultiPlace,
                 ..
             }
         )
@@ -580,6 +585,10 @@ where
         target_type: HirType<'a, 'bump>,
         span: SourceSpan<'a>,
     },
+    Uninit {
+        span: SourceSpan<'a>,
+        ty: HirType<'a, 'bump>,
+    },
     Null(SourceSpan<'a>),
     Number(i64, SourceSpan<'a>),
     Char(char, SourceSpan<'a>),
@@ -679,6 +688,7 @@ where
         span: SourceSpan<'a>,
         ty: HirType<'a, 'bump>,
     },
+
     UnknownIntrinsic {
         span: SourceSpan<'a>,
         name: StrId,
@@ -1106,4 +1116,17 @@ pub struct HirLambdaParam<'a, 'bump> {
     pub name: StrId,
     pub param_type: Option<HirType<'a, 'bump>>,
     pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HirEffectAccess<'bump> {
+    pub mutable: bool,
+    pub path: &'bump [HirEffectSegment],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HirEffectSegment {
+    Field(StrId),
+    IndexConst(i64),
+    IndexOpaque,
 }

@@ -47,6 +47,7 @@ pub struct MirExprLowerer<'el, 'f, 'a, 'cx, 'bump> {
     module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
     module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
     pub constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+    promoted_to_stack: &'el mut HashSet<StrId>,
 }
 
 impl<'el, 'f, 'a, 'cx, 'bump> MirExprLowerer<'el, 'f, 'a, 'cx, 'bump>
@@ -77,6 +78,7 @@ where
         module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
         constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        promoted_to_stack: &'el mut HashSet<StrId>,
     ) -> Self {
         Self {
             current_block_data,
@@ -103,6 +105,7 @@ where
             module_import_aliases,
             module_named_imports,
             constants,
+            promoted_to_stack,
         }
     }
 
@@ -147,9 +150,41 @@ where
 
             HirExpr::Ident(name, span) => {
                 if let Some(&v) = self.var_map.get(name) {
-                    v
+                    if self.promoted_to_stack.contains(name) {
+                        let pointee_ty = match self.current_block_data.value_types.get(&v) {
+                            Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                            other => panic!(
+                                "Ident `{}` marked stack-promoted but its value type isn't a pointer: {:?}",
+                                name, other
+                            ),
+                        };
+                        let dest = self.current_block_data.fresh_value();
+                        self.emit(Instruction::Load {
+                            dest,
+                            ptr: Operand::Value(v),
+                        });
+                        self.current_block_data.value_types.insert(dest, pointee_ty);
+                        dest
+                    } else {
+                        v
+                    }
                 } else if let Some(const_expr) = self.constants.get(name) {
                     self.lower_expr(const_expr)
+                } else if let Some(func) =
+                    self.funcs.get(name).or_else(|| self.global_funcs.get(name))
+                {
+                    let dest = self.current_block_data.fresh_value();
+                    let ty = SsaType::FuncPointer {
+                        params: func.params.iter().map(|(_, t)| t.clone()).collect(),
+                        return_type: Box::new(func.ret_type.clone()),
+                    };
+                    self.emit(Instruction::Const {
+                        dest,
+                        ty: ty.clone(),
+                        value: Operand::FunctionRef(*name),
+                    });
+                    self.current_block_data.value_types.insert(dest, ty);
+                    dest
                 } else {
                     panic!(
                         "lower_expr: variable `{}` (StrId {:?}) referenced before definition at span {}",
@@ -788,6 +823,52 @@ where
                 });
                 self.current_block_data.value_types.insert(v, SsaType::Char);
                 v
+            }
+            HirExpr::Uninit { span: _, ty } => {
+                let ssa_ty = lower_type_hir(ty, self.enums);
+                self.lower_uninit_value(&ssa_ty)
+            }
+        }
+    }
+
+    fn lower_uninit_value(&mut self, ssa_ty: &SsaType) -> Value {
+        match ssa_ty {
+            SsaType::Array(inner, len) => {
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::StackAlloc {
+                    dest,
+                    ty: (**inner).clone(),
+                    count: *len,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, SsaType::Pointer(inner.clone()));
+                dest
+            }
+
+            ty if Self::is_aggregate_ssa_type(ty) => {
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::StackAlloc {
+                    dest,
+                    ty: ty.clone(),
+                    count: 1,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, SsaType::Pointer(Box::new(ty.clone())));
+                dest
+            }
+
+            _ => {
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::Undef {
+                    dest,
+                    ty: ssa_ty.clone(),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, ssa_ty.clone());
+                dest
             }
         }
     }
@@ -2609,6 +2690,43 @@ where
             )
         });
 
+        if self.promoted_to_stack.contains(&name) {
+            let value_to_store = match op {
+                AssignmentOperator::Assign => rhs,
+                _ => {
+                    let pointee_ty = match self.current_block_data.value_types.get(&var_val) {
+                        Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                        other => {
+                            panic!("promoted local `{}` isn't pointer-typed: {:?}", name, other)
+                        }
+                    };
+                    let current = self.new_value();
+                    self.emit(Instruction::Load {
+                        dest: current,
+                        ptr: Operand::Value(var_val),
+                    });
+                    self.current_block_data
+                        .value_types
+                        .insert(current, pointee_ty.clone());
+
+                    let dest = self.new_value();
+                    self.emit(Instruction::Binary {
+                        dest,
+                        op: assign_op_to_bin_op(op),
+                        left: Operand::Value(current),
+                        right: Operand::Value(rhs),
+                    });
+                    self.current_block_data.value_types.insert(dest, pointee_ty);
+                    dest
+                }
+            };
+            self.emit(Instruction::Store {
+                ptr: Operand::Value(var_val),
+                value: Operand::Value(value_to_store),
+            });
+            return value_to_store;
+        }
+
         let result = match op {
             AssignmentOperator::Assign => rhs,
             AssignmentOperator::AddAssign
@@ -3154,6 +3272,43 @@ where
 
         match callee {
             HirExpr::Ident(fname, _) => {
+                if let Some(&ptr_val) = self.var_map.get(fname) {
+                    let (param_types, ret_ty) = match self
+                        .current_block_data
+                        .value_types
+                        .get(&ptr_val)
+                    {
+                        Some(SsaType::FuncPointer {
+                            params,
+                            return_type,
+                        }) => (params.clone(), (**return_type).clone()),
+                        other => panic!(
+                            "lower_call: `{}` is called but its value type isn't a function pointer: {:?}",
+                            fname, other
+                        ),
+                    };
+
+                    let arg_ops: SmallVec<Operand, 8> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            if matches!(param_types.get(i), Some(SsaType::User(_, _))) {
+                                record_move_if_any(self.scope_stack, self.drop_state, a);
+                            }
+                            Operand::Value(self.lower_expr(a))
+                        })
+                        .collect();
+
+                    let dest = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Call {
+                        dest: Some(dest),
+                        func: Operand::Value(ptr_val),
+                        args: arg_ops,
+                    });
+                    self.current_block_data.value_types.insert(dest, ret_ty);
+                    return dest;
+                }
+
                 let param_types: Vec<SsaType> = self
                     .funcs
                     .get(fname)
@@ -3350,6 +3505,44 @@ where
             }
 
             other => {
+                if let HirExpr::Ident(name, _) = other {
+                    if let Some(&cur) = self.var_map.get(name) {
+                        if !self.promoted_to_stack.contains(name) {
+                            if let Some(ty) = self.current_block_data.value_types.get(&cur).cloned()
+                            {
+                                let already_addressable = matches!(
+                                    ty,
+                                    SsaType::Pointer(_)
+                                        | SsaType::User(_, _)
+                                        | SsaType::Enum { .. }
+                                        | SsaType::Slice(_)
+                                        | SsaType::Owned(_)
+                                        | SsaType::Tuple(_)
+                                        | SsaType::Array(_, _)
+                                );
+                                if !already_addressable {
+                                    let slot = self.current_block_data.fresh_value();
+                                    self.emit(Instruction::StackAlloc {
+                                        dest: slot,
+                                        ty: ty.clone(),
+                                        count: 1,
+                                    });
+                                    self.current_block_data
+                                        .value_types
+                                        .insert(slot, SsaType::Pointer(Box::new(ty.clone())));
+                                    self.emit(Instruction::Store {
+                                        ptr: Operand::Value(slot),
+                                        value: Operand::Value(cur),
+                                    });
+                                    self.var_map.insert(*name, slot);
+                                    self.promoted_to_stack.insert(*name);
+                                    return (slot, ty);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let val = self.lower_expr(other);
                 match self.current_block_data.value_types.get(&val).cloned() {
                     Some(SsaType::Pointer(inner_ty)) => (val, *inner_ty),
