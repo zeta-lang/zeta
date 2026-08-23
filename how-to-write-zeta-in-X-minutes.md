@@ -8,9 +8,6 @@ import zeta::utils::mallocator.RawMallocator;
 import zeta::utils::mallocator.Mallocator;
 
 func main() {
-  	// No stdout for now
-    // It'd look like this
-    // StdOutWriter would be a zero-sized struct
     let writer: StdOutWriter = zeta::io.stdout();
     writer.writeln("Hello, world!");
 
@@ -218,12 +215,10 @@ func borrow_checking_and_move_semantics_with_arrays() {
     let mut other: [4]i64 = [10, 20, 30, 40];
 
     let left: &mut [4]i64 = &mut other;
-    let right: &mut [4]i64 = &mut other;
 
     // Since `left` mutates a thing in the array,
     // `right` may safely modify different things in the same array.
     left[0] = 15;
-    right[1] = 25;
 
     // Both variables remain valid because every element was copied.
     let x: i64 = arr[0];
@@ -253,11 +248,11 @@ func error_with_borrow_checking_and_move_semantics() {
         y: 6,
     };
 
+    // ERROR:
+    // Two mutable borrows are active at the same time
     let a: &mut Pair = &mut pair2;
     let b: &mut Pair = &mut pair2;
 
-    // ERROR:
-    // Two mutable borrows are active at the same use site.
     a.set_x(1);
     b.set_x(2);
 
@@ -293,4 +288,5 @@ func error_with_borrow_checking_and_move_semantics() {
     let moved_pair: Pair = pair3;
     borrow2.set_x(10);
 }
+
 ```
