@@ -164,6 +164,10 @@ func consume_pair(a: &mut i64, b: &mut i64) {
 }
 ```
 
+### Why Zeta?
+- Reliability: Ergonomic memory safety without a garbage collector like you have never seen
+- Performance: Build high performance no-gc applications that compile to machine code and utilize zero cost abstractions
+
 # Install Zeta (Linux)
 
 The recommended way to install Zeta is through the official release archive.
