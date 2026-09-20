@@ -4,9 +4,9 @@ use std::sync::Arc;
 use super::context::HirLowerer;
 use ir::ast::Stmt;
 use ir::ast::{FuncDecl, Path};
-use ir::hir::HirFunc;
 use ir::hir::HirFuncProto;
 use ir::hir::{Hir, HirModule, HirStmt, StrId};
+use ir::hir::{HirEnum, HirEnumVariant, HirField, HirFunc, HirInterface, HirStruct};
 use ir::hir::{HirParam, HirType};
 use ir::ir_hasher::FxHashMap;
 use ir::span::SourceSpan;
@@ -265,6 +265,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     pub fn collect_type_declarations(&mut self, stmts: &[Stmt<'a, 'bump>]) {
+        self.pre_register_type_names(stmts);
+
         for stmt in stmts {
             if let Stmt::InterfaceDecl(interface_decl) = stmt {
                 let hir_interface = self.lower_interface_decl(**interface_decl);
@@ -294,6 +296,71 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
             if let Stmt::Module(module_decl) = stmt {
                 self.collect_type_declarations(module_decl.body);
+            }
+        }
+    }
+
+    fn pre_register_type_names(&mut self, stmts: &[Stmt<'a, 'bump>]) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::StructDecl(s) => {
+                    let mangled = self.ctx.mangle_type_name(s.name);
+                    self.ctx
+                        .structs
+                        .borrow_mut()
+                        .entry(mangled)
+                        .or_insert(HirStruct {
+                            name: mangled,
+                            visibility: ir::hir_utils::lower_visibility(&s.visibility),
+                            generics: None,
+                            fields: self.ctx.bump.alloc_slice::<HirField>(&[]),
+                        });
+                    self.ctx
+                        .struct_owner_module
+                        .borrow_mut()
+                        .insert(mangled, self.ctx.module_idx);
+                }
+                Stmt::EnumDecl(e) => {
+                    let mangled = self.ctx.mangle_type_name(e.name);
+                    self.ctx
+                        .enums
+                        .borrow_mut()
+                        .entry(mangled)
+                        .or_insert(HirEnum {
+                            name: mangled,
+                            visibility: ir::hir_utils::lower_visibility(&e.visibility),
+                            generics: None,
+                            variants: self.ctx.bump.alloc_slice::<HirEnumVariant>(&[]),
+                        });
+                    self.ctx
+                        .enum_owner_module
+                        .borrow_mut()
+                        .insert(mangled, self.ctx.module_idx);
+                }
+                Stmt::InterfaceDecl(i) => {
+                    let is_builtin = matches!(
+                        i.name.as_str(),
+                        "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator"
+                    );
+                    let mangled =
+                        if is_builtin && !self.ctx.interfaces.borrow().contains_key(&i.name) {
+                            i.name
+                        } else {
+                            self.mangle_with_module_path(i.name)
+                        };
+                    self.ctx
+                        .interfaces
+                        .borrow_mut()
+                        .entry(mangled)
+                        .or_insert(HirInterface {
+                            name: mangled,
+                            visibility: ir::hir_utils::lower_visibility(&i.visibility),
+                            methods: None,
+                            generics: None,
+                        });
+                }
+                Stmt::Module(module_decl) => self.pre_register_type_names(module_decl.body),
+                _ => {}
             }
         }
     }
@@ -467,8 +534,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     imports.push(*import_stmt.path);
                 }
                 Stmt::Package(package_stmt) => {
-                    let joined = format!("{}", package_stmt.path);
-                    pkg_name = Some(StrId(self.ctx.context.intern(&joined)));
+                    pkg_name = Some(StrId(intern_fmt!(
+                        self.ctx.context,
+                        "{}",
+                        package_stmt.path
+                    )));
                 }
                 Stmt::Module(module_decl) => {
                     for &body_stmt in module_decl.body {
@@ -568,6 +638,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
         HirStmt::Block {
             body: self.ctx.bump.alloc_slice(&stmts),
+            span: block.span,
         }
     }
 
@@ -616,10 +687,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let body_vec: Vec<HirStmt<'a, 'bump>> =
                     b.block.into_iter().map(|s| self.lower_stmt(*s)).collect();
                 let body_slice = self.ctx.bump.alloc_slice(&body_vec);
-                let inner_block = self
-                    .ctx
-                    .bump
-                    .alloc_value_immutable(HirStmt::Block { body: body_slice });
+                let inner_block = self.ctx.bump.alloc_value_immutable(HirStmt::Block {
+                    body: body_slice,
+                    span: b.span,
+                });
                 let stmt = HirStmt::UnsafeBlock { body: inner_block };
                 Hir::Stmt(self.ctx.bump.alloc_value_immutable(stmt))
             }

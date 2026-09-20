@@ -1,4 +1,3 @@
-// TODO: this should be a directory in the future that auto imports everything it contains
 package zeta::io;
 
 import zeta::libc;
@@ -18,7 +17,7 @@ interface Writer {
         let written: usize = 0;
         while (written < bytes.len) {
             let n: usize = unsafe {
-                this.write_raw(bytes[written..bytes.len])
+                this.write_raw(bytes[written..<bytes.len])
             };
             if (n == 0) {
                 debug.debug_panic("Writer.write: write_raw made no progress");

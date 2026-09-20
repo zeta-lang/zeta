@@ -366,6 +366,11 @@ where
                 Ok(Pattern::Wildcard)
             }
 
+            TokenKind::Null => {
+                self.cursor.advance();
+                Ok(Pattern::Null)
+            }
+
             TokenKind::Number => {
                 let tok = self.cursor.bump();
                 let text = tok.text.unwrap_or_default();

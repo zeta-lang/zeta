@@ -178,6 +178,7 @@ impl CfgBuilder {
                 cond,
                 then_block,
                 else_block,
+                span: _,
             } => {
                 self.visit_expr_control_flow(entry, cond);
 
@@ -265,9 +266,13 @@ impl CfgBuilder {
                 Some(after)
             }
 
-            HirStmt::Block { body } => self.visit_block(entry, body),
+            HirStmt::Block { body, span: _ } => self.visit_block(entry, body),
 
-            HirStmt::Match { expr, arms } => {
+            HirStmt::Match {
+                expr,
+                arms,
+                span: _,
+            } => {
                 self.visit_expr_control_flow(entry, expr);
 
                 let mut tails = Vec::new();
@@ -311,7 +316,7 @@ impl CfgBuilder {
                 None
             }
 
-            HirStmt::Return(value) => {
+            HirStmt::Return(value, _span) => {
                 if let Some(v) = *value {
                     self.visit_expr_control_flow(entry, v);
                 }

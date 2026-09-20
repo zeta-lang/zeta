@@ -41,6 +41,10 @@ impl StrId {
         StrId(vm_string)
     }
 
+    pub const fn from_static(s: &'static str) -> Self {
+        Self(VmString::from_static(s))
+    }
+
     pub fn into_inner(self) -> VmString {
         self.0
     }
@@ -66,6 +70,16 @@ impl PartialEq<&StrId> for StrId {
 
     fn ne(&self, other: &&StrId) -> bool {
         self != *other
+    }
+}
+
+impl PartialEq<&str> for StrId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+
+    fn ne(&self, other: &&str) -> bool {
+        self.as_str() != *other
     }
 }
 
@@ -123,6 +137,7 @@ pub enum IntrinsicKind {
     CpuRelax,
     Unreachable,
     Reinterpret,
+    Replace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -289,6 +304,7 @@ pub enum ThisPassingKind {
     /// `mut this`
     MoveMut,
     MultiPlace,
+    RefAlias,
 }
 
 impl Display for ThisPassingKind {
@@ -303,6 +319,7 @@ impl Display for ThisPassingKind {
             ThisPassingKind::Move => write!(f, "this"),
             ThisPassingKind::MoveMut => write!(f, "mut this"),
             ThisPassingKind::MultiPlace => write!(f, "this.{{..}}"),
+            ThisPassingKind::RefAlias => write!(f, "&alias this"),
         }
     }
 }
@@ -355,6 +372,7 @@ impl<'a, 'bump> HirParam<'a, 'bump> {
 pub struct HirGeneric<'a, 'bump> {
     pub name: StrId,
     pub constraints: &'bump [HirType<'a, 'bump>],
+    pub default_type: Option<HirType<'a, 'bump>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -393,7 +411,7 @@ where
     },
     Ref {
         inner: &'a HirType<'a, 'bump>,
-        mutability_state: MutabilityState,
+        ref_kind: RefKind,
         provenance: Option<ProvenanceAnnotation<'bump>>,
     },
     UnsafePointer {
@@ -459,12 +477,13 @@ where
         span: SourceSpan<'a>,
     },
     Const(&'bump ConstStmt<'a, 'bump>),
-    Return(Option<&'bump HirExpr<'a, 'bump>>),
+    Return(Option<&'bump HirExpr<'a, 'bump>>, SourceSpan<'a>),
     Expr(&'bump HirExpr<'a, 'bump>),
     If {
         cond: HirExpr<'a, 'bump>,
         then_block: &'bump [HirStmt<'a, 'bump>],
         else_block: Option<&'bump HirStmt<'a, 'bump>>,
+        span: SourceSpan<'a>,
     },
     While {
         cond: &'bump HirExpr<'a, 'bump>,
@@ -479,12 +498,14 @@ where
     Match {
         expr: &'bump HirExpr<'a, 'bump>,
         arms: &'bump [HirMatchArm<'a, 'bump>],
+        span: SourceSpan<'a>,
     },
     UnsafeBlock {
         body: &'bump HirStmt<'a, 'bump>,
     },
     Block {
         body: &'bump [HirStmt<'a, 'bump>],
+        span: SourceSpan<'a>,
     },
     Break(Option<&'bump HirExpr<'a, 'bump>>, SourceSpan<'a>),
     Continue(SourceSpan<'a>),
@@ -546,6 +567,7 @@ pub enum HirPattern<'bump> {
     },
     Or(&'bump [HirPattern<'bump>]),
     Wildcard,
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -661,7 +683,7 @@ where
     },
     Ref {
         expr: &'bump HirExpr<'a, 'bump>,
-        mutable: bool,
+        ref_kind: RefKind,
         span: SourceSpan<'a>,
     },
     This {
@@ -860,19 +882,18 @@ where
             HirType::Char => write!(f, "char"),
             HirType::Ref {
                 inner,
-                mutability_state,
+                ref_kind,
                 provenance,
             } => {
                 write!(f, "&")?;
-
-                if let Some(provenance) = provenance {
-                    write!(f, "{} ", provenance)?;
+                if let Some(p) = provenance {
+                    write!(f, "{} ", p)?;
                 }
-
-                if let MutabilityState::Mut = mutability_state {
-                    write!(f, "mut ")?;
+                match ref_kind {
+                    RefKind::Unique => write!(f, "mut ")?,
+                    RefKind::Alias => write!(f, "alias ")?,
+                    RefKind::Shared => {}
                 }
-
                 write!(f, "{inner}")
             }
             HirType::Nullable(hir_type) => write!(f, "{}?", hir_type),
@@ -1115,18 +1136,61 @@ pub struct HirModuleAccess<'a, 'bump> {
 pub struct HirLambdaParam<'a, 'bump> {
     pub name: StrId,
     pub param_type: Option<HirType<'a, 'bump>>,
+    pub multi_place: Option<&'bump [HirEffectAccess<'bump>]>,
     pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirEffectAccess<'bump> {
-    pub mutable: bool,
-    pub path: &'bump [HirEffectSegment],
+    pub ref_kind: RefKind,
+    pub path: &'bump [HirEffectSegment<'bump>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HirEffectSegment {
+pub enum HirEffectSegment<'bump> {
     Field(StrId),
-    IndexConst(i64),
-    IndexOpaque,
+    Index(EffectIndexKey<'bump>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectIndexKey<'bump> {
+    Const(i64),
+    Place { root: StrId, path: &'bump [StrId] },
+    Dynamic,
+}
+
+impl<'bump> EffectIndexKey<'bump> {
+    pub fn provably_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EffectIndexKey::Const(a), EffectIndexKey::Const(b)) => a == b,
+            (
+                EffectIndexKey::Place { root: ra, path: pa },
+                EffectIndexKey::Place { root: rb, path: pb },
+            ) => ra == rb && pa == pb,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefKind {
+    Shared, // &
+    Alias,  // &alias
+    Unique, // &mut
+}
+
+impl RefKind {
+    /// Unique -> Alias -> Shared.
+    pub fn coerces_to(self, target: RefKind) -> bool {
+        use RefKind::*;
+        matches!(
+            (self, target),
+            (Unique, Unique)
+                | (Unique, Alias)
+                | (Unique, Shared)
+                | (Alias, Alias)
+                | (Alias, Shared)
+                | (Shared, Shared)
+        )
+    }
 }

@@ -27,7 +27,7 @@ impl CPathBuf {
         if (bytes.len >= 4096) {
             debug.debug_panic("path exceeds max length");
         }
-        let mut cbuf: CPathBuf = CPathBuf { buf: undefined, len: bytes.len };
+        let mut cbuf: CPathBuf = CPathBuf { buf: uninit, len: bytes.len };
         for (let i: usize = 0; i < bytes.len; i += 1) {
             cbuf.buf[i] = bytes[i];
         }
@@ -102,7 +102,7 @@ impl FileReader by ReadChannel {
     func read_exact(&mut this, buffer: &[]u8): Result<usize, IOError> {
         let mut filled: usize = 0;
         while (filled < buffer.len) {
-            let n: usize = match (unsafe { this.read_raw(buffer[filled..buffer.len]) }) {
+            let n: usize = match (unsafe { this.read_raw(buffer[filled..<buffer.len]) }) {
                 case Result.Ok { value } -> value,
                 case Result.Err { error } -> return Result.Err { error },
             };
@@ -130,9 +130,9 @@ impl FileReader by ReadChannel {
         return Result.Ok { value: count };
     }
 
-    func read_to_end<A: Allocator>(&mut this, out: &ArrayList<u8, A>): Result<usize, IOError> {
+    func read_to_end<A: Allocator>(&mut this, out: &ArrayList<u8, A>): Result<usize, IOError> { // line 133
         let mut total: usize = 0;
-        let mut chunk: [4096]u8 = undefined;
+        let mut chunk: [4096]u8 = uninit;
         while (true) {
             let n: usize = match (unsafe { this.read_raw(&chunk) }) {
                 case Result.Ok { value } -> value,
@@ -149,7 +149,7 @@ impl FileReader by ReadChannel {
 
     func read_line<A: Allocator>(&mut this, out: &String<A>): Result<usize, IOError> {
         let mut total: usize = 0;
-        let mut byte: [1]u8 = undefined;
+        let mut byte: [1]u8 = uninit;
         while (true) {
             let n: usize = match (unsafe { this.read_raw(&mut byte) }) {
                 case Result.Ok { value } -> value,
@@ -173,7 +173,7 @@ impl FileWriter {
     func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
         let mut written: usize = 0;
         while (written < bytes.len) {
-            let n: usize = match (unsafe { this.write_raw(bytes[written..bytes.len]) }) {
+            let n: usize = match (unsafe { this.write_raw(bytes[written..<bytes.len]) }) {
                 case Result.Ok { value } -> value,
                 case Result.Err { error } -> return Result.Err { error },
             };
@@ -185,10 +185,15 @@ impl FileWriter {
         return Result.Ok { value: written };
     }
 
-    func writeln(&mut this, s: str): Result<bool, IOError> {
+    func writeln(&mut this, s: str): Result<usize, IOError> {
         return match (this.write_all(s.as_bytes())) {
             case Result.Err { error } -> Result.Err { error },
-            case Result.Ok { value } -> this.write_all("\n".as_bytes()),
+            case Result.Ok { value } -> {
+                match (this.write_all("\n".as_bytes())) {
+                    case Result.Err { error } -> Result.Err { error },
+                    case Result.Ok { value: second_value } -> Result.Ok { value: value + second_value },
+                }
+            },
         }
     }
 

@@ -3,10 +3,14 @@ use std::sync::Arc;
 use crate::hir_lowerer::module_lowering::{ImplTargetKind, primitive_hir_type};
 
 use super::context::HirLowerer;
-use ir::ast::{FuncDecl, Generic, InterfaceDecl, Param, ParamPassingKind, StructDecl};
+use ir::ast::{
+    EffectAccess, EffectSegment, FuncDecl, Generic, InterfaceDecl, Param, ParamPassingKind,
+    StructDecl,
+};
 use ir::hir::{
-    ConstStmt, HirEnum, HirEnumVariant, HirField, HirFunc, HirGeneric, HirImpl, HirInterface,
-    HirParam, HirStmt, HirStruct, HirType, StrId, ThisPassingKind,
+    ConstStmt, EffectIndexKey, HirEffectAccess, HirEffectSegment, HirEnum, HirEnumVariant,
+    HirField, HirFunc, HirGeneric, HirImpl, HirInterface, HirParam, HirStmt, HirStruct, HirType,
+    StrId, ThisPassingKind,
 };
 use ir::hir_utils::lower_visibility;
 use ir::span::SourceSpan;
@@ -51,6 +55,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 b.block.into_iter().map(|s| self.lower_stmt(*s)).collect();
             HirStmt::Block {
                 body: self.ctx.bump.alloc_slice(&stmts),
+                span: b.span,
             }
         });
 
@@ -98,9 +103,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .map(|ty| self.lower_type(ty, g.span))
                     .collect();
 
+                let default_type = g
+                    .default_type
+                    .as_ref()
+                    .map(|ty| self.lower_type(ty, g.span));
+
                 HirGeneric {
                     name: g.type_name,
                     constraints: self.ctx.bump.alloc_slice_immutable(&constraints_vec),
+                    default_type,
                 }
             })
             .collect();
@@ -120,6 +131,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     name: p.name,
                     param_type: self.lower_type(&p.type_annotation, p.span),
                     span: p.span,
+                    multi_place: self.lower_multi_place(p.multi_place),
                 },
                 Param::This(tp) => HirParam::This {
                     kind: match tp.passing_kind {
@@ -131,7 +143,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         ParamPassingKind::ConstSafePtr => ThisPassingKind::ConstSafePtr,
                         ParamPassingKind::Move => ThisPassingKind::Move,
                         ParamPassingKind::MoveMut => ThisPassingKind::MoveMut,
+                        ParamPassingKind::MultiPlace => ThisPassingKind::MultiPlace,
+                        ParamPassingKind::RefAlias => ThisPassingKind::RefAlias,
                     },
+                    multi_place: self.lower_multi_place(tp.multi_place),
                     span: tp.span,
                 },
             })
@@ -247,10 +262,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     ),
                     i.span,
                 );
-                (
-                    StrId(self.ctx.context.intern("<error>")),
-                    ImplTargetKind::UserType,
-                )
+                (StrId::from_static("<error>"), ImplTargetKind::UserType)
             }
         };
         let target_generics = self.lower_impl_type_args(&i.target, i.span);
@@ -471,6 +483,64 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             declaring_module_idx: self.ctx.module_idx,
             impl_target: None,
             span: func.span,
+        }
+    }
+
+    pub(crate) fn lower_multi_place(
+        &self,
+        multi_place: Option<&[EffectAccess<'a, 'bump>]>,
+    ) -> Option<&'bump [HirEffectAccess<'bump>]> {
+        multi_place.map(|ast_mps| {
+            let mut hir_mps = Vec::with_capacity(ast_mps.len());
+            for ast_mp in ast_mps {
+                let hir_path: Vec<HirEffectSegment<'bump>> = ast_mp
+                    .path
+                    .iter()
+                    .map(|seg| match seg {
+                        EffectSegment::Field(str_id) => HirEffectSegment::Field(*str_id),
+                        EffectSegment::Index(expr) => {
+                            HirEffectSegment::Index(self.lower_effect_index_key(expr))
+                        }
+                    })
+                    .collect();
+
+                hir_mps.push(HirEffectAccess {
+                    ref_kind: Self::lower_ref_kind(ast_mp.ref_kind),
+                    path: self.ctx.bump.alloc_slice_immutable(&hir_path),
+                });
+            }
+            &*self.ctx.bump.alloc_slice_immutable(&hir_mps)
+        })
+    }
+
+    fn lower_effect_index_key(&self, expr: &ir::ast::Expr<'a, 'bump>) -> EffectIndexKey<'bump> {
+        if let ir::ast::Expr::Number { value, .. } = expr {
+            return EffectIndexKey::Const(*value);
+        }
+        let this_id = StrId::from_static("this");
+        match Self::ast_static_field_path(expr, this_id) {
+            Some((root, path)) => EffectIndexKey::Place {
+                root,
+                path: self.ctx.bump.alloc_slice_immutable(&path),
+            },
+            None => EffectIndexKey::Dynamic,
+        }
+    }
+
+    fn ast_static_field_path(
+        expr: &ir::ast::Expr<'a, 'bump>,
+        this_id: StrId,
+    ) -> Option<(StrId, Vec<StrId>)> {
+        match expr {
+            ir::ast::Expr::Ident { name, .. } => Some((*name, Vec::new())),
+            ir::ast::Expr::This { .. } => Some((this_id, Vec::new())),
+            ir::ast::Expr::FieldAccess { object, field, .. }
+            | ir::ast::Expr::Get { object, field, .. } => {
+                let (root, mut path) = Self::ast_static_field_path(object, this_id)?;
+                path.push(*field);
+                Some((root, path))
+            }
+            _ => None,
         }
     }
 }

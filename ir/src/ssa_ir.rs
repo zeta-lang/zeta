@@ -171,42 +171,43 @@ pub enum SsaType {
 }
 
 impl fmt::Display for SsaType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SsaType::I8 => todo!(),
-            SsaType::U8 => todo!(),
-            SsaType::I16 => todo!(),
-            SsaType::U16 => todo!(),
-            SsaType::I32 => todo!(),
-            SsaType::U32 => todo!(),
-            SsaType::I64 => todo!(),
-            SsaType::U64 => todo!(),
-            SsaType::I128 => todo!(),
-            SsaType::U128 => todo!(),
-            SsaType::F32 => todo!(),
-            SsaType::F64 => todo!(),
-            SsaType::Isize => todo!(),
-            SsaType::Usize => todo!(),
-            SsaType::Null => todo!(),
-            SsaType::Bool => todo!(),
-            SsaType::String => todo!(),
-            SsaType::Void => todo!(),
-            SsaType::User(str_id, ssa_types) => todo!(),
-            SsaType::Interface(str_id) => todo!(),
-            SsaType::Enum { name, variants } => todo!(),
-            SsaType::Tuple(ssa_types) => todo!(),
-            SsaType::Pointer(ssa_type) => todo!(),
-            SsaType::Owned(ssa_type) => todo!(),
-            SsaType::Dyn => todo!(),
-            SsaType::Slice(ssa_type) => todo!(),
-            SsaType::Array(ssa_type, _) => todo!(),
-            SsaType::Char => todo!(),
-            SsaType::Nullable(ssa_type) => todo!(),
-            SsaType::FuncPointer {
-                params,
-                return_type,
-            } => todo!(),
-        });
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+        // f.write_str(match self {
+        //     SsaType::I8 => todo!(),
+        //     SsaType::U8 => todo!(),
+        //     SsaType::I16 => todo!(),
+        //     SsaType::U16 => todo!(),
+        //     SsaType::I32 => todo!(),
+        //     SsaType::U32 => todo!(),
+        //     SsaType::I64 => todo!(),
+        //     SsaType::U64 => todo!(),
+        //     SsaType::I128 => todo!(),
+        //     SsaType::U128 => todo!(),
+        //     SsaType::F32 => todo!(),
+        //     SsaType::F64 => todo!(),
+        //     SsaType::Isize => todo!(),
+        //     SsaType::Usize => todo!(),
+        //     SsaType::Null => todo!(),
+        //     SsaType::Bool => todo!(),
+        //     SsaType::String => todo!(),
+        //     SsaType::Void => todo!(),
+        //     SsaType::User(str_id, ssa_types) => todo!(),
+        //     SsaType::Interface(str_id) => todo!(),
+        //     SsaType::Enum { name, variants } => todo!(),
+        //     SsaType::Tuple(ssa_types) => todo!(),
+        //     SsaType::Pointer(ssa_type) => todo!(),
+        //     SsaType::Owned(ssa_type) => todo!(),
+        //     SsaType::Dyn => todo!(),
+        //     SsaType::Slice(ssa_type) => todo!(),
+        //     SsaType::Array(ssa_type, _) => todo!(),
+        //     SsaType::Char => todo!(),
+        //     SsaType::Nullable(ssa_type) => todo!(),
+        //     SsaType::FuncPointer {
+        //         params,
+        //         return_type,
+        //     } => todo!(),
+        // });
     }
 }
 
@@ -320,24 +321,6 @@ pub enum Instruction {
         dest: Value,
         base: Operand,
         offset: usize,
-    },
-
-    /// Interpolation (string concatenation)
-    Interpolate {
-        dest: Value,
-        parts: SmallVec<InterpolationOperand, 4>, // usually <=4 parts
-    },
-
-    EnumConstruct {
-        dest: Value,
-        enum_name: StrId,
-        variant: StrId,
-        args: SmallVec<Operand, 8>, // usually <=8 fields
-    },
-
-    MatchEnum {
-        value: Value,
-        arms: SmallVec<(StrId, BlockId), 8>, // usually <=8 arms
     },
 
     Jump {
@@ -599,10 +582,7 @@ pub enum BinOp {
 pub fn inst_is_terminator(inst: &Instruction) -> bool {
     matches!(
         inst,
-        Instruction::Jump { .. }
-            | Instruction::Branch { .. }
-            | Instruction::Ret { .. }
-            | Instruction::MatchEnum { .. } // lower this to br_table (terminator)
+        Instruction::Jump { .. } | Instruction::Branch { .. } | Instruction::Ret { .. }
     )
 }
 
@@ -686,8 +666,6 @@ pub fn cast_kind(src: &SsaType, dst: &SsaType) -> CastKind {
     panic!("unsupported cast {:?} -> {:?}", src, dst);
 }
 
-/// Which flavor of allocator interface a struct implements, needed to pick
-/// the free-call shape at drop time
 #[derive(Copy, Clone, Debug)]
 pub enum AllocatorKind {
     /// Implements `Allocator`: has a `free<T>(&mut this, ^Self T)` that

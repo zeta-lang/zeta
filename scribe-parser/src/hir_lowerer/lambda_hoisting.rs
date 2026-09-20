@@ -1,6 +1,7 @@
 use ir::ast::{ExternModifier, FuncSafety, InlineModifier, Visibility};
 use ir::hir::{
-    FuncModifiers, Hir, HirExpr, HirFieldInit, HirFunc, HirModule, HirParam, HirStmt, StrId,
+    FuncModifiers, Hir, HirExpr, HirFieldInit, HirFunc, HirLambdaParam, HirModule, HirParam,
+    HirStmt, StrId,
 };
 use std::sync::Arc;
 use zetaruntime::arena::GrowableAtomicBump;
@@ -100,9 +101,9 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 else_block,
                 span,
             },
-            HirStmt::Return(Some(expr)) => {
+            HirStmt::Return(Some(expr), span) => {
                 let new_expr = self.rewrite_expr(*expr);
-                HirStmt::Return(Some(self.bump.alloc_value_immutable(new_expr)))
+                HirStmt::Return(Some(self.bump.alloc_value_immutable(new_expr)), span)
             }
             HirStmt::Expr(expr) => {
                 let new_expr = self.rewrite_expr(*expr);
@@ -112,6 +113,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 cond,
                 then_block,
                 else_block,
+                span,
             } => {
                 let new_cond = self.rewrite_expr(cond);
                 let new_then: Vec<HirStmt<'a, 'bump>> =
@@ -125,6 +127,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     cond: new_cond,
                     then_block: new_then_slice,
                     else_block: new_else,
+                    span,
                 }
             }
             HirStmt::While { cond, body } => {
@@ -161,7 +164,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     body: self.bump.alloc_value_immutable(new_body),
                 }
             }
-            HirStmt::Match { expr, arms } => {
+            HirStmt::Match { expr, arms, span } => {
                 let new_expr = self.rewrite_expr(*expr);
                 let new_arms: Vec<ir::hir::HirMatchArm<'a, 'bump>> = arms
                     .iter()
@@ -181,6 +184,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 HirStmt::Match {
                     expr: self.bump.alloc_value_immutable(new_expr),
                     arms: self.bump.alloc_slice(&new_arms),
+                    span,
                 }
             }
             HirStmt::UnsafeBlock { body } => {
@@ -189,11 +193,12 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     body: self.bump.alloc_value_immutable(new_body),
                 }
             }
-            HirStmt::Block { body } => {
+            HirStmt::Block { body, span } => {
                 let new_body: Vec<HirStmt<'a, 'bump>> =
                     body.iter().map(|s| self.rewrite_stmt(*s)).collect();
                 HirStmt::Block {
                     body: self.bump.alloc_slice(&new_body),
+                    span,
                 }
             }
             HirStmt::Defer(inner) => {
@@ -382,7 +387,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
 
                 let hir_params: Vec<HirParam<'a, 'bump>> = params
                     .iter()
-                    .map(|p| HirParam::Normal {
+                    .map(|p: &HirLambdaParam<'a, 'bump>| HirParam::Normal {
                         name: p.name,
                         param_type: p.param_type.unwrap_or_else(|| {
                             panic!(
@@ -391,6 +396,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                                 p.name
                             )
                         }),
+                        multi_place: p.multi_place,
                         span: p.span,
                     })
                     .collect();
@@ -553,13 +559,13 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             }
             HirExpr::Ref {
                 expr,
-                mutable,
+                ref_kind: mutable,
                 span,
             } => {
                 let new_inner = self.rewrite_expr(*expr);
                 HirExpr::Ref {
                     expr: self.bump.alloc_value(new_inner),
-                    mutable,
+                    ref_kind: mutable,
                     span,
                 }
             }

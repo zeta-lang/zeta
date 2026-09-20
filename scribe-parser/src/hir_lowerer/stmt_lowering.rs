@@ -11,6 +11,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             Stmt::Return(r) => HirStmt::Return(
                 r.value
                     .map(|v| self.ctx.bump.alloc_value_immutable(self.lower_expr(v))),
+                r.span,
             ),
             Stmt::ExprStmt(e) => {
                 HirStmt::Expr(self.ctx.bump.alloc_value_immutable(self.lower_expr(e.expr)))
@@ -25,6 +26,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .collect();
                 let body = self.ctx.bump.alloc_value_immutable(HirStmt::Block {
                     body: self.ctx.bump.alloc_slice(&body_vec),
+                    span: while_stmt.block.span,
                 });
                 HirStmt::While {
                     cond: self
@@ -43,6 +45,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .collect();
                 let body = self.ctx.bump.alloc_value_immutable(HirStmt::Block {
                     body: self.ctx.bump.alloc_slice(&body_vec),
+                    span: for_stmt.block.span,
                 });
 
                 match &for_stmt.kind {
@@ -87,6 +90,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                                 a.block.into_iter().map(|s| self.lower_stmt(*s)).collect();
                             let body = self.ctx.bump.alloc_value_immutable(HirStmt::Block {
                                 body: self.ctx.bump.alloc_slice(&body_vec),
+                                span: a.block.span,
                             });
                             HirMatchArm {
                                 pattern: self.lower_pattern(&a.pattern),
@@ -105,6 +109,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .bump
                         .alloc_value_immutable(self.lower_expr(&match_stmt.expr)),
                     arms,
+                    span: match_stmt.span,
                 }
             }
 
@@ -117,7 +122,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let body_vec: Vec<HirStmt<'a, 'bump>> =
                     block.into_iter().map(|s| self.lower_stmt(*s)).collect();
                 let body = self.ctx.bump.alloc_slice(&body_vec);
-                HirStmt::Block { body }
+                HirStmt::Block {
+                    body,
+                    span: block.span,
+                }
             }
 
             Stmt::FuncDecl(_)
@@ -130,16 +138,22 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 panic!("Declaration statements should not appear in function bodies");
             }
 
-            Stmt::Import(_import_stmt) => {
+            Stmt::Import(import_stmt) => {
                 // Import statements are handled at module level for dependency tracking
                 // Return a no-op statement here
-                HirStmt::Block { body: &[] }
+                HirStmt::Block {
+                    body: &[],
+                    span: import_stmt.span,
+                }
             }
 
-            Stmt::Package(_package_stmt) => {
+            Stmt::Package(package_stmt) => {
                 // Package statements are handled at module level for dependency tracking
                 // Return a no-op statement here
-                HirStmt::Block { body: &[] }
+                HirStmt::Block {
+                    body: &[],
+                    span: package_stmt.span,
+                }
             }
 
             Stmt::Const(const_stmt) => HirStmt::Const(
@@ -156,7 +170,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .collect();
                 let body = self.ctx.bump.alloc_slice(&body_vec);
                 HirStmt::UnsafeBlock {
-                    body: self.ctx.bump.alloc_value_immutable(HirStmt::Block { body }),
+                    body: self.ctx.bump.alloc_value_immutable(HirStmt::Block {
+                        body,
+                        span: unsafe_block.span,
+                    }),
                 }
             }
 
@@ -167,7 +184,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         let body_vec: Vec<HirStmt<'a, 'bump>> =
                             block.into_iter().map(|s| self.lower_stmt(*s)).collect();
                         let body = self.ctx.bump.alloc_slice(&body_vec);
-                        HirStmt::Block { body }
+                        HirStmt::Block {
+                            body,
+                            span: block.span,
+                        }
                     }
                     DeferAction::Stmt(stmt) => self.lower_stmt(**stmt),
                 };
@@ -181,7 +201,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .map(|s| self.lower_stmt(*s))
                     .collect();
                 let body = self.ctx.bump.alloc_slice(&body_vec);
-                HirStmt::Block { body }
+                HirStmt::Block {
+                    body,
+                    span: module_decl.span,
+                }
             }
         }
     }
@@ -204,6 +227,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             cond,
             then_block,
             else_block,
+            span: i.span,
         }
     }
 
@@ -215,7 +239,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .map(|s| self.lower_stmt(*s))
                     .collect();
                 let body = self.ctx.bump.alloc_slice(&body_vec);
-                HirStmt::Block { body }
+                HirStmt::Block {
+                    body,
+                    span: else_block.span,
+                }
             }
 
             ElseBranch::If(else_if) => self.lower_stmt(Stmt::If(else_if)),
@@ -285,7 +312,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     body,
                 } => {
                     let (hir_error_type, body_stmts) = lower_branch(error_type, *binding, body);
-                    let HirStmt::Block { body } = body_stmts else {
+                    let HirStmt::Block { body, span: _ } = body_stmts else {
                         unreachable!()
                     };
                     HirErrorHandlerPattern::Single {
@@ -300,7 +327,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .map(|b| {
                             let (hir_error_type, body_stmts) =
                                 lower_branch(&b.error_type, b.binding, b.body);
-                            let HirStmt::Block { body } = body_stmts else {
+                            let HirStmt::Block { body, span: _ } = body_stmts else {
                                 unreachable!()
                             };
                             HirErrorHandlerBranch {

@@ -19,7 +19,7 @@ impl str {
         let len: usize = unsafe { *($reinterpret<[*]const usize>(this)) };
         unsafe {
             let data_ptr: [*]const u8 = $reinterpret<[*]const u8>($reinterpret<usize>(this) + 8);
-            return data_ptr[0..len];
+            return data_ptr[0..<len];
         }
     }
 }
@@ -27,14 +27,19 @@ impl str {
 struct Utf8ConversionError {}
 
 
+import zeta::libc;
+
 func debug_panic(msg: str): never {
-    let mut w: FileWriter = File.stderr().writer();
-    // Best-effort: if writing the panic message itself fails, there's
-    // nothing more useful to do than abort anyway.
-    let _: Result<usize, IOError> = w.write_all("panic: ".as_bytes());
-    let _: Result<usize, IOError> = w.write_all(msg.as_bytes());
-    let _: Result<usize, IOError> = w.write_all("\n".as_bytes());
-    unsafe { libc.abort(); }
+    let fd: i32 = 2;
+    let prefix: &[]u8 = "panic: ".as_bytes();
+    let body: &[]u8 = msg.as_bytes();
+    let nl: &[]u8 = "\n".as_bytes();
+    unsafe {
+        let _: isize = libc.write(fd, prefix as [*]const void, prefix.len);
+        let _: isize = libc.write(fd, body as [*]const void, body.len);
+        let _: isize = libc.write(fd, nl as [*]const void, nl.len);
+        libc.abort();
+    }
     $unreachable();
 }
 

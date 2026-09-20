@@ -1,7 +1,7 @@
 use codex_dependency_graph::dep_graph::DepGraph;
 use ir::auto_imports::AutoImportRegistry;
 use ir::errors::reporter::ErrorReporter;
-use ir::hir::{HirEnum, HirExpr, HirFuncProto};
+use ir::hir::{HirEnum, HirExpr, HirFuncProto, RefKind};
 use ir::hir::{HirFunc, HirInterface, HirStruct, HirType, StrId};
 use ir::ir_hasher::{FxHashBuilder, FxHashMap};
 use ir::registry::global_registry::GlobalRegistry;
@@ -243,5 +243,13 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn get_generic_params(&self) -> HashSet<StrId> {
         self.ctx.generic_params.borrow().clone()
+    }
+
+    pub(crate) fn lower_ref_kind(ref_kind: ir::ast::RefKind) -> RefKind {
+        match ref_kind {
+            ir::ast::RefKind::Shared => RefKind::Shared,
+            ir::ast::RefKind::Alias => RefKind::Alias,
+            ir::ast::RefKind::Unique => RefKind::Unique,
+        }
     }
 }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
     Block, EffectAccess, EffectSegment, Generic, MatchArm, MutabilityState, NormalParam, Param,
-    ParamPassingKind, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, ThisParam, Type,
-    TypeKind, Visibility,
+    ParamPassingKind, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, RefKind,
+    ThisParam, Type, TypeKind, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::tokens::TokenKind::LBracket;
@@ -15,7 +15,7 @@ impl<'a, 'bump> DescentParser<'a, 'bump>
 where
     'bump: 'a,
 {
-    fn parse_multi_place(
+    pub fn parse_multi_place(
         &mut self,
     ) -> Result<Option<&'bump [EffectAccess<'a, 'bump>]>, DiagnosticError<'a>> {
         if self.cursor.peek() != TokenKind::Dot {
@@ -33,7 +33,13 @@ where
         while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
             let amp_span = self.cursor.peek_token().span;
             self.cursor.expect(TokenKind::BitAnd)?;
-            let mutable = self.cursor.consume(TokenKind::Mut);
+            let ref_kind = if self.cursor.consume(TokenKind::Mut) {
+                RefKind::Unique
+            } else if self.cursor.consume(TokenKind::Alias) {
+                RefKind::Alias
+            } else {
+                RefKind::Shared
+            };
 
             let mut path = Vec::new();
             let (first, _) = self.cursor.expect_ident()?;
@@ -53,7 +59,7 @@ where
                 }
             }
             accesses.push(EffectAccess {
-                mutable,
+                ref_kind,
                 path: self.bump.alloc_slice_immutable(&path),
                 span: amp_span,
             });
@@ -76,6 +82,7 @@ where
         self.cursor.bump(); // consume '<'
 
         let mut generics = Vec::new();
+        let mut has_seen_default = false;
 
         loop {
             let is_const = self.cursor.consume(TokenKind::Const);
@@ -104,12 +111,26 @@ where
                 &[]
             };
 
+            let default_type = if self.cursor.consume(TokenKind::Assign) {
+                has_seen_default = true;
+                Some(self.parse_type()?)
+            } else {
+                if has_seen_default {
+                    return Err(DiagnosticError::new(
+                        ParseErrorKind::GenericWithoutDefaultAfterDefault,
+                        span,
+                    ));
+                }
+                None
+            };
+
             generics.push(Generic {
                 type_name: name,
                 span,
                 is_const,
                 is_static,
                 constraints,
+                default_type,
             });
 
             if !self.cursor.consume(TokenKind::Comma) {
@@ -195,6 +216,7 @@ where
                 let this_token = self.cursor.expect(TokenKind::This)?;
                 Param::This(self.bump.alloc_value_immutable(ThisParam {
                     passing_kind,
+                    multi_place: None,
                     span: this_token.span,
                 }))
             } else if self.cursor.peek() == TokenKind::This {
@@ -217,6 +239,7 @@ where
                 let token = self.cursor.expect(TokenKind::This)?;
                 Param::This(self.bump.alloc_value_immutable(ThisParam {
                     passing_kind: ParamPassingKind::MoveMut,
+                    multi_place: None,
                     span: token.span,
                 }))
             } else {
@@ -330,6 +353,8 @@ where
 
                 if self.cursor.consume(TokenKind::Mut) {
                     Ok(ParamPassingKind::RefMut)
+                } else if self.cursor.consume(TokenKind::Alias) {
+                    Ok(ParamPassingKind::RefAlias)
                 } else {
                     Ok(ParamPassingKind::RefConst)
                 }
@@ -411,10 +436,12 @@ where
 
                     return Ok(Type { kind, nullable });
                 } else {
-                    let mutability_state = if cursor.consume(TokenKind::Mut) {
-                        MutabilityState::Mut
+                    let ref_kind = if cursor.consume(TokenKind::Mut) {
+                        RefKind::Unique
+                    } else if cursor.consume(TokenKind::Alias) {
+                        RefKind::Alias
                     } else {
-                        MutabilityState::Const
+                        RefKind::Shared
                     };
 
                     let is_dyn = cursor.consume(TokenKind::Dyn);
@@ -433,7 +460,7 @@ where
                                     },
                                     nullable: false,
                                 }),
-                                mutability_state: MutabilityState::Const,
+                                ref_kind: RefKind::Shared,
                                 provenance,
                             },
                             nullable: false,
@@ -445,7 +472,7 @@ where
                     return Ok(Type {
                         kind: TypeKind::Ref {
                             inner: bump.alloc_value_immutable(inner),
-                            mutability_state,
+                            ref_kind,
                             provenance,
                         },
                         nullable,

@@ -71,11 +71,20 @@ impl BuildHasher for IdentityBuild {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct VmString {
     pub offset: *const u8,
     pub length: usize,
+}
+
+impl VmString {
+    pub const fn from_static(s: &'static str) -> Self {
+        Self {
+            offset: s.as_ptr(),
+            length: s.len(),
+        }
+    }
 }
 
 impl fmt::Debug for VmString {

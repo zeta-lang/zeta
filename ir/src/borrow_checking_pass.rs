@@ -2,8 +2,8 @@ use crate::{hir::StrId, ir_hasher::FxHashMap};
 
 use crate::borrow_checker::{
     AliasReasoner, BorrowChecker, BorrowError, BorrowKind, BorrowResult, Bound, IndexContainer,
-    Interval, Loan, LoanId, MemoryRelation, Place, PlaceId, Projection, Provenance, ProvenanceId,
-    ProvenanceOrigin, Scope,
+    Interval, Loan, LoanId, MemoryRelation, Place, PlaceId, PlaceInitStatus, Projection,
+    Provenance, ProvenanceId, ProvenanceOrigin, Scope,
 };
 
 impl BorrowChecker {
@@ -29,6 +29,7 @@ impl BorrowChecker {
             deref_places: FxHashMap::default(),
             index_places: FxHashMap::default(),
             pointee_origin: FxHashMap::default(),
+            place_init: FxHashMap::default(),
         }
     }
 
@@ -122,11 +123,12 @@ impl BorrowChecker {
         loan_place: PlaceId,
         loan_kind: BorrowKind,
     ) -> bool {
+        let non_exclusive = |k: BorrowKind| !matches!(k, BorrowKind::Mutable);
         if let Some(true) = self.ancestor_crosses_indirection(place, loan_place) {
-            return kind == BorrowKind::Shared;
+            return non_exclusive(kind);
         }
         if let Some(true) = self.ancestor_crosses_indirection(loan_place, place) {
-            return loan_kind == BorrowKind::Shared;
+            return non_exclusive(loan_kind);
         }
         false
     }
@@ -154,6 +156,11 @@ impl BorrowChecker {
         self.create_loan(place, BorrowKind::Shared)
     }
 
+    pub fn borrow_alias(&mut self, place: PlaceId) -> BorrowResult<LoanId> {
+        self.check_definite_conflict(place, BorrowKind::Alias)?;
+        self.create_loan(place, BorrowKind::Alias)
+    }
+
     pub fn borrow_mut(&mut self, place: PlaceId) -> BorrowResult<LoanId> {
         self.check_definite_conflict(place, BorrowKind::Mutable)?;
         self.create_loan(place, BorrowKind::Mutable)
@@ -172,18 +179,17 @@ impl BorrowChecker {
                 continue;
             }
 
-            // Only a PROVEN overlap blocks creation. An Unknown relation is not
-            // rejected here, the program may go on to establish disjointness
-            // (e.g. via a runtime pointer-identity check) before either
-            // reference is actually used. That obligation is enforced at
-            // check_use, not here.
             if let MemoryRelation::Overlap = self.overlaps(place, loan.place)? {
-                if kind == BorrowKind::Mutable || loan.kind == BorrowKind::Mutable {
-                    return Err(match loan.kind {
-                        BorrowKind::Shared => BorrowError::Borrowed { place: loan.place },
-                        BorrowKind::Mutable => {
+                if !kind.compatible_with(loan.kind) {
+                    return Err(match (kind, loan.kind) {
+                        (BorrowKind::Mutable, BorrowKind::Mutable) => {
                             BorrowError::AlreadyMutablyBorrowed { place: loan.place }
                         }
+                        (BorrowKind::Mutable, _) | (_, BorrowKind::Mutable) => {
+                            BorrowError::MutablyBorrowed { place: loan.place }
+                        }
+                        // remaining incompatible case: Alias vs Shared, either direction
+                        _ => BorrowError::AliasConflict { place: loan.place },
                     });
                 }
             }
@@ -211,7 +217,7 @@ impl BorrowChecker {
             match self.overlaps(place, loan.place)? {
                 MemoryRelation::Disjoint => {}
                 MemoryRelation::Overlap | MemoryRelation::Unknown
-                    if kind == BorrowKind::Mutable || loan.kind == BorrowKind::Mutable =>
+                    if !kind.compatible_with(loan.kind) =>
                 {
                     return Err(BorrowError::UnknownAlias {
                         lhs: place,
@@ -225,6 +231,12 @@ impl BorrowChecker {
     }
 
     pub fn check_use(&self, place: PlaceId, kind: BorrowKind) -> BorrowResult<()> {
+        match self.place_init_status(place) {
+            PlaceInitStatus::Uninit => return Err(BorrowError::UseOfUninitialized { place }),
+            PlaceInitStatus::Moved => return Err(BorrowError::UseAfterMove { place }),
+            _ => {}
+        }
+
         let root = self.place_roots[&place];
         let Some(loans) = self.root_loans.get(&root) else {
             return Ok(());
@@ -250,7 +262,7 @@ impl BorrowChecker {
             match self.overlaps(place, loan.place)? {
                 MemoryRelation::Disjoint => {}
                 MemoryRelation::Overlap | MemoryRelation::Unknown
-                    if kind == BorrowKind::Mutable || loan.kind == BorrowKind::Mutable =>
+                    if !kind.compatible_with(loan.kind) =>
                 {
                     return Err(BorrowError::UnknownAlias {
                         lhs: place,
@@ -470,6 +482,7 @@ impl BorrowChecker {
                 projection: Some(Projection::Deref),
             },
         );
+
         let root = self.place_roots[&base];
         self.place_roots.insert(id, root);
         self.deref_places.insert(base, id);
@@ -477,6 +490,12 @@ impl BorrowChecker {
     }
 
     pub fn check_move(&self, place: PlaceId) -> BorrowResult<()> {
+        match self.place_init_status(place) {
+            PlaceInitStatus::Uninit => return Err(BorrowError::UseOfUninitialized { place }),
+            PlaceInitStatus::Moved => return Err(BorrowError::UseAfterMove { place }),
+            _ => {}
+        }
+
         let root = self.place_roots[&place];
         let Some(loans) = self.root_loans.get(&root) else {
             return Ok(());
@@ -705,5 +724,61 @@ impl BorrowChecker {
 
     pub fn pointee_of(&self, ptr_place: PlaceId) -> Option<&(PlaceId, Interval)> {
         self.pointee_origin.get(&ptr_place)
+    }
+
+    pub fn mark_place_init(&mut self, place: PlaceId) {
+        self.place_init.insert(place, PlaceInitStatus::Init);
+    }
+
+    pub fn mark_place_uninit(&mut self, place: PlaceId) {
+        self.place_init.insert(place, PlaceInitStatus::Uninit);
+    }
+
+    pub fn mark_place_moved(&mut self, place: PlaceId) {
+        self.place_init.insert(place, PlaceInitStatus::Moved);
+    }
+
+    pub fn place_init_status(&self, place: PlaceId) -> PlaceInitStatus {
+        if let Some(status) = self.place_init.get(&place) {
+            return *status;
+        }
+        if let Some(p) = self.places.get(&place) {
+            if let Some(parent) = p.parent {
+                return self.place_init_status(parent);
+            }
+        }
+        PlaceInitStatus::Init
+    }
+
+    pub fn is_less_than(&self, lhs: &Bound, rhs: &Bound) -> bool {
+        if lhs == rhs {
+            return false;
+        }
+        if let (Bound::Const(l), Bound::Const(r)) = (lhs, rhs) {
+            return l < r;
+        }
+        self.reasoning
+            .less_than
+            .get(lhs)
+            .map_or(false, |set| set.contains(rhs))
+    }
+
+    pub fn proves_index_in_bounds(&self, index: &Bound, len: &Bound) -> bool {
+        self.is_less_than(index, len)
+    }
+
+    pub fn proves_index_uninit(&self, index: &Bound, len: &Bound) -> bool {
+        if index == len {
+            return true;
+        }
+        self.is_less_than(len, index)
+    }
+
+    pub fn check_drop(&self, place: PlaceId) -> BorrowResult<()> {
+        match self.place_init_status(place) {
+            PlaceInitStatus::Uninit => Err(BorrowError::CannotDropUninitialized { place }),
+            PlaceInitStatus::Moved => Err(BorrowError::UseAfterMove { place }),
+            _ => Ok(()),
+        }
     }
 }

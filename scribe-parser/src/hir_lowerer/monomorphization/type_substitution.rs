@@ -15,11 +15,11 @@ pub fn substitute_type<'a, 'subs, 'bump>(
         }
         HirType::Ref {
             inner,
-            mutability_state,
+            ref_kind,
             provenance,
         } => HirType::Ref {
             inner: bump.alloc_value_immutable(substitute_type(inner, subs, bump.clone())),
-            mutability_state: *mutability_state,
+            ref_kind: *ref_kind,
             provenance: *provenance,
         },
         HirType::SafePointer {

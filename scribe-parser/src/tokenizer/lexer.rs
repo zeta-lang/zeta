@@ -713,6 +713,7 @@ fn keyword_or_ident(text: &str) -> TokenKind {
         "const" => TokenKind::Const,
         "let" => TokenKind::Let,
         "mut" => TokenKind::Mut,
+        "alias" => TokenKind::Alias,
         "match" => TokenKind::Match,
         "case" => TokenKind::Case,
         "defer" => TokenKind::Defer,

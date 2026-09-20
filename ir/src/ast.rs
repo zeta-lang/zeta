@@ -260,6 +260,7 @@ pub enum Pattern<'bump> {
     },
     Or(&'bump [Pattern<'bump>]),
     Wildcard,
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +356,7 @@ pub struct Generic<'a, 'bump> {
     pub is_const: bool,
     pub is_static: bool,
     pub constraints: &'bump [Type<'a, 'bump>],
+    pub default_type: Option<Type<'a, 'bump>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -500,7 +502,7 @@ where
     },
     Ref {
         expr: &'bump Expr<'a, 'bump>,
-        mutable: bool,
+        ref_kind: RefKind,
         span: SourceSpan<'a>,
     },
     Lambda {
@@ -543,6 +545,7 @@ where
 pub struct LambdaParam<'a, 'bump> {
     pub name: StrId,
     pub type_annotation: Option<Type<'a, 'bump>>,
+    pub multi_place: Option<&'bump [EffectAccess<'a, 'bump>]>,
     pub span: SourceSpan<'a>,
 }
 
@@ -719,7 +722,7 @@ where
     Char,
     Ref {
         inner: &'a Type<'a, 'bump>,
-        mutability_state: MutabilityState,
+        ref_kind: RefKind,
         provenance: Option<ProvenanceAnnotation<'bump>>,
     },
     Dyn {
@@ -806,6 +809,7 @@ pub enum ParamPassingKind {
     Move,
     RefConst,
     RefMut,
+    RefAlias,
     ConstSafePtr,
     ConstUnsafePtr,
     MutSafePtr,
@@ -1241,7 +1245,7 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
             TypeKind::Infer => f.write_str("_"),
             TypeKind::Ref {
                 inner,
-                mutability_state,
+                ref_kind,
                 provenance,
             } => {
                 write!(f, "&")?;
@@ -1250,8 +1254,10 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                     write!(f, "{} ", provenance)?;
                 }
 
-                if let MutabilityState::Mut = mutability_state {
+                if let RefKind::Unique = ref_kind {
                     write!(f, "mut ")?;
+                } else if let RefKind::Alias = ref_kind {
+                    write!(f, "alias ")?;
                 }
 
                 write!(f, "{inner}")
@@ -1284,7 +1290,7 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                 allocator: _, // TODO: unignore
             } => write!(f, "^{}", inner),
             TypeKind::Never => f.write_str("never"),
-            TypeKind::Tuple { values } => todo!(),
+            TypeKind::Tuple { values: _ } => todo!(),
         }?;
 
         if self.nullable {
@@ -1297,7 +1303,7 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EffectAccess<'a, 'bump> {
-    pub mutable: bool, // &mut vs &
+    pub ref_kind: RefKind,
     pub path: &'bump [EffectSegment<'a, 'bump>],
     pub span: SourceSpan<'a>,
 }
@@ -1306,4 +1312,27 @@ pub struct EffectAccess<'a, 'bump> {
 pub enum EffectSegment<'a, 'bump> {
     Field(StrId),
     Index(&'bump Expr<'a, 'bump>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefKind {
+    Shared, // &
+    Alias,  // &alias
+    Unique, // &mut
+}
+
+impl RefKind {
+    /// Unique -> Alias -> Shared.
+    pub fn coerces_to(self, target: RefKind) -> bool {
+        use RefKind::*;
+        matches!(
+            (self, target),
+            (Unique, Unique)
+                | (Unique, Alias)
+                | (Unique, Shared)
+                | (Alias, Alias)
+                | (Alias, Shared)
+                | (Shared, Shared)
+        )
+    }
 }

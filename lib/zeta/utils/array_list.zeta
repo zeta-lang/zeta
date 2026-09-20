@@ -1,23 +1,39 @@
 package zeta::utils::array_list;
 
 import zeta::libc;
-
 import zeta::alloc::allocator.Allocator;
+import zeta::utils::mallocator.Mallocator;
 
-struct ArrayList<T, A: Allocator> {
+struct ArrayList<T, A: Allocator = Mallocator> {
     data: ^this.alloc []T,
     alloc: A,
 }
 
-impl<T, A: Allocator> ArrayList<T, A> {
-    func new(alloc: A): ArrayList<T, A> {
+impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
+    func new(): ArrayList<T, Mallocator> {
+        let alloc: Mallocator = Mallocator {};
+        return ArrayList<T, Mallocator> {
+            data: alloc.calloc<T>(16),
+            alloc,
+        };
+    }
+
+    func with_capacity(capacity: usize): ArrayList<T, Mallocator> {
+        let alloc: Mallocator = Mallocator {};
+        return ArrayList<T, Mallocator> {
+            data: alloc.calloc<T>(capacity),
+            alloc,
+        };
+    }
+
+    func new_in(alloc: A): ArrayList<T, A> {
         return ArrayList<T, A> {
             data: alloc.calloc<T>(16),
             alloc,
         };
     }
 
-    func with_capacity(capacity: usize, alloc: A): ArrayList<T, A> {
+    func with_capacity_in(capacity: usize, alloc: A): ArrayList<T, A> {
         return ArrayList<T, A> {
             data: alloc.calloc<T>(capacity),
             alloc,
@@ -37,8 +53,10 @@ impl<T, A: Allocator> ArrayList<T, A> {
             this.grow();
         }
 
-        this.data[this.data.len] = value;
-        this.data.len += 1;
+        unsafe {
+            this.data.write_uninit(this.data.len, value);
+            this.data.len += 1;
+        }
     }
 
     func get(&this, index: usize): &T {
@@ -83,11 +101,11 @@ impl<T, A: Allocator> ArrayList<T, A> {
                 this.data.cap * 2
             };
 
-        this.data = this.alloc.alloc(this.data, new_cap);
+        this.data = this.alloc.realloc(this.data, new_cap);
     }
 
     func as_slice(&this): &[]T {
-        return this.data[0..this.data.len];
+        return this.data[0..<this.data.len];
     }
 
     func clear(&mut this) {

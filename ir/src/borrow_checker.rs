@@ -1,6 +1,9 @@
 use fxhash::FxHashSet;
 
-use crate::{hir::StrId, ir_hasher::FxHashMap};
+use crate::{
+    hir::{RefKind, StrId},
+    ir_hasher::FxHashMap,
+};
 
 /// Stable identifier for a memory location.
 ///
@@ -52,7 +55,17 @@ pub struct ValueId(pub u32);
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BorrowKind {
     Shared,
+    Alias,
     Mutable,
+}
+
+impl BorrowKind {
+    pub(crate) fn compatible_with(self, other: BorrowKind) -> bool {
+        matches!(
+            (self, other),
+            (BorrowKind::Shared, BorrowKind::Shared) | (BorrowKind::Alias, BorrowKind::Alias)
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +206,15 @@ pub struct BorrowChecker {
     pub(super) deref_places: FxHashMap<PlaceId, PlaceId>,
     pub(super) index_places: FxHashMap<(PlaceId, Bound), PlaceId>,
     pub pointee_origin: FxHashMap<PlaceId, (PlaceId, Interval)>,
+    pub place_init: FxHashMap<PlaceId, PlaceInitStatus>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum PlaceInitStatus {
+    Uninit,
+    Init,
+    MaybeInit,
+    Moved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +233,7 @@ pub enum RefTemplate {
     /// mutable: true, projections: [Index(Param(1))] }.
     Path {
         base: TemplateBase,
-        mutable: bool,
+        ref_kind: RefKind,
         projections: Vec<TemplateProjection>,
     },
     /// Couldn't symbolically pin down what's returned
@@ -387,22 +409,18 @@ pub type BorrowResult<T> = Result<T, BorrowError>;
 #[derive(Debug)]
 pub enum BorrowError {
     UseAfterMove { place: PlaceId },
-
     MutablyBorrowed { place: PlaceId },
-
     AlreadyMutablyBorrowed { place: PlaceId },
-
     Borrowed { place: PlaceId },
-
     InvalidMove { place: PlaceId },
-
     InvalidWrite { place: PlaceId },
-
     InvalidRead { place: PlaceId },
-
     LoanNotFound(LoanId),
     PlaceNotFound(PlaceId),
     ProvenanceNotFound(ProvenanceId),
     UnknownAlias { lhs: PlaceId, rhs: PlaceId },
     CannotMoveBorrowed { place: PlaceId },
+    UseOfUninitialized { place: PlaceId },
+    CannotDropUninitialized { place: PlaceId },
+    AliasConflict { place: PlaceId },
 }

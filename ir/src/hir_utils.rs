@@ -1,6 +1,6 @@
 use crate::{
     ast::{self, MutabilityState},
-    hir::{self, HirType, Operator, StrId},
+    hir::{self, HirType, Operator, RefKind, StrId},
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -96,12 +96,14 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
 
         HirType::Ref {
             inner,
-            mutability_state,
+            ref_kind,
             provenance: _,
         } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            let tag = if *mutability_state == MutabilityState::Mut {
+            let tag = if *ref_kind == RefKind::Unique {
                 "refmut"
+            } else if *ref_kind == RefKind::Alias {
+                "refalias"
             } else {
                 "refconst"
             };

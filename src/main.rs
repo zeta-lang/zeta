@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{ArgMatches, CommandFactory, Error, FromArgMatches, Parser, Subcommand};
-use snmalloc_rs::SnMalloc;
+use mimalloc::MiMalloc;
 use zeta_compiler_api::Compiler;
 
 use zeta_compiler_api::file_handling::compiler_lib_path;
@@ -10,7 +10,7 @@ use zeta_compiler_api::file_loader::choose_file_loader;
 use zeta_compiler_api::main_structs::CompilerError;
 
 #[global_allocator]
-static ALLOCATOR: SnMalloc = SnMalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]

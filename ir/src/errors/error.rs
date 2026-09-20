@@ -175,6 +175,8 @@ pub enum ParseErrorKind {
     ExpectedBlock,
     ExpectedTypeAfterThrows,
     EmptyString,
+    UnsupportedDisjointBorrow,
+    GenericWithoutDefaultAfterDefault,
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -244,6 +246,14 @@ impl fmt::Display for ParseErrorKind {
                 "Wrong arrow detected: should use the thin arrow `case EnumVariant -> {{}}` instead of the fat arrow `case EnumVariant => {{}}`."
             ),
             ParseErrorKind::EmptyString => write!(f, "Expected a non-empty string"),
+            ParseErrorKind::UnsupportedDisjointBorrow => write!(
+                f,
+                "This type does not support parameters or fields with disjoint borrows."
+            ),
+            ParseErrorKind::GenericWithoutDefaultAfterDefault => write!(
+                f,
+                "generic parameter without a default cannot follow a parameter with a default"
+            ),
         }
     }
 }
@@ -337,6 +347,10 @@ impl<'a> DiagnosticError<'a> {
 
     pub fn invalid_expr(found: TokenKind, span: SourceSpan<'a>) -> Self {
         Self::new(ParseErrorKind::InvalidExpression { found }, span)
+    }
+
+    pub fn unsupported_disjoint_borrow(span: SourceSpan<'a>) -> Self {
+        Self::new(ParseErrorKind::UnsupportedDisjointBorrow, span)
     }
 
     pub fn empty_ident(span: SourceSpan<'a>) -> Self {

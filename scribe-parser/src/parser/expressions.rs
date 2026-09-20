@@ -1,7 +1,7 @@
 use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
     ElseBranch, ErrorHandlerBranch, ErrorHandlerPattern, FieldInit, IfStmt, LambdaModifier,
-    LambdaParam, MatchStmt, Type, UnsafeBlock,
+    LambdaParam, MatchStmt, RefKind, Type, UnsafeBlock,
 };
 use ir::hir::StrId;
 use ir::tokens::TokenKind;
@@ -125,7 +125,19 @@ where
                             )
                         }
 
-                        self.cursor.expect(TokenKind::Gt)?;
+                        if !Self::try_consume_close_angle(
+                            &mut self.cursor,
+                            &mut self.pending_close_angle,
+                        ) {
+                            let token = self.cursor.peek_token();
+                            return Err(DiagnosticError::new(
+                                ParseErrorKind::UnexpectedToken {
+                                    expected: TokenKind::Gt,
+                                    found: token.kind,
+                                },
+                                token.span,
+                            ));
+                        }
 
                         let callee = self.bump.alloc_value_immutable(lhs);
                         let type_args = self.bump.alloc_slice_immutable(&generic_args);
@@ -692,11 +704,17 @@ where
 
             TokenKind::BitAnd => {
                 self.cursor.advance();
-                let mutable = self.cursor.consume(TokenKind::Mut);
+                let ref_kind = if self.cursor.consume(TokenKind::Mut) {
+                    RefKind::Unique
+                } else if self.cursor.consume(TokenKind::Alias) {
+                    RefKind::Alias
+                } else {
+                    RefKind::Shared
+                };
                 let operand = self.parse_expr_inner(80, true)?;
                 Ok(Expr::Ref {
                     expr: self.bump.alloc_value_immutable(operand),
-                    mutable,
+                    ref_kind,
                     span: tok.span,
                 })
             }
@@ -762,16 +780,19 @@ where
             loop {
                 let (name, param_span) = self.cursor.expect_ident()?;
 
-                // Types are optional on closures: `fn (a, b)` or `fn (a: i32, b: i32)`.
+                // Types are optional on lambdas/closures: `fn (a, b)` or `fn (a: i32, b: i32)`.
                 let type_annotation = if self.cursor.consume(TokenKind::Colon) {
                     Some(self.parse_type()?)
                 } else {
                     None
                 };
 
+                let multi_place = self.parse_multi_place()?;
+
                 params.push(LambdaParam {
                     name,
                     type_annotation,
+                    multi_place,
                     span: param_span,
                 });
 

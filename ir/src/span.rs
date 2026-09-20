@@ -46,7 +46,7 @@ impl<'a> fmt::Display for SourceSpan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Line number {} at column {} inside of file named {}",
+            "line number {} at column {} inside of file named {}",
             self.line, self.column, self.file_name
         )
     }

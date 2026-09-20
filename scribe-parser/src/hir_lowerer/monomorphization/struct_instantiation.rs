@@ -1,6 +1,7 @@
 use super::naming::instantiate_struct_name;
 use super::type_substitution::substitute_type;
 use crate::hir_lowerer::context::LoweringCtx;
+use crate::hir_lowerer::monomorphization::monomorphizer::contains_unresolved_generic;
 use crate::hir_lowerer::monomorphization::naming::instantiate_enum_name;
 use crate::hir_lowerer::monomorphization::suffix_for_subs;
 use ir::hir::{HirEnum, HirEnumVariant, HirField, HirStruct, HirType, StrId};
@@ -148,9 +149,28 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
 
     let binding = ctx.structs.borrow();
     let base = binding.get(&base_id)?;
+    let mut full_concrete_args = concrete_args.to_vec();
+    if let Some(generics) = &base.generics {
+        if full_concrete_args.len() < generics.len() {
+            let mut subs = FxHashMap::default();
+            for (param, arg) in generics.iter().zip(full_concrete_args.iter()) {
+                subs.insert(param.name, arg.clone());
+            }
+            let start = full_concrete_args.len();
+            for param in &generics[start..] {
+                if let Some(ref def_ty) = param.default_type {
+                    let resolved = substitute_type(def_ty, &subs, bump.clone());
+                    subs.insert(param.name, resolved.clone());
+                    full_concrete_args.push(resolved);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
     let type_map = if let Some(generics) = &base.generics {
         let mut map = FxHashMap::default();
-        for (param, arg) in generics.iter().zip(concrete_args) {
+        for (param, arg) in generics.iter().zip(full_concrete_args.iter()) {
             map.insert(param.name, arg.clone());
         }
         map
@@ -172,22 +192,42 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
             }
         }
     }
+
+    let interned = instantiate_struct_name(&full_concrete_args, base, ctx.context.clone());
+    let base_owned = base.clone();
     drop(binding);
-    let base = {
-        let structs = ctx.structs.borrow();
-        structs.get(&base_id)?.clone()
-    };
-    let mut new_struct = base.clone();
-    let interned = instantiate_struct_name(concrete_args, &base, ctx.context.clone());
+
+    let mut placeholder = base_owned.clone();
+    placeholder.name = interned;
+    placeholder.generics = None;
+    ctx.structs.borrow_mut().insert(interned, placeholder);
+    instantiated_structs.borrow_mut().insert(key, interned);
+    instantiated_struct_origins
+        .borrow_mut()
+        .insert(interned, (base_id, full_concrete_args.clone()));
+
+    let interfaces = { ctx.struct_interfaces.borrow().get(&base_id).cloned() };
+    if let Some(interfaces) = interfaces {
+        ctx.struct_interfaces
+            .borrow_mut()
+            .insert(interned, interfaces);
+    }
+    let methods = { ctx.struct_methods.borrow().get(&base_id).cloned() };
+    if let Some(methods) = methods {
+        ctx.struct_methods.borrow_mut().insert(interned, methods);
+    }
+
+    let mut new_struct = base_owned.clone();
     new_struct.name = interned;
-    if let Some(generics) = &base.generics {
+    if let Some(generics) = &base_owned.generics {
         let mut type_map = FxHashMap::default();
-        for (param, arg) in generics.iter().zip(concrete_args) {
+        for (param, arg) in generics.iter().zip(full_concrete_args.iter()) {
             type_map.insert(param.name, arg.clone());
         }
         let mut new_fields = Vec::new();
         for field in new_struct.fields {
             let substituted = substitute_type(&field.field_type, &type_map, bump.clone());
+
             let new_field_type = instantiate_type_recursively_ctx(
                 ctx,
                 instantiated_structs,
@@ -206,29 +246,9 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
         new_struct.fields = bump.alloc_slice(&new_fields);
         new_struct.generics = None;
     }
-    let new_struct_ptr = bump.alloc_value(new_struct);
-    {
-        let mut structs = ctx.structs.borrow_mut();
-        structs.insert(interned, *new_struct_ptr);
-        instantiated_structs
-            .borrow_mut()
-            .insert(key, new_struct_ptr.name);
-        instantiated_struct_origins
-            .borrow_mut()
-            .insert(interned, (base_id, concrete_args.to_vec()));
-    }
 
-    let interfaces = { ctx.struct_interfaces.borrow().get(&base_id).cloned() };
-    if let Some(interfaces) = interfaces {
-        ctx.struct_interfaces
-            .borrow_mut()
-            .insert(interned, interfaces);
-    }
-
-    let methods = { ctx.struct_methods.borrow().get(&base_id).cloned() };
-    if let Some(methods) = methods {
-        ctx.struct_methods.borrow_mut().insert(interned, methods);
-    }
+    let new_struct_ptr = bump.alloc_value(new_struct.clone());
+    ctx.structs.borrow_mut().insert(interned, new_struct);
 
     Some(new_struct_ptr)
 }
@@ -303,11 +323,20 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                     &rec_args,
                     bump.clone(),
                 ) {
-                    let nested_fields: Vec<HirType> =
-                        nested_inst.fields.iter().map(|f| f.field_type).collect();
+                    let still_generic = nested_inst
+                        .fields
+                        .iter()
+                        .any(|f| contains_unresolved_generic(&f.field_type));
+                    let field_types: &[HirType] = if still_generic {
+                        &[]
+                    } else {
+                        let nested_fields: Vec<HirType> =
+                            nested_inst.fields.iter().map(|f| f.field_type).collect();
+                        bump.alloc_slice_immutable(&nested_fields)
+                    };
                     HirType::Struct {
                         name: nested_inst.name,
-                        field_types: bump.alloc_slice_immutable(&nested_fields),
+                        field_types,
                         type_args: &[],
                     }
                 } else {
@@ -383,7 +412,7 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
         ),
         HirType::Ref {
             inner,
-            mutability_state,
+            ref_kind,
             provenance,
         } => HirType::Ref {
             inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
@@ -395,7 +424,7 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 *inner,
                 bump.clone(),
             )),
-            mutability_state,
+            ref_kind,
             provenance,
         },
         HirType::SafePointer {
@@ -440,6 +469,34 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
             )),
             allocator,
         },
+        HirType::Nullable(inner) => {
+            HirType::Nullable(bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+                ctx,
+                instantiated_structs,
+                instantiated_struct_origins,
+                instantiated_enums,
+                instantiated_enum_origins,
+                *inner,
+                bump.clone(),
+            )))
+        }
+        HirType::Tuple(hir_types) => {
+            let types: Vec<HirType<'a, 'bump>> = hir_types
+                .iter()
+                .map(|inner| {
+                    instantiate_type_recursively_ctx(
+                        ctx,
+                        instantiated_structs,
+                        instantiated_struct_origins,
+                        instantiated_enums,
+                        instantiated_enum_origins,
+                        *inner,
+                        bump.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            HirType::Tuple(bump.alloc_slice_immutable(types.as_slice()))
+        }
         other => other,
     }
 }

@@ -338,6 +338,7 @@ where
                 + self.registry.instantiated_enums.borrow().len();
 
             self.force_instantiate_drops();
+            self.force_instantiate_allocator_frees();
 
             let after = self.registry.instantiated_functions.borrow().len()
                 + self.registry.instantiated_structs.borrow().len()
@@ -940,6 +941,34 @@ where
 
     fn first_ctx_enums_lookup(&self, name: &StrId) -> Option<HirEnum<'a, 'bump>> {
         self.registry.enums.borrow().get(name).copied()
+    }
+
+    fn force_instantiate_allocator_frees(&self) {
+        let Some(scratch_bump) = self.modules.values().next().map(|m| m.bump.clone()) else {
+            return;
+        };
+
+        let mut scratch_lowerer = HirLowerer::new(
+            self.pool.clone(),
+            scratch_bump.clone(),
+            self.dep_graph,
+            self.registry.clone(),
+            self.auto_imports.clone(),
+        );
+
+        let monomorphizer = Monomorphizer::new(
+            self.pool.clone(),
+            scratch_bump,
+            self.registry.functions.clone(),
+            &mut scratch_lowerer.ctx,
+            self.registry.instantiated_functions.clone(),
+            self.registry.instantiated_structs.clone(),
+            self.registry.instantiated_struct_origins.clone(),
+            self.registry.instantiated_enums.clone(),
+            self.registry.instantiated_enum_origins.clone(),
+        );
+
+        monomorphizer.force_instantiate_allocator_frees();
     }
 
     fn force_instantiate_drops(&self) {

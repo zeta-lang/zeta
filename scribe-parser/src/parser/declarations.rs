@@ -5,6 +5,7 @@ use ir::ast::{
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::hir::StrId;
+use ir::span::SourceSpan;
 use ir::tokens::TokenKind;
 
 impl<'a, 'bump> DescentParser<'a, 'bump>
@@ -61,6 +62,36 @@ where
                 self.cursor.expect(TokenKind::Colon)?;
                 let field_type = self.parse_type()?;
 
+                let unmerged_mp_span = self.cursor.peek_token().span;
+                let multi_place = self.parse_multi_place();
+                let multi_place_span =
+                    SourceSpan::merge(self.cursor.peek_token().span, unmerged_mp_span);
+                match multi_place {
+                    Ok(None) => {}
+
+                    Ok(Some(_)) => {
+                        self.diag
+                            .record(DiagnosticError::unsupported_disjoint_borrow(
+                                multi_place_span,
+                            ));
+                        let stop = self.diag.synchronize(&mut self.cursor);
+                        if stop == TokenKind::RBrace || stop == TokenKind::EOF {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        self.diag
+                            .record(DiagnosticError::unsupported_disjoint_borrow(
+                                multi_place_span,
+                            ));
+                        self.diag.record(e);
+                        let stop = self.diag.synchronize(&mut self.cursor);
+                        if stop == TokenKind::RBrace || stop == TokenKind::EOF {
+                            break;
+                        }
+                    }
+                }
+
                 fields.push(Field {
                     name: field_name,
                     field_type,
@@ -82,6 +113,7 @@ where
                         type_annotation: f.field_type,
                         visibility: f.visibility,
                         default_value: None,
+                        multi_place: None,
                         span: f.span,
                     }))
                 })
@@ -230,6 +262,36 @@ where
             let peeked_token = self.cursor.peek_token();
             let field_type = self.parse_type()?;
 
+            let unmerged_mp_span = self.cursor.peek_token().span;
+            let multi_place = self.parse_multi_place();
+            let multi_place_span =
+                SourceSpan::merge(self.cursor.peek_token().span, unmerged_mp_span);
+            match multi_place {
+                Ok(None) => {}
+
+                Ok(Some(_)) => {
+                    self.diag
+                        .record(DiagnosticError::unsupported_disjoint_borrow(
+                            multi_place_span,
+                        ));
+                    let stop = self.diag.synchronize(&mut self.cursor);
+                    if stop == TokenKind::RBrace || stop == TokenKind::EOF {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    self.diag
+                        .record(DiagnosticError::unsupported_disjoint_borrow(
+                            multi_place_span,
+                        ));
+                    self.diag.record(e);
+                    let stop = self.diag.synchronize(&mut self.cursor);
+                    if stop == TokenKind::RBrace || stop == TokenKind::EOF {
+                        break;
+                    }
+                }
+            }
+
             fields.push(Param::Normal(
                 self.bump.alloc_value_immutable(ir::ast::NormalParam {
                     is_mut: false,
@@ -240,6 +302,7 @@ where
                     type_annotation: field_type,
                     visibility: field_vis,
                     default_value: None,
+                    multi_place: None,
                     span: peeked_token.span,
                 }),
             ));

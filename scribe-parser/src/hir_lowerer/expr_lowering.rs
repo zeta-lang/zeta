@@ -1,8 +1,10 @@
 use crate::optimized_string_buffering::build_module_scoped_name;
 
 use super::context::HirLowerer;
+use super::monomorphization::substitute_type;
 use ir::ast::{
-    self, Expr, FieldInit, InlineModifier, Op, Pattern, ProvenanceAnnotation, Type, TypeKind,
+    self, Expr, FieldInit, InlineModifier, LambdaParam, Op, Pattern, ProvenanceAnnotation, Type,
+    TypeKind,
 };
 use ir::hir::{
     self, AssignmentOperator, HirExpr, HirFieldInit, HirFunc, HirLambdaParam, HirMatchArm,
@@ -12,6 +14,8 @@ use ir::hir_utils::lower_cmp_operator;
 use ir::ir_hasher::FxHashBuilder;
 use ir::span::SourceSpan;
 use std::collections::HashMap;
+use std::sync::Arc;
+use zetaruntime::arena::GrowableAtomicBump;
 
 const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("sizeof", IntrinsicKind::SizeOf),
@@ -25,6 +29,7 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("cpu_relax", IntrinsicKind::CpuRelax),
     ("unreachable", IntrinsicKind::Unreachable),
     ("reinterpret", IntrinsicKind::Reinterpret),
+    ("replace", IntrinsicKind::Replace),
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -56,10 +61,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             Expr::Ref {
                 expr,
                 span,
-                mutable,
+                ref_kind,
             } => HirExpr::Ref {
                 expr: self.ctx.bump.alloc_value(self.lower_expr(expr)),
-                mutable: *mutable,
+                ref_kind: Self::lower_ref_kind(*ref_kind),
                 span: *span,
             },
             Expr::Call {
@@ -322,10 +327,21 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     })
                     .collect();
                 let args = self.ctx.bump.alloc_slice(&args_vec);
-                let type_args_vec: Vec<HirType<'a, 'bump>> = type_args
+                let mut type_args_vec: Vec<HirType<'a, 'bump>> = type_args
                     .iter()
                     .map(|a| self.lower_type(a, *span))
                     .collect();
+                if let Some(sid) = struct_name_id {
+                    if let Some(ty_struct) = self.ctx.structs.borrow().get(&sid) {
+                        if let Some(declared) = ty_struct.generics {
+                            Self::fill_default_type_args(
+                                declared,
+                                &mut type_args_vec,
+                                self.ctx.bump.clone(),
+                            );
+                        }
+                    }
+                }
                 let type_args = if type_args_vec.is_empty() {
                     None
                 } else {
@@ -567,12 +583,13 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             } => {
                 let lowered_params: Vec<HirLambdaParam<'a, 'bump>> = params
                     .iter()
-                    .map(|p| HirLambdaParam {
+                    .map(|p: &LambdaParam<'a, 'bump>| HirLambdaParam {
                         name: p.name,
                         param_type: p
                             .type_annotation
                             .as_ref()
                             .map(|t| self.lower_type(t, p.span)),
+                        multi_place: self.lower_multi_place(p.multi_place),
                         span: p.span,
                     })
                     .collect();
@@ -635,7 +652,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ty: HirType::Unknown,
             },
             Expr::Block(block) => {
-                let HirStmt::Block { body } = self.lower_block(block) else {
+                let HirStmt::Block { body, span: _ } = self.lower_block(block) else {
                     unreachable!()
                 };
                 HirExpr::Block {
@@ -645,7 +662,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 }
             }
             Expr::UnsafeBlock(ub) => {
-                let HirStmt::Block { body } = self.lower_block(ub.block) else {
+                let HirStmt::Block { body, span: _ } = self.lower_block(ub.block) else {
                     unreachable!()
                 };
                 HirExpr::Block {
@@ -983,7 +1000,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     let f = self.ctx.functions.borrow();
                     f.get(&name).expect("unknown function").return_type.unwrap()
                 }
-                _ => panic!("invalid call target"),
+                other => panic!("invalid call target: {other:?}"),
             },
 
             HirExpr::InterfaceCall {
@@ -1122,9 +1139,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         param_map: &HashMap<StrId, HirExpr<'a, 'bump>, FxHashBuilder>,
     ) -> Option<HirExpr<'a, 'bump>> {
         match stmt {
-            HirStmt::Return(Some(expr)) => Some(self.substitute_expr(expr, param_map)),
+            HirStmt::Return(Some(expr), _span) => Some(self.substitute_expr(expr, param_map)),
             HirStmt::Expr(expr) => Some(self.substitute_expr(expr, param_map)),
-            HirStmt::Block { body } => {
+            HirStmt::Block { body, span: _ } => {
                 if let Some(last_stmt) = body.last() {
                     self.inline_stmt_as_expr(last_stmt, param_map)
                 } else {
@@ -1318,6 +1335,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub(super) fn lower_pattern(&self, pattern: &Pattern) -> HirPattern<'bump> {
         match pattern {
             Pattern::Ident(name) => HirPattern::Ident(*name),
+            Pattern::Null => HirPattern::Null,
             Pattern::Number(n) => HirPattern::Number(*n),
             Pattern::String(s) => HirPattern::String(*s),
             Pattern::Tuple(inner) => {
@@ -1419,13 +1437,33 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 }
 
                 let resolved_name = self.ctx.resolve_type_path_name(path, *name, span);
-                let lowered_type_args: Vec<HirType<'a, 'bump>> = type_args
+                let mut lowered_type_args: Vec<HirType<'a, 'bump>> = type_args
                     .iter()
                     .map(|ty| self.lower_type(ty, span))
                     .collect();
-                let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
 
                 if let Some(ty_struct) = self.ctx.structs.borrow().get(&resolved_name) {
+                    if let Some(declared) = ty_struct.generics {
+                        if !Self::fill_default_type_args(
+                            declared,
+                            &mut lowered_type_args,
+                            self.ctx.bump.clone(),
+                        ) {
+                            self.ctx.record_error(
+                                format!(
+                                    "type `{}` expects at least {} generic argument(s), found {}",
+                                    self.ctx.context.resolve_string(name),
+                                    declared
+                                        .iter()
+                                        .take_while(|g| g.default_type.is_none())
+                                        .count(),
+                                    type_args.len(),
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
                     let field_types: Vec<HirType<'a, 'bump>> =
                         ty_struct.fields.iter().map(|f| f.field_type).collect();
                     let field_slice = self.ctx.bump.alloc_slice_immutable(&field_types);
@@ -1436,11 +1474,50 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     };
                 }
 
-                if self.ctx.interfaces.borrow().contains_key(&resolved_name) {
+                if let Some(ty_iface) = self.ctx.interfaces.borrow().get(&resolved_name) {
+                    if let Some(declared) = ty_iface.generics {
+                        if !Self::fill_default_type_args(
+                            declared,
+                            &mut lowered_type_args,
+                            self.ctx.bump.clone(),
+                        ) {
+                            self.ctx.record_error(
+                                format!(
+                                    "interface `{}` expects at least {} generic argument(s), found {}",
+                                    self.ctx.context.resolve_string(name),
+                                    declared.iter().take_while(|g| g.default_type.is_none()).count(),
+                                    type_args.len(),
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
                     return HirType::DynInterface(resolved_name, type_args_slice);
                 }
 
                 if let Some(ty_enum) = self.ctx.enums.borrow().get(&resolved_name) {
+                    if let Some(declared) = ty_enum.generics {
+                        if !Self::fill_default_type_args(
+                            declared,
+                            &mut lowered_type_args,
+                            self.ctx.bump.clone(),
+                        ) {
+                            self.ctx.record_error(
+                                format!(
+                                    "enum `{}` expects at least {} generic argument(s), found {}",
+                                    self.ctx.context.resolve_string(name),
+                                    declared
+                                        .iter()
+                                        .take_while(|g| g.default_type.is_none())
+                                        .count(),
+                                    type_args.len(),
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
                     return HirType::Enum {
                         name: resolved_name,
                         variants: ty_enum.variants,
@@ -1448,31 +1525,27 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     };
                 }
 
-                self.ctx.record_error(
-                    format!(
-                        "cannot resolve type `{}`{}: no struct or interface by that name is visible \
-                         here (resolved lookup key: `{}`). This usually means a missing or incorrect \
-                         `import`, or a typo in the type name.",
-                        self.ctx.context.resolve_string(name),
-                        if path.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                " (path `{}`)",
-                                path.iter()
-                                    .map(|s| self.ctx.context.resolve_string(s).to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("::")
-                            )
-                        },
-                        self.ctx.context.resolve_string(&resolved_name),
-                    ),
-                    span,
+                let type_path = if path.is_empty() {
+                    String::new()
+                } else {
+                    let built_path = path
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    format!("{}.", built_path)
+                };
+
+                let msg = format!(
+                    "cannot resolve type `{}{}`: no type or function by that name is visible here.",
+                    type_path, name,
                 );
+
+                self.ctx.record_error(msg, span);
                 HirType::Struct {
                     name: resolved_name,
                     field_types: &[],
-                    type_args: type_args_slice,
+                    type_args: self.ctx.bump.alloc_slice_immutable(&lowered_type_args),
                 }
             }
             TypeKind::OwnedPointer { inner, allocator } => {
@@ -1507,13 +1580,13 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
             TypeKind::Ref {
                 inner,
-                mutability_state,
+                ref_kind,
                 provenance: ast_provenance,
             } => {
                 let inner = self.ctx.bump.alloc_value(self.lower_type(inner, span));
                 HirType::Ref {
                     inner,
-                    mutability_state: *mutability_state,
+                    ref_kind: Self::lower_ref_kind(*ref_kind),
                     provenance: self.lower_provenance(ast_provenance),
                 }
             }
@@ -1668,5 +1741,31 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             .and_then(|e| e.variants.iter().find(|v| v.name == variant_name))
             .and_then(|v| v.fields.iter().find(|f| f.name == field_name))
             .map(|f| f.field_type)
+    }
+
+    pub(crate) fn fill_default_type_args(
+        declared: &[ir::hir::HirGeneric<'a, 'bump>],
+        type_args: &mut Vec<HirType<'a, 'bump>>,
+        bump: Arc<GrowableAtomicBump<'bump>>,
+    ) -> bool {
+        if type_args.len() >= declared.len() {
+            return true;
+        }
+        let mut subs: ir::ir_hasher::HashMap<StrId, HirType<'a, 'bump>> =
+            ir::ir_hasher::HashMap::default();
+        for (p, a) in declared.iter().zip(type_args.iter()) {
+            subs.insert(p.name, *a);
+        }
+        let start_idx = type_args.len();
+        for param in &declared[start_idx..] {
+            if let Some(ref def_ty) = param.default_type {
+                let resolved_def = substitute_type(def_ty, &subs, bump.clone());
+                subs.insert(param.name, resolved_def);
+                type_args.push(resolved_def);
+            } else {
+                return false;
+            }
+        }
+        true
     }
 }

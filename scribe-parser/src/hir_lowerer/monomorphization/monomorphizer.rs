@@ -5,21 +5,21 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::hir_lowerer::LoweringCtx;
 use crate::hir_lowerer::monomorphization::instantiate_struct_for_types;
 use crate::hir_lowerer::monomorphization::struct_instantiation::instantiate_enum_for_types;
+use crate::hir_lowerer::{HirLowerer, LoweringCtx};
 
 use super::naming::suffix_for_subs;
 use super::type_substitution::substitute_type;
 use ir::hir::{
     Hir, HirExpr, HirFieldInit, HirFunc, HirGeneric, HirMatchArm, HirModule, HirParam, HirStmt,
-    HirType, InterpolationPart, StrId,
+    HirType, InterpolationPart, IntrinsicKind, StrId,
 };
 use ir::ir_hasher::{FxHashMap, HashMap};
 use zetaruntime::arena::GrowableAtomicBump;
 use zetaruntime::string_pool::StringPool;
 
-fn contains_unresolved_generic(ty: &HirType) -> bool {
+pub fn contains_unresolved_generic(ty: &HirType) -> bool {
     match ty {
         HirType::Generic(_) => true,
         HirType::Slice(inner) | HirType::Array(inner, _) => contains_unresolved_generic(inner),
@@ -189,15 +189,24 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                                 HirParam::Normal {
                                                     name,
                                                     param_type,
+                                                    multi_place,
                                                     span,
                                                 } => HirParam::Normal {
                                                     name: *name,
-                                                    param_type: self
-                                                        .instantiate_type_recursively(*param_type),
+                                                    param_type: self.instantiate_type_recursively(
+                                                        *param_type,
+                                                        *span,
+                                                    ),
+                                                    multi_place: *multi_place,
                                                     span: *span,
                                                 },
-                                                HirParam::This { kind, span } => HirParam::This {
+                                                HirParam::This {
+                                                    kind,
+                                                    span,
+                                                    multi_place,
+                                                } => HirParam::This {
                                                     kind: *kind,
+                                                    multi_place: *multi_place,
                                                     span: *span,
                                                 },
                                             })
@@ -207,7 +216,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                     }
                                     nm.return_type = nm
                                         .return_type
-                                        .map(|rt| self.instantiate_type_recursively(rt));
+                                        .map(|rt| self.instantiate_type_recursively(rt, nm.span));
                                 }
                                 new_methods.push(nm);
                             }
@@ -222,56 +231,74 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         if let Some(methods) = new_impl.methods {
                             let mut new_methods = Vec::new();
                             for m in methods.iter() {
-                                let mut nm = m.clone();
-
-                                if let Some(params) = nm.params {
-                                    let new_params: Vec<HirParam> = params
-                                        .iter()
-                                        .map(|p| match p {
-                                            HirParam::Normal {
-                                                name,
-                                                param_type,
-                                                span,
-                                            } => {
-                                                let substituted = substitute_type(
-                                                    param_type,
-                                                    &empty_subs,
-                                                    self.bump.clone(),
-                                                );
-                                                HirParam::Normal {
-                                                    name: *name,
-                                                    param_type: self
-                                                        .instantiate_type_recursively(substituted),
-                                                    span: *span,
-                                                }
-                                            }
-                                            HirParam::This { kind, span } => HirParam::This {
-                                                kind: *kind,
-                                                span: *span,
-                                            },
-                                        })
-                                        .collect();
-                                    nm.params = Some(self.bump.alloc_slice_immutable(&new_params));
+                                if m.generics.is_some() {
+                                    continue;
                                 }
 
-                                if let Some(body) = nm.body {
-                                    let prev_module_idx = self.ctx.module_idx;
-                                    self.ctx.module_idx = m.declaring_module_idx;
+                                let mut nm = m.clone();
 
-                                    let return_type_for_body = nm.return_type.map(|ret_ty| {
-                                        substitute_type(&ret_ty, &empty_subs, self.bump.clone())
-                                    });
+                                if nm.generics.is_none() {
+                                    if let Some(params) = nm.params {
+                                        let new_params: Vec<HirParam> = params
+                                            .iter()
+                                            .map(|p| match p {
+                                                HirParam::Normal {
+                                                    name,
+                                                    param_type,
+                                                    multi_place,
+                                                    span,
+                                                } => {
+                                                    let substituted = substitute_type(
+                                                        param_type,
+                                                        &empty_subs,
+                                                        self.bump.clone(),
+                                                    );
+                                                    HirParam::Normal {
+                                                        name: *name,
+                                                        param_type: self
+                                                            .instantiate_type_recursively(
+                                                                substituted,
+                                                                *span,
+                                                            ),
+                                                        multi_place: *multi_place,
+                                                        span: *span,
+                                                    }
+                                                }
+                                                HirParam::This {
+                                                    kind,
+                                                    span,
+                                                    multi_place,
+                                                } => HirParam::This {
+                                                    kind: *kind,
+                                                    span: *span,
+                                                    multi_place: *multi_place,
+                                                },
+                                            })
+                                            .collect();
+                                        nm.params =
+                                            Some(self.bump.alloc_slice_immutable(&new_params));
+                                    }
 
-                                    let prev_return_type =
-                                        self.current_return_type.replace(return_type_for_body);
-                                    let new_body = self.monomorphize_stmt(&body, &empty_subs);
-                                    self.current_return_type.replace(prev_return_type);
+                                    if let Some(body) = nm.body {
+                                        let prev_module_idx = self.ctx.module_idx;
+                                        self.ctx.module_idx = m.declaring_module_idx;
 
-                                    nm.body = Some(*self.bump.alloc_value_immutable(new_body));
-                                    nm.return_type = return_type_for_body
-                                        .map(|ty| self.instantiate_type_recursively(ty));
+                                        let return_type_for_body = nm.return_type.map(|ret_ty| {
+                                            substitute_type(&ret_ty, &empty_subs, self.bump.clone())
+                                        });
 
-                                    self.ctx.module_idx = prev_module_idx;
+                                        let prev_return_type =
+                                            self.current_return_type.replace(return_type_for_body);
+                                        let new_body = self.monomorphize_stmt(&body, &empty_subs);
+                                        self.current_return_type.replace(prev_return_type);
+
+                                        nm.body = Some(*self.bump.alloc_value_immutable(new_body));
+                                        nm.return_type = return_type_for_body.map(|ty| {
+                                            self.instantiate_type_recursively(ty, nm.span)
+                                        });
+
+                                        self.ctx.module_idx = prev_module_idx;
+                                    }
                                 }
                                 new_methods.push(nm);
                             }
@@ -293,7 +320,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             _ => true,
         });
 
-        self.assert_fully_monomorphized(&new_items);
+        #[cfg(debug_assertions)]
+        {
+            self.assert_fully_monomorphized(&new_items);
+        }
 
         HirModule {
             name: module.name,
@@ -498,12 +528,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             if *cur_struct_name == resolved_name {
                                 return Some(self_ty);
                             }
-                            if let Some((origin, _)) = self
+                            let origin = self
                                 .instantiated_struct_origins
                                 .borrow()
                                 .get(&cur_struct_name)
-                                .cloned()
-                            {
+                                .cloned();
+                            if let Some((origin, _)) = origin {
                                 if origin == resolved_name {
                                     return Some(self_ty);
                                 }
@@ -598,9 +628,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         };
 
         if type_args.is_empty() {
-            if let Some((origin_name, origin_targs)) =
-                self.instantiated_struct_origins.borrow().get(name).cloned()
-            {
+            let origin: Option<(StrId, Vec<HirType<'a, 'bump>>)> =
+                self.instantiated_struct_origins.borrow().get(name).cloned();
+
+            if let Some((origin_name, origin_targs)) = origin {
                 let targs_slice = self.bump.alloc_slice_immutable(&origin_targs);
                 let generic_ty = HirType::Struct {
                     name: origin_name,
@@ -641,6 +672,43 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     inner_subs.insert(p.name, resolved);
                 }
                 let prev_self = self.current_this.replace(Some(*struct_ty));
+                let result = self.monomorphize_function(&base_func, &inner_subs);
+                self.current_this.replace(prev_self);
+                return result;
+            }
+
+            if let Some(type_params) = base_func.generics {
+                let mut inner_subs: FxHashMap<StrId, HirType> = FxHashMap::default();
+                if let Some(targs) = call_type_args {
+                    if targs.len() != type_params.len() {
+                        return None;
+                    }
+                    for (p, a) in type_params.iter().zip(targs.iter()) {
+                        inner_subs
+                            .insert(p.name, substitute_type(a, outer_subs, self.bump.clone()));
+                    }
+                } else if let Some(declared_params) = base_func.params {
+                    let declared_types: Vec<HirType> = declared_params
+                        .iter()
+                        .filter_map(|p| match p {
+                            HirParam::Normal { param_type, .. } => Some(*param_type),
+                            HirParam::This { .. } => None,
+                        })
+                        .collect();
+                    self.infer_missing_generics(
+                        type_params,
+                        &declared_types,
+                        &[],
+                        outer_subs,
+                        &mut inner_subs,
+                    );
+                    if inner_subs.len() != type_params.len() {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+                let prev_self = self.current_this.replace(Some(struct_ty.clone()));
                 let result = self.monomorphize_function(&base_func, &inner_subs);
                 self.current_this.replace(prev_self);
                 return result;
@@ -730,7 +798,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
 
         let mut new_func = func.clone();
-        self.apply_substitutions_to_func(&mut new_func, substitutions);
+        self.apply_substitutions_to_func(&mut new_func, substitutions, func.span);
 
         if new_func.impl_target.is_some() {
             let cur_self = *self.current_this.borrow();
@@ -810,19 +878,23 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         substitute_type(ty, subs, self.bump.clone())
     }
 
-    fn instantiate_type_recursively(&self, ty: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
-        let ty = self.instantiate_struct_ty_if_needed(ty);
+    fn instantiate_type_recursively(
+        &self,
+        ty: HirType<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> HirType<'a, 'bump> {
+        let ty = self.instantiate_struct_ty_if_needed(ty, span);
         let ty = self.instantiate_enum_ty_if_needed(ty);
         match ty {
             HirType::Ref {
                 inner,
-                mutability_state,
+                ref_kind: mutability_state,
                 provenance,
             } => HirType::Ref {
                 inner: self
                     .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
-                mutability_state,
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                ref_kind: mutability_state,
                 provenance,
             },
             HirType::SafePointer {
@@ -831,7 +903,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             } => HirType::SafePointer {
                 inner: self
                     .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
                 mutability_state,
             },
             HirType::UnsafePointer {
@@ -840,32 +912,32 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             } => HirType::UnsafePointer {
                 inner: self
                     .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
                 mutability_state,
             },
             HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
                 inner: self
                     .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
                 allocator,
             },
             HirType::Slice(inner) => HirType::Slice(
                 self.bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
             ),
             HirType::Array(inner, len) => HirType::Array(
                 self.bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
                 len,
             ),
             HirType::Nullable(inner) => HirType::Nullable(
                 self.bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner)),
+                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
             ),
             HirType::Tuple(elems) => {
                 let new_elems: Vec<HirType> = elems
                     .iter()
-                    .map(|e| self.instantiate_type_recursively(*e))
+                    .map(|e| self.instantiate_type_recursively(*e, span))
                     .collect();
                 HirType::Tuple(self.bump.alloc_slice_immutable(&new_elems))
             }
@@ -877,12 +949,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         &self,
         func: &mut HirFunc<'a, 'bump>,
         substitutions: &'subs FxHashMap<StrId, HirType<'a, 'bump>>,
+        span: SourceSpan<'a>,
     ) {
         self.apply_substitutions_to_params(func, substitutions);
 
         if let Some(ret) = &mut func.return_type {
             let substituted = self.substitute_type_with_self(ret, substitutions);
-            *ret = self.instantiate_type_recursively(substituted);
+            *ret = self.instantiate_type_recursively(substituted, span);
         }
 
         func.generics = None;
@@ -904,16 +977,23 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     HirParam::Normal {
                         name,
                         param_type,
+                        multi_place,
                         span,
                     } => {
                         let substituted = self.substitute_type_with_self(param_type, substitutions);
                         HirParam::Normal {
                             name: *name,
-                            param_type: self.instantiate_type_recursively(substituted),
+                            param_type: self.instantiate_type_recursively(substituted, *span),
+                            multi_place: *multi_place,
                             span: *span,
                         }
                     }
-                    HirParam::This { kind, span } => HirParam::This {
+                    HirParam::This {
+                        kind,
+                        span,
+                        multi_place,
+                    } => HirParam::This {
+                        multi_place: *multi_place,
                         kind: *kind,
                         span: *span,
                     },
@@ -960,6 +1040,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 cond,
                 then_block,
                 else_block,
+                span,
             } => {
                 let new_cond = self.monomorphize_expr(cond, substitutions);
                 let new_then: Vec<HirStmt> = then_block
@@ -975,6 +1056,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     cond: *self.bump.alloc_value_immutable(new_cond),
                     then_block: then_slice,
                     else_block: new_else,
+                    span: *span,
                 }
             }
             HirStmt::While { cond, body } => {
@@ -1003,8 +1085,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         self.monomorphize_expr_with_expected_type(value, &subd_ty, substitutions)
                     });
 
-                let new_ty = self.instantiate_struct_ty_if_needed(subd_ty);
-                let new_ty = self.instantiate_enum_ty_if_needed(new_ty);
+                let new_ty = self.instantiate_type_recursively(subd_ty, *span);
                 self.ctx.variable_types.borrow_mut().insert(*name, new_ty);
 
                 HirStmt::Let {
@@ -1018,7 +1099,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     span: *span,
                 }
             }
-            HirStmt::Return(opt) => {
+            HirStmt::Return(opt, span) => {
                 let new_opt = opt.map(|e| {
                     let ret_ty = *self.current_return_type.borrow();
                     let new_expr = match ret_ty {
@@ -1029,7 +1110,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     };
                     self.bump.alloc_value_immutable(new_expr)
                 });
-                HirStmt::Return(new_opt)
+                HirStmt::Return(new_opt, *span)
             }
             HirStmt::Expr(e) => {
                 let new_expr = self.monomorphize_expr(e, substitutions);
@@ -1041,16 +1122,17 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     body: self.bump.alloc_value_immutable(new_body),
                 }
             }
-            HirStmt::Block { body } => {
+            HirStmt::Block { body, span } => {
                 let new_body: Vec<HirStmt> = body
                     .iter()
                     .map(|s| self.monomorphize_stmt(s, substitutions))
                     .collect();
                 HirStmt::Block {
                     body: self.bump.alloc_slice(&new_body),
+                    span: *span,
                 }
             }
-            HirStmt::Match { expr, arms } => {
+            HirStmt::Match { expr, arms, span } => {
                 let new_expr = self.monomorphize_expr(expr, substitutions);
                 let new_arms: Vec<HirMatchArm> = arms
                     .iter()
@@ -1068,6 +1150,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 HirStmt::Match {
                     expr: self.bump.alloc_value_immutable(new_expr),
                     arms: self.bump.alloc_slice(&new_arms),
+                    span: *span,
                 }
             }
             HirStmt::Defer(stmt) => {
@@ -1395,7 +1478,11 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         })
     }
 
-    fn instantiate_struct_ty_if_needed(&self, ty: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
+    fn instantiate_struct_ty_if_needed(
+        &self,
+        ty: HirType<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> HirType<'a, 'bump> {
         let HirType::Struct {
             name, type_args, ..
         } = &ty
@@ -1405,7 +1492,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         if type_args.is_empty() {
             return ty;
         }
-        let Some(new_struct) = instantiate_struct_for_types(
+        match instantiate_struct_for_types(
             self.ctx,
             &self.instantiated_structs,
             &self.instantiated_struct_origins,
@@ -1414,15 +1501,22 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             *name,
             type_args,
             self.bump.clone(),
-        ) else {
-            return ty;
-        };
-
-        let field_types: Vec<HirType> = new_struct.fields.iter().map(|f| f.field_type).collect();
-        HirType::Struct {
-            name: new_struct.name,
-            field_types: self.bump.alloc_slice_immutable(&field_types),
-            type_args: &[],
+        ) {
+            Some(new_struct) => {
+                let field_types: Vec<HirType> =
+                    new_struct.fields.iter().map(|f| f.field_type).collect();
+                HirType::Struct {
+                    name: new_struct.name,
+                    field_types: self.bump.alloc_slice_immutable(&field_types),
+                    type_args: &[],
+                }
+            }
+            None => panic!(
+                "instantiate_struct_ty_if_needed: failed to instantiate `{}` with type args {:?} at {span}; \
+                 this struct type would otherwise be silently left un-renamed, which produces \
+                 confusing 'unknown struct' failures much later in MIR lowering. Please open an issue if you see this error message.",
+                name, type_args
+            ),
         }
     }
 
@@ -1491,7 +1585,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     .alloc_value_immutable(self.monomorphize_expr(expr, subs)),
                 target_type: {
                     let substituted = self.substitute_type_with_self(target_type, subs);
-                    self.instantiate_type_recursively(substituted)
+                    self.instantiate_type_recursively(substituted, *span)
                 },
                 span: *span,
             },
@@ -1672,10 +1766,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                 .resolve_type_path_name(module_path, struct_name, acc.span)
                         };
 
-                        let resolved_targs: Vec<HirType> = targs
+                        let mut resolved_targs: Vec<HirType> = targs
                             .iter()
                             .map(|t| substitute_type(t, subs, self.bump.clone()))
                             .collect();
+
+                        if let Some(ty_struct) = self.ctx.structs.borrow().get(&target_key) {
+                            if let Some(declared) = ty_struct.generics {
+                                HirLowerer::fill_default_type_args(
+                                    declared,
+                                    &mut resolved_targs,
+                                    self.bump.clone(),
+                                );
+                            }
+                        }
 
                         let struct_ty = HirType::Struct {
                             name: target_key,
@@ -1889,13 +1993,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             }
             HirExpr::Ref {
                 expr,
-                mutable,
+                ref_kind,
                 span,
             } => {
                 let new_expr = self.monomorphize_expr(expr, subs);
                 HirExpr::Ref {
                     expr: self.bump.alloc_value_immutable(new_expr),
-                    mutable: *mutable,
+                    ref_kind: *ref_kind,
                     span: *span,
                 }
             }
@@ -2034,7 +2138,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
     fn assert_stmt_monomorphized(&self, stmt: &HirStmt<'a, 'bump>, owner: StrId) {
         match stmt {
-            HirStmt::Block { body } => {
+            HirStmt::Block { body, span: _ } => {
                 for s in body.iter() {
                     self.assert_stmt_monomorphized(s, owner);
                 }
@@ -2043,6 +2147,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 cond,
                 then_block,
                 else_block,
+                span: _,
             } => {
                 self.assert_expr_monomorphized(cond, owner);
                 for s in then_block.iter() {
@@ -2074,10 +2179,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 self.assert_stmt_monomorphized(body, owner);
             }
             HirStmt::Let { value, .. } => self.assert_expr_monomorphized(value, owner),
-            HirStmt::Return(Some(e)) => self.assert_expr_monomorphized(e, owner),
+            HirStmt::Return(Some(e), _span) => self.assert_expr_monomorphized(e, owner),
             HirStmt::Expr(e) => self.assert_expr_monomorphized(e, owner),
             HirStmt::UnsafeBlock { body } => self.assert_stmt_monomorphized(body, owner),
-            HirStmt::Match { expr, arms } => {
+            HirStmt::Match {
+                expr,
+                arms,
+                span: _,
+            } => {
                 self.assert_expr_monomorphized(expr, owner);
                 for arm in arms.iter() {
                     if let Some(g) = arm.guard {
@@ -2326,9 +2435,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     });
                 HirStmt::Expr(self.bump.alloc_value_immutable(new_expr))
             }
-            HirStmt::Block { body } => {
+            HirStmt::Block { body, span } => {
                 let Some((last, rest)) = body.split_last() else {
-                    return HirStmt::Block { body };
+                    return HirStmt::Block { body, span: *span };
                 };
                 let mut new_body: Vec<HirStmt> = rest
                     .iter()
@@ -2341,12 +2450,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 ));
                 HirStmt::Block {
                     body: self.bump.alloc_slice(&new_body),
+                    span: *span,
                 }
             }
             HirStmt::If {
                 cond,
                 then_block,
                 else_block,
+                span,
             } => {
                 let new_cond = self.monomorphize_expr(cond, substitutions);
                 let new_then: Vec<HirStmt> = match then_block.split_last() {
@@ -2370,12 +2481,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     self.bump.alloc_value_immutable(new_stmt)
                 });
                 HirStmt::If {
-                    cond: *self.bump.alloc_value_immutable(new_cond),
+                    cond: new_cond,
                     then_block: self.bump.alloc_slice(&new_then),
                     else_block: new_else,
+                    span: *span,
                 }
             }
-            HirStmt::Match { expr, arms } => {
+            HirStmt::Match { expr, arms, span } => {
                 let new_expr = self.monomorphize_expr(expr, substitutions);
                 let new_arms: Vec<HirMatchArm> = arms
                     .iter()
@@ -2397,6 +2509,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 HirStmt::Match {
                     expr: self.bump.alloc_value_immutable(new_expr),
                     arms: self.bump.alloc_slice(&new_arms),
+                    span: *span,
                 }
             }
             HirStmt::UnsafeBlock { body } => {
@@ -2407,6 +2520,273 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 }
             }
             other => self.monomorphize_stmt(other, substitutions),
+        }
+    }
+
+    pub fn force_instantiate_allocator_frees(&self) {
+        let free_method_name = StrId(self.context.intern("free"));
+
+        let mut needed: Vec<(StrId, HirType<'a, 'bump>)> = Vec::new();
+
+        let funcs: Vec<HirFunc<'a, 'bump>> = self.functions.borrow().values().cloned().collect();
+
+        for func in &funcs {
+            let Some(body) = func.body else { continue };
+
+            let mut param_map: FxHashMap<StrId, HirType> = FxHashMap::default();
+            if let Some(params) = func.params {
+                for p in params.iter() {
+                    if let HirParam::Normal {
+                        name, param_type, ..
+                    } = p
+                    {
+                        param_map.insert(*name, *param_type);
+                    }
+                }
+            }
+
+            let this_ty = func.impl_target.map(|name| HirType::Struct {
+                name,
+                field_types: &[],
+                type_args: &[],
+            });
+
+            let prev_params = self.current_params.replace(param_map);
+            let prev_this = self.current_this.replace(this_ty);
+
+            self.collect_owned_pointer_allocs(&body, &mut needed);
+
+            self.current_params.replace(prev_params);
+            self.current_this.replace(prev_this);
+        }
+
+        for (allocator_name, pointee_ty) in needed {
+            let allocator_ty = HirType::Struct {
+                name: allocator_name,
+                field_types: &[],
+                type_args: &[],
+            };
+
+            let type_args_slice = self.bump.alloc_slice_immutable(&[pointee_ty]);
+            self.resolve_method_for_type(
+                &allocator_ty,
+                free_method_name,
+                Some(type_args_slice),
+                &HashMap::default(),
+            );
+        }
+    }
+
+    fn infer_allocator_ty_from_expr(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+    ) -> Option<HirType<'a, 'bump>> {
+        match expr {
+            HirExpr::Intrinsic {
+                kind: IntrinsicKind::Own,
+                args,
+                ..
+            } => {
+                if args.len() == 3 || args.len() == 2 {
+                    if let Some(ty) = self.concrete_type_of(&args[1]) {
+                        return Some(ty);
+                    }
+                }
+                self.concrete_type_of(&HirExpr::This {
+                    span: Default::default(),
+                })
+            }
+
+            // Post-monomorphization shape: method calls are desugared into a
+            // direct call to a mangled function with the receiver as the first
+            // argument. That's the allocator identity — not necessarily `this`.
+            HirExpr::Call { args, .. } | HirExpr::InterfaceCall { args, .. } => {
+                let first = args.first()?;
+                if let Some(ty) = self.concrete_type_of(first) {
+                    return Some(ty);
+                }
+                self.infer_allocator_ty_from_expr(first)
+            }
+
+            HirExpr::Cast { expr, .. }
+            | HirExpr::Deref { expr, .. }
+            | HirExpr::Ref { expr, .. } => self.infer_allocator_ty_from_expr(expr),
+
+            _ => None,
+        }
+    }
+
+    fn collect_owned_pointer_allocs(
+        &self,
+        stmt: &HirStmt<'a, 'bump>,
+        needed: &mut Vec<(StrId, HirType<'a, 'bump>)>,
+    ) {
+        match stmt {
+            HirStmt::Let {
+                ty, value, span: _, ..
+            } => {
+                if let HirType::OwnedPointer { inner, .. } = ty {
+                    if let Some(alloc_ty) = self.infer_allocator_ty_from_expr(value) {
+                        if let HirType::Struct { name, .. } = peel_to_struct_owned(alloc_ty) {
+                            needed.push((name, **inner));
+                        }
+                    }
+                }
+                self.collect_owned_pointer_allocs_expr(value, needed);
+            }
+            HirStmt::Block { body, .. } => {
+                for s in body.iter() {
+                    self.collect_owned_pointer_allocs(s, needed);
+                }
+            }
+            HirStmt::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                self.collect_owned_pointer_allocs_expr(cond, needed);
+                for s in then_block.iter() {
+                    self.collect_owned_pointer_allocs(s, needed);
+                }
+                if let Some(e) = else_block {
+                    self.collect_owned_pointer_allocs(e, needed);
+                }
+            }
+            HirStmt::While { cond, body } => {
+                self.collect_owned_pointer_allocs_expr(cond, needed);
+                self.collect_owned_pointer_allocs(body, needed);
+            }
+            HirStmt::For {
+                init,
+                condition,
+                increment,
+                body,
+            } => {
+                if let Some(i) = init {
+                    self.collect_owned_pointer_allocs(i, needed);
+                }
+                if let Some(c) = condition {
+                    self.collect_owned_pointer_allocs_expr(c, needed);
+                }
+                if let Some(i) = increment {
+                    self.collect_owned_pointer_allocs_expr(i, needed);
+                }
+                self.collect_owned_pointer_allocs(body, needed);
+            }
+            HirStmt::Return(Some(e), _) => self.collect_owned_pointer_allocs_expr(e, needed),
+            HirStmt::Expr(e) => self.collect_owned_pointer_allocs_expr(e, needed),
+            HirStmt::UnsafeBlock { body } => self.collect_owned_pointer_allocs(body, needed),
+            HirStmt::Match { expr, arms, .. } => {
+                self.collect_owned_pointer_allocs_expr(expr, needed);
+                for arm in arms.iter() {
+                    if let Some(g) = arm.guard {
+                        self.collect_owned_pointer_allocs_expr(g, needed);
+                    }
+                    self.collect_owned_pointer_allocs(arm.body, needed);
+                }
+            }
+            HirStmt::Defer(s) => self.collect_owned_pointer_allocs(s, needed),
+            _ => {}
+        }
+    }
+
+    fn collect_owned_pointer_allocs_expr(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+        needed: &mut Vec<(StrId, HirType<'a, 'bump>)>,
+    ) {
+        match expr {
+            HirExpr::Block { body, .. } => {
+                for s in body.iter() {
+                    self.collect_owned_pointer_allocs(s, needed);
+                }
+            }
+            HirExpr::If { if_stmt, .. } => self.collect_owned_pointer_allocs(if_stmt, needed),
+            HirExpr::Match { expr, arms, .. } => {
+                self.collect_owned_pointer_allocs_expr(expr, needed);
+                for arm in arms.iter() {
+                    if let Some(g) = arm.guard {
+                        self.collect_owned_pointer_allocs_expr(g, needed);
+                    }
+                    self.collect_owned_pointer_allocs(arm.body, needed);
+                }
+            }
+            HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
+                self.collect_owned_pointer_allocs_expr(callee, needed);
+                for a in args.iter() {
+                    self.collect_owned_pointer_allocs_expr(a, needed);
+                }
+            }
+            HirExpr::Binary { left, right, .. } | HirExpr::Comparison { left, right, .. } => {
+                self.collect_owned_pointer_allocs_expr(left, needed);
+                self.collect_owned_pointer_allocs_expr(right, needed);
+            }
+            HirExpr::Assignment { target, value, .. } => {
+                self.collect_owned_pointer_allocs_expr(target, needed);
+                self.collect_owned_pointer_allocs_expr(value, needed);
+            }
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                self.collect_owned_pointer_allocs_expr(object, needed);
+            }
+            HirExpr::Cast { expr, .. }
+            | HirExpr::Deref { expr, .. }
+            | HirExpr::Ref { expr, .. } => {
+                self.collect_owned_pointer_allocs_expr(expr, needed);
+            }
+            HirExpr::Index { object, index, .. } => {
+                self.collect_owned_pointer_allocs_expr(object, needed);
+                self.collect_owned_pointer_allocs_expr(index, needed);
+            }
+            HirExpr::ArrayLiteral { elements, .. } => {
+                for e in elements.iter() {
+                    self.collect_owned_pointer_allocs_expr(e, needed);
+                }
+            }
+            HirExpr::Tuple(exprs, _) => {
+                for e in exprs.iter() {
+                    self.collect_owned_pointer_allocs_expr(e, needed);
+                }
+            }
+            HirExpr::StructInit { args, .. } => {
+                for f in args.iter() {
+                    self.collect_owned_pointer_allocs_expr(&f.value, needed);
+                }
+            }
+            HirExpr::EnumInit { args, .. } => {
+                for a in args.iter() {
+                    self.collect_owned_pointer_allocs_expr(a, needed);
+                }
+            }
+            HirExpr::Slice {
+                object, start, end, ..
+            } => {
+                self.collect_owned_pointer_allocs_expr(object, needed);
+                self.collect_owned_pointer_allocs_expr(start, needed);
+                self.collect_owned_pointer_allocs_expr(end, needed);
+            }
+            HirExpr::Range { start, end, .. } => {
+                self.collect_owned_pointer_allocs_expr(start, needed);
+                self.collect_owned_pointer_allocs_expr(end, needed);
+            }
+            HirExpr::ExprList { list, .. } => {
+                for e in list.iter() {
+                    self.collect_owned_pointer_allocs_expr(e, needed);
+                }
+            }
+            HirExpr::Intrinsic { args, .. } => {
+                for a in args.iter() {
+                    self.collect_owned_pointer_allocs_expr(a, needed);
+                }
+            }
+            HirExpr::InterpolatedString(parts) => {
+                for p in parts.iter() {
+                    if let InterpolationPart::Expr(e) = p {
+                        self.collect_owned_pointer_allocs_expr(e, needed);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

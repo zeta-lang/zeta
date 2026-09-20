@@ -119,7 +119,7 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
         HirType::Char => SsaType::Char,
         HirType::Ref {
             inner,
-            mutability_state: _,
+            ref_kind: _,
             provenance: _,
         } => {
             // Same rationale as SafePointer/UnsafePointer above: `&dyn T`
