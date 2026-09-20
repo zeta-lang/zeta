@@ -22,10 +22,9 @@ use ir::ir_hasher::FxHashBuilder;
 use ir::layout::TargetInfo;
 use ir::layout::sizeof_ssa;
 use ir::ssa_ir::{
-    BasicBlock, BinOp, BlockId, CastKind, Function, Instruction, InterpolationOperand, Module,
-    Operand, SsaType, UnOp, Value, inst_is_terminator,
+    BasicBlock, BinOp, BlockId, CastKind, Function, Instruction, Module, Operand, SsaType, UnOp,
+    Value, inst_is_terminator,
 };
-use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
@@ -38,9 +37,6 @@ use zetaruntime::string_pool::{StringPool, VmString};
 pub struct CraneliftBackend {
     module: ObjectModule,
     string_data: HashMap<VmString, ZetaDataId>,
-    interp_func: FuncId,
-    enum_new: FuncId,
-    enum_tag: FuncId,
     func_ids: HashMap<StrId, FuncId, FxHashBuilder>,
     func_param_types: HashMap<StrId, Vec<SsaType>, FxHashBuilder>,
     context: Arc<StringPool>,
@@ -102,29 +98,6 @@ impl CraneliftBackend {
         .unwrap();
         let mut module = ObjectModule::new(builder);
 
-        let mut sig_interp = Signature::new(module.isa().default_call_conv());
-        sig_interp.params.push(AbiParam::new(types::I64));
-        sig_interp.params.push(AbiParam::new(types::I64));
-        sig_interp.returns.push(AbiParam::new(types::I64));
-        let interp_func = module
-            .declare_function("__interp", Linkage::Import, &sig_interp)
-            .unwrap();
-
-        let mut sig_enum_new = Signature::new(module.isa().default_call_conv());
-        sig_enum_new.params.push(AbiParam::new(types::I64)); // tag
-        sig_enum_new.params.push(AbiParam::new(types::I64)); // payload size, new
-        sig_enum_new.returns.push(AbiParam::new(types::I64));
-        let enum_new = module
-            .declare_function("__enum_new", Linkage::Import, &sig_enum_new)
-            .unwrap();
-
-        let mut sig_enum_tag = Signature::new(module.isa().default_call_conv());
-        sig_enum_tag.params.push(AbiParam::new(types::I64));
-        sig_enum_tag.returns.push(AbiParam::new(types::I64));
-        let enum_tag = module
-            .declare_function("__enum_tag", Linkage::Import, &sig_enum_tag)
-            .unwrap();
-
         let sig_cpu_relax = Signature::new(module.isa().default_call_conv());
         let cpu_relax_func = module
             .declare_function("__zeta_cpu_relax", Linkage::Import, &sig_cpu_relax)
@@ -133,9 +106,6 @@ impl CraneliftBackend {
         CraneliftBackend {
             module,
             string_data: HashMap::new(),
-            interp_func,
-            enum_new,
-            enum_tag,
             func_ids: HashMap::with_hasher(FxHashBuilder),
             func_param_types: HashMap::with_hasher(FxHashBuilder),
             context,
@@ -251,12 +221,13 @@ impl CraneliftBackend {
 
     fn is_aggregate_ty(ty: &SsaType) -> bool {
         match ty {
-            SsaType::User(_, _) => true,
-            SsaType::Array(_, _) => true,
-            SsaType::Tuple(_) => true,
-            SsaType::Enum { .. } => true,
-            SsaType::Slice(_) => true,
+            SsaType::User(_, _)
+            | SsaType::Array(_, _)
+            | SsaType::Tuple(_)
+            | SsaType::Enum { .. }
+            | SsaType::Slice(_) => true,
             SsaType::Owned(inner) => matches!(inner.as_ref(), SsaType::Slice(_)),
+            SsaType::Nullable(_) => ty.is_tagged_nullable(),
             _ => false,
         }
     }
@@ -383,23 +354,84 @@ impl CraneliftBackend {
                     (l, r)
                 };
 
+                let operand_ty = |operand: &Operand| -> Option<&SsaType> {
+                    match operand {
+                        Operand::Value(v) => func.value_types.get(v),
+                        _ => None,
+                    }
+                };
+                let unsigned = operand_ty(left)
+                    .or_else(|| operand_ty(right))
+                    .map(is_unsigned_ssa_type)
+                    .unwrap_or(false);
+
                 let res = match op {
                     BinOp::Add => builder.ins().iadd(l, r),
                     BinOp::Sub => builder.ins().isub(l, r),
                     BinOp::Mul => builder.ins().imul(l, r),
-                    BinOp::Div => builder.ins().sdiv(l, r),
-                    BinOp::Mod => builder.ins().srem(l, r),
+                    BinOp::Div => {
+                        if unsigned {
+                            builder.ins().udiv(l, r)
+                        } else {
+                            builder.ins().sdiv(l, r)
+                        }
+                    }
+                    BinOp::Mod => {
+                        if unsigned {
+                            builder.ins().urem(l, r)
+                        } else {
+                            builder.ins().srem(l, r)
+                        }
+                    }
                     BinOp::Eq => builder.ins().icmp(IntCC::Equal, l, r),
                     BinOp::Ne => builder.ins().icmp(IntCC::NotEqual, l, r),
-                    BinOp::Lt => builder.ins().icmp(IntCC::SignedLessThan, l, r),
-                    BinOp::Le => builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
-                    BinOp::Gt => builder.ins().icmp(IntCC::SignedGreaterThan, l, r),
-                    BinOp::Ge => builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r),
+                    BinOp::Lt => builder.ins().icmp(
+                        if unsigned {
+                            IntCC::UnsignedLessThan
+                        } else {
+                            IntCC::SignedLessThan
+                        },
+                        l,
+                        r,
+                    ),
+                    BinOp::Le => builder.ins().icmp(
+                        if unsigned {
+                            IntCC::UnsignedLessThanOrEqual
+                        } else {
+                            IntCC::SignedLessThanOrEqual
+                        },
+                        l,
+                        r,
+                    ),
+                    BinOp::Gt => builder.ins().icmp(
+                        if unsigned {
+                            IntCC::UnsignedGreaterThan
+                        } else {
+                            IntCC::SignedGreaterThan
+                        },
+                        l,
+                        r,
+                    ),
+                    BinOp::Ge => builder.ins().icmp(
+                        if unsigned {
+                            IntCC::UnsignedGreaterThanOrEqual
+                        } else {
+                            IntCC::SignedGreaterThanOrEqual
+                        },
+                        l,
+                        r,
+                    ),
                     BinOp::BitAnd => builder.ins().band(l, r),
                     BinOp::BitOr => builder.ins().bor(l, r),
                     BinOp::BitXor => builder.ins().bxor(l, r),
                     BinOp::ShiftLeft => builder.ins().ishl(l, r),
-                    BinOp::ShiftRight => builder.ins().sshr(l, r),
+                    BinOp::ShiftRight => {
+                        if unsigned {
+                            builder.ins().ushr(l, r)
+                        } else {
+                            builder.ins().sshr(l, r)
+                        }
+                    }
                     BinOp::LogicalAnd => unreachable!(),
                     BinOp::LogicalOr => unreachable!(),
                 };
@@ -473,7 +505,19 @@ impl CraneliftBackend {
                         for (pred, val) in incomings {
                             if pred == &curr_bb {
                                 let v = *val;
-                                let var = var_map.get(&v).expect("phi incoming value not lowered");
+                                let var = var_map.get(&v).unwrap_or_else(|| {
+                                    panic!(
+                                        "phi incoming value not lowered: \
+                                         curr_bb={:?} -> target={:?}, \
+                                         phi_dest={:?}, missing_val={:?}, \
+                                         var_map_keys={:?}",
+                                        curr_bb,
+                                        target,
+                                        dest,
+                                        v,
+                                        var_map.keys().collect::<Vec<_>>()
+                                    )
+                                });
                                 let valv = builder.use_var(*var);
                                 let phi_ty = func
                                     .value_types
@@ -726,9 +770,7 @@ impl CraneliftBackend {
                         None => {}
                         Some(_) => panic!(
                             "Ret: aggregate return must be a Value (address) in function `{}` (ret_type: {:?}, value: {:?})",
-                            self.context.resolve_string(&func.name),
-                            func.ret_type,
-                            value
+                            func.name, func.ret_type, value
                         ),
                     }
 
@@ -1111,11 +1153,11 @@ impl CraneliftBackend {
 
                     CastKind::FloatTruncate => builder.ins().fdemote(dst_ty, src),
 
-                    CastKind::Bitcast => builder.ins().bitcast(dst_ty, MemFlags::new(), src),
+                    CastKind::Bitcast => self.coerce_bitcast(builder, src, dst_ty),
 
-                    CastKind::PtrToInt => builder.ins().bitcast(dst_ty, MemFlags::new(), src),
+                    CastKind::PtrToInt => self.coerce_bitcast(builder, src, dst_ty),
 
-                    CastKind::IntToPtr => builder.ins().bitcast(dst_ty, MemFlags::new(), src),
+                    CastKind::IntToPtr => self.coerce_bitcast(builder, src, dst_ty),
                 };
 
                 let var = self.def_fresh_var(builder, result, Some(dst_ty), "Cast");
@@ -1391,9 +1433,6 @@ impl CraneliftBackend {
                 }
             }
             Instruction::UpcastToInterface { .. } => todo!(),
-            Instruction::Interpolate { .. } => todo!(),
-            Instruction::EnumConstruct { .. } => todo!(),
-            Instruction::MatchEnum { .. } => todo!(),
             Instruction::FieldAddr { dest, base, offset } => {
                 let base_val = match base {
                     Operand::Value(bv) => {
@@ -1624,6 +1663,35 @@ impl CraneliftBackend {
         } else {
             builder.ins().bitcast(want, MemFlags::new(), value)
         }
+    }
+
+    fn coerce_bitcast(
+        &self,
+        builder: &mut FunctionBuilder,
+        src: cranelift_codegen::ir::Value,
+        dst_ty: Type,
+    ) -> cranelift_codegen::ir::Value {
+        let src_ty = builder.func.dfg.value_type(src);
+        if src_ty == dst_ty {
+            return src;
+        }
+        if src_ty.bits() == dst_ty.bits() {
+            return builder.ins().bitcast(dst_ty, MemFlags::new(), src);
+        }
+        if src_ty.is_int() && dst_ty.is_int() {
+            return if src_ty.bits() < dst_ty.bits() {
+                builder.ins().uextend(dst_ty, src)
+            } else {
+                builder.ins().ireduce(dst_ty, src)
+            };
+        }
+        panic!(
+            "coerce_bitcast: cannot reconcile {:?} ({} bits) with {:?} ({} bits)",
+            src_ty,
+            src_ty.bits(),
+            dst_ty,
+            dst_ty.bits()
+        );
     }
 }
 
@@ -1951,134 +2019,15 @@ impl CraneliftBackend {
         bb: &&BasicBlock,
     ) {
         for inst in &bb.instructions {
-            match inst {
-                Instruction::Interpolate { dest, parts } => {
-                    self.process_interpolate_instruction(&mut builder, &mut var_map, dest, parts);
-                }
-
-                Instruction::EnumConstruct { dest, variant, .. } => {
-                    self.process_enum_construct_instruction(
-                        &mut builder,
-                        &mut var_map,
-                        dest,
-                        variant,
-                    );
-                }
-
-                Instruction::MatchEnum { value, arms } => {
-                    self.process_match_instruction(
-                        &mut builder,
-                        &block_map,
-                        &mut var_map,
-                        value,
-                        arms,
-                    );
-                }
-
-                other => {
-                    self.lower_basic_inst(
-                        other,
-                        bb.id,
-                        &mut builder,
-                        &mut var_map,
-                        &block_map,
-                        &phi_param_map,
-                        func,
-                    );
-                }
-            }
-        }
-    }
-
-    fn process_interpolate_instruction(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        var_map: &mut HashMap<Value, Variable, FxHashBuilder>,
-        dest: &Value,
-        parts: &SmallVec<InterpolationOperand, 4>,
-    ) {
-        let count = parts.len() as i64;
-
-        let arr_size = self.target.ptr_bytes as i64 * count;
-        let arr_ptr =
-            cranelift_intrinsics::stack_alloc(builder, &mut self.module, arr_size as usize);
-
-        for (i, part) in parts.iter().enumerate() {
-            let offset = i as i64 * self.target.ptr_bytes as i64;
-            let val = match part {
-                InterpolationOperand::Literal(s) => {
-                    let did = self.get_or_create_string(&s);
-                    let gv = self.module.declare_data_in_func(did, &mut builder.func);
-                    builder.ins().global_value(types::I64, gv)
-                }
-                InterpolationOperand::Value(v) => {
-                    builder.use_var(*var_map.get(v).expect("undefined interpolation value"))
-                }
-            };
-            let addr = builder.ins().iadd_imm(arr_ptr, offset);
-            builder.ins().store(MemFlags::new(), val, addr, 0);
-        }
-
-        let func_ref = self
-            .module
-            .declare_func_in_func(self.interp_func, &mut builder.func);
-        let count_val = builder.ins().iconst(types::I64, count);
-        let call = builder.ins().call(func_ref, &[arr_ptr, count_val]);
-        let res = builder.inst_results(call)[0];
-        let var = self.def_fresh_var(builder, res, None, "Interpolate");
-        var_map.insert(*dest, var);
-    }
-
-    fn process_enum_construct_instruction(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        var_map: &mut HashMap<Value, Variable, FxHashBuilder>,
-        dest: &Value,
-        variant: &StrId,
-    ) {
-        let tag = self
-            .context
-            .resolve_string(variant)
-            .parse::<i64>()
-            .expect("enum variant must be numeric for now");
-
-        let func_ref = self
-            .module
-            .declare_func_in_func(self.enum_new, &mut builder.func);
-        let tag_val = builder.ins().iconst(types::I64, tag);
-        let call = builder.ins().call(func_ref, &[tag_val]);
-        let res = builder.inst_results(call)[0];
-        let var = self.def_fresh_var(builder, res, None, "EnumConstruct");
-        var_map.insert(*dest, var);
-    }
-
-    fn process_match_instruction(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        block_map: &HashMap<BlockId, ClifBlock, FxHashBuilder>,
-        var_map: &mut HashMap<Value, Variable, FxHashBuilder>,
-        value: &Value,
-        arms: &SmallVec<(StrId, BlockId), 8>,
-    ) {
-        let val = builder.use_var(*var_map.get(value).expect("undefined match value"));
-
-        let func_ref = self
-            .module
-            .declare_func_in_func(self.enum_tag, &mut builder.func);
-        let call = builder.ins().call(func_ref, &[val]);
-        let tag_val = builder.inst_results(call)[0];
-
-        for (arm_tag, target_bbid) in arms {
-            let target_blk = block_map.get(target_bbid).expect("target block missing");
-            let tag = self
-                .context
-                .resolve_string(arm_tag)
-                .parse::<i64>()
-                .expect("enum tag must be numeric for br_table");
-
-            let cmp = builder.ins().icmp_imm(IntCC::Equal, tag_val, tag);
-            let current_blk = builder.current_block().expect("no current block");
-            builder.ins().brif(cmp, *target_blk, &[], current_blk, &[]);
+            self.lower_basic_inst(
+                inst,
+                bb.id,
+                &mut builder,
+                &mut var_map,
+                &block_map,
+                &phi_param_map,
+                func,
+            );
         }
     }
 
@@ -2119,4 +2068,11 @@ pub extern "C" fn __enum_new(tag: i64, size: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn __enum_tag(obj: *const u8) -> i64 {
     unsafe { *(obj as *const i64) }
+}
+
+fn is_unsigned_ssa_type(ty: &SsaType) -> bool {
+    matches!(
+        ty,
+        SsaType::U8 | SsaType::U16 | SsaType::U32 | SsaType::U64 | SsaType::U128 | SsaType::Usize
+    )
 }
