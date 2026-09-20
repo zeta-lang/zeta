@@ -37,7 +37,7 @@ impl<'bump> ModuleBuilder<'bump> {
 }
 
 fn extract_symbol_info(stmt: &Stmt<'_, '_>, pool: &StringPool) -> (StrId, StrId) {
-    let kind = |s: &str| StrId(pool.intern(s));
+    let kind = |s: &str| StrId(pool.thread_local().intern(s));
     match stmt {
         Stmt::FuncDecl(f) => (f.name, kind("function")),
         Stmt::StructDecl(s) => (s.name, kind("struct")),
@@ -47,9 +47,9 @@ fn extract_symbol_info(stmt: &Stmt<'_, '_>, pool: &StringPool) -> (StrId, StrId)
         Stmt::ImplDecl(i) => (
             i.target
                 .struct_name()
-                .unwrap_or_else(|| StrId(pool.intern("<anon>"))),
+                .unwrap_or_else(|| StrId(pool.thread_local().intern("<anon>"))),
             kind("impl"),
         ),
-        _ => (StrId(pool.intern("<anon>")), kind("unknown")),
+        _ => (StrId(pool.thread_local().intern("<anon>")), kind("unknown")),
     }
 }
