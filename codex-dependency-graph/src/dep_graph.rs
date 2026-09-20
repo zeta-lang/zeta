@@ -220,7 +220,7 @@ impl DepGraph {
             Some(pkg) => pool
                 .resolve_string(&pkg)
                 .split("::")
-                .map(|seg| StrId(pool.intern(seg)))
+                .map(|seg| StrId(pool.thread_local().intern(seg)))
                 .collect(),
             None => Vec::new(),
         }
@@ -275,7 +275,7 @@ impl DepGraph {
             joined.push('_');
         }
         joined.push_str(pool.resolve_string(&name));
-        StrId(pool.intern(&joined))
+        StrId(pool.thread_local().intern(&joined))
     }
 
     fn builtin_type_strid(&self, kind: &TypeKind, pool: &StringPool) -> Option<StrId> {
@@ -299,7 +299,7 @@ impl DepGraph {
             TypeKind::Char => "char",
             _ => return None,
         };
-        Some(StrId(pool.intern(s)))
+        Some(StrId(pool.thread_local().intern(s)))
     }
 
     fn type_name_of<'a, 'bump>(&self, ty: &Type<'a, 'bump>, pool: &StringPool) -> Option<StrId> {
@@ -317,11 +317,11 @@ impl DepGraph {
         match expr {
             Expr::This { .. } => self.current_self_type,
             Expr::Ident { name, .. } => self.current_locals.get(name).copied(),
-            Expr::String { .. } => Some(StrId(pool.intern("str"))),
-            Expr::Number { .. } => Some(StrId(pool.intern("i64"))),
-            Expr::Decimal { .. } => Some(StrId(pool.intern("f64"))),
-            Expr::Boolean { .. } => Some(StrId(pool.intern("bool"))),
-            Expr::Char { .. } => Some(StrId(pool.intern("char"))),
+            Expr::String { .. } => Some(StrId(pool.thread_local().intern("str"))),
+            Expr::Number { .. } => Some(StrId(pool.thread_local().intern("i64"))),
+            Expr::Decimal { .. } => Some(StrId(pool.thread_local().intern("f64"))),
+            Expr::Boolean { .. } => Some(StrId(pool.thread_local().intern("bool"))),
+            Expr::Char { .. } => Some(StrId(pool.thread_local().intern("char"))),
             Expr::StructInit { callee, .. } => match callee {
                 Expr::Ident { name, .. } => Some(*name),
                 _ => None,
@@ -2103,5 +2103,5 @@ fn path_to_strid<'a, 'bump>(path: &Path<'a, 'bump>, pool: &StringPool) -> StrId 
         .map(|s| pool.resolve_string(s))
         .collect::<Vec<_>>()
         .join("::");
-    StrId(pool.intern(&joined))
+    StrId(pool.thread_local().intern(&joined))
 }
