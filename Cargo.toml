@@ -1,3 +1,5 @@
+cargo-features = ["codegen-backend"]
+
 [package]
 name = "zeta-lang"
 version = "0.2.0-alpha"
@@ -9,6 +11,14 @@ debug = "line-tables-only"
 strip = "debuginfo"
 lto = "thin"
 codegen-units = 1
+
+[profile.debug]
+debug = "line-tables-only"
+codegen-backend = "cranelift"
+
+[build]
+jobs = 12
+rustflags = ["-Zthreads=8"]
 
 [workspace]
 members = [
@@ -26,8 +36,8 @@ members = [
 ]
 
 [dependencies]
-snmalloc-rs = "0.7.4"
-zeta-compiler-api = { path = "./zeta-compiler-api"}
+mimalloc = "0.1.52"
+zeta-compiler-api = { path = "./zeta-compiler-api" }
 walkdir = "2.5.0"
 thiserror = "2.0.17"
 clap = { version = "4.5.53", features = ["derive"] }
