@@ -20,6 +20,7 @@ pub struct DropScope<'a, 'bump> {
 pub struct DropLocalState {
     pub moved_whole: bool,
     pub moved_fields: HashSet<StrId>,
+    pub initialized_indices: HashSet<i64>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -51,10 +52,44 @@ impl<'a, 'bump> DropMoveState<'a, 'bump> {
         self.locals.get(&name).map_or(false, |l| l.moved_whole)
     }
 
+    pub fn mark_index_initialized(&mut self, name: StrId, index: i64) {
+        self.locals
+            .entry(name)
+            .or_default()
+            .initialized_indices
+            .insert(index);
+    }
+
+    pub fn is_index_uninit(&self, name: StrId, index: i64) -> bool {
+        self.locals.get(&name).map_or(false, |l| {
+            l.moved_whole && !l.initialized_indices.contains(&index)
+        })
+    }
+
     pub fn is_field_moved(&self, name: StrId, field: StrId) -> bool {
         self.locals
             .get(&name)
-            .map_or(false, |l| l.moved_whole || l.moved_fields.contains(&field))
+            .map_or(false, |l| l.moved_fields.contains(&field))
+    }
+
+    pub fn mark_whole_initialized(&mut self, name: StrId) {
+        if let Some(s) = self.locals.get_mut(&name) {
+            s.moved_whole = false;
+        }
+    }
+
+    pub fn mark_field_initialized(&mut self, name: StrId, field: StrId) {
+        if let Some(s) = self.locals.get_mut(&name) {
+            s.moved_fields.remove(&field);
+        }
+    }
+
+    pub fn mark_whole_uninit(&mut self, name: StrId) {
+        self.mark_whole_moved(name);
+    }
+
+    pub fn mark_field_uninit(&mut self, name: StrId, field: StrId) {
+        self.mark_field_moved(name, field);
     }
 }
 
@@ -82,14 +117,16 @@ pub fn record_move_if_any<'a, 'bump>(
             }
         }
         HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
-            if let HirExpr::Ident(root, _) = &**object {
-                // Only Struct locals have fields to partially move out of.
-                // `p.field` where `p: ^T` is a move *through* the pointer
-                // (of the pointee's field), not a move of the pointer
-                // binding
-                if let Some(_) = local_is_droppable(scope_stack, *root) {
-                    drop_state.mark_field_moved(*root, *field);
+            match &**object {
+                HirExpr::Ident(root, _) => {
+                    if local_is_droppable(scope_stack, *root).is_some() {
+                        drop_state.mark_field_moved(*root, *field);
+                    }
                 }
+                HirExpr::This { .. } => {
+                    drop_state.mark_field_moved(StrId::from_static("this"), *field);
+                }
+                _ => {}
             }
         }
         _ => {}
