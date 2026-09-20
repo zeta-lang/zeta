@@ -4,6 +4,7 @@ use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation,
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::HashMap;
 use ir::registry::global_registry::GlobalRegistry;
+use ir::span::SourceSpan;
 use ir::ssa_ir::{
     AllocatorKind, BasicBlock, BlockId, Function, Instruction, Operand, SsaType, Value,
 };
@@ -41,7 +42,7 @@ pub struct DropGlueRegistry {
 
 impl DropGlueRegistry {
     pub fn new<'a, 'bump>(registry: &GlobalRegistry<'a, 'bump>, context: Arc<StringPool>) -> Self {
-        let drop_iface = StrId(context.intern("Drop"));
+        let drop_iface = StrId(context.thread_local().intern("Drop"));
 
         let struct_names: Vec<StrId> = {
             let structs = registry.structs.borrow();
@@ -53,9 +54,6 @@ impl DropGlueRegistry {
         };
 
         let mut is_droppable: HashMap<StrId, bool> = HashMap::default();
-        for &name in &struct_names {
-            is_droppable.insert(name, false);
-        }
 
         let implements_drop = |name: StrId| -> bool {
             registry
@@ -68,6 +66,7 @@ impl DropGlueRegistry {
 
         let mut has_own_drop: HashMap<StrId, bool> = HashMap::default();
         for &name in &struct_names {
+            is_droppable.insert(name, false);
             has_own_drop.insert(name, implements_drop(name));
         }
 
@@ -236,7 +235,7 @@ impl DropGlueBuilder {
 
         let mut cbd = CurrentBlockData::new(&mut func, entry_bb, 1usize, 1usize, value_types);
 
-        let drop_method_name = StrId(context.intern("drop"));
+        let drop_method_name = StrId(context.thread_local().intern("drop"));
         if let Some(mangled_drop) = struct_mangled_map
             .get(&struct_name)
             .and_then(|m| m.get(&drop_method_name))
@@ -364,6 +363,7 @@ impl DropGlueBuilder {
                         false,
                         None,
                         &mut resolver,
+                        SourceSpan::default(),
                     );
                 }
             }
