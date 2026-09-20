@@ -68,15 +68,15 @@ where
     ) -> Self {
         let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
-        let nullable_enum_name = StrId(context.intern("__nullable"));
+        let nullable_enum_name = StrId(context.thread_local().intern("__nullable"));
         let mut nullable_tags = HashMap::default();
-        nullable_tags.insert(StrId(context.intern("null")), 0usize);
-        nullable_tags.insert(StrId(context.intern("some")), 1usize);
+        nullable_tags.insert(StrId(context.thread_local().intern("null")), 0usize);
+        nullable_tags.insert(StrId(context.thread_local().intern("some")), 1usize);
         enum_variant_tags.insert(nullable_enum_name, nullable_tags);
 
-        let throws_enum_name = StrId(context.intern("__throws"));
+        let throws_enum_name = StrId(context.thread_local().intern("__throws"));
         let mut throws_tags = HashMap::default();
-        throws_tags.insert(StrId(context.intern("__success")), 0usize);
+        throws_tags.insert(StrId(context.thread_local().intern("__success")), 0usize);
         enum_variant_tags.insert(throws_enum_name, throws_tags);
 
         Self {
@@ -299,8 +299,8 @@ where
     }
 
     fn compute_allocator_kinds(&mut self) {
-        let allocator_iface = StrId(self.context.intern("Allocator"));
-        let raw_allocator_iface = StrId(self.context.intern("RawAllocator"));
+        let allocator_iface = StrId(self.context.thread_local().intern("Allocator"));
+        let raw_allocator_iface = StrId(self.context.thread_local().intern("RawAllocator"));
 
         for (&struct_name, ifaces) in self.struct_interfaces.iter() {
             if ifaces.contains(&allocator_iface) {
@@ -366,8 +366,13 @@ where
                             name: _,
                             param_type,
                             span: _,
+                            multi_place: _,
                         } => lower_type_hir(&param_type, &self.enums),
-                        HirParam::This { kind, span: _ } => match kind {
+                        HirParam::This {
+                            kind,
+                            span: _,
+                            multi_place: _,
+                        } => match kind {
                             ThisPassingKind::Move | ThisPassingKind::MoveMut => SsaType::Dyn,
                             _ => SsaType::Pointer(Box::new(SsaType::Dyn)),
                         },
@@ -415,9 +420,17 @@ where
                         panic!("failed to compute alignment for field {}: {:?}", f.name, e)
                     });
 
+            debug_assert!(
+                layout.align > 0,
+                "layout_of_ssa returned align=0 for field `{}` of struct `{}` (type {:?}); \
+                 this would corrupt every subsequent field's offset",
+                f.name,
+                hir_struct.name,
+                field_ssa_ty
+            );
+
             current_offset = ir::layout::round_up_to_align(current_offset, layout.align);
             offsets.insert(f.name, current_offset);
-
             current_offset += layout.size;
         }
 
