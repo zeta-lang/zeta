@@ -1,0 +1,93 @@
+package zeta::utils::linked_list;
+
+import zeta::alloc::allocator.Allocator;
+import zeta::utils::mallocator.Mallocator;
+import zeta::io;
+
+struct Node<T> {
+    value: T,
+    prev: ?&alias Node<T>,
+    next: ?^Node<T>,
+}
+
+struct LinkedList<T, A: Allocator = Mallocator> {
+    head: ?^Node<T>,
+    tail: ?&alias Node<T>,
+    len: usize,
+    alloc: A,
+}
+
+impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
+    func new(): LinkedList<T, Mallocator> {
+        let alloc: Mallocator = Mallocator {};
+        return LinkedList<T, Mallocator> {
+            head: null,
+            tail: null,
+            len: 0,
+            alloc,
+        };
+    }
+
+    func push_back(&mut this, value: T) {
+        let node: ^Node<T> = this.alloc.new<Node<T>>(Node<T> {
+            value: value,
+            prev: null,
+            next: null,
+        });
+
+        if (this.tail == null) {
+            this.head = node;
+            this.tail = &alias *this.head;
+            this.len += 1;
+            return;
+        }
+
+        let tail: ?&alias Node<T> = this.tail;
+
+        node.prev = tail;
+        tail.next = node;
+
+        this.tail = tail.next;
+        this.len += 1;
+    }
+
+    func remove_back(&mut this): ?T {
+        let tail: ?&alias Node<T> = this.tail;
+
+        if (tail == null) {
+            return null;
+        }
+
+        let prev: ?&alias Node<T> = tail.prev;
+
+        if (prev != null) {
+            let node: ?^Node<T> = $replace(prev.next, null);
+            this.tail = prev;
+
+            this.len -= 1;
+
+            match (node) {
+                case null -> {
+                    $unreachable();
+                },
+                case unwrapped_node -> {
+                    return unwrapped_node.value;
+                }
+            }
+        } else {
+            let node: ?^Node<T> = $replace(this.head, null);
+
+            this.tail = null;
+            this.len -= 1;
+
+            match (node) {
+                case null -> {
+                    $unreachable();
+                },
+                case unwrapped_node -> {
+                    return unwrapped_node.value;
+                }
+            }
+        }
+    }
+}
