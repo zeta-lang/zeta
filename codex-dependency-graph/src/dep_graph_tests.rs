@@ -18,7 +18,7 @@ mod tests {
     }
 
     fn sid(s: &str, p: &StringPool) -> StrId {
-        StrId(p.intern(s))
+        StrId(p.thread_local().intern(s))
     }
 
     fn dummy_span<'a>() -> SourceSpan<'a> {
