@@ -58,6 +58,13 @@ impl<'f> CurrentBlockData<'f> {
         id
     }
 
+    pub fn push_block(&mut self, id: BlockId) {
+        self.func.blocks.push(BasicBlock {
+            id,
+            instructions: Vec::new(),
+        });
+    }
+
     pub fn bb(&mut self) -> &mut BasicBlock {
         self.func
             .blocks
