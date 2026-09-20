@@ -1,7 +1,8 @@
 use crate::ast::MutabilityState;
 use crate::borrow_checker::{Bound, Interval};
 use crate::hir::{
-    AssignmentOperator, Hir, HirEnum, HirExpr, HirModule, HirParam, HirType, Operator, StrId,
+    AssignmentOperator, Hir, HirEnum, HirExpr, HirModule, HirParam, HirType, Operator, RefKind,
+    StrId,
 };
 use crate::ir_hasher::FxHashMap;
 use crate::registry::global_registry::GlobalRegistry;
@@ -116,7 +117,7 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
         resolve: &impl Fn(StrId) -> Option<HirFunc<'a, 'bump>>,
         ctx: &Self,
     ) -> MethodSummary {
-        let Some(HirStmt::Block { body }) = method.body else {
+        let Some(HirStmt::Block { body, span: _ }) = method.body else {
             return MethodSummary {
                 returned_region: Interval {
                     lower: Bound::Opaque(0),
@@ -171,10 +172,10 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
 
                     if let Some(stmt) = else_block {
                         match stmt {
-                            HirStmt::Block { body } => {
+                            HirStmt::Block { body, span: _ } => {
                                 return Self::analyze_stmts(body, resolve, ctx, locals);
                             }
-                            HirStmt::Return(Some(expr)) => {
+                            HirStmt::Return(Some(expr), _span) => {
                                 return MethodSummary {
                                     returned_region: Self::expr_to_interval(
                                         expr, resolve, ctx, locals,
@@ -182,7 +183,7 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
                                     fresh_per_call: false,
                                 };
                             }
-                            HirStmt::Return(None) => {
+                            HirStmt::Return(None, _span) => {
                                 return Self::opaque_summary();
                             }
                             _ => return Self::opaque_summary(),
@@ -192,14 +193,14 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
                     return Self::opaque_summary();
                 }
 
-                HirStmt::Return(Some(expr)) => {
+                HirStmt::Return(Some(expr), _span) => {
                     return MethodSummary {
                         returned_region: Self::expr_to_interval(expr, resolve, ctx, locals),
                         fresh_per_call: false,
                     };
                 }
 
-                HirStmt::Return(None) => {
+                HirStmt::Return(None, _span) => {
                     return Self::opaque_summary();
                 }
 
@@ -219,7 +220,7 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
             return false;
         }
 
-        let Some(HirStmt::Block { body }) = method.body else {
+        let Some(HirStmt::Block { body, span: _ }) = method.body else {
             return false;
         };
 
@@ -235,11 +236,14 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
                 value: HirExpr::Number(amount, _),
                 ..
             }),
-            HirStmt::Return(Some(HirExpr::FieldAccess {
-                object: return_obj,
-                field: return_field,
-                ..
-            })),
+            HirStmt::Return(
+                Some(HirExpr::FieldAccess {
+                    object: return_obj,
+                    field: return_field,
+                    ..
+                }),
+                _span,
+            ),
         ] = body
         else {
             return false;
@@ -396,9 +400,9 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
 
     fn is_early_exit_only(block: &[HirStmt<'a, 'bump>]) -> bool {
         block.iter().all(|stmt| match stmt {
-            HirStmt::Return(_) => true,
+            HirStmt::Return(_, _span) => true,
 
-            HirStmt::Block { body } => Self::is_early_exit_only(body),
+            HirStmt::Block { body, span: _ } => Self::is_early_exit_only(body),
 
             HirStmt::If {
                 then_block,
@@ -409,8 +413,8 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
                     && else_block
                         .as_ref()
                         .map(|stmt| match stmt {
-                            HirStmt::Block { body } => Self::is_early_exit_only(body),
-                            HirStmt::Return(_) => true,
+                            HirStmt::Block { body, span: _ } => Self::is_early_exit_only(body),
+                            HirStmt::Return(_, _span) => true,
                             _ => false,
                         })
                         .unwrap_or(true)
@@ -698,10 +702,8 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             | HirType::Never
             | HirType::Range { .. } => true,
 
-            HirType::Ref {
-                mutability_state, ..
-            }
-            | HirType::SafePointer {
+            HirType::Ref { ref_kind, .. } => *ref_kind != RefKind::Unique,
+            HirType::SafePointer {
                 mutability_state, ..
             }
             | HirType::UnsafePointer {
