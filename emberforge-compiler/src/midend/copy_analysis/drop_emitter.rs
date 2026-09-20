@@ -7,6 +7,7 @@ use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::HashMap;
 use ir::layout::{Layout, TargetInfo, layout_of_ssa, sizeof_ssa};
+use ir::span::SourceSpan;
 use ir::ssa_ir::{
     AllocatorKind, BinOp, BlockId, Instruction, IntrinsicOp, Operand, SsaType, Value,
 };
@@ -39,7 +40,7 @@ impl<'r> AllocatorResolver for FnAllocatorResolver<'r> {
                 )
             }),
             hir::ProvenanceRoot::ThisRoot => {
-                let this_name = StrId(self.context.intern("this"));
+                let this_name = StrId::from_static("this");
                 *self.var_map.get(&this_name).unwrap_or_else(|| {
                     panic!(
                         "resolve_allocator_value: `this` not bound but allocator root is ThisRoot"
@@ -306,7 +307,14 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
     ) -> StrId {
         let base = self.mangled_method_name(struct_name, method_name);
         let suffix = type_suffix_with_pool(self.context.clone(), ty);
-        StrId(intern_fmt!(self.context, "{}{}", base.as_str(), suffix))
+        let (base_s, suffix_s) = (base.as_str(), suffix.as_str());
+
+        // The map may already hold the instantiated name; don't suffix twice.
+        if base_s.ends_with(suffix_s) {
+            return base;
+        }
+        // Match monomorphize_function, which joins with '_'.
+        StrId(intern_fmt!(self.context, "{}_{}", base_s, suffix_s))
     }
 
     pub fn struct_name_of_value(&self, v: Value) -> Option<StrId> {
@@ -453,6 +461,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         track_partial_moves: bool,
         drop_state: Option<&DropMoveState<'a, 'bump>>,
         resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
         let alloc_val = match (allocator.root, allocator.path, known_allocator_field_ty) {
             (
@@ -475,6 +484,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             track_partial_moves,
             drop_state,
             resolver,
+            span,
         );
     }
 
@@ -488,6 +498,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         track_partial_moves: bool,
         drop_state: Option<&DropMoveState<'a, 'bump>>,
         resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
         let (alloc_val, known_name) = self.resolve_allocator_value_named(allocator, resolver);
         let alloc_cls_name = known_name
@@ -507,8 +518,15 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .get(&alloc_cls_name)
             .copied()
             .unwrap_or_else(|| {
+                eprintln!(
+                    "[alloc-drop] allocator={:?}\n  alloc_val={:?} ty={:?}\n  alloc_cls_name={}",
+                    allocator,
+                    alloc_val,
+                    self.current_block_data.value_types.get(&alloc_val),
+                    alloc_cls_name
+                );
                 unreachable!(
-                    "struct `{}` used as an allocator but has no AllocatorKind entry",
+                    "struct `{}` used as an allocator but has no AllocatorKind entry at {span}",
                     alloc_cls_name
                 )
             });
@@ -544,7 +562,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 element,
                 element_ty,
             } => {
-                self.emit_slice_loop_drop(element, element_ty, ptr_val, resolver);
+                self.emit_slice_loop_drop(element, element_ty, ptr_val, resolver, span);
                 self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
             }
 
@@ -579,6 +597,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     false,
                     drop_state,
                     resolver,
+                    span,
                 );
                 self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
             }
@@ -596,6 +615,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         track_partial_moves: bool,
         drop_state: Option<&DropMoveState<'a, 'bump>>,
         resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
         let alloc_cls_name = self.struct_name_of_value(alloc_val).unwrap_or_else(|| {
             panic!(
@@ -612,8 +632,15 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .get(&alloc_cls_name)
             .copied()
             .unwrap_or_else(|| {
+                eprintln!(
+                    "[alloc-drop] allocator={:?}\n  alloc_val={:?} ty={:?}\n  alloc_cls_name={}",
+                    allocator,
+                    alloc_val,
+                    self.current_block_data.value_types.get(&alloc_val),
+                    alloc_cls_name
+                );
                 unreachable!(
-                    "struct `{}` used as an allocator but has no AllocatorKind entry",
+                    "struct `{}` used as an allocator but has no AllocatorKind entry at {span}",
                     alloc_cls_name
                 )
             });
@@ -649,7 +676,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 element,
                 element_ty,
             } => {
-                self.emit_slice_loop_drop(element, element_ty, ptr_val, resolver);
+                self.emit_slice_loop_drop(element, element_ty, ptr_val, resolver, span);
                 self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
             }
 
@@ -684,6 +711,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     false,
                     drop_state,
                     resolver,
+                    span,
                 );
                 self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
             }
@@ -743,6 +771,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         kind: &DropKind<'a, 'bump>,
         elem_addr: Value,
         resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
         match kind {
             DropKind::Type(struct_name) => {
@@ -768,14 +797,14 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     .value_types
                     .insert(loaded, lower_type_hir(pointee_ty, self.enums));
                 self.emit_owned_pointer_drop(
-                    None, pointee, pointee_ty, allocator, loaded, false, None, resolver,
+                    None, pointee, pointee_ty, allocator, loaded, false, None, resolver, span,
                 );
             }
             DropKind::Slice {
                 element,
                 element_ty,
             } => {
-                self.emit_slice_loop_drop(element, element_ty, elem_addr, resolver);
+                self.emit_slice_loop_drop(element, element_ty, elem_addr, resolver, span);
             }
             DropKind::Undroppable => {}
         }
@@ -806,6 +835,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         element_ty: &HirType<'a, 'bump>,
         fat_ptr_addr: Value,
         resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
         if !element_kind.is_droppable() {
             return;
@@ -912,7 +942,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .value_types
             .insert(elem_addr, SsaType::Pointer(Box::new(elem_ssa)));
 
-        self.emit_element_drop(element_kind, elem_addr, resolver);
+        self.emit_element_drop(element_kind, elem_addr, resolver, span);
 
         let i_next = self.current_block_data.fresh_value();
         self.emit(Instruction::Binary {
