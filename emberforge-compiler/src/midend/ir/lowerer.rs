@@ -1,4 +1,6 @@
-use crate::midend::copy_analysis::drop_emitter::{DropEmitter, FnAllocatorResolver};
+use crate::midend::copy_analysis::drop_emitter::{
+    DropEmitter, FnAllocatorResolver, is_struct_owns_chain,
+};
 use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::{
     DropLocal, DropMoveState, DropScope, record_move_if_any,
@@ -103,6 +105,8 @@ pub struct FunctionLowerer<'f, 'a, 'bump> {
     promoted_to_stack: HashSet<StrId>,
     narrowed_fields: HashMap<(StrId, Vec<StrId>), Value>,
     nullable_owned_locals: HashMap<StrId, HirType<'a, 'bump>>,
+    uninit_declared_arrays: HashSet<StrId>,
+    moved_arrays: HashSet<StrId>,
 }
 
 impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump>
@@ -318,6 +322,8 @@ where
             promoted_to_stack: HashSet::default(),
             narrowed_fields: HashMap::default(),
             nullable_owned_locals: HashMap::default(),
+            uninit_declared_arrays: HashSet::default(),
+            moved_arrays: HashSet::default(),
         })
     }
 
@@ -419,7 +425,9 @@ where
                     name: struct_name, ..
                 } = ty
                 {
-                    if self.glue_registry.is_droppable(*struct_name) {
+                    if self.glue_registry.is_droppable(*struct_name)
+                        || self.struct_owns_chain(*struct_name)
+                    {
                         self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
                             name: *name,
                             kind: DropKind::Type(*struct_name),
@@ -472,6 +480,17 @@ where
                             self.drop_state.mark_field_uninit(*name, fi.name);
                         }
                     }
+                }
+
+                self.register_array_drop_local(*name, &expected_ssa);
+
+                // Shadowing resets any previous tracking for this name.
+                self.uninit_declared_arrays.remove(name);
+                self.moved_arrays.remove(name);
+                if matches!(value, HirExpr::Uninit { .. })
+                    && matches!(expected_ssa, SsaType::Array(..))
+                {
+                    self.uninit_declared_arrays.insert(*name);
                 }
             }
 
@@ -5027,6 +5046,7 @@ where
                         var_val
                     };
 
+                    let mut chain_struct: Option<StrId> = None;
                     let mut resolver = FnAllocatorResolver {
                         var_map: &self.var_map,
                         context: self.context.clone(),
@@ -5045,6 +5065,7 @@ where
 
                     match &drop_kind {
                         DropKind::Type(struct_name) => {
+                            chain_struct = Some(*struct_name);
                             let partial_move = self.drop_state.has_any_field_moves(name);
                             if !partial_move {
                                 if let Some(glue) = self.glue_registry.glue_name_for(*struct_name) {
@@ -5095,6 +5116,9 @@ where
                             );
                         }
                         DropKind::Undroppable => {}
+                    }
+                    if let Some(sn) = chain_struct {
+                        self.emit_owned_chain_drops_for_local(sn, val_to_drop, Some(name), span);
                     }
                 }
             }
@@ -6986,6 +7010,9 @@ where
     pub fn record_move_if_any(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::Ident(name, _) => {
+                if self.uninit_declared_arrays.contains(name) {
+                    self.moved_arrays.insert(*name);
+                }
                 if self.local_is_droppable(*name).is_some() {
                     self.drop_state.mark_whole_moved(*name);
                 }
@@ -7012,6 +7039,24 @@ where
 
     fn emit_scope_drops(&mut self, scope: &DropScope<'a, 'bump>, span: SourceSpan<'a>) {
         for local in scope.locals.iter().rev() {
+            // Array markers (kind `Undroppable`, see `register_array_drop_local`).
+            if matches!(local.kind, DropKind::Undroppable) {
+                let moved = if self.uninit_declared_arrays.contains(&local.name) {
+                    // `drop_state` reports "moved" for uninit locals; only trust our own record.
+                    self.moved_arrays.contains(&local.name)
+                } else {
+                    self.drop_state.is_whole_moved(local.name)
+                };
+                if moved {
+                    continue;
+                }
+                let Some(&val) = self.var_map.get(&local.name) else {
+                    continue;
+                };
+                self.emit_array_local_drops(local.name, val, span);
+                continue;
+            }
+
             if self.drop_state.is_whole_moved(local.name) {
                 continue;
             }
@@ -7026,6 +7071,98 @@ where
         }
     }
 
+    // Performant reimplementation of owned_chains_of that is specialized
+    fn struct_owns_chain(&self, struct_name: StrId) -> bool {
+        is_struct_owns_chain(self.structs, self.struct_field_offsets, struct_name)
+    }
+
+    fn emit_owned_chain_drops_for_local(
+        &mut self,
+        struct_name: StrId,
+        val: Value,
+        local_name: Option<StrId>,
+        span: SourceSpan<'a>,
+    ) {
+        if !self.struct_owns_chain(struct_name) {
+            return;
+        }
+        let mut resolver = FnAllocatorResolver {
+            var_map: &self.var_map,
+            context: self.context.clone(),
+            dep_graph: self.dep_graph,
+        };
+        let mut emitter = DropEmitter::new(
+            &mut self.current_block_data,
+            self.context.clone(),
+            self.struct_mangled_map,
+            self.struct_field_offsets,
+            self.structs,
+            self.enums,
+            self.allocator_kind,
+            self.glue_registry,
+        );
+        emitter.emit_owned_chain_field_drops(
+            struct_name,
+            val,
+            local_name,
+            Some(&self.drop_state),
+            &mut resolver,
+            span,
+        );
+    }
+
+    /// `let a: [N]T = ...` where `T` is a droppable struct. Registered with a
+    /// marker `DropLocal` (kind `Undroppable`); `emit_array_local_drops` does the work.
+    fn register_array_drop_local(&mut self, name: StrId, ssa: &SsaType) {
+        let SsaType::Array(elem, _) = ssa else {
+            return;
+        };
+        let SsaType::User(elem_struct, _) = elem.as_ref() else {
+            return;
+        };
+        if !(self.glue_registry.is_droppable(*elem_struct) || self.struct_owns_chain(*elem_struct))
+        {
+            return;
+        }
+        self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
+            name,
+            kind: DropKind::Undroppable,
+        });
+    }
+
+    /// Unrolled per-element drops, skipping indices still tracked as uninitialized.
+    fn emit_array_local_drops(&mut self, name: StrId, val: Value, span: SourceSpan<'a>) {
+        let Some(SsaType::Array(elem, len)) = self.value_type(val).cloned() else {
+            return;
+        };
+        let SsaType::User(elem_struct, _) = elem.as_ref() else {
+            return;
+        };
+        if !(self.glue_registry.is_droppable(*elem_struct) || self.struct_owns_chain(*elem_struct))
+        {
+            return;
+        }
+        let kind = DropKind::Type(*elem_struct);
+        let elem_size = ir::layout::sizeof_ssa(&elem, TargetInfo { ptr_bytes: 8 })
+            .expect("array element type has no known size");
+
+        for i in 0..len {
+            if self.drop_state.is_index_uninit(name, i as i64) {
+                continue;
+            }
+            let addr = self.current_block_data.fresh_value();
+            self.emit(Instruction::FieldAddr {
+                dest: addr,
+                base: Operand::Value(val),
+                offset: i * elem_size,
+            });
+            self.current_block_data
+                .value_types
+                .insert(addr, SsaType::Pointer(Box::new((*elem).clone())));
+            self.emit_indexed_element_drop(&kind, addr, span);
+        }
+    }
+
     fn emit_drop_for_kind(
         &mut self,
         kind: &DropKind<'a, 'bump>,
@@ -7034,54 +7171,57 @@ where
         span: SourceSpan<'a>,
     ) {
         match kind {
-            DropKind::Type(struct_name) => match local_name {
-                Some(name) => {
-                    let partial_move = self.drop_state.has_any_field_moves(name);
-                    if !partial_move {
-                        if let Some(glue) = self.glue_registry.glue_name_for(*struct_name) {
+            DropKind::Type(struct_name) => {
+                match local_name {
+                    Some(name) => {
+                        let partial_move = self.drop_state.has_any_field_moves(name);
+                        match (partial_move, self.glue_registry.glue_name_for(*struct_name)) {
+                            (false, Some(glue)) => {
+                                self.emit(Instruction::Call {
+                                    dest: None,
+                                    func: Operand::FunctionRef(glue),
+                                    args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
+                                });
+                            }
+                            _ => {
+                                let mut emitter = DropEmitter::new(
+                                    &mut self.current_block_data,
+                                    self.context.clone(),
+                                    self.struct_mangled_map,
+                                    self.struct_field_offsets,
+                                    self.structs,
+                                    self.enums,
+                                    self.allocator_kind,
+                                    self.glue_registry,
+                                );
+                                emitter.emit_partial_struct_field_drops(
+                                    name,
+                                    *struct_name,
+                                    val,
+                                    &self.drop_state,
+                                );
+                            }
+                        }
+                    }
+                    None => match self.glue_registry.glue_name_for(*struct_name) {
+                        Some(glue) => {
                             self.emit(Instruction::Call {
                                 dest: None,
                                 func: Operand::FunctionRef(glue),
                                 args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
                             });
-                            return;
                         }
-                    }
-                    let mut emitter = DropEmitter::new(
-                        &mut self.current_block_data,
-                        self.context.clone(),
-                        self.struct_mangled_map,
-                        self.struct_field_offsets,
-                        self.structs,
-                        self.enums,
-                        self.allocator_kind,
-                        self.glue_registry,
-                    );
-                    emitter.emit_partial_struct_field_drops(
-                        name,
-                        *struct_name,
-                        val,
-                        &self.drop_state,
-                    );
-                }
-                None => {
-                    let glue = self
-                        .glue_registry
-                        .glue_name_for(*struct_name)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "no drop glue registered for struct `{}`; every droppable \
+                        None if self.struct_owns_chain(*struct_name) => {}
+                        None => panic!(
+                            "no drop glue registered for struct `{}`; every droppable \
                              struct should have glue built by DropGlueBuilder::build_all",
-                                struct_name
-                            )
-                        });
-                    self.emit(Instruction::Call {
-                        dest: None,
-                        func: Operand::FunctionRef(glue),
-                        args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
-                    });
+                            struct_name
+                        ),
+                    },
                 }
-            },
+                // Glue doesn't cover `?^Node` chains, so walk them here.
+                self.emit_owned_chain_drops_for_local(*struct_name, val, local_name, span);
+            }
 
             DropKind::OwnedPointer {
                 pointee,

@@ -9,7 +9,7 @@ use ir::ir_hasher::HashMap;
 use ir::layout::{Layout, TargetInfo, layout_of_ssa, sizeof_ssa};
 use ir::span::SourceSpan;
 use ir::ssa_ir::{
-    AllocatorKind, BinOp, BlockId, Instruction, IntrinsicOp, Operand, SsaType, Value,
+    AllocatorKind, BinOp, BlockId, Instruction, IntrinsicOp, Operand, SsaType, Value, cast_kind,
 };
 use smallvec::SmallVec;
 use std::cell::RefCell;
@@ -77,6 +77,190 @@ impl<'r> AllocatorResolver for FnAllocatorResolver<'r> {
             self.context.clone(),
         )
     }
+}
+
+struct ThisRebased<'r> {
+    this_val: Value,
+    inner: &'r mut dyn AllocatorResolver,
+}
+
+impl<'r> AllocatorResolver for ThisRebased<'r> {
+    fn resolve_root(&mut self, root: &hir::ProvenanceRoot) -> Value {
+        match root {
+            hir::ProvenanceRoot::ThisRoot => self.this_val,
+            other => self.inner.resolve_root(other),
+        }
+    }
+
+    fn lower_global_ref(&mut self, module_idx: usize, name: StrId) -> StrId {
+        self.inner.lower_global_ref(module_idx, name)
+    }
+}
+
+/// A field that owns the head of a singly-linked chain, e.g.
+/// `LinkedList.head: ?^Node<T>` where `Node<T>.next: ?^Node<T>`.
+#[derive(Clone, Debug)] // Wouldn't want this to be Copy, since it's quite chonky
+pub struct OwnedChain<'a, 'bump> {
+    pub head_field: StrId,
+    pub head_offset: usize,
+    pub head_field_ty: HirType<'a, 'bump>,
+    pub node_struct: StrId,
+    pub node_ty: HirType<'a, 'bump>,
+    pub link_field: StrId,
+    pub link_offset: usize,
+    pub link_field_ty: HirType<'a, 'bump>,
+    pub allocator: ChainAlloc<'bump>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ChainAlloc<'bump> {
+    /// Type carried `?^Node` with a provenance annotation.
+    Annotated(ProvenanceAnnotation<'bump>),
+    /// No annotation: use the containing struct's allocator field (`this.<field>`).
+    Field(StrId),
+}
+
+/// `?^S` / `^S` -> (S as a HirType, S's name, allocator annotation)
+pub fn owned_link_parts<'a, 'bump>(
+    ty: &HirType<'a, 'bump>,
+) -> Option<(
+    HirType<'a, 'bump>,
+    StrId,
+    Option<ProvenanceAnnotation<'bump>>,
+)> {
+    let owned: HirType<'a, 'bump> = match ty {
+        HirType::Nullable(inner) => **inner,
+        other => *other,
+    };
+    let HirType::OwnedPointer { inner, allocator } = owned else {
+        return None;
+    };
+    let pointee: HirType<'a, 'bump> = *inner;
+    let HirType::Struct { name, .. } = pointee else {
+        return None;
+    };
+    Some((pointee, name, allocator))
+}
+
+/// The single field of `node` that owns another `node` (`next: ?^Node<T>`).
+/// `None` if there isn't exactly one. Two self-links means a tree, which
+/// needs a worklist rather than a simple loop, so it is not handled here.
+pub fn self_link_of<'a, 'bump>(
+    structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+    node: StrId,
+) -> Option<(StrId, HirType<'a, 'bump>)> {
+    let hir_struct = structs.get(&node)?;
+    let mut found: Option<(StrId, HirType<'a, 'bump>)> = None;
+    for f in hir_struct.fields.iter() {
+        if let Some((_, pointee, _)) = owned_link_parts(&f.field_type) {
+            if pointee == node {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((f.name, f.field_type));
+            }
+        }
+    }
+    found
+}
+
+pub fn find_allocator_field<'a, 'bump>(
+    structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+    allocator_kind: &HashMap<StrId, AllocatorKind>,
+    struct_name: StrId,
+) -> Option<StrId> {
+    structs
+        .get(&struct_name)?
+        .fields
+        .iter()
+        .find_map(|f| match &f.field_type {
+            HirType::Struct { name, .. } if allocator_kind.contains_key(name) => Some(f.name),
+            _ => None,
+        })
+}
+
+pub fn owned_chains_of<'a, 'bump>(
+    structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+    field_offsets: &HashMap<StrId, HashMap<StrId, usize>>,
+    allocator_kind: &HashMap<StrId, AllocatorKind>,
+    struct_name: StrId,
+) -> Vec<OwnedChain<'a, 'bump>> {
+    let mut out = Vec::new();
+    let Some(hir_struct) = structs.get(&struct_name) else {
+        return out;
+    };
+    let Some(offsets) = field_offsets.get(&struct_name) else {
+        return out;
+    };
+    for f in hir_struct.fields.iter() {
+        let Some((node_ty, node_struct, ann)) = owned_link_parts(&f.field_type) else {
+            continue;
+        };
+        let allocator = match ann {
+            Some(a) => ChainAlloc::Annotated(a),
+            None => match find_allocator_field(structs, allocator_kind, struct_name) {
+                Some(field) => ChainAlloc::Field(field),
+                None => continue,
+            },
+        };
+        let Some((link_field, link_field_ty)) = self_link_of(structs, node_struct) else {
+            continue;
+        };
+        let Some(&head_offset) = offsets.get(&f.name) else {
+            continue;
+        };
+        let Some(&link_offset) = field_offsets
+            .get(&node_struct)
+            .and_then(|o| o.get(&link_field))
+        else {
+            continue;
+        };
+        out.push(OwnedChain {
+            head_field: f.name,
+            head_offset,
+            head_field_ty: f.field_type,
+            node_struct,
+            node_ty,
+            link_field,
+            link_offset,
+            link_field_ty,
+            allocator,
+        });
+    }
+    out
+}
+
+// Performant reimplementation of owned_chains_of that is specialized
+pub(crate) fn is_struct_owns_chain<'a, 'bump>(
+    structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
+    field_offsets: &HashMap<StrId, HashMap<StrId, usize>>,
+    struct_name: StrId,
+) -> bool {
+    let Some(hir_struct) = structs.get(&struct_name) else {
+        return false;
+    };
+    let Some(offsets) = field_offsets.get(&struct_name) else {
+        return false;
+    };
+    for f in hir_struct.fields.iter() {
+        let Some((_, node_struct, _)) = owned_link_parts(&f.field_type) else {
+            continue;
+        };
+        let Some((link_field, _)) = self_link_of(structs, node_struct) else {
+            continue;
+        };
+        let Some(_) = offsets.get(&f.name) else {
+            continue;
+        };
+        let Some(_) = field_offsets
+            .get(&node_struct)
+            .and_then(|o| o.get(&link_field))
+        else {
+            continue;
+        };
+        return true;
+    }
+    false
 }
 
 pub struct DropEmitter<'x, 'a, 'bump, 'f> {
@@ -782,6 +966,14 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                         args: SmallVec::from_slice_copy(&[Operand::Value(elem_addr)]),
                     });
                 }
+                self.emit_owned_chain_field_drops(
+                    *struct_name,
+                    elem_addr,
+                    None,
+                    None,
+                    resolver,
+                    span,
+                );
             }
             DropKind::OwnedPointer {
                 pointee,
@@ -808,6 +1000,235 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             }
             DropKind::Undroppable => {}
         }
+    }
+
+    /// Drops every owned chain hanging off `base` (an address / `User` value of
+    /// `struct_name`). This is also the entry point `DropGlueBuilder` should call
+    /// for each struct, so nested lists and lists inside fields get dropped.
+    ///
+    /// `owner`/`drop_state` are only used to skip chain heads that were moved out.
+    pub fn emit_owned_chain_field_drops<R: AllocatorResolver>(
+        &mut self,
+        struct_name: StrId,
+        base: Value,
+        owner: Option<StrId>,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        let structs = self.structs;
+        let offsets = self.struct_field_offsets;
+        for chain in owned_chains_of(structs, offsets, self.allocator_kind, struct_name) {
+            if let (Some(o), Some(ds)) = (owner, drop_state) {
+                if ds.is_field_moved(o, chain.head_field) {
+                    continue;
+                }
+            }
+            let mut this_resolver = ThisRebased {
+                this_val: base,
+                inner: &mut *resolver,
+            };
+            self.emit_owned_chain_drop(&chain, base, &mut this_resolver, span);
+        }
+    }
+
+    /// Emits:
+    ///
+    /// ```text
+    /// pre:   alloc = <resolve once>; head = load base.head; jump cond
+    /// cond:  cur = phi [pre: head, body: next]
+    ///        if cur == null goto after else body
+    /// body:  node = cur; next = node.link      // read before free
+    ///        drop node's non-link fields
+    ///        free_raw(alloc, node)
+    ///        jump cond
+    /// after: ...
+    /// ```
+    fn emit_owned_chain_drop<R: AllocatorResolver>(
+        &mut self,
+        chain: &OwnedChain<'a, 'bump>,
+        base: Value,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        let head_ssa = lower_type_hir(&chain.head_field_ty, self.enums);
+        if head_ssa.is_tagged_nullable() {
+            return; // only pointer-optimized nullables / plain owned pointers
+        }
+        let link_ssa = lower_type_hir(&chain.link_field_ty, self.enums);
+        let node_ssa = lower_type_hir(&chain.node_ty, self.enums);
+        let node_ptr_ty = SsaType::Pointer(Box::new(node_ssa));
+
+        // Resolved once, outside the loop: every node came from the same allocator.
+        let (alloc_val, known_name) = match &chain.allocator {
+            ChainAlloc::Annotated(a) => self.resolve_allocator_value_named(a, resolver),
+            ChainAlloc::Field(f) => {
+                let (addr, _ty, name) = self.field_addr_on_value(base, *f);
+                (addr, name)
+            }
+        };
+        let alloc_cls_name = known_name
+            .or_else(|| self.struct_name_of_value(alloc_val))
+            .unwrap_or_else(|| {
+                panic!(
+                    "emit_owned_chain_drop: could not determine allocator's struct type \
+                     (alloc_val={:?}, resolved SsaType={:?}, allocator={:?})",
+                    alloc_val,
+                    self.current_block_data.value_types.get(&alloc_val),
+                    chain.allocator,
+                )
+            });
+
+        let head_addr = self.current_block_data.fresh_value();
+        self.emit(Instruction::FieldAddr {
+            dest: head_addr,
+            base: Operand::Value(base),
+            offset: chain.head_offset,
+        });
+        self.current_block_data
+            .value_types
+            .insert(head_addr, SsaType::Pointer(Box::new(head_ssa.clone())));
+        let head = self.current_block_data.fresh_value();
+        self.emit(Instruction::Load {
+            dest: head,
+            ptr: Operand::Value(head_addr),
+        });
+        self.current_block_data
+            .value_types
+            .insert(head, head_ssa.clone());
+
+        let pre_bb = self.current_block_data.current_block;
+        let cond_bb = self.current_block_data.new_block();
+        let body_bb = self.current_block_data.new_block();
+        let after_bb = self.current_block_data.new_block();
+        self.emit(Instruction::Jump { target: cond_bb });
+
+        // cond
+        self.current_block_data.switch_to(cond_bb);
+        let cur = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(cur, head_ssa.clone());
+        let phi_idx = self.current_block_data.bb().instructions.len();
+        self.emit(Instruction::Phi {
+            dest: cur,
+            incoming: SmallVec::new(),
+        });
+        self.contribute_phi_edge(cond_bb, phi_idx, pre_bb, head);
+
+        let zero = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: zero,
+            ty: node_ptr_ty.clone(),
+            value: Operand::ConstInt(0),
+        });
+        self.current_block_data
+            .value_types
+            .insert(zero, node_ptr_ty.clone());
+        let is_null = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: is_null,
+            op: BinOp::Eq,
+            left: Operand::Value(cur),
+            right: Operand::Value(zero),
+        });
+        self.current_block_data
+            .value_types
+            .insert(is_null, SsaType::Bool);
+        self.emit(Instruction::Branch {
+            cond: Operand::Value(is_null),
+            then_bb: after_bb,
+            else_bb: body_bb,
+        });
+
+        // body
+        self.current_block_data.switch_to(body_bb);
+        let node = self.current_block_data.fresh_value();
+        self.emit(Instruction::Cast {
+            dest: node,
+            value: Operand::Value(cur),
+            kind: cast_kind(&node_ptr_ty, &node_ptr_ty),
+        });
+        self.current_block_data
+            .value_types
+            .insert(node, node_ptr_ty.clone());
+
+        // next must be read before the node is freed
+        let link_addr = self.current_block_data.fresh_value();
+        self.emit(Instruction::FieldAddr {
+            dest: link_addr,
+            base: Operand::Value(node),
+            offset: chain.link_offset,
+        });
+        self.current_block_data
+            .value_types
+            .insert(link_addr, SsaType::Pointer(Box::new(link_ssa.clone())));
+        let next_raw = self.current_block_data.fresh_value();
+        self.emit(Instruction::Load {
+            dest: next_raw,
+            ptr: Operand::Value(link_addr),
+        });
+        self.current_block_data
+            .value_types
+            .insert(next_raw, link_ssa.clone());
+        let next = if link_ssa != head_ssa {
+            let retyped = self.current_block_data.fresh_value();
+            self.emit(Instruction::Cast {
+                dest: retyped,
+                value: Operand::Value(next_raw),
+                kind: cast_kind(&head_ssa, &head_ssa),
+            });
+            self.current_block_data
+                .value_types
+                .insert(retyped, head_ssa.clone());
+            retyped
+        } else {
+            next_raw
+        };
+
+        // drop everything in the node except the link (aliases are Undroppable)
+        let structs = self.structs;
+        let enums = self.enums;
+        if let (Some(node_struct), Some(node_offsets)) = (
+            structs.get(&chain.node_struct),
+            self.struct_field_offsets.get(&chain.node_struct),
+        ) {
+            let mut node_resolver = ThisRebased {
+                this_val: node,
+                inner: &mut *resolver,
+            };
+            for f in node_struct.fields.iter() {
+                if f.name == chain.link_field {
+                    continue;
+                }
+                let kind = f.field_type.drop_kind();
+                if !kind.is_droppable() {
+                    continue;
+                }
+                let Some(&off) = node_offsets.get(&f.name) else {
+                    continue;
+                };
+                let fty = lower_type_hir(&f.field_type, enums);
+                let faddr = self.current_block_data.fresh_value();
+                self.emit(Instruction::FieldAddr {
+                    dest: faddr,
+                    base: Operand::Value(node),
+                    offset: off,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(faddr, SsaType::Pointer(Box::new(fty)));
+                self.emit_element_drop(&kind, faddr, &mut node_resolver, span);
+            }
+        }
+
+        self.emit_free_raw_call(alloc_val, alloc_cls_name, &chain.node_ty, node);
+
+        let body_tail = self.current_block_data.current_block;
+        self.contribute_phi_edge(cond_bb, phi_idx, body_tail, next);
+        self.emit(Instruction::Jump { target: cond_bb });
+
+        self.current_block_data.switch_to(after_bb);
     }
 
     pub fn contribute_phi_edge(
