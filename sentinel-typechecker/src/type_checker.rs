@@ -1309,12 +1309,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(t) = self.read_templates.get(&func.name) {
             return t.clone();
         }
-        let templates = Self::build_read_templates(func);
+        self.read_templates.insert(func.name, Vec::new());
+        let templates = self.build_read_templates(func);
         self.read_templates.insert(func.name, templates.clone());
         templates
     }
 
-    fn build_read_templates(func: &HirFunc<'a, 'bump>) -> Vec<ReadTemplate> {
+    fn build_read_templates(&mut self, func: &HirFunc<'a, 'bump>) -> Vec<ReadTemplate> {
         let Some(params) = func.params else {
             return Vec::new();
         };
@@ -1334,7 +1335,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let mut templates = vec![ReadTemplate::Paths(Vec::new()); normal_idx];
         if let Some(body) = func.body {
-            Self::collect_param_reads_stmt(&body, &param_index, has_this, &mut templates);
+            let prev_module = std::mem::replace(
+                &mut self.context.current_module_idx,
+                func.declaring_module_idx,
+            );
+            self.collect_param_reads_stmt(&body, &param_index, has_this, &mut templates);
+            self.context.current_module_idx = prev_module;
         }
         templates
     }
@@ -1358,6 +1364,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn collect_param_reads_write_target(
+        &mut self,
         target: &HirExpr<'a, 'bump>,
         param_index: &FxHashMap<StrId, usize>,
         has_this: bool,
@@ -1371,7 +1378,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             return;
         }
-        Self::collect_param_reads_expr(target, param_index, has_this, templates);
+        self.collect_param_reads_expr(target, param_index, has_this, templates);
     }
 
     fn mut_raw_ptr_cast_operand<'e>(
@@ -1396,7 +1403,65 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn resolve_callee_for_template(
+        &self,
+        callee: &HirExpr<'a, 'bump>,
+    ) -> Option<HirFunc<'a, 'bump>> {
+        match callee {
+            HirExpr::Ident(name, _) => self.context.get_function(&self.str_id_to_string(*name)),
+            HirExpr::ModuleAccess(access) => {
+                let cur = self.context.current_module_idx;
+                let aliased: Option<usize> = if access.path.len() == 1 {
+                    self.imports_by_module.get(&cur).and_then(|imp| {
+                        imp.named
+                            .get(&access.path[0])
+                            .or_else(|| imp.module_aliases.get(&access.path[0]))
+                            .copied()
+                    })
+                } else {
+                    None
+                };
+                let midx = match aliased {
+                    Some(m) => m,
+                    None => self
+                        .context
+                        .dep_graph
+                        .borrow()
+                        .resolve_module_path(access.path)?,
+                };
+                self.context
+                    .get_module_function(midx, &access.member.to_string())
+            }
+            // Methods, interface calls, lambdas: no receiver type here.
+            _ => None,
+        }
+    }
+
+    /// Whether the callee may read through its `arg_idx`th parameter's pointee.
+    /// Bodiless (extern/FFI) callees are trusted; callees with a body use their own
+    /// read template; anything unresolvable is assumed to read.
+    fn callee_may_read_arg(&mut self, callee: &HirExpr<'a, 'bump>, arg_idx: usize) -> bool {
+        let Some(func) = self.resolve_callee_for_template(callee) else {
+            return true;
+        };
+        let Some(params) = func.params else {
+            return true;
+        };
+        // Template indices count only `Normal` params, so bail out if `this` shifts them.
+        if arg_idx >= params.len() || params.iter().any(|p| matches!(p, HirParam::This { .. })) {
+            return true;
+        }
+        if func.body.is_none() {
+            return false;
+        }
+        let templates = self.analyze_read_templates(&func);
+        templates
+            .get(arg_idx)
+            .map_or(true, Self::read_template_touches_contents)
+    }
+
     fn collect_param_reads_expr(
+        &mut self,
         expr: &HirExpr<'a, 'bump>,
         param_index: &FxHashMap<StrId, usize>,
         has_this: bool,
@@ -1409,115 +1474,110 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         match expr {
             HirExpr::Match { expr, arms, .. } => {
-                Self::collect_param_reads_expr(expr, param_index, has_this, templates);
+                self.collect_param_reads_expr(expr, param_index, has_this, templates);
                 for arm in arms.iter() {
                     if let Some(guard) = arm.guard {
-                        Self::collect_param_reads_expr(guard, param_index, has_this, templates);
+                        self.collect_param_reads_expr(guard, param_index, has_this, templates);
                     }
-                    Self::collect_param_reads_stmt(arm.body, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(arm.body, param_index, has_this, templates);
                 }
             }
             HirExpr::Block { body, .. } => {
                 for s in body.iter() {
-                    Self::collect_param_reads_stmt(s, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(s, param_index, has_this, templates);
                 }
             }
             HirExpr::Range { start, end, .. } => {
-                Self::collect_param_reads_expr(start, param_index, has_this, templates);
-                Self::collect_param_reads_expr(end, param_index, has_this, templates);
+                self.collect_param_reads_expr(start, param_index, has_this, templates);
+                self.collect_param_reads_expr(end, param_index, has_this, templates);
             }
             HirExpr::Slice {
                 object, start, end, ..
             } => {
-                Self::collect_param_reads_expr(object, param_index, has_this, templates);
-                Self::collect_param_reads_expr(start, param_index, has_this, templates);
-                Self::collect_param_reads_expr(end, param_index, has_this, templates);
+                self.collect_param_reads_expr(object, param_index, has_this, templates);
+                self.collect_param_reads_expr(start, param_index, has_this, templates);
+                self.collect_param_reads_expr(end, param_index, has_this, templates);
             }
             HirExpr::Tuple(exprs, _)
             | HirExpr::ArrayLiteral {
                 elements: exprs, ..
             } => {
                 for e in exprs.iter() {
-                    Self::collect_param_reads_expr(e, param_index, has_this, templates);
+                    self.collect_param_reads_expr(e, param_index, has_this, templates);
                 }
             }
             HirExpr::Binary { left, right, .. } | HirExpr::Comparison { left, right, .. } => {
-                Self::collect_param_reads_expr(left, param_index, has_this, templates);
-                Self::collect_param_reads_expr(right, param_index, has_this, templates);
+                self.collect_param_reads_expr(left, param_index, has_this, templates);
+                self.collect_param_reads_expr(right, param_index, has_this, templates);
             }
             HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
-                Self::collect_param_reads_expr(callee, param_index, has_this, templates);
-                for a in args.iter() {
+                self.collect_param_reads_expr(callee, param_index, has_this, templates);
+                for (idx, a) in args.iter().enumerate() {
                     if let Some(inner) = Self::mut_raw_ptr_cast_operand(a) {
-                        // `param as [*]mut T` handed straight to a callee: not a read
-                        // of the contents. Prefix loads are still recorded.
-                        Self::collect_param_reads_write_target(
-                            inner,
-                            param_index,
-                            has_this,
-                            templates,
-                        );
-                    } else {
-                        Self::collect_param_reads_expr(a, param_index, has_this, templates);
+                        if !self.callee_may_read_arg(callee, idx) {
+                            self.collect_param_reads_write_target(
+                                inner,
+                                param_index,
+                                has_this,
+                                templates,
+                            );
+                            continue;
+                        }
                     }
+                    self.collect_param_reads_expr(a, param_index, has_this, templates);
                 }
             }
             HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
-                Self::collect_param_reads_expr(object, param_index, has_this, templates);
+                self.collect_param_reads_expr(object, param_index, has_this, templates);
             }
             HirExpr::Assignment {
                 target, op, value, ..
             } => {
                 if matches!(op, AssignmentOperator::Assign) {
-                    Self::collect_param_reads_write_target(
-                        target,
-                        param_index,
-                        has_this,
-                        templates,
-                    );
+                    self.collect_param_reads_write_target(target, param_index, has_this, templates);
                 } else {
                     // compound assignment reads the old value
-                    Self::collect_param_reads_expr(target, param_index, has_this, templates);
+                    self.collect_param_reads_expr(target, param_index, has_this, templates);
                 }
-                Self::collect_param_reads_expr(value, param_index, has_this, templates);
+                self.collect_param_reads_expr(value, param_index, has_this, templates);
             }
             HirExpr::StructInit { args, .. } => {
                 for f in args.iter() {
-                    Self::collect_param_reads_expr(&f.value, param_index, has_this, templates);
+                    self.collect_param_reads_expr(&f.value, param_index, has_this, templates);
                 }
             }
             HirExpr::EnumInit { args, .. } => {
                 for a in args.iter() {
-                    Self::collect_param_reads_expr(a, param_index, has_this, templates);
+                    self.collect_param_reads_expr(a, param_index, has_this, templates);
                 }
             }
             HirExpr::ExprList { list, .. } => {
                 for e in list.iter() {
-                    Self::collect_param_reads_expr(e, param_index, has_this, templates);
+                    self.collect_param_reads_expr(e, param_index, has_this, templates);
                 }
             }
             HirExpr::Deref { expr, .. }
             | HirExpr::Cast { expr, .. }
             | HirExpr::Ref { expr, .. } => {
-                Self::collect_param_reads_expr(expr, param_index, has_this, templates);
+                self.collect_param_reads_expr(expr, param_index, has_this, templates);
             }
             HirExpr::Index { object, index, .. } => {
-                Self::collect_param_reads_expr(object, param_index, has_this, templates);
-                Self::collect_param_reads_expr(index, param_index, has_this, templates);
+                self.collect_param_reads_expr(object, param_index, has_this, templates);
+                self.collect_param_reads_expr(index, param_index, has_this, templates);
             }
             HirExpr::InterpolatedString(parts) => {
                 for p in parts.iter() {
                     if let InterpolationPart::Expr(e) = p {
-                        Self::collect_param_reads_expr(e, param_index, has_this, templates);
+                        self.collect_param_reads_expr(e, param_index, has_this, templates);
                     }
                 }
             }
             HirExpr::If { if_stmt, .. } => {
-                Self::collect_param_reads_stmt(if_stmt, param_index, has_this, templates);
+                self.collect_param_reads_stmt(if_stmt, param_index, has_this, templates);
             }
             HirExpr::Intrinsic { args, .. } => {
                 for a in args.iter() {
-                    Self::collect_param_reads_expr(a, param_index, has_this, templates);
+                    self.collect_param_reads_expr(a, param_index, has_this, templates);
                 }
             }
             HirExpr::Lambda { .. } => {
@@ -1534,6 +1594,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn collect_param_reads_stmt(
+        &mut self,
         stmt: &HirStmt<'a, 'bump>,
         param_index: &FxHashMap<StrId, usize>,
         has_this: bool,
@@ -1546,21 +1607,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 catch_pattern,
                 ..
             } => {
-                Self::collect_param_reads_expr(value, param_index, has_this, templates);
+                self.collect_param_reads_expr(value, param_index, has_this, templates);
                 if let Some(b) = else_block {
-                    Self::collect_param_reads_stmt(b, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(b, param_index, has_this, templates);
                 }
                 if let Some(pattern) = catch_pattern {
                     match pattern {
                         HirErrorHandlerPattern::Single { body, .. } => {
                             for s in body.iter() {
-                                Self::collect_param_reads_stmt(s, param_index, has_this, templates);
+                                self.collect_param_reads_stmt(s, param_index, has_this, templates);
                             }
                         }
                         HirErrorHandlerPattern::Multiple { branches } => {
                             for branch in branches.iter() {
                                 for s in branch.body.iter() {
-                                    Self::collect_param_reads_stmt(
+                                    self.collect_param_reads_stmt(
                                         s,
                                         param_index,
                                         has_this,
@@ -1573,34 +1634,34 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
             HirStmt::Const(c) => {
-                Self::collect_param_reads_expr(&c.value, param_index, has_this, templates)
+                self.collect_param_reads_expr(&c.value, param_index, has_this, templates)
             }
             HirStmt::Return(Some(e), _) | HirStmt::Break(Some(e), _) => {
-                Self::collect_param_reads_expr(e, param_index, has_this, templates)
+                self.collect_param_reads_expr(e, param_index, has_this, templates)
             }
             HirStmt::Return(None, _)
             | HirStmt::Break(None, _)
             | HirStmt::Continue(_)
             | HirStmt::Import(..)
             | HirStmt::Package(..) => {}
-            HirStmt::Expr(e) => Self::collect_param_reads_expr(e, param_index, has_this, templates),
+            HirStmt::Expr(e) => self.collect_param_reads_expr(e, param_index, has_this, templates),
             HirStmt::If {
                 cond,
                 then_block,
                 else_block,
                 span: _,
             } => {
-                Self::collect_param_reads_expr(cond, param_index, has_this, templates);
+                self.collect_param_reads_expr(cond, param_index, has_this, templates);
                 for s in then_block.iter() {
-                    Self::collect_param_reads_stmt(s, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(s, param_index, has_this, templates);
                 }
                 if let Some(e) = else_block {
-                    Self::collect_param_reads_stmt(e, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(e, param_index, has_this, templates);
                 }
             }
             HirStmt::While { cond, body } => {
-                Self::collect_param_reads_expr(cond, param_index, has_this, templates);
-                Self::collect_param_reads_stmt(body, param_index, has_this, templates);
+                self.collect_param_reads_expr(cond, param_index, has_this, templates);
+                self.collect_param_reads_stmt(body, param_index, has_this, templates);
             }
             HirStmt::For {
                 init,
@@ -1609,19 +1670,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 body,
             } => {
                 if let Some(i) = init {
-                    Self::collect_param_reads_stmt(i, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(i, param_index, has_this, templates);
                 }
                 if let Some(c) = condition {
-                    Self::collect_param_reads_expr(c, param_index, has_this, templates);
+                    self.collect_param_reads_expr(c, param_index, has_this, templates);
                 }
                 if let Some(inc) = increment {
-                    Self::collect_param_reads_expr(inc, param_index, has_this, templates);
+                    self.collect_param_reads_expr(inc, param_index, has_this, templates);
                 }
-                Self::collect_param_reads_stmt(body, param_index, has_this, templates);
+                self.collect_param_reads_stmt(body, param_index, has_this, templates);
             }
             HirStmt::Block { body, span: _ } => {
                 for s in body.iter() {
-                    Self::collect_param_reads_stmt(s, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(s, param_index, has_this, templates);
                 }
             }
             HirStmt::Match {
@@ -1629,16 +1690,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 arms,
                 span: _,
             } => {
-                Self::collect_param_reads_expr(expr, param_index, has_this, templates);
+                self.collect_param_reads_expr(expr, param_index, has_this, templates);
                 for arm in arms.iter() {
                     if let Some(g) = arm.guard {
-                        Self::collect_param_reads_expr(g, param_index, has_this, templates);
+                        self.collect_param_reads_expr(g, param_index, has_this, templates);
                     }
-                    Self::collect_param_reads_stmt(arm.body, param_index, has_this, templates);
+                    self.collect_param_reads_stmt(arm.body, param_index, has_this, templates);
                 }
             }
             HirStmt::UnsafeBlock { body } | HirStmt::Defer(body) => {
-                Self::collect_param_reads_stmt(body, param_index, has_this, templates)
+                self.collect_param_reads_stmt(body, param_index, has_this, templates)
             }
         }
     }
