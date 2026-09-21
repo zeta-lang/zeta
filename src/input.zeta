@@ -487,6 +487,20 @@ func test_linked_list_new(): i64 {
     return 0;
 }
 
+func test_linked_list_dropping_test(): i64 {
+    io.stdout().writeln("=== Running: test_linked_list_dropping_test ===");
+
+    let mut list: LinkedList<DroppableItem> = LinkedList.new();
+
+    list.push_back(DroppableItem { tag: "clear_one" });
+    list.push_back(DroppableItem { tag: "clear_two" });
+    list.push_back(DroppableItem { tag: "clear_three" });
+
+    io.stdout().writeln("Should see 3 drops after this println");
+
+    return 0;
+}
+
 
 func test_linked_list_push_back(): i64 {
     io.stdout().writeln("=== Running: test_linked_list_push_back ===");
@@ -1291,6 +1305,11 @@ func linked_list_tests(): i64 {
         return status6;
     }
 
+    let status7: i64 = test_linked_list_dropping_test();
+    if (status7 != 0) {
+        return status7;
+    }
+
     io.stdout().writeln(
         "=== All LinkedList tests finished successfully ==="
     );
@@ -1455,7 +1474,7 @@ func test_array_and_slice_drops() {
     arr[0] = DroppableItem { tag: "arr_0_original" };
 
     io.stdout().writeln("  Initializing arr[1] for first time (expect NO drop)...");
-    //arr[1] = DroppableItem { tag: "arr_1_original" };
+    arr[1] = DroppableItem { tag: "arr_1_original" };
 
     io.stdout().writeln("  Initializing arr[2] for first time (expect NO drop)...");
     arr[2] = DroppableItem { tag: "arr_2_original" };
