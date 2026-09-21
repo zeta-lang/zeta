@@ -230,6 +230,8 @@ pub struct TypeChecker<'a, 'bump> {
     local_ref_kind: FxHashMap<StrId, RefKind>,
     binding_mode_backfill: FxHashMap<usize, BindingMode>,
     non_null_state: FxHashMap<StrId, HashSet<Vec<StrId>>>,
+    in_place_context: bool,
+    skip_slice_init_check: bool,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -277,6 +279,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             binding_mode_backfill: FxHashMap::default(),
             non_null_state: FxHashMap::default(),
             suppress_init_read: false,
+            in_place_context: false,
+            skip_slice_init_check: false,
         }
     }
 
@@ -1353,6 +1357,45 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn collect_param_reads_write_target(
+        target: &HirExpr<'a, 'bump>,
+        param_index: &FxHashMap<StrId, usize>,
+        has_this: bool,
+        templates: &mut [ReadTemplate],
+    ) {
+        if let Some((base, mut projections)) = Self::expr_to_template(target, param_index, has_this)
+        {
+            projections.pop();
+            if !projections.is_empty() {
+                Self::record_param_read(base, projections, templates);
+            }
+            return;
+        }
+        Self::collect_param_reads_expr(target, param_index, has_this, templates);
+    }
+
+    fn mut_raw_ptr_cast_operand<'e>(
+        expr: &'e HirExpr<'a, 'bump>,
+    ) -> Option<&'e HirExpr<'a, 'bump>> {
+        let HirExpr::Cast {
+            expr: inner,
+            target_type,
+            ..
+        } = expr
+        else {
+            return None;
+        };
+        match target_type {
+            HirType::UnsafePointer {
+                mutability_state, ..
+            }
+            | HirType::SafePointer {
+                mutability_state, ..
+            } if *mutability_state == MutabilityState::Mut => Some(inner),
+            _ => None,
+        }
+    }
+
     fn collect_param_reads_expr(
         expr: &HirExpr<'a, 'bump>,
         param_index: &FxHashMap<StrId, usize>,
@@ -1405,14 +1448,37 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
                 Self::collect_param_reads_expr(callee, param_index, has_this, templates);
                 for a in args.iter() {
-                    Self::collect_param_reads_expr(a, param_index, has_this, templates);
+                    if let Some(inner) = Self::mut_raw_ptr_cast_operand(a) {
+                        // `param as [*]mut T` handed straight to a callee: not a read
+                        // of the contents. Prefix loads are still recorded.
+                        Self::collect_param_reads_write_target(
+                            inner,
+                            param_index,
+                            has_this,
+                            templates,
+                        );
+                    } else {
+                        Self::collect_param_reads_expr(a, param_index, has_this, templates);
+                    }
                 }
             }
             HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
                 Self::collect_param_reads_expr(object, param_index, has_this, templates);
             }
-            HirExpr::Assignment { target, value, .. } => {
-                Self::collect_param_reads_expr(target, param_index, has_this, templates);
+            HirExpr::Assignment {
+                target, op, value, ..
+            } => {
+                if matches!(op, AssignmentOperator::Assign) {
+                    Self::collect_param_reads_write_target(
+                        target,
+                        param_index,
+                        has_this,
+                        templates,
+                    );
+                } else {
+                    // compound assignment reads the old value
+                    Self::collect_param_reads_expr(target, param_index, has_this, templates);
+                }
                 Self::collect_param_reads_expr(value, param_index, has_this, templates);
             }
             HirExpr::StructInit { args, .. } => {
@@ -3341,6 +3407,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn check_expr_as_place(&mut self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
+        let prev = self.in_place_context;
+        self.in_place_context = true;
+        let ty = self.check_expr_as_place_inner(expr);
+        self.in_place_context = prev;
+        ty
+    }
+
+    fn check_expr_as_place_inner(&mut self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
         match expr {
             HirExpr::Ident(name, span) => {
                 let var_name = self.str_id_to_string(*name);
@@ -3418,6 +3492,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
             } => {
                 self.set_span(*span);
+                // Consumed here so it can't leak into nested expressions.
+                let skip_init = std::mem::take(&mut self.skip_slice_init_check);
                 let object_ty = self.check_expr_suppressed(object);
                 let start_ty = self.check_expr(start);
                 let end_ty = self.check_expr(end);
@@ -3426,7 +3502,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "slice bounds must be integers".to_string(),
                     ));
                 }
-                if matches!(*Self::strip_ref(&object_ty), HirType::Array(..)) {
+                if !skip_init && matches!(*Self::strip_ref(&object_ty), HirType::Array(..)) {
                     self.check_slice_range_init(object, start, end);
                 }
                 match *Self::strip_ref(&object_ty) {
@@ -6663,6 +6739,38 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Some(result)
     }
 
+    fn callee_ignores_initial_contents(
+        write_template: Option<&[bool]>,
+        read_template: Option<&[ReadTemplate]>,
+        i: usize,
+    ) -> bool {
+        let definitely_written = write_template
+            .and_then(|t| t.get(i))
+            .copied()
+            .unwrap_or(false);
+        let never_reads_contents = read_template
+            .and_then(|t| t.get(i))
+            .is_some_and(|rt| !Self::read_template_touches_contents(rt));
+        definitely_written || never_reads_contents
+    }
+
+    fn check_ref_expr_deferring_init(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        ref_kind: RefKind,
+        span: SourceSpan<'a>,
+        register_loan: bool,
+        skip_init: bool,
+    ) -> HirType<'a, 'bump> {
+        let prev = self.skip_slice_init_check;
+        // Only arm the flag for a top-level slice operand, so it can't be
+        // picked up by an unrelated nested `&mut x[..]`.
+        self.skip_slice_init_check = skip_init && matches!(expr, HirExpr::Slice { .. });
+        let ty = self.check_ref_expr(expr, ref_kind, span, register_loan);
+        self.skip_slice_init_check = prev;
+        ty
+    }
+
     fn check_all_func_args(
         &mut self,
         args: &[HirExpr<'a, 'bump>],
@@ -6708,7 +6816,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     span,
                 } = arg
                 {
-                    let arg_type = self.check_ref_expr(expr, *ref_kind, *span, false);
+                    let ignores_init = *ref_kind != RefKind::Shared
+                        && Self::callee_ignores_initial_contents(
+                            write_template.as_deref(),
+                            read_template.as_deref(),
+                            i,
+                        );
+                    let arg_type = self.check_ref_expr_deferring_init(
+                        expr,
+                        *ref_kind,
+                        *span,
+                        false,
+                        ignores_init,
+                    );
                     if let Some(pt) = param_type {
                         self.recover(self.types_compatible(pt, &arg_type), ());
                     }
@@ -6739,21 +6859,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 },
             ) = (param, arg)
             {
-                let arg_type = self.check_ref_expr(expr, *rk, *span, true);
+                let ignores_init = Self::callee_ignores_initial_contents(
+                    write_template.as_deref(),
+                    read_template.as_deref(),
+                    i,
+                );
+                let arg_type =
+                    self.check_ref_expr_deferring_init(expr, *rk, *span, true, ignores_init);
                 if let Some(pt) = param_type {
                     self.recover(self.types_compatible(pt, &arg_type), ());
                 }
-                let definitely_written = write_template
-                    .as_ref()
-                    .and_then(|t| t.get(i))
-                    .copied()
-                    .unwrap_or(false);
-
-                let never_reads_contents = read_template
-                    .as_ref()
-                    .and_then(|t| t.get(i))
-                    .is_some_and(|rt| !Self::read_template_touches_contents(rt));
-                if definitely_written || never_reads_contents {
+                if ignores_init {
                     self.optimistically_mark_mut_target_init(expr);
                 }
                 if let Some(place) = self.resolve_place(expr) {
