@@ -2597,9 +2597,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 })
             }
 
-            // Post-monomorphization shape: method calls are desugared into a
-            // direct call to a mangled function with the receiver as the first
-            // argument. That's the allocator identity — not necessarily `this`.
             HirExpr::Call { args, .. } | HirExpr::InterfaceCall { args, .. } => {
                 let first = args.first()?;
                 if let Some(ty) = self.concrete_type_of(first) {
