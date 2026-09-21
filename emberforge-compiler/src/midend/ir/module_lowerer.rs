@@ -1,5 +1,5 @@
 use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry};
-use crate::midend::ir::lowerer::FunctionLowerer;
+use crate::midend::ir::mir_lowering::FunctionLowerer;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
     Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, StrId,

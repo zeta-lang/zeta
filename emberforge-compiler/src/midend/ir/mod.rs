@@ -1,3 +1,3 @@
 pub mod block_data;
-pub mod lowerer;
+pub mod mir_lowering;
 pub mod module_lowerer;

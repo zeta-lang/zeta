@@ -230,7 +230,6 @@ pub fn owned_chains_of<'a, 'bump>(
     out
 }
 
-// Performant reimplementation of owned_chains_of that is specialized
 pub(crate) fn is_struct_owns_chain<'a, 'bump>(
     structs: &HashMap<StrId, HirStruct<'a, 'bump>>,
     field_offsets: &HashMap<StrId, HashMap<StrId, usize>>,
