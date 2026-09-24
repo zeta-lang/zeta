@@ -13,7 +13,6 @@ lto = "thin"
 codegen-units = 1
 
 [profile.debug]
-debug = "line-tables-only"
 codegen-backend = "cranelift"
 
 [build]

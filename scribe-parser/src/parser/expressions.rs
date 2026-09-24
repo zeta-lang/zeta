@@ -53,7 +53,7 @@ where
                         lhs = Expr::Call {
                             callee,
                             generic_args: &[],
-                            arguments: self.bump.alloc_slice_immutable(&args),
+                            arguments: self.bump.alloc_slice(&args),
                             span,
                         };
                     }
@@ -140,7 +140,7 @@ where
                         }
 
                         let callee = self.bump.alloc_value_immutable(lhs);
-                        let type_args = self.bump.alloc_slice_immutable(&generic_args);
+                        let type_args = self.bump.alloc_slice(&generic_args);
 
                         if self.cursor.peek() == TokenKind::LBrace && allow_struct_init {
                             // `Ident<T> { field: value, .. }`
@@ -168,7 +168,7 @@ where
                             lhs = Expr::Call {
                                 callee,
                                 generic_args: type_args,
-                                arguments: self.bump.alloc_slice_immutable(&args),
+                                arguments: self.bump.alloc_slice(&args),
                                 span,
                             };
                         }
@@ -333,7 +333,7 @@ where
         Ok(Expr::StructInit {
             callee,
             type_args,
-            arguments: self.bump.alloc_slice_immutable(args.as_slice()),
+            arguments: self.bump.alloc_slice(args.as_slice()),
             span,
         })
     }
@@ -391,7 +391,7 @@ where
         cursor.advance();
         if cursor.peek() != TokenKind::Gt {
             loop {
-                match Self::parse_type_impl(self.bump.clone(), &mut cursor, &mut pending) {
+                match Self::parse_type_impl(self.bump, &mut cursor, &mut pending) {
                     Ok(arg) => arg,
                     Err(_) => return false,
                 };
@@ -490,8 +490,8 @@ where
 
                 Ok(Expr::Intrinsic {
                     name,
-                    generic_args: self.bump.alloc_slice_immutable(&generic_args),
-                    arguments: self.bump.alloc_slice_immutable(&args),
+                    generic_args: self.bump.alloc_slice(&generic_args),
+                    arguments: self.bump.alloc_slice(&args),
                     span: tok.span.merge(end_span),
                 })
             }
@@ -532,7 +532,7 @@ where
                 self.cursor.expect(TokenKind::RBracket)?;
 
                 Ok(Expr::ArrayLiteral {
-                    elements: self.bump.alloc_slice_immutable(&elements),
+                    elements: self.bump.alloc_slice(&elements),
                     span: tok.span.merge(end_span),
                 })
             }
@@ -651,7 +651,7 @@ where
                     }
 
                     return Ok(Expr::ModulePath {
-                        segments: self.bump.alloc_slice_immutable(&segments),
+                        segments: self.bump.alloc_slice(&segments),
                         span: tok.span,
                     });
                 }
@@ -816,7 +816,7 @@ where
 
         Ok(Expr::Lambda {
             modifiers,
-            params: self.bump.alloc_slice_immutable(&params),
+            params: self.bump.alloc_slice(&params),
             return_type,
             body,
             span,
@@ -913,7 +913,7 @@ where
         self.cursor.expect(TokenKind::RBrace)?;
 
         Ok(ErrorHandlerPattern::Multiple {
-            branches: self.bump.alloc_slice_immutable(&branches),
+            branches: self.bump.alloc_slice(&branches),
         })
     }
 }

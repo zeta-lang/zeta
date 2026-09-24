@@ -10,6 +10,7 @@ use std::fmt::Formatter;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::str::from_utf8_unchecked;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::VmString;
 
 /// A reference to an interned string in the global string pool
@@ -1192,5 +1193,205 @@ impl RefKind {
                 | (Alias, Shared)
                 | (Shared, Shared)
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    ByValue,
+    ByRef(RefKind),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HirClosureCapture<'bump> {
+    /// Synthesized env-field name (`__cap_0`, `__cap_1`, ...) — capture
+    /// paths can collide on their last segment (`a.x` and `b.x`), so this
+    /// is never derived from `source_path` itself.
+    pub name: StrId,
+    pub mode: CaptureMode,
+    /// Root local in the *enclosing* scope.
+    pub source: StrId,
+    /// Field/index projection from `source` — e.g. `self.items[i]` is
+    /// `source: self, source_path: [Field(items), Index(Place(i))]`. Empty
+    /// = the whole variable. Reuses `HirEffectAccess`'s segment type so the
+    /// borrow checker's existing field/index disjointness reasoning (the
+    /// same machinery backing multi-place params) applies unchanged to
+    /// captures. An index that isn't a literal or another static path
+    /// (`arr[i + 1]`) never appears here — inference stops one level up
+    /// and captures the whole container instead (see `static_effect_path`).
+    pub source_path: &'bump [HirEffectSegment<'bump>],
+}
+
+/// Derived from what the body does to its captures.
+///   Fn     - only reads
+///   FnMut  - mutates at least one capture
+///   FnOnce - moves at least one capture out
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+/// Everything the hoister needs to closure-convert one lambda. Produced by the
+/// type checker (it needs types to infer modes), keyed by the address of the
+/// lambda's `body: &'bump HirStmt`, which is stable across the by-value copies
+/// the hoister makes of HirExpr/HirStmt.
+#[derive(Clone)]
+pub struct ClosureLowering<'a, 'bump> {
+    pub env_name: StrId, // `__closure_env_N`, the synthetic struct type
+    pub fn_name: StrId,  // `__closure_fn_N`,  the hoisted function
+    /// HirType::Struct { name: env_name, field_types: <one per capture> }
+    pub env_ty: HirType<'a, 'bump>,
+    pub captures: Vec<HirClosureCapture<'bump>>,
+    /// Resolved parameter / return types (annotation, else from the generic
+    /// constraint). The hoister must use these, not `HirLambdaParam::param_type`.
+    pub param_tys: Vec<HirType<'a, 'bump>>,
+    pub ret_ty: HirType<'a, 'bump>,
+    pub kind: ClosureKind,
+}
+
+/// Structural (syntax-only) field/index path from a local root. Shared by
+/// the type checker (capture inference, via `fv_expr`) and the hoister
+/// (closure-conversion substitution) so the two agree on what counts as
+/// "the same place" without duplicating the walk.
+///
+/// Returns `None` when `expr` isn't a static place at all (goes through a
+/// call, an opaque deref, etc.) — recursing into sub-expressions to find
+/// free variables elsewhere is the caller's job; this function only ever
+/// answers "is this one spot a static path, and if so which."
+///
+/// An index that isn't itself a numeric literal or a *field-only* static
+/// path (`arr[i + 1]`, or `arr[self.items[0]]` since that index is itself
+/// indexed) makes the *whole containing expression* not a static path
+/// (`None`), deliberately: the caller's normal recursive fallback then
+/// treats the array one level up as the free thing (captures the whole
+/// container, conservatively) rather than trying to represent an
+/// unreconstructible index. `i` itself is still found as its own free
+/// variable by that same fallback recursion, separately. The field-only
+/// restriction matches `EffectIndexKey::Place`, which stores a flat
+/// `&'bump [StrId]` field path (no room for a nested index) — the same
+/// shape `effect_index_key_to_bound` already expects.
+pub fn static_effect_path<'x, 'bump>(
+    expr: &HirExpr<'x, 'bump>,
+    this_id: StrId,
+    bump: &GrowableBump<'bump>,
+) -> Option<(StrId, Vec<HirEffectSegment<'bump>>)> {
+    match expr {
+        HirExpr::Ident(name, _) => Some((*name, Vec::new())),
+        HirExpr::This { .. } => Some((this_id, Vec::new())),
+        HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+            let (root, mut path) = static_effect_path(object, this_id, bump)?;
+            path.push(HirEffectSegment::Field(*field));
+            Some((root, path))
+        }
+        HirExpr::Index { object, index, .. } => {
+            let (root, mut path) = static_effect_path(object, this_id, bump)?;
+            let key = static_index_key(index, this_id, bump)?;
+            path.push(HirEffectSegment::Index(key));
+            Some((root, path))
+        }
+        _ => None,
+    }
+}
+
+fn static_index_key<'x, 'bump>(
+    index: &HirExpr<'x, 'bump>,
+    this_id: StrId,
+    bump: &GrowableBump<'bump>,
+) -> Option<EffectIndexKey<'bump>> {
+    match index {
+        HirExpr::Number(n, _) => Some(EffectIndexKey::Const(*n)),
+        other => {
+            let (root, path) = static_effect_path(other, this_id, bump)?;
+            // EffectIndexKey::Place stores a flat field-name path (matching
+            // effect_index_key_to_bound's own str_id_to_string walk over
+            // `path`), so an index that's itself indexed (`arr[self.items[0]]`)
+            // has no representation here — bail to None, which makes the
+            // *outer* static_effect_path stop one level up and capture the
+            // container conservatively, same as a non-static index would.
+            let field_path: Vec<StrId> = path
+                .into_iter()
+                .map(|seg| match seg {
+                    HirEffectSegment::Field(f) => Some(f),
+                    HirEffectSegment::Index(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(EffectIndexKey::Place {
+                root,
+                path: bump.alloc_slice(&field_path),
+            })
+        }
+    }
+}
+
+/// True if `prefix` is a segment-wise prefix of (or equal to) `full` —
+/// `self` (empty path) is a prefix of everything under `self`; `self.items`
+/// is a prefix of `self.items[3]` but not of `self.name`. Two `Index`
+/// segments only compare equal when their keys structurally match, with one
+/// deliberate exception: any two `Dynamic` keys compare equal, since
+/// distinguishing them isn't provable anyway and treating them as the same
+/// symbolic slot is the conservative (and only sound) choice. In practice a
+/// finalized capture path never contains `Dynamic` (see `static_effect_path`
+/// above) — this exception matters only while coalescing raw scan results,
+/// before captures are finalized.
+pub fn effect_path_is_prefix(
+    prefix: &[HirEffectSegment<'_>],
+    full: &[HirEffectSegment<'_>],
+) -> bool {
+    if prefix.len() > full.len() {
+        return false;
+    }
+    prefix
+        .iter()
+        .zip(full.iter())
+        .all(|(a, b)| effect_segment_eq(a, b))
+}
+
+pub fn effect_segment_eq(a: &HirEffectSegment<'_>, b: &HirEffectSegment<'_>) -> bool {
+    match (a, b) {
+        (HirEffectSegment::Field(x), HirEffectSegment::Field(y)) => x == y,
+        (HirEffectSegment::Index(x), HirEffectSegment::Index(y)) => effect_index_key_eq(x, y),
+        _ => false,
+    }
+}
+
+pub fn effect_index_key_eq(a: &EffectIndexKey<'_>, b: &EffectIndexKey<'_>) -> bool {
+    match (a, b) {
+        (EffectIndexKey::Const(x), EffectIndexKey::Const(y)) => x == y,
+        (
+            EffectIndexKey::Place { root: rx, path: px },
+            EffectIndexKey::Place { root: ry, path: py },
+        ) => rx == ry && px == py,
+        (EffectIndexKey::Dynamic, EffectIndexKey::Dynamic) => true,
+        _ => false,
+    }
+}
+
+/// Names a pattern binds (syntactic; shared by the checker and the hoister).
+pub fn pattern_bound_names(pat: &HirPattern<'_>, out: &mut Vec<StrId>) {
+    match pat {
+        HirPattern::Ident(n) => out.push(*n),
+        HirPattern::EnumVariant { bindings, .. } => out.extend(bindings.iter().copied()),
+        HirPattern::Tuple(ps) | HirPattern::Array(ps) => {
+            for p in ps.iter() {
+                pattern_bound_names(p, out);
+            }
+        }
+        HirPattern::Struct { fields, .. } => {
+            for (_, p) in fields.iter() {
+                pattern_bound_names(p, out);
+            }
+        }
+        HirPattern::Or(ps) => {
+            if let Some(first) = ps.first() {
+                pattern_bound_names(first, out);
+            }
+        }
+        HirPattern::Wildcard
+        | HirPattern::Number(_)
+        | HirPattern::String(_)
+        | HirPattern::Boolean(_)
+        | HirPattern::Null => {}
     }
 }

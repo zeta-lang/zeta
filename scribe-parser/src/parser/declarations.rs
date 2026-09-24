@@ -122,7 +122,7 @@ where
             if fields_as_params.is_empty() {
                 None
             } else {
-                Some(self.bump.alloc_slice_immutable(&fields_as_params))
+                Some(self.bump.alloc_slice(&fields_as_params))
             }
         };
 
@@ -225,12 +225,12 @@ where
             methods: if methods.is_empty() {
                 None
             } else {
-                Some(self.bump.alloc_slice_immutable(&methods))
+                Some(self.bump.alloc_slice(&methods))
             },
             constants: if constants.is_empty() {
                 None
             } else {
-                Some(self.bump.alloc_slice_immutable(&constants))
+                Some(self.bump.alloc_slice(&constants))
             },
             span: token.span,
         };
@@ -314,7 +314,7 @@ where
 
         self.cursor.expect(TokenKind::RParen)?;
 
-        Ok(self.bump.alloc_slice_immutable(&fields))
+        Ok(self.bump.alloc_slice(&fields))
     }
 
     pub fn parse_const_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
@@ -415,7 +415,7 @@ where
             methods: if methods.is_empty() {
                 None
             } else {
-                Some(self.bump.alloc_slice_immutable(&methods))
+                Some(self.bump.alloc_slice(&methods))
             },
             generics,
             span: token.span,
@@ -441,7 +441,7 @@ where
         }
 
         Ok(self.bump.alloc_value_immutable(ir::ast::PermitsExpr {
-            types: self.bump.alloc_slice_immutable(&types),
+            types: self.bump.alloc_slice(&types),
             span: token.span,
         }))
     }
@@ -468,7 +468,7 @@ where
             name,
             visibility,
             generics,
-            variants: self.bump.alloc_slice_immutable(&variants),
+            variants: self.bump.alloc_slice(&variants),
             span: token.span,
         })))
     }
@@ -546,7 +546,7 @@ where
             self.cursor.expect(TokenKind::RBrace)?;
             Ok(EnumVariant {
                 name,
-                fields: self.bump.alloc_slice_immutable(&fields),
+                fields: self.bump.alloc_slice(&fields),
                 span,
             })
         }

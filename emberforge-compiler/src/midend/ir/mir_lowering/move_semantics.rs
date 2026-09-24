@@ -1288,4 +1288,110 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         );
         emitter.emit_element_drop(drop_kind, addr, &mut resolver, span);
     }
+
+    pub(crate) fn handle_potential_drop(
+        &mut self,
+        field: StrId,
+        span: SourceSpan<'a>,
+        obj_val: Value,
+        field_offset: usize,
+        owner: Option<StrId>,
+        nullable_owned: Option<HirType<'_, '_>>,
+        f: &ir::hir::HirField<'_, '_>,
+    ) {
+        let drop_kind = if nullable_owned.is_some() {
+            DropKind::Undroppable // already handled above
+        } else {
+            f.field_type.drop_kind()
+        };
+        if drop_kind.is_droppable() {
+            let is_uninit = owner.map_or(false, |o| self.drop_state.is_field_moved(o, field));
+            if !is_uninit {
+                let field_addr = self.current_block_data.fresh_value();
+                self.emit(Instruction::FieldAddr {
+                    dest: field_addr,
+                    base: Operand::Value(obj_val),
+                    offset: field_offset,
+                });
+                self.current_block_data.value_types.insert(
+                    field_addr,
+                    SsaType::Pointer(Box::new(lower_type_hir(&f.field_type, self.enums))),
+                );
+                let mut resolver = FnAllocatorResolver {
+                    var_map: &self.var_map,
+                    context: self.context.clone(),
+                    dep_graph: self.dep_graph,
+                };
+                let mut emitter = DropEmitter::new(
+                    &mut self.current_block_data,
+                    self.context.clone(),
+                    self.struct_mangled_map,
+                    self.struct_field_offsets,
+                    self.structs,
+                    self.enums,
+                    self.allocator_kind,
+                    self.glue_registry,
+                );
+                match &drop_kind {
+                    DropKind::OwnedPointer {
+                        pointee,
+                        pointee_ty,
+                        allocator,
+                    } => {
+                        if matches!(pointee_ty, HirType::Slice(_)) {
+                            emitter.emit_owned_pointer_drop(
+                                None,
+                                pointee,
+                                pointee_ty,
+                                allocator,
+                                field_addr,
+                                false,
+                                None,
+                                &mut resolver,
+                                span,
+                            );
+                        } else {
+                            let old_ptr = emitter.current_block_data.fresh_value();
+                            emitter.emit(Instruction::Load {
+                                dest: old_ptr,
+                                ptr: Operand::Value(field_addr),
+                            });
+                            let pointee_ssa = lower_type_hir(pointee_ty, emitter.enums);
+                            emitter
+                                .current_block_data
+                                .value_types
+                                .insert(old_ptr, pointee_ssa);
+                            emitter.emit_owned_pointer_drop(
+                                None,
+                                pointee,
+                                pointee_ty,
+                                allocator,
+                                old_ptr,
+                                false,
+                                None,
+                                &mut resolver,
+                                span,
+                            );
+                        }
+                    }
+                    DropKind::Type(_) => {
+                        emitter.emit_element_drop(&drop_kind, field_addr, &mut resolver, span);
+                    }
+                    DropKind::Slice {
+                        element,
+                        element_ty,
+                    } => {
+                        emitter.emit_slice_loop_drop(
+                            element,
+                            element_ty,
+                            field_addr,
+                            &mut resolver,
+                            span,
+                        );
+                    }
+                    DropKind::Undroppable => {}
+                }
+            }
+        }
+    }
 }

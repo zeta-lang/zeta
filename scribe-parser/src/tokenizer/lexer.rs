@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read};
 use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 // Maps ASCII bytes 0..128 to a dispatch category.
@@ -125,7 +125,7 @@ impl Lexer {
     pub fn tokenize_file<'a, 'bump>(
         &self,
         file_name: &'a str,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> std::io::Result<Tokens<'a, 'bump>>
     where
         'bump: 'a,
@@ -143,7 +143,7 @@ impl Lexer {
         &self,
         src: &str,
         file_name: &'a str,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> Tokens<'a, 'bump>
     where
         'a: 'bump,

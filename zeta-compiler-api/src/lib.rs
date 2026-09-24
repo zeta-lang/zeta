@@ -1,5 +1,3 @@
-#![feature(allocator_api)]
-
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -20,7 +18,6 @@ use scribe_parser::hir_lowerer::HirLowerer;
 use scribe_parser::hir_lowerer::lambda_hoisting::LambdaHoister;
 use scribe_parser::hir_lowerer::monomorphization::Monomorphizer;
 use sentinel_typechecker::TypeChecker;
-use zetaruntime::arena::GrowableAtomicBump;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
@@ -179,7 +176,7 @@ where
             self.loaded_sources
                 .insert(name.to_string(), parsed.source.to_string());
 
-            for perr in &parsed.parser_diagnostics.errors {
+            for perr in &parsed.parse_result.diagnostics.errors {
                 reporter.add_parser_error(perr.clone());
             }
 
@@ -190,7 +187,7 @@ where
             let ast_module = codex_dependency_graph::dep_graph::AstModule {
                 name,
                 path: parsed.path.clone(),
-                stmts: parsed.stmts.as_slice(),
+                stmts: parsed.parse_result.statements.as_slice(),
             };
             self.dep_graph.borrow_mut().register_module_structure(
                 module_idx,
@@ -205,7 +202,7 @@ where
             let ast_module = codex_dependency_graph::dep_graph::AstModule {
                 name: *name,
                 path: parsed.path.clone(),
-                stmts: parsed.stmts.as_slice(),
+                stmts: parsed.parse_result.statements.as_slice(),
             };
             self.dep_graph.borrow_mut().extract_edges_for_module(
                 *module_idx,
@@ -292,10 +289,9 @@ where
 
     fn make_lowerer(&self, parsed: &ModuleWithArena<'a, 'bump>) -> HirLowerer<'a, 'bump> {
         let module_auto_imports = self.auto_imports.clone();
-
         HirLowerer::new(
             self.pool.clone(),
-            parsed.bump.clone(),
+            parsed.bump_ref(),
             self.dep_graph,
             self.registry.clone(),
             module_auto_imports,
@@ -309,7 +305,7 @@ where
         parsed: ModuleWithArena<'a, 'bump>,
         reporter: &mut ErrorReporter<'a>,
     ) -> Option<HirLowerer<'a, 'bump>> {
-        let hir = lowerer.lower_module_bodies(&parsed.stmts, module_idx);
+        let hir = lowerer.lower_module_bodies(&parsed.parse_result.statements, module_idx);
 
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
@@ -421,7 +417,7 @@ where
             let bump = self
                 .modules
                 .get(&module_idx)
-                .map(|m| m.bump.clone())
+                .map(|m| &m.bump)
                 .expect("Expected module idx to exist");
             let new_module = HirModule {
                 name: existing.name,
@@ -434,14 +430,18 @@ where
 
     fn monomorphize_module(&mut self, module_idx: usize, lowerer: &mut HirLowerer<'a, 'bump>) {
         let checked_hir = self.hir_modules[&module_idx];
-        let bump = &self.modules.get(&module_idx).unwrap().bump;
 
-        let hoister = LambdaHoister::new(bump.clone(), self.pool.clone(), checked_hir.name);
-        let hoisted_module = hoister.run(checked_hir);
+        let hoister = LambdaHoister::new(
+            lowerer.ctx.bump, // was &lowerer.ctx.bump
+            self.pool.clone(),
+            checked_hir.name,
+            self.type_checker.borrow().closure_table().clone(),
+        );
+        let (hoisted_module, env_to_fn) = hoister.run(checked_hir);
 
         let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            bump.clone(),
+            lowerer.ctx.bump, // was &lowerer.ctx.bump
             self.registry.functions.clone(),
             &mut lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -449,6 +449,7 @@ where
             self.registry.instantiated_struct_origins.clone(),
             self.registry.instantiated_enums.clone(),
             self.registry.instantiated_enum_origins.clone(),
+            env_to_fn,
         );
         let monomorphized_module = monomorphizer.run(hoisted_module);
 
@@ -479,20 +480,19 @@ where
             groups.push(scc);
         }
 
-        let shared_bump = pending.values().next().unwrap().1.bump.clone();
+        let bump = self.scratch_bump_ref();
         let mut lowerer = HirLowerer::new(
             self.pool.clone(),
-            shared_bump,
+            bump, // was &bump
             self.dep_graph,
             self.registry.clone(),
             self.auto_imports.clone(),
         );
 
-        let module_stmts: FxHashMap<usize, Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>> =
-            pending
-                .iter()
-                .map(|(&idx, (_name, parsed))| (idx, parsed.stmts.clone()))
-                .collect();
+        let module_stmts: FxHashMap<usize, Vec<Stmt<'a, 'bump>>> = pending
+            .iter()
+            .map(|(&idx, (_name, parsed))| (idx, parsed.parse_result.statements.clone()))
+            .collect();
 
         let mut lowered = lowerer.lower_all_modules(&module_stmts, order);
 
@@ -564,7 +564,7 @@ where
     ) -> ErrorReporter<'a> {
         let mut reporter = self.make_reporter();
         let mut lowerer = self.make_lowerer(&parsed);
-        lowerer.lower_module_prototypes(&parsed.stmts, module_idx);
+        lowerer.lower_module_prototypes(&parsed.parse_result.statements, module_idx);
 
         let Some(mut lowerer) =
             self.lower_module_bodies_phase(module_idx, lowerer, parsed, &mut reporter)
@@ -736,22 +736,22 @@ where
             }
         };
 
-        for perr in &parsed.parser_diagnostics.errors {
+        for perr in &parsed.parse_result.diagnostics.errors {
             reporter.add_parser_error(perr.clone());
         }
         reporter.add_source_file(canonical_name.to_string(), parsed.source.to_string());
-        if parsed.parser_diagnostics.has_errors() {
+        if parsed.parse_result.diagnostics.has_errors() {
             return reporter;
         }
 
         let mut lowerer = HirLowerer::new(
             self.pool.clone(),
-            parsed.bump.clone(),
+            parsed.bump_ref(),
             self.dep_graph,
             self.registry.clone(),
             self.auto_imports.clone(),
         );
-        let hir = lowerer.lower_module(&parsed.stmts, module_idx);
+        let hir = lowerer.lower_module(&parsed.parse_result.statements, module_idx);
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
                 kind: TypeErrorKind::Generic(err.0.clone()),
@@ -762,7 +762,7 @@ where
         let ast_module = AstModule {
             name: canonical_name,
             path: parsed.path.clone(),
-            stmts: parsed.stmts.as_slice(),
+            stmts: parsed.parse_result.statements.as_slice(),
         };
 
         let importers = self.dep_graph.borrow().get_module_importers(module_idx);
@@ -776,7 +776,7 @@ where
                 let imp_ast = codex_dependency_graph::dep_graph::AstModule {
                     name: imp_module.name,
                     path: parsed.path.clone(),
-                    stmts: imp_module.stmts.as_slice(),
+                    stmts: imp_module.parse_result.statements.as_slice(),
                 };
                 self.dep_graph
                     .borrow_mut()
@@ -845,8 +845,8 @@ where
                 parsed.source.to_string(),
             );
 
-            if parsed.parser_diagnostics.has_errors() {
-                for perr in &parsed.parser_diagnostics.errors {
+            if parsed.parse_result.diagnostics.has_errors() {
+                for perr in &parsed.parse_result.diagnostics.errors {
                     reporter.add_parser_error(perr.clone());
                 }
                 continue;
@@ -857,7 +857,7 @@ where
             let ast_module = codex_dependency_graph::dep_graph::AstModule {
                 name,
                 path: parsed.path.clone(),
-                stmts: parsed.stmts.as_slice(),
+                stmts: parsed.parse_result.statements.as_slice(),
             };
             self.dep_graph.borrow_mut().register_module_structure(
                 module_idx,
@@ -871,7 +871,7 @@ where
             let ast_module = codex_dependency_graph::dep_graph::AstModule {
                 name: *name,
                 path: parsed.path.clone(),
-                stmts: parsed.stmts.as_slice(),
+                stmts: parsed.parse_result.statements.as_slice(),
             };
             self.dep_graph.borrow_mut().extract_edges_for_module(
                 *module_idx,
@@ -944,13 +944,11 @@ where
     }
 
     fn force_instantiate_allocator_frees(&self) {
-        let Some(scratch_bump) = self.modules.values().next().map(|m| m.bump.clone()) else {
-            return;
-        };
+        let scratch_bump = self.scratch_bump_ref();
 
         let mut scratch_lowerer = HirLowerer::new(
             self.pool.clone(),
-            scratch_bump.clone(),
+            scratch_bump,
             self.dep_graph,
             self.registry.clone(),
             self.auto_imports.clone(),
@@ -958,7 +956,7 @@ where
 
         let monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            scratch_bump,
+            &scratch_bump,
             self.registry.functions.clone(),
             &mut scratch_lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -966,19 +964,18 @@ where
             self.registry.instantiated_struct_origins.clone(),
             self.registry.instantiated_enums.clone(),
             self.registry.instantiated_enum_origins.clone(),
+            FxHashMap::default(),
         );
 
         monomorphizer.force_instantiate_allocator_frees();
     }
 
     fn force_instantiate_drops(&self) {
-        let Some(scratch_bump) = self.modules.values().next().map(|m| m.bump.clone()) else {
-            return;
-        };
+        let scratch_bump = self.scratch_bump_ref();
 
         let mut scratch_lowerer = HirLowerer::new(
             self.pool.clone(),
-            scratch_bump.clone(),
+            scratch_bump,
             self.dep_graph,
             self.registry.clone(),
             self.auto_imports.clone(),
@@ -986,7 +983,7 @@ where
 
         let monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            scratch_bump,
+            &scratch_lowerer.ctx.bump,
             self.registry.functions.clone(),
             &mut scratch_lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -994,8 +991,17 @@ where
             self.registry.instantiated_struct_origins.clone(),
             self.registry.instantiated_enums.clone(),
             self.registry.instantiated_enum_origins.clone(),
+            FxHashMap::default(),
         );
 
         monomorphizer.force_instantiate_drops();
+    }
+
+    /// SAFETY: same justification as `dep_graph`/`dep_graph_storage` — the
+    /// Box's heap allocation is stable across moves of `Compiler`, and
+    /// `GrowableBump` only mutates through its own interior mutability, so
+    /// handing out a `&'bump` ref derived from `&self` is sound.
+    fn scratch_bump_ref(&self) -> &'bump GrowableBump<'bump> {
+        unsafe { &*(self.lowerer_bump.as_ref() as *const GrowableBump<'bump>) }
     }
 }

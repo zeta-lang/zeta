@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use super::context::HirLowerer;
 use ir::ast::Stmt;
@@ -10,7 +9,6 @@ use ir::hir::{HirEnum, HirEnumVariant, HirField, HirFunc, HirInterface, HirStruc
 use ir::hir::{HirParam, HirType};
 use ir::ir_hasher::FxHashMap;
 use ir::span::SourceSpan;
-use zetaruntime::arena::GrowableAtomicBump;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
@@ -91,10 +89,14 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             }
                         }
                         Some(member) => {
-                            self.ctx
-                                .named_imports
-                                .borrow_mut()
-                                .insert(member, target_idx);
+                            // `import zeta::io.File` -> expand to the real module now,
+                            // so nothing downstream ever sees the facade.
+                            let real_idx = self
+                                .ctx
+                                .dep_graph
+                                .borrow()
+                                .canonical_member_module(target_idx, member);
+                            self.ctx.named_imports.borrow_mut().insert(member, real_idx);
                         }
                     },
                     None => {
@@ -122,11 +124,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
     }
 
-    pub fn lower_module_types(
-        &mut self,
-        stmts: &Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
-        module_idx: usize,
-    ) {
+    pub fn lower_module_types(&mut self, stmts: &Vec<Stmt<'a, 'bump>>, module_idx: usize) {
         self.ctx.module_idx = module_idx;
         self.resolve_imports(stmts);
         self.register_auto_import_aliases(module_idx);
@@ -134,11 +132,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         self.collect_const_declarations(stmts);
     }
 
-    pub fn lower_module_prototypes(
-        &mut self,
-        stmts: &Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
-        module_idx: usize,
-    ) {
+    pub fn lower_module_prototypes(&mut self, stmts: &Vec<Stmt<'a, 'bump>>, module_idx: usize) {
         self.ctx.module_idx = module_idx;
         self.resolve_imports(stmts);
         self.register_auto_import_aliases(module_idx);
@@ -159,7 +153,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn lower_module_bodies(
         &mut self,
-        stmts: &Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
+        stmts: &Vec<Stmt<'a, 'bump>>,
         module_idx: usize,
     ) -> HirModule<'a, 'bump> {
         self.ctx.module_idx = module_idx;
@@ -177,7 +171,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn lower_module(
         &mut self,
-        stmts: &Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
+        stmts: &Vec<Stmt<'a, 'bump>>,
         module_idx: usize,
     ) -> HirModule<'a, 'bump> {
         self.lower_module_prototypes(stmts, module_idx);
@@ -186,7 +180,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn lower_all_modules(
         &mut self,
-        module_stmts: &FxHashMap<usize, Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>>,
+        module_stmts: &FxHashMap<usize, Vec<Stmt<'a, 'bump>>>,
         compile_order: &[usize],
     ) -> FxHashMap<usize, HirModule<'a, 'bump>> {
         let mut seen: HashSet<usize> = HashSet::default();
@@ -233,14 +227,23 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     fn register_auto_import_aliases(&mut self, module_idx: usize) {
-        for auto_path in self.ctx.auto_imports.borrow().paths() {
-            let Some(&last) = auto_path.last() else {
+        let static_auto_paths: Vec<Vec<StrId>> = self
+            .ctx
+            .auto_imports
+            .borrow()
+            .paths()
+            .map(|p| {
+                p.iter()
+                    .map(|s| StrId(self.ctx.context.intern(s)))
+                    .collect()
+            })
+            .collect();
+        let impl_auto_paths = self.ctx.dep_graph.borrow().auto_import_packages();
+
+        for segments in static_auto_paths.into_iter().chain(impl_auto_paths) {
+            let Some(&last) = segments.last() else {
                 continue;
             };
-            let segments: Vec<StrId> = auto_path
-                .iter()
-                .map(|s| StrId(self.ctx.context.intern(s)))
-                .collect();
             let Some(target_idx) = self.ctx.dep_graph.borrow().resolve_module_path(&segments)
             else {
                 continue;
@@ -248,11 +251,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             if target_idx == module_idx {
                 continue;
             }
-            let alias = StrId(self.ctx.context.intern(last));
             self.ctx
                 .imported_modules
                 .borrow_mut()
-                .entry(alias)
+                .entry(last)
                 .or_insert(target_idx);
         }
     }
@@ -522,7 +524,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn lower_function_bodies(
         &mut self,
-        stmts: &Vec<ir::ast::Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
+        stmts: &Vec<ir::ast::Stmt<'a, 'bump>>,
     ) -> (Vec<Path<'a, 'bump>>, Vec<Hir<'a, 'bump>>, Option<StrId>) {
         let mut imports: Vec<Path<'a, 'bump>> = Vec::with_capacity(64);
         let mut items: Vec<Hir<'a, 'bump>> = Vec::with_capacity(64);
@@ -605,7 +607,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
         let params = f.params.map(|ps| {
             let lowered: Vec<HirParam<'a, 'bump>> = self.lower_params(ps);
-            self.ctx.bump.alloc_slice_immutable(&lowered)
+            self.ctx.bump.alloc_slice(&lowered)
         });
         let return_type = match f.return_type {
             Some(ty) => self.lower_type(&ty, f.span),

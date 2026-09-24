@@ -1058,7 +1058,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         let node_ssa = lower_type_hir(&chain.node_ty, self.enums);
         let node_ptr_ty = SsaType::Pointer(Box::new(node_ssa));
 
-        // Resolved once, outside the loop: every node came from the same allocator.
+        // every node came from the same allocator.
         let (alloc_val, known_name) = match &chain.allocator {
             ChainAlloc::Annotated(a) => self.resolve_allocator_value_named(a, resolver),
             ChainAlloc::Field(f) => {
@@ -1102,7 +1102,6 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         let after_bb = self.current_block_data.new_block();
         self.emit(Instruction::Jump { target: cond_bb });
 
-        // cond
         self.current_block_data.switch_to(cond_bb);
         let cur = self.current_block_data.fresh_value();
         self.current_block_data
@@ -1140,7 +1139,6 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             else_bb: body_bb,
         });
 
-        // body
         self.current_block_data.switch_to(body_bb);
         let node = self.current_block_data.fresh_value();
         self.emit(Instruction::Cast {

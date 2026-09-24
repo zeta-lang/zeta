@@ -55,7 +55,7 @@ pub fn build_semantic_tokens(
                     continue;
                 };
 
-                match module_with_arena.stmts.get(*item_idx) {
+                match module_with_arena.parse_result.statements.get(*item_idx) {
                     Some(Stmt::FuncDecl(_)) => 2,
                     Some(Stmt::StructDecl(_)) => 4,
                     Some(Stmt::EnumDecl(_)) => 5,

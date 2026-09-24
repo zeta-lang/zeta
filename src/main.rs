@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Instant;
 
 use clap::{ArgMatches, CommandFactory, Error, FromArgMatches, Parser, Subcommand};
@@ -89,18 +90,48 @@ fn main() -> Result<(), CompilerError<'static>> {
                 println!("Output directory: {}", out_dir.display());
                 println!("Optimization: {}", optimize);
             }
-            run_compiler(path, out_dir, optimize, verbose, emit_obj, lib_override)
+
+            run_compiler(path, &out_dir, optimize, verbose, emit_obj, lib_override)?;
+            Ok(())
         }
         Commands::Run { path, args } => {
             let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
+            let out_dir = PathBuf::from("./build");
+
             if verbose {
                 println!("Running from: {}", source_path.display());
+
                 if !args.is_empty() {
                     println!("Arguments: {:?}", args);
                 }
             }
-            // TODO: implement run
-            Ok(())
+
+            let program_path = run_compiler(
+                path,
+                &out_dir,
+                false,
+                verbose,
+                false, // always link for `run`
+                lib_override,
+            )?;
+
+            let duration = start.elapsed();
+            println!("Operation completed in {:.2?}", duration);
+
+            if verbose {
+                println!("Executing: {}", program_path.display());
+            }
+
+            let status = Command::new(&program_path)
+                .args(&args)
+                .status()
+                .expect("failed to execute compiled Zeta program");
+
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+
+            return Ok(());
         }
     };
 
@@ -118,12 +149,12 @@ fn main() -> Result<(), CompilerError<'static>> {
 
 fn run_compiler<'a, 'bump>(
     path: Option<PathBuf>,
-    out_dir: PathBuf,
+    out_dir: &PathBuf,
     optimize: bool,
     verbose: bool,
     emit_obj: bool,
     lib_override: Option<PathBuf>,
-) -> Result<(), CompilerError<'a>>
+) -> Result<PathBuf, CompilerError<'a>>
 where
     'bump: 'a,
     'a: 'bump,
@@ -133,14 +164,17 @@ where
     } else {
         compiler_lib_path()?
     };
+
     let source_path = path.unwrap_or_else(|| PathBuf::from("./src"));
+
+    let file_loader = choose_file_loader();
 
     let mut compiler = Compiler::new()?;
 
-    let file_loader = choose_file_loader();
     let stdlib_diags = compiler
         .load_directory(&file_loader, &stdlib_path, true)
         .unwrap_or_else(|e| panic!("Could not load stdlib because of {e}"));
+
     if stdlib_diags.has_errors() {
         stdlib_diags.report_all();
         return Err(CompilerError::ParserError(vec![]));
@@ -149,11 +183,11 @@ where
     let user_diags = compiler
         .load_directory(&file_loader, &source_path, false)
         .unwrap_or_else(|e| panic!("Could not load user directory because of {e}"));
+
     if user_diags.has_errors() {
         user_diags.report_all();
         return Err(CompilerError::TypeCheckError);
     }
 
-    compiler.emit(&out_dir, optimize, verbose, emit_obj)?;
-    Ok(())
+    compiler.emit(out_dir, optimize, verbose, emit_obj)
 }

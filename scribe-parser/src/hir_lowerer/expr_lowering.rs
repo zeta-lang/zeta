@@ -14,8 +14,7 @@ use ir::hir_utils::lower_cmp_operator;
 use ir::ir_hasher::FxHashBuilder;
 use ir::span::SourceSpan;
 use std::collections::HashMap;
-use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 
 const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("sizeof", IntrinsicKind::SizeOf),
@@ -33,6 +32,36 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
+    fn canonical_module_path(&self, path: &'bump [StrId], member: StrId) -> Option<&'bump [StrId]> {
+        if member.is_empty() {
+            return None;
+        }
+        let dg = self.ctx.dep_graph.borrow();
+        // Same order as resolve_type_path_name: alias first, then full path.
+        let module_idx = self
+            .ctx
+            .imported_modules
+            .borrow()
+            .get(path.last()?)
+            .copied()
+            .or_else(|| dg.resolve_module_path(path))?;
+        let real = dg.resolve_reexport(module_idx, member)?;
+        let segs = dg.package_segments(real)?;
+        Some(self.ctx.bump.alloc_slice(segs))
+    }
+
+    fn canonical_module_access(
+        &self,
+        path: &'bump [StrId],
+        member: StrId,
+        span: SourceSpan<'a>,
+    ) -> &'bump HirModuleAccess<'a, 'bump> {
+        let path = self.canonical_module_path(path, member).unwrap_or(path);
+        self.ctx
+            .bump
+            .alloc_value_immutable(HirModuleAccess { path, member, span })
+    }
+
     pub(super) fn lower_expr_expected(
         &self,
         expr: &Expr<'a, 'bump>,
@@ -85,7 +114,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     || self.ctx.named_imports.borrow().contains_key(&name)
                 {
                     let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
-                        path: self.ctx.bump.alloc_slice_immutable(&[*name]),
+                        path: self.ctx.bump.alloc_slice(&[*name]),
                         member: StrId(self.ctx.context.intern("")),
                         span: *span,
                     });
@@ -150,12 +179,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
 
                         if acc.member.is_empty() {
-                            let new_acc = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
-                                path: acc.path,
-                                member: *field,
-                                span: *span,
-                            });
-                            HirExpr::ModuleAccess(new_acc)
+                            HirExpr::ModuleAccess(
+                                self.canonical_module_access(acc.path, *field, *span),
+                            )
                         } else {
                             HirExpr::FieldAccess {
                                 object: self.ctx.bump.alloc_value_immutable(lowered_object),
@@ -221,7 +247,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 span,
             } => HirExpr::GenericIdent(
                 *name,
-                self.ctx.bump.alloc_slice_immutable(
+                self.ctx.bump.alloc_slice(
                     generic_args
                         .iter()
                         .map(|a| self.lower_type(a, *span))
@@ -279,12 +305,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             let type_args_opt = if type_args_vec.is_empty() {
                                 None
                             } else {
-                                Some(self.ctx.bump.alloc_slice_immutable(&type_args_vec))
+                                Some(self.ctx.bump.alloc_slice(&type_args_vec))
                             };
                             return HirExpr::EnumInit {
                                 enum_name: resolved_enum,
                                 variant: *field,
-                                args: self.ctx.bump.alloc_slice_immutable(
+                                args: self.ctx.bump.alloc_slice(
                                     &args.iter().map(|fi| fi.value).collect::<Vec<_>>(),
                                 ),
                                 type_args: type_args_opt,
@@ -337,7 +363,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             Self::fill_default_type_args(
                                 declared,
                                 &mut type_args_vec,
-                                self.ctx.bump.clone(),
+                                self.ctx.bump,
                             );
                         }
                     }
@@ -345,7 +371,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let type_args = if type_args_vec.is_empty() {
                     None
                 } else {
-                    Some(self.ctx.bump.alloc_slice_immutable(&type_args_vec))
+                    Some(self.ctx.bump.alloc_slice(&type_args_vec))
                 };
                 HirExpr::StructInit {
                     name: self.ctx.bump.alloc_value(name),
@@ -593,7 +619,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         span: p.span,
                     })
                     .collect();
-                let params_slice = self.ctx.bump.alloc_slice_immutable(&lowered_params);
+                let params_slice = self.ctx.bump.alloc_slice(&lowered_params);
 
                 let ret = match return_type {
                     Some(t) => self.lower_type(t, *span),
@@ -614,7 +640,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
             Expr::ModulePath { segments, span } => {
                 let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
-                    path: self.ctx.bump.alloc_slice_immutable(segments),
+                    path: self.ctx.bump.alloc_slice(segments),
                     member: StrId(self.ctx.context.intern("")),
                     span: *span,
                 });
@@ -625,16 +651,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 segments,
                 member,
                 span,
-            } => {
-                let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
-                    path: self.ctx.bump.alloc_slice_immutable(segments),
-                    member: *member,
-                    span: *span,
-                });
-                HirExpr::ModuleAccess(access)
-            }
+            } => HirExpr::ModuleAccess(self.canonical_module_access(*segments, *member, *span)),
             Expr::ArrayLiteral { elements, span } => HirExpr::ArrayLiteral {
-                elements: self.ctx.bump.alloc_slice_immutable(
+                elements: self.ctx.bump.alloc_slice(
                     elements
                         .iter()
                         .map(|t| self.lower_expr(t))
@@ -684,6 +703,29 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
     }
 
+    fn resolve_module_function(&self, acc: &HirModuleAccess<'a, 'bump>) -> Option<StrId> {
+        if acc.member.is_empty() {
+            return None;
+        }
+        let dg = self.ctx.dep_graph.borrow();
+        let module_idx = self
+            .ctx
+            .imported_modules
+            .borrow()
+            .get(acc.path.last()?)
+            .copied()
+            .or_else(|| dg.resolve_module_path(acc.path))?;
+
+        // Not a facade re-export: leave the ModuleAccess callee alone.
+        if dg.resolve_reexport(module_idx, acc.member).is_none() {
+            return None;
+        }
+
+        let real_idx = dg.canonical_member_module(module_idx, acc.member);
+        let mangled = dg.mangle_free_function(real_idx, acc.member, false, &self.ctx.context);
+        self.ctx.functions.borrow().get(&mangled).map(|f| f.name)
+    }
+
     pub(super) fn lower_expr_call(
         &self,
         callee: &Expr<'a, 'bump>,
@@ -701,6 +743,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 if let Some(func) = self.resolve_function(*func_name) {
                     lowered_callee = HirExpr::Ident(func.name, *ident_span);
                 }
+            }
+        }
+
+        if let HirExpr::ModuleAccess(acc) = &lowered_callee {
+            if let Some(name) = self.resolve_module_function(acc) {
+                lowered_callee = HirExpr::Ident(name, acc.span);
             }
         }
 
@@ -760,7 +808,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 None
             } else {
                 Some(
-                    self.ctx.bump.alloc_slice_immutable(
+                    self.ctx.bump.alloc_slice(
                         generic_args
                             .iter()
                             .map(|a| self.lower_type(a, span))
@@ -850,10 +898,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
+        //let named = self.ctx.named_imports.borrow().get(&name).copied();
         let imports = self.ctx.imported_modules.borrow();
 
         for module_idx in imports.values().copied() {
-            let Some(pkg) = self.ctx.dep_graph.borrow().get_module_package(module_idx) else {
+            let real_idx = self
+                .ctx
+                .dep_graph
+                .borrow()
+                .canonical_member_module(module_idx, name);
+            let Some(pkg) = self.ctx.dep_graph.borrow().get_module_package(real_idx) else {
                 continue;
             };
 
@@ -1030,13 +1084,13 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let HirExpr::Ident(n, _) = **name else {
                     unreachable!()
                 };
-                let field_slice: &mut [HirType<'a, 'bump>] =
+                let field_slice: &[HirType<'a, 'bump>] =
                     if let Some(ty_struct) = self.ctx.structs.borrow().get(&n) {
                         let field_types: Vec<HirType<'a, 'bump>> =
                             ty_struct.fields.iter().map(|f| f.field_type).collect();
                         self.ctx.bump.alloc_slice(&field_types)
                     } else {
-                        &mut []
+                        &[]
                     };
 
                 HirType::Struct {
@@ -1447,7 +1501,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         if !Self::fill_default_type_args(
                             declared,
                             &mut lowered_type_args,
-                            self.ctx.bump.clone(),
+                            self.ctx.bump,
                         ) {
                             self.ctx.record_error(
                                 format!(
@@ -1463,10 +1517,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             );
                         }
                     }
-                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
+                    let type_args_slice = self.ctx.bump.alloc_slice(&lowered_type_args);
                     let field_types: Vec<HirType<'a, 'bump>> =
                         ty_struct.fields.iter().map(|f| f.field_type).collect();
-                    let field_slice = self.ctx.bump.alloc_slice_immutable(&field_types);
+                    let field_slice = self.ctx.bump.alloc_slice(&field_types);
                     return HirType::Struct {
                         name: resolved_name,
                         field_types: field_slice,
@@ -1479,7 +1533,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         if !Self::fill_default_type_args(
                             declared,
                             &mut lowered_type_args,
-                            self.ctx.bump.clone(),
+                            self.ctx.bump,
                         ) {
                             self.ctx.record_error(
                                 format!(
@@ -1492,7 +1546,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             );
                         }
                     }
-                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
+                    let type_args_slice = self.ctx.bump.alloc_slice(&lowered_type_args);
                     return HirType::DynInterface(resolved_name, type_args_slice);
                 }
 
@@ -1501,7 +1555,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         if !Self::fill_default_type_args(
                             declared,
                             &mut lowered_type_args,
-                            self.ctx.bump.clone(),
+                            self.ctx.bump,
                         ) {
                             self.ctx.record_error(
                                 format!(
@@ -1517,7 +1571,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             );
                         }
                     }
-                    let type_args_slice = self.ctx.bump.alloc_slice_immutable(&lowered_type_args);
+                    let type_args_slice = self.ctx.bump.alloc_slice(&lowered_type_args);
                     return HirType::Enum {
                         name: resolved_name,
                         variants: ty_enum.variants,
@@ -1545,7 +1599,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 HirType::Struct {
                     name: resolved_name,
                     field_types: &[],
-                    type_args: self.ctx.bump.alloc_slice_immutable(&lowered_type_args),
+                    type_args: self.ctx.bump.alloc_slice(&lowered_type_args),
                 }
             }
             TypeKind::OwnedPointer { inner, allocator } => {
@@ -1598,7 +1652,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let lowered_params: Vec<HirType<'a, 'bump>> =
                     params.iter().map(|p| self.lower_type(p, span)).collect();
 
-                let params_slice = self.ctx.bump.alloc_slice_immutable(&lowered_params);
+                let params_slice = self.ctx.bump.alloc_slice(&lowered_params);
 
                 let ret = self
                     .ctx
@@ -1746,7 +1800,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub(crate) fn fill_default_type_args(
         declared: &[ir::hir::HirGeneric<'a, 'bump>],
         type_args: &mut Vec<HirType<'a, 'bump>>,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> bool {
         if type_args.len() >= declared.len() {
             return true;
@@ -1759,7 +1813,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         let start_idx = type_args.len();
         for param in &declared[start_idx..] {
             if let Some(ref def_ty) = param.default_type {
-                let resolved_def = substitute_type(def_ty, &subs, bump.clone());
+                let resolved_def = substitute_type(def_ty, &subs, bump);
                 subs.insert(param.name, resolved_def);
                 type_args.push(resolved_def);
             } else {

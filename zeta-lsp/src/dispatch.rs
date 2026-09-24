@@ -578,7 +578,7 @@ fn document_symbols_at(
     let module_with_arena = state.compiler.module_with_arena(module_idx)?;
 
     let mut symbols = Vec::new();
-    for stmt in &module_with_arena.stmts {
+    for stmt in &module_with_arena.parse_result.statements {
         let (name, kind, span) = match stmt {
             Stmt::FuncDecl(f) => (f.name.to_string(), SymbolKind::FUNCTION, f.span),
             Stmt::StructDecl(s) => (s.name.to_string(), SymbolKind::STRUCT, s.span),
@@ -700,7 +700,8 @@ fn references_at(state: &ServerState, params: &ReferenceParams) -> Vec<Location>
         let Some(module_with_arena) = state.compiler.module_with_arena(m) else {
             return vec![];
         };
-        let Some(span) = item_decl_span(&module_with_arena.stmts, item_idx, tag) else {
+        let Some(span) = item_decl_span(&module_with_arena.parse_result.statements, item_idx, tag)
+        else {
             return vec![];
         };
         let Some(target_path) = state.compiler.path_for_module(m) else {

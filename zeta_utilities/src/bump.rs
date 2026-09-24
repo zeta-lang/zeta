@@ -229,6 +229,24 @@ impl<'bump> GrowableBump<'bump> {
         }
     }
 
+    pub fn alloc_slice_mut<T>(&self, slice: &[T]) -> &'bump [T] {
+        if slice.is_empty() {
+            return &[];
+        }
+
+        let layout = Layout::array::<T>(slice.len()).expect("Failed to create layout for slice");
+
+        let ptr = self
+            .allocate(layout)
+            .expect("Failed to allocate slice in bump allocator")
+            .as_ptr() as *mut T;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), ptr, slice.len());
+            std::slice::from_raw_parts_mut(ptr, slice.len())
+        }
+    }
+
     pub fn alloc_slice<T>(&self, slice: &[T]) -> &'bump [T] {
         if slice.is_empty() {
             return &[];

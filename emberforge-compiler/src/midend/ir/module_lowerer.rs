@@ -2,7 +2,7 @@ use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry}
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
-    Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, StrId,
+    Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, HirType, StrId,
     ThisPassingKind,
 };
 use ir::ir_conversion::lower_type_hir;
@@ -196,7 +196,18 @@ where
                             if func.generics.is_none() {
                                 self.register_method_signature(func);
                             }
-                        }
+                        } // None => {
+                        //     if func.generics.is_none() {
+                        //         let f = Function::from_signature(
+                        //             func,
+                        //             &self.module.structs,
+                        //             &self.module.enums,
+                        //             &self.module.interfaces,
+                        //             &self.context,
+                        //         );
+                        //         self.module.functions.insert(f.name, f);
+                        //     }
+                        // }
                         None => {
                             if func.generics.is_none() {
                                 let f = Function::from_signature(
@@ -207,6 +218,15 @@ where
                                     &self.context,
                                 );
                                 self.module.functions.insert(f.name, f);
+
+                                // Closure fns are callable through their env: `env.__call(args)`.
+                                if let Some(env) = Self::closure_env_of(func) {
+                                    let call = StrId(self.context.thread_local().intern("__call"));
+                                    self.struct_mangled_map
+                                        .entry(env)
+                                        .or_insert_with(|| HashMap::default())
+                                        .insert(call, func.name);
+                                }
                             }
                         }
                     },
@@ -540,5 +560,26 @@ where
         fl.finish();
 
         self.module.functions.insert(hir_fn.name, function);
+    }
+
+    /// A hoisted closure fn is named `__closure_fn_N` and takes its env first:
+    /// `&__closure_env_N` (Fn/FnMut) or `__closure_env_N` (FnOnce).
+    fn closure_env_of(func: &HirFunc<'a, 'bump>) -> Option<StrId> {
+        if !func.name.as_str().starts_with("__closure_fn_") {
+            return None;
+        }
+        let Some(HirParam::Normal { param_type, .. }) = func.params?.first() else {
+            return None;
+        };
+        let ty = match param_type {
+            HirType::Ref { inner, .. } => *inner,
+            other => other,
+        };
+        match ty {
+            HirType::Struct { name, .. } if name.as_str().starts_with("__closure_env_") => {
+                Some(*name)
+            }
+            _ => None,
+        }
     }
 }

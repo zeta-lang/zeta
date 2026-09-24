@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 pub type FxHashSet<T> = HashSet<T, FxHashBuilder>;
@@ -31,7 +31,7 @@ pub struct LoweringCtx<'a, 'bump> {
     pub context: Arc<StringPool>,
     pub dep_graph: &'a RefCell<DepGraph>,
     pub imported_modules: RefCell<FxHashMap<StrId, usize>>,
-    pub bump: Arc<GrowableAtomicBump<'bump>>,
+    pub bump: &'bump GrowableBump<'bump>,
     pub module_idx: usize,
     pub struct_interfaces: Rc<RefCell<FxHashMap<StrId, Vec<StrId>>>>,
     pub struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
@@ -73,11 +73,20 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
             }
 
             let mut found: Option<(usize, StrId)> = None;
-            for auto_path in self.auto_imports.borrow().paths() {
-                let segments: Vec<StrId> = auto_path
-                    .iter()
-                    .map(|seg| StrId(self.context.intern(seg)))
-                    .collect();
+
+            let static_auto_paths: Vec<Vec<StrId>> = self
+                .auto_imports
+                .borrow()
+                .paths()
+                .map(|p| {
+                    p.iter()
+                        .map(|seg| StrId(self.context.intern(seg)))
+                        .collect()
+                })
+                .collect();
+            let impl_auto_paths = self.dep_graph.borrow().auto_import_packages();
+
+            for segments in static_auto_paths.into_iter().chain(impl_auto_paths) {
                 let Some(target_module_idx) =
                     self.dep_graph.borrow().resolve_module_path(&segments)
                 else {
@@ -162,9 +171,9 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
     }
 
     fn mangle_via_module(&self, target_module_idx: usize, name: StrId) -> StrId {
-        self.dep_graph
-            .borrow()
-            .mangle_type_name(target_module_idx, name, &self.context)
+        let dg = self.dep_graph.borrow();
+        let real_idx = dg.canonical_member_module(target_module_idx, name);
+        dg.mangle_type_name(real_idx, name, &self.context)
     }
 
     pub(crate) fn record_error(&self, message: impl Into<String>, span: SourceSpan<'a>) {
@@ -183,7 +192,7 @@ pub struct HirLowerer<'a, 'bump> {
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub fn new(
         context: Arc<StringPool>,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         dep_graph: &'a RefCell<DepGraph>,
         registry: GlobalRegistry<'a, 'bump>,
         auto_imports: Rc<RefCell<AutoImportRegistry>>,
@@ -202,7 +211,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 enum_owner_module: registry.enum_owner_module,
                 struct_owner_module: registry.struct_owner_module,
                 context: context.clone(),
-                bump: bump.clone(),
+                bump,
                 imported_modules: RefCell::new(FxHashMap::default()),
                 dep_graph,
                 module_idx: usize::MAX,

@@ -8,12 +8,13 @@ use ir::hir::{HirModule, StrId};
 use ir::ir_hasher::HashSet;
 use ir::registry::global_registry::GlobalRegistry;
 use ir::ssa_ir::Module;
+use scribe_parser::parser::ParseResult;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use walkdir::WalkDir;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 pub fn compiler_lib_path<'a>() -> Result<PathBuf, CompilerError<'a>> {
@@ -111,50 +112,55 @@ where
 
     let name = StrId(pool.intern(file_name_str));
 
-    let bump = Arc::new(GrowableAtomicBump::new());
+    let bump: Box<GrowableBump<'bump>> = Box::new(GrowableBump::new(
+        std::cmp::max(BASE, contents.len() * 2 + FOUR_KB),
+        8,
+    ));
+
+    // The Box may move, but the GrowableBump allocation itself will not.
+    //
+    // We need to manufacture the long-lived reference because Rust's
+    // borrow checker cannot express the self-reference between `bump`
+    // and `parse_result`.
+    let bump_ref: &'bump GrowableBump<'bump> = unsafe { &*(&*bump as *const GrowableBump<'bump>) };
+
     if contents.is_empty() {
         return Ok(ModuleWithArena {
-            bump: bump.clone(),
+            bump,
             name,
             path,
-            stmts: Vec::new_in(bump),
-            parser_diagnostics: scribe_parser::parser::ParserDiagnostics::new(),
+            parse_result: ParseResult {
+                statements: Vec::new(),
+                diagnostics: scribe_parser::parser::ParserDiagnostics::new(),
+            },
             source: String::new(),
         });
     }
 
     const BASE: usize = 16 * 1024;
     const FOUR_KB: usize = 4 * 1024;
-    let initial_capacity = std::cmp::max(BASE, contents.len() * 2 + FOUR_KB);
-
-    let atomic_bump = GrowableAtomicBump::with_capacity_and_aligned(initial_capacity, 8)
-        .map_err(|_| CompilerError::FailedToAllocateBump)?;
-    let bump = Arc::new(atomic_bump);
 
     let file_name_static: &str = {
         let bytes = file_name_str.as_bytes();
-        let stored = bump
-            .alloc_many(bytes)
-            .ok_or(CompilerError::FailedToAllocateBump)?;
+        let stored = bump.alloc_slice(bytes);
         // SAFETY: Always valid UTF-8
         unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(stored.as_ptr(), bytes.len()))
         }
     };
 
-    let parse_result = scribe_parser::parser::parse_program(
+    let parse_result: ParseResult<'a, 'bump> = scribe_parser::parser::parse_program(
         contents.as_str(),
         file_name_static,
         pool.clone(),
-        bump.clone(),
+        bump_ref,
     );
 
     Ok(ModuleWithArena {
         bump,
         name,
         path,
-        stmts: parse_result.statements,
-        parser_diagnostics: parse_result.diagnostics,
+        parse_result,
         source: contents,
     })
 }

@@ -1,0 +1,3 @@
+package zeta::thread::threads;
+
+struct AS {}

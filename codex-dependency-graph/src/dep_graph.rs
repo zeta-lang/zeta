@@ -8,7 +8,14 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use zetaruntime::string_pool::StringPool;
 
+const PACKAGE_FILE_NAME: &str = "package.zeta";
+const MAX_REEXPORT_DEPTH: usize = 16;
+
 pub type NodeIdx = usize;
+
+fn is_package_file(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some(PACKAGE_FILE_NAME)
+}
 
 #[derive(Debug)]
 pub struct PackageMismatch {
@@ -193,6 +200,12 @@ pub struct DepGraph {
     current_locals: HashMap<StrId, StrId>,
     current_self_type: Option<StrId>,
     package_segments: HashMap<usize, Vec<StrId>>,
+    /// Modules that are `package.zeta` facades.
+    package_facades: HashSet<usize>,
+    /// (facade module, exported name) -> module path the name is imported from.
+    /// Stored as raw segments and resolved lazily, so file load order is irrelevant.
+    facade_exports: HashMap<(usize, StrId), Vec<StrId>>,
+    auto_import_modules: HashSet<usize>,
 }
 
 impl DepGraph {
@@ -210,6 +223,9 @@ impl DepGraph {
             current_locals: HashMap::default(),
             current_self_type: None,
             package_segments: HashMap::default(),
+            facade_exports: HashMap::default(),
+            package_facades: HashSet::default(),
+            auto_import_modules: HashSet::default(),
         }
     }
 
@@ -375,7 +391,7 @@ impl DepGraph {
         module_idx: usize,
         name: StrId,
     ) -> Option<(usize, usize, &'static str)> {
-        self.symbol_table.get(&(name, module_idx)).copied()
+        self.lookup_symbol(name, module_idx)
     }
 
     fn remove_node(&mut self, idx: NodeIdx) {
@@ -424,6 +440,9 @@ impl DepGraph {
         self.symbol_table.retain(|&(_, m), _| m != module_idx);
         self.unresolved_imports
             .retain(|imp| imp.from_module_idx != module_idx);
+        self.facade_exports.retain(|&(m, _), _| m != module_idx);
+        self.package_facades.remove(&module_idx);
+        self.auto_import_modules.remove(&module_idx);
 
         if let Some(mod_node_idx) = self.lookup_item_node(module_idx, 0, "module") {
             let old_deps = self.nodes[mod_node_idx].deps.clone();
@@ -461,6 +480,17 @@ impl DepGraph {
                 let seg_vec: Vec<StrId> = pkg.path.path.to_vec();
                 self.package_segments.insert(module_idx, seg_vec.clone());
                 self.path_index.insert(seg_vec, module_idx);
+            }
+        }
+        if is_package_file(&module.path) {
+            self.package_facades.insert(module_idx);
+            for stmt in module.stmts {
+                if let Stmt::Import(imp) = stmt {
+                    if let Some(member) = imp.path.member {
+                        self.facade_exports
+                            .insert((module_idx, member), imp.path.path.to_vec());
+                    }
+                }
             }
         }
         for (item_idx, stmt) in module.stmts.iter().enumerate() {
@@ -534,7 +564,7 @@ impl DepGraph {
     }
 
     pub fn resolve_global_const(&self, module_idx: usize, name: StrId) -> Option<(usize, usize)> {
-        let &(m, item_idx, tag) = self.symbol_table.get(&(name, module_idx))?;
+        let (m, item_idx, tag) = self.lookup_symbol(name, module_idx)?;
 
         if tag == "const" {
             Some((m, item_idx))
@@ -558,7 +588,7 @@ impl DepGraph {
         module_idx: usize,
         name: StrId,
     ) -> Option<(usize, usize)> {
-        let &(m, i, tag) = self.symbol_table.get(&(name, module_idx))?;
+        let (m, i, tag) = self.lookup_symbol(name, module_idx)?;
         if tag == "func_sig" || tag == "func_body" {
             Some((m, i))
         } else {
@@ -734,6 +764,13 @@ impl DepGraph {
                 }
             }
 
+            if expected_components.last().map(String::as_str) == Some("package") {
+                expected_components.pop();
+                if expected_components.is_empty() {
+                    continue; // root-level package.zeta: nothing to compare against
+                }
+            }
+
             let declared: Vec<String> = segments
                 .iter()
                 .map(|s| pool.resolve_string(s).to_string())
@@ -898,18 +935,28 @@ impl DepGraph {
             Stmt::Import(imp) => {
                 let seg_vec: Vec<StrId> = imp.path.path.to_vec();
                 match self.path_index.resolve(&seg_vec) {
-                    Some(target_module_idx) => {
-                        ir::zdebug!(
-                            "import resolved: module {module_idx} -> module {target_module_idx} (path {:?})",
-                            seg_vec.iter().map(|s| s.to_string()).collect::<Vec<_>>()
-                        );
-                        self.register_import(module_idx, target_module_idx);
+                    Some(target) => {
+                        // Edge to the module written in source (keeps LSP invalidation right)...
+                        self.register_import(module_idx, target);
+                        if let Some(member) = imp.path.member {
+                            // ...and to the module that really owns the item.
+                            if let Some(real) = self.resolve_reexport(target, member) {
+                                self.register_import(module_idx, real);
+                            }
+                            // A facade may only export things that exist.
+                            if self.package_facades.contains(&module_idx)
+                                && self.lookup_symbol(member, target).is_none()
+                            {
+                                let mut path = seg_vec.clone();
+                                path.push(member);
+                                self.unresolved_imports.push(UnresolvedImport {
+                                    from_module_idx: module_idx,
+                                    path,
+                                });
+                            }
+                        }
                     }
                     None => {
-                        ir::zdebug!(
-                            "import UNRESOLVED: module {module_idx} wants path {:?}",
-                            seg_vec.iter().map(|s| s.to_string()).collect::<Vec<_>>()
-                        );
                         self.unresolved_imports.push(UnresolvedImport {
                             from_module_idx: module_idx,
                             path: seg_vec,
@@ -1109,6 +1156,7 @@ impl DepGraph {
         if let Some(iface) = &i.interface {
             self.add_ast_type_dep(from_node, iface, module_idx, pool);
         }
+        self.record_auto_import_eligibility(i, module_idx);
         if let Some(generics) = i.generics {
             for g in generics {
                 for c in g.constraints {
@@ -1542,7 +1590,7 @@ impl DepGraph {
     /// Try to resolve a bare `StrId` name to a declaration node and add an
     /// edge.  Searches the current module first, then any imported modules.
     fn resolve_name_to_edge(&mut self, name: StrId, from_node: NodeIdx, module_idx: usize) {
-        if let Some(&(m, i, tag)) = self.symbol_table.get(&(name, module_idx)) {
+        if let Some((m, i, tag)) = self.lookup_symbol(name, module_idx) {
             if let Some(to) = self.lookup_item_node(m, i, tag) {
                 self.add_edge(from_node, to);
                 return;
@@ -1550,7 +1598,7 @@ impl DepGraph {
         }
         let imports = self.get_module_imports(module_idx);
         for imp_idx in imports {
-            if let Some(&(m, i, tag)) = self.symbol_table.get(&(name, imp_idx)) {
+            if let Some((m, i, tag)) = self.lookup_symbol(name, imp_idx) {
                 if let Some(to) = self.lookup_item_node(m, i, tag) {
                     self.add_edge(from_node, to);
                     return;
@@ -1874,6 +1922,48 @@ impl DepGraph {
             .collect()
     }
 
+    /// If `module_idx` is a facade that re-exports `name` (and doesn't declare it
+    /// itself), returns the real module that owns it. Follows facade chains.
+    /// `None` means "no redirect, use `module_idx` as-is".
+    pub fn resolve_reexport(&self, module_idx: usize, name: StrId) -> Option<usize> {
+        let mut current = module_idx;
+        for _ in 0..MAX_REEXPORT_DEPTH {
+            if self.symbol_table.contains_key(&(name, current)) {
+                break; // declared locally, own declaration wins
+            }
+            let Some(path) = self.facade_exports.get(&(current, name)) else {
+                break;
+            };
+            match self.path_index.resolve(path) {
+                Some(next) if next != current => current = next,
+                _ => break,
+            }
+        }
+        (current != module_idx).then_some(current)
+    }
+
+    /// Convenience: the real module for `module_idx.name`.
+    pub fn canonical_member_module(&self, module_idx: usize, name: StrId) -> usize {
+        self.resolve_reexport(module_idx, name)
+            .unwrap_or(module_idx)
+    }
+
+    fn lookup_symbol(
+        &self,
+        name: StrId,
+        module_idx: usize,
+    ) -> Option<(usize, usize, &'static str)> {
+        if let Some(&e) = self.symbol_table.get(&(name, module_idx)) {
+            return Some(e);
+        }
+        let real = self.resolve_reexport(module_idx, name)?;
+        self.symbol_table.get(&(name, real)).copied()
+    }
+
+    pub fn is_package_facade(&self, module_idx: usize) -> bool {
+        self.package_facades.contains(&module_idx)
+    }
+
     pub fn get_function_callees(
         &self,
         caller_module: usize,
@@ -2053,6 +2143,46 @@ impl DepGraph {
                 eprintln!("[zeta-debug] compile order: module {m} ({name})");
             }
         }
+    }
+
+    fn record_auto_import_eligibility<'a, 'bump>(
+        &mut self,
+        i: &ImplDecl<'a, 'bump>,
+        module_idx: usize,
+    ) {
+        let eligible = match &i.interface {
+            None => true,
+            Some(iface_ty) => {
+                let TypeKind::Struct {
+                    name: iface_name,
+                    path: iface_path,
+                    ..
+                } = iface_ty.kind
+                else {
+                    return;
+                };
+                let decl_module = if iface_path.is_empty() {
+                    self.lookup_symbol(iface_name, module_idx)
+                        .filter(|&(_, _, tag)| tag == "trait")
+                        .map(|(m, _, _)| m)
+                } else {
+                    self.path_index.resolve(iface_path)
+                };
+                decl_module.is_some_and(|dm| {
+                    self.package_segments.get(&dm) == self.package_segments.get(&module_idx)
+                })
+            }
+        };
+        if eligible {
+            self.auto_import_modules.insert(module_idx);
+        }
+    }
+
+    pub fn auto_import_packages(&self) -> Vec<Vec<StrId>> {
+        self.auto_import_modules
+            .iter()
+            .filter_map(|&m| self.package_segments.get(&m).cloned())
+            .collect()
     }
 }
 

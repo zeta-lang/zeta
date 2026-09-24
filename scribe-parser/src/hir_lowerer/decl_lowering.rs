@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::hir_lowerer::module_lowering::{ImplTargetKind, primitive_hir_type};
 
 use super::context::HirLowerer;
@@ -14,7 +12,7 @@ use ir::hir::{
 };
 use ir::hir_utils::lower_visibility;
 use ir::span::SourceSpan;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -110,7 +108,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
                 HirGeneric {
                     name: g.type_name,
-                    constraints: self.ctx.bump.alloc_slice_immutable(&constraints_vec),
+                    constraints: self.ctx.bump.alloc_slice(&constraints_vec),
                     default_type,
                 }
             })
@@ -120,7 +118,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             self.remove_generic_param(g.type_name);
         }
 
-        Some(self.ctx.bump.alloc_slice_immutable(&lowered))
+        Some(self.ctx.bump.alloc_slice(&lowered))
     }
 
     pub fn lower_params(&self, params: &[Param<'a, 'bump>]) -> Vec<HirParam<'a, 'bump>> {
@@ -303,8 +301,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let prev_self = self.ctx.current_self_type.replace(Some(self_ty));
                 let mut func = self.lower_func_body_from_proto(*f, Some(target_key));
                 self.ctx.current_self_type.replace(prev_self);
-                func.generics =
-                    Self::merge_generics(generics, func.generics, self.ctx.bump.clone());
+                func.generics = Self::merge_generics(generics, func.generics, self.ctx.bump);
                 func
             })
             .collect();
@@ -351,8 +348,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .unwrap_or_default();
                 HirType::Struct {
                     name: target_key,
-                    field_types: self.ctx.bump.alloc_slice_immutable(&field_types),
-                    type_args: self.ctx.bump.alloc_slice_immutable(self_type_args),
+                    field_types: self.ctx.bump.alloc_slice(&field_types),
+                    type_args: self.ctx.bump.alloc_slice(self_type_args),
                 }
             }
             ImplTargetKind::Primitive => primitive_hir_type(target_key, &self.ctx.context)
@@ -382,13 +379,13 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             return None;
         }
         let lowered: Vec<HirType> = generics.iter().map(|g| self.lower_type(g, span)).collect();
-        Some(self.ctx.bump.alloc_slice_immutable(&lowered))
+        Some(self.ctx.bump.alloc_slice(&lowered))
     }
 
     fn merge_generics<'x>(
         impl_generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
         method_generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> Option<&'bump [HirGeneric<'a, 'bump>]> {
         match (impl_generics, method_generics) {
             (None, m) => m,
@@ -397,7 +394,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let mut combined: Vec<HirGeneric> = Vec::with_capacity(i.len() + m.len());
                 combined.extend_from_slice(i);
                 combined.extend_from_slice(m);
-                Some(bump.alloc_slice_immutable(&combined))
+                Some(bump.alloc_slice(&combined))
             }
         }
     }
@@ -435,7 +432,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 }
             })
             .collect();
-        let variants: &mut [HirEnumVariant<'a, 'bump>] = self.ctx.bump.alloc_slice(&variants_vec);
+        let variants: &[HirEnumVariant<'a, 'bump>] = self.ctx.bump.alloc_slice(&variants_vec);
 
         if let Some(gs) = generics {
             for g in gs {
@@ -506,10 +503,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
                 hir_mps.push(HirEffectAccess {
                     ref_kind: Self::lower_ref_kind(ast_mp.ref_kind),
-                    path: self.ctx.bump.alloc_slice_immutable(&hir_path),
+                    path: self.ctx.bump.alloc_slice(&hir_path),
                 });
             }
-            &*self.ctx.bump.alloc_slice_immutable(&hir_mps)
+            &*self.ctx.bump.alloc_slice(&hir_mps)
         })
     }
 
@@ -521,7 +518,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         match Self::ast_static_field_path(expr, this_id) {
             Some((root, path)) => EffectIndexKey::Place {
                 root,
-                path: self.ctx.bump.alloc_slice_immutable(&path),
+                path: self.ctx.bump.alloc_slice(&path),
             },
             None => EffectIndexKey::Dynamic,
         }

@@ -16,21 +16,21 @@ use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 #[derive(Clone, Copy)]
-pub(super) enum IndexedContainer {
+pub(crate) enum IndexedContainer {
     Array(usize),
     BorrowedSlice,
     OwnedSlice,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum SlicePrimitive {
+pub(crate) enum SlicePrimitive {
     WriteUninit,
     WriteUninitAll,
     GetUnchecked,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum FieldInitVal {
+pub(crate) enum FieldInitVal {
     Null,
     Uninit,
     Val(Value),

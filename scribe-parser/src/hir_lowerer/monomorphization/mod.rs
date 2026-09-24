@@ -1,7 +1,11 @@
+pub mod assertions;
+pub mod exprs;
 pub mod monomorphizer;
 pub mod naming;
+pub mod stmts;
 pub mod struct_instantiation;
 pub mod type_substitution;
+pub mod types;
 
 pub use monomorphizer::Monomorphizer;
 pub use naming::{instantiate_struct_name, suffix_for_subs};

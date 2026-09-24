@@ -1,21 +1,27 @@
-use ir::ast::Stmt;
 use ir::hir::StrId;
-use scribe_parser::parser::ParserDiagnostics;
+use scribe_parser::parser::ParseResult;
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 
 #[derive(Clone, Debug)]
 pub struct ModuleWithArena<'a, 'bump> {
-    pub bump: Arc<GrowableAtomicBump<'bump>>,
+    pub bump: Box<GrowableBump<'bump>>,
     pub name: StrId,
     pub path: PathBuf,
-    pub stmts: Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
-    pub parser_diagnostics: ParserDiagnostics<'a>,
+    pub parse_result: ParseResult<'a, 'bump>,
     pub source: String,
+}
+
+impl<'a, 'bump> ModuleWithArena<'a, 'bump> {
+    /// SAFETY: `bump` is heap-allocated via `Box`; moving `ModuleWithArena`
+    /// afterwards only moves the pointer, not the `GrowableBump` itself, so
+    /// this reference stays valid for as long as the `Box` is kept alive.
+    pub fn bump_ref(&self) -> &'bump GrowableBump<'bump> {
+        unsafe { &*(self.bump.as_ref() as *const GrowableBump<'bump>) }
+    }
 }
 
 #[derive(Debug)]

@@ -1,0 +1,21 @@
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+extern "C" func clock_gettime(
+    clock_id: i32,
+    tp: [*]mut Timespec
+): i32;
+
+extern "C" func nanosleep(
+    req: [*]const Timespec,
+    rem: [*]mut Timespec
+): i32;
+
+extern "C" func clock_nanosleep(
+    clock_id: i32,
+    flags: i32,
+    request: [*]const Timespec,
+    remain: [*]mut Timespec
+): i32;

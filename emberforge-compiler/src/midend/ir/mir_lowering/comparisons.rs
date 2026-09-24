@@ -1,5 +1,6 @@
 use ir::{
-    hir::HirExpr,
+    hir::{HirExpr, Operator},
+    ir_conversion::lower_operator_bin,
     ssa_ir::{BinOp, Instruction, Operand, SsaType, Value},
 };
 
@@ -169,5 +170,193 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .insert(result, SsaType::Bool);
 
         result
+    }
+
+    pub(crate) fn lower_null_comparison(
+        &mut self,
+        operand: &HirExpr<'a, 'bump>,
+        is_eq: bool,
+    ) -> Value {
+        enum Src {
+            Val(Value),
+            Addr(Value),
+        }
+        let cmp_op = if is_eq { BinOp::Eq } else { BinOp::Ne };
+
+        let (src, ty) = match operand {
+            HirExpr::FieldAccess {
+                object,
+                field,
+                span,
+            }
+            | HirExpr::Get {
+                object,
+                field,
+                span,
+            } if self.narrowed_field_value(operand).is_none() => {
+                let (addr, ty) = self.lower_field_addr(object, *field, span);
+                (Src::Addr(addr), ty)
+            }
+            _ => {
+                let v = self.lower_expr(operand);
+                let ty = self
+                    .current_block_data
+                    .value_types
+                    .get(&v)
+                    .cloned()
+                    .unwrap_or(SsaType::I64);
+                (Src::Val(v), ty)
+            }
+        };
+
+        // `null == null`
+        if ty == SsaType::Null {
+            let v = self.current_block_data.fresh_value();
+            self.emit(Instruction::Const {
+                dest: v,
+                ty: SsaType::Bool,
+                value: Operand::ConstBool(is_eq),
+            });
+            self.current_block_data.value_types.insert(v, SsaType::Bool);
+            return v;
+        }
+
+        let pointee: Option<SsaType> = if let Some(p) = ty.nullable_pointer_repr() {
+            Some(p.clone())
+        } else if let SsaType::Pointer(inner) = &ty {
+            Some((**inner).clone())
+        } else {
+            None
+        };
+
+        if let Some(pointee) = pointee {
+            let val = match src {
+                Src::Val(v) => v,
+                Src::Addr(a) => {
+                    let loaded = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Load {
+                        dest: loaded,
+                        ptr: Operand::Value(a),
+                    });
+                    self.current_block_data
+                        .value_types
+                        .insert(loaded, ty.clone());
+                    loaded
+                }
+            };
+            let ptr_ty = SsaType::Pointer(Box::new(pointee));
+            let zero = self.current_block_data.fresh_value();
+            self.emit(Instruction::Const {
+                dest: zero,
+                ty: ptr_ty.clone(),
+                value: Operand::ConstInt(0),
+            });
+            self.current_block_data.value_types.insert(zero, ptr_ty);
+
+            let cmp = self.current_block_data.fresh_value();
+            self.emit(Instruction::Binary {
+                dest: cmp,
+                op: cmp_op,
+                left: Operand::Value(val),
+                right: Operand::Value(zero),
+            });
+            self.current_block_data
+                .value_types
+                .insert(cmp, SsaType::Bool);
+            return cmp;
+        }
+
+        if ty.is_tagged_nullable() {
+            let base = match src {
+                Src::Val(v) | Src::Addr(v) => v,
+            };
+            let tag = self.current_block_data.fresh_value();
+            self.emit(Instruction::LoadField {
+                dest: tag,
+                base: Operand::Value(base),
+                offset: 0,
+            });
+            self.current_block_data.value_types.insert(tag, SsaType::U8);
+
+            let cmp = self.current_block_data.fresh_value();
+            self.emit(Instruction::Binary {
+                dest: cmp,
+                op: cmp_op,
+                left: Operand::Value(tag),
+                right: Operand::ConstInt(0),
+            });
+            self.current_block_data
+                .value_types
+                .insert(cmp, SsaType::Bool);
+            return cmp;
+        }
+
+        // Legacy fallback: compare the raw value against 0.
+        let val = match src {
+            Src::Val(v) => v,
+            Src::Addr(a) => {
+                let loaded = self.current_block_data.fresh_value();
+                self.emit(Instruction::Load {
+                    dest: loaded,
+                    ptr: Operand::Value(a),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(loaded, ty.clone());
+                loaded
+            }
+        };
+        let zero = self.lower_expr_null();
+        let cmp = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: cmp,
+            op: cmp_op,
+            left: Operand::Value(val),
+            right: Operand::Value(zero),
+        });
+        self.current_block_data
+            .value_types
+            .insert(cmp, SsaType::Bool);
+        cmp
+    }
+
+    pub(crate) fn lower_comparison_expr(
+        &mut self,
+        left: &HirExpr<'a, 'bump>,
+        op: Operator,
+        right: &HirExpr<'a, 'bump>,
+    ) -> Value {
+        if matches!(op, Operator::Equals | Operator::NotEquals) {
+            let (l_expr, r_expr): (&HirExpr<'a, 'bump>, &HirExpr<'a, 'bump>) = (left, right);
+            let null_other = match (l_expr, r_expr) {
+                (HirExpr::Null(_), HirExpr::Null(_)) => None,
+                (o, HirExpr::Null(_)) | (HirExpr::Null(_), o) => Some(o),
+                _ => None,
+            };
+            if let Some(other) = null_other {
+                return self.lower_null_comparison(other, matches!(op, Operator::Equals));
+            }
+        }
+
+        let l = self.lower_expr(left);
+        let l_ty = self
+            .current_block_data
+            .value_types
+            .get(&l)
+            .cloned()
+            .unwrap_or(SsaType::I64);
+        if matches!(op, Operator::Equals | Operator::NotEquals) && l_ty.is_tagged_nullable() {
+            return self.lower_tagged_nullable_eq(l, &l_ty, right, matches!(op, Operator::Equals));
+        }
+        let r = self.lower_expr_expected(right, &l_ty);
+        let v = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: v,
+            op: lower_operator_bin(&op),
+            left: Operand::Value(l),
+            right: Operand::Value(r),
+        });
+        self.current_block_data.value_types.insert(v, SsaType::Bool);
+        v
     }
 }

@@ -89,7 +89,7 @@ impl<T, E> Result<T, E> {
         };
     }
 
-    func map_or<U>(this, default: U, f: func(T): U): U {
+    func map_or<U, F: func(T): U>(this, default: U, f: F): U {
         return match (this) {
             case Result.Ok { value } -> f(value),
             case Result.Err { error } -> default,

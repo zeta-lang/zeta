@@ -2,8 +2,7 @@ use crate::errors::error::{DiagnosticError, ParseErrorKind};
 use crate::hir::StrId;
 use crate::span::SourceSpan;
 use std::fmt;
-use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Token<'a> {
@@ -18,8 +17,8 @@ pub struct Tokens<'a, 'bump> {
 }
 
 impl<'a, 'bump> Tokens<'a, 'bump> {
-    pub fn new(bump: Arc<GrowableAtomicBump<'bump>>, tokens: Vec<Token<'a>>) -> Self {
-        let slice = bump.alloc_slice_immutable(&tokens);
+    pub fn new(bump: &'bump GrowableBump<'bump>, tokens: Vec<Token<'a>>) -> Self {
+        let slice = bump.alloc_slice(&tokens);
         Self { slice }
     }
 

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
     Block, EffectAccess, EffectSegment, Generic, MatchArm, MutabilityState, NormalParam, Param,
@@ -9,7 +7,7 @@ use ir::ast::{
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::tokens::TokenKind::LBracket;
 use ir::tokens::{Cursor, TokenKind};
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 
 impl<'a, 'bump> DescentParser<'a, 'bump>
 where
@@ -60,7 +58,7 @@ where
             }
             accesses.push(EffectAccess {
                 ref_kind,
-                path: self.bump.alloc_slice_immutable(&path),
+                path: self.bump.alloc_slice(&path),
                 span: amp_span,
             });
             if !self.cursor.consume(TokenKind::Comma) {
@@ -69,7 +67,7 @@ where
         }
         self.cursor.expect(TokenKind::RBrace)?;
 
-        Ok(Some(self.bump.alloc_slice_immutable(&accesses)))
+        Ok(Some(self.bump.alloc_slice(&accesses)))
     }
 
     pub fn parse_generics(
@@ -106,7 +104,7 @@ where
                     }
                 }
 
-                self.bump.alloc_slice_immutable(&types)
+                self.bump.alloc_slice(&types)
             } else {
                 &[]
             };
@@ -149,7 +147,7 @@ where
             ));
         }
 
-        Ok(Some(self.bump.alloc_slice_immutable(&generics)))
+        Ok(Some(self.bump.alloc_slice(&generics)))
     }
 
     pub fn parse_params(
@@ -183,7 +181,7 @@ where
 
         if self.cursor.peek() == TokenKind::RParen {
             self.cursor.advance();
-            return Ok(Some(self.bump.alloc_slice_immutable(&params)));
+            return Ok(Some(self.bump.alloc_slice(&params)));
         }
 
         while self.cursor.peek() != TokenKind::RParen && self.cursor.peek() != TokenKind::EOF {
@@ -319,7 +317,7 @@ where
             }
         }
 
-        Ok(Some(self.bump.alloc_slice_immutable(&params)))
+        Ok(Some(self.bump.alloc_slice(&params)))
     }
 
     pub fn try_consume_close_angle(cursor: &mut Cursor<'a, 'bump>, pending: &mut u8) -> bool {
@@ -402,15 +400,11 @@ where
     }
 
     pub(crate) fn parse_type(&mut self) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
-        Self::parse_type_impl(
-            self.bump.clone(),
-            &mut self.cursor,
-            &mut self.pending_close_angle,
-        )
+        Self::parse_type_impl(self.bump, &mut self.cursor, &mut self.pending_close_angle)
     }
 
     pub fn parse_type_impl(
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
@@ -424,10 +418,10 @@ where
             TokenKind::BitAnd => {
                 cursor.advance();
 
-                let provenance = Self::parse_optional_provenance_impl(bump.clone(), cursor)?;
+                let provenance = Self::parse_optional_provenance_impl(bump, cursor)?;
 
                 if cursor.peek() == LBracket {
-                    let kind = Self::parse_bracket_type_kind_impl(bump.clone(), cursor, pending)?;
+                    let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
                     if let TypeKind::UnsafePointer { .. } = kind {
                         todo!("Handle error when & and [*] are mixed together.")
                     }
@@ -448,15 +442,15 @@ where
 
                     if is_dyn {
                         let mut bounds = Vec::new();
-                        bounds.push(Self::parse_core_type_impl(bump.clone(), cursor, pending)?);
+                        bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
                         while cursor.consume(TokenKind::Add) {
-                            bounds.push(Self::parse_core_type_impl(bump.clone(), cursor, pending)?);
+                            bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
                         }
                         return Ok(Type {
                             kind: TypeKind::Ref {
                                 inner: bump.alloc_value(Type {
                                     kind: TypeKind::Dyn {
-                                        bounds: bump.alloc_slice_immutable(&bounds),
+                                        bounds: bump.alloc_slice(&bounds),
                                     },
                                     nullable: false,
                                 }),
@@ -467,7 +461,7 @@ where
                         });
                     }
 
-                    let inner = Self::parse_core_type_impl(bump.clone(), cursor, pending)?;
+                    let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
 
                     return Ok(Type {
                         kind: TypeKind::Ref {
@@ -482,11 +476,10 @@ where
             TokenKind::BitXor => {
                 cursor.advance();
 
-                let allocator = Self::parse_optional_provenance_impl(bump.clone(), cursor)?;
+                let allocator = Self::parse_optional_provenance_impl(bump, cursor)?;
 
                 if cursor.peek() == TokenKind::LBracket {
-                    let bracket =
-                        Self::parse_bracket_type_kind_impl(bump.clone(), cursor, pending)?;
+                    let bracket = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
 
                     let kind = match bracket {
                         TypeKind::Slice { inner } => TypeKind::OwnedPointer {
@@ -507,7 +500,7 @@ where
                     return Ok(Type { kind, nullable });
                 }
 
-                let inner = Self::parse_core_type_impl(bump.clone(), cursor, pending)?;
+                let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
 
                 return Ok(Type {
                     kind: TypeKind::OwnedPointer {
@@ -525,15 +518,15 @@ where
         if is_dyn {
             let mut bounds = Vec::new();
 
-            bounds.push(Self::parse_core_type_impl(bump.clone(), cursor, pending)?);
+            bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
 
             while cursor.consume(TokenKind::Add) {
-                bounds.push(Self::parse_core_type_impl(bump.clone(), cursor, pending)?);
+                bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
             }
 
             return Ok(Type {
                 kind: TypeKind::Dyn {
-                    bounds: bump.alloc_slice_immutable(&bounds),
+                    bounds: bump.alloc_slice(&bounds),
                 },
                 nullable: false,
             });
@@ -548,7 +541,7 @@ where
 
     /// Assumes `[` has already been consumed. Parses `]inner`, `N]inner`, or `*]mut/const inner`.
     fn parse_bracket_type_kind_inner_impl(
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
@@ -556,7 +549,7 @@ where
 
         if token.kind == TokenKind::RBracket {
             cursor.advance();
-            let inner = Self::parse_core_type_impl(bump.clone(), cursor, pending)?;
+            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::Slice { inner: inner_ref });
         } else if token.kind == TokenKind::Number {
@@ -575,7 +568,7 @@ where
                 )
             })?;
 
-            let inner = Self::parse_core_type_impl(bump.clone(), cursor, pending)?;
+            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::Array {
                 inner: inner_ref,
@@ -591,7 +584,7 @@ where
                 _ => MutabilityState::Const,
             };
 
-            let inner = Self::parse_core_type_impl(bump.clone(), cursor, pending)?;
+            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::UnsafePointer {
                 inner: inner_ref,
@@ -609,7 +602,7 @@ where
     }
 
     fn parse_optional_provenance_impl(
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
     ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
         // &self Player / &self.world Player
@@ -620,7 +613,7 @@ where
             if cursor.consume(TokenKind::Dot) {
                 let (field, _) = cursor.expect_ident()?;
                 if Self::starts_type_impl(cursor) {
-                    let path = bump.alloc_slice_immutable(&[ProvenancePathSegment::Field(field)]);
+                    let path = bump.alloc_slice(&[ProvenancePathSegment::Field(field)]);
                     return Ok(Some(ProvenanceAnnotation {
                         root: ProvenanceRoot::ThisRoot,
                         path,
@@ -662,7 +655,7 @@ where
 
     /// Consumes `[` itself, then delegates. Use this when `[` hasn't been consumed yet.
     fn parse_bracket_type_kind_impl(
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
@@ -671,7 +664,7 @@ where
     }
 
     fn parse_core_type_impl(
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
@@ -712,7 +705,7 @@ where
                     // I wish rust knew that only Mut and Const is possible here :(
                     _ => MutabilityState::Const,
                 };
-                let inner = Self::parse_type_impl(bump.clone(), cursor, pending)?;
+                let inner = Self::parse_type_impl(bump, cursor, pending)?;
                 let inner_ref = bump.alloc_value(inner);
                 TypeKind::SafePointer {
                     inner: inner_ref,
@@ -721,8 +714,8 @@ where
             }
 
             TokenKind::BitXor => {
-                let allocator = Self::parse_optional_provenance_impl(bump.clone(), cursor)?;
-                let inner = Self::parse_type_impl(bump.clone(), cursor, pending)?;
+                let allocator = Self::parse_optional_provenance_impl(bump, cursor)?;
+                let inner = Self::parse_type_impl(bump, cursor, pending)?;
                 let inner_ref = bump.alloc_value(inner);
                 TypeKind::OwnedPointer {
                     inner: inner_ref,
@@ -734,7 +727,7 @@ where
                 cursor.expect(TokenKind::LParen)?;
                 let mut params: Vec<Type<'a, 'bump>> = Vec::new();
                 while cursor.peek() != TokenKind::RParen {
-                    params.push(Self::parse_type_impl(bump.clone(), cursor, pending)?);
+                    params.push(Self::parse_type_impl(bump, cursor, pending)?);
                     if cursor.peek() == TokenKind::Comma {
                         cursor.advance();
                     }
@@ -743,7 +736,7 @@ where
 
                 let return_type = if cursor.peek() == TokenKind::Colon {
                     cursor.advance();
-                    Self::parse_type_impl(bump.clone(), cursor, pending)?
+                    Self::parse_type_impl(bump, cursor, pending)?
                 } else {
                     Type::void()
                 };
@@ -811,7 +804,7 @@ where
                     cursor.advance();
                     let mut args: Vec<Type<'a, 'bump>> = Vec::new();
                     loop {
-                        args.push(Self::parse_type_impl(bump.clone(), cursor, pending)?);
+                        args.push(Self::parse_type_impl(bump, cursor, pending)?);
 
                         if cursor.peek() == TokenKind::Comma {
                             cursor.advance();
@@ -877,7 +870,7 @@ where
         }
 
         self.cursor.expect(TokenKind::RBrace)?;
-        Ok(self.bump.alloc_slice_immutable(&arms))
+        Ok(self.bump.alloc_slice(&arms))
     }
 
     pub fn parse_impl_target(&mut self) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
@@ -955,7 +948,7 @@ where
             };
             let stmt_ref = self.bump.alloc_value_immutable(stmt);
             Block {
-                block: self.bump.alloc_slice_immutable(&[*stmt_ref]),
+                block: self.bump.alloc_slice(&[*stmt_ref]),
                 span,
             }
         };

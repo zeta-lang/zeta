@@ -2,7 +2,7 @@ use ir::ast::{Stmt, Visibility};
 use ir::diagnostics_context::{DiagnosticWarning, ParserDiagnosticsContext};
 use ir::errors::error::DiagnosticError;
 use std::sync::Arc;
-use zetaruntime::arena::GrowableAtomicBump;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 use crate::tokenizer::lexer::Lexer;
@@ -13,7 +13,7 @@ where
     'bump: 'a,
 {
     pub(crate) cursor: Cursor<'a, 'bump>,
-    pub(crate) bump: Arc<GrowableAtomicBump<'bump>>,
+    pub(crate) bump: &'bump GrowableBump<'bump>,
     pub(crate) string_pool: Arc<StringPool>,
     pub(crate) diag: ParserDiagnosticsContext<'a, 'bump>,
     pub(crate) pending_close_angle: u8, // To prevent mismatches when closing generics between `>` and `>>` and `>>>`, etc
@@ -25,9 +25,9 @@ where
 {
     pub fn parse(
         string_pool: Arc<StringPool>,
-        bump: Arc<GrowableAtomicBump<'bump>>,
+        bump: &'bump GrowableBump<'bump>,
         tokens: &'bump Tokens<'a, 'bump>,
-    ) -> Result<Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>, DiagnosticError<'a>> {
+    ) -> Result<Vec<Stmt<'a, 'bump>>, DiagnosticError<'a>> {
         let mut parser = DescentParser {
             cursor: Cursor::new(tokens, 0),
             string_pool,
@@ -39,10 +39,8 @@ where
         parser.parse_toplevel()
     }
 
-    fn parse_toplevel(
-        &mut self,
-    ) -> Result<Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>, DiagnosticError<'a>> {
-        let mut stmts = Vec::new_in(self.bump.clone());
+    fn parse_toplevel(&mut self) -> Result<Vec<Stmt<'a, 'bump>>, DiagnosticError<'a>> {
+        let mut stmts = Vec::new();
 
         while self.cursor.peek() != TokenKind::EOF {
             match self.parse_stmt(Visibility::Public) {
@@ -174,9 +172,9 @@ pub fn token_to_visibility(token_kind: TokenKind) -> Visibility {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParseResult<'a, 'bump> {
-    pub statements: Vec<Stmt<'a, 'bump>, Arc<GrowableAtomicBump<'bump>>>,
+    pub statements: Vec<Stmt<'a, 'bump>>,
     pub diagnostics: ParserDiagnostics<'a>,
 }
 
@@ -184,26 +182,26 @@ pub fn parse_program<'a, 'bump>(
     src: &str,
     file_name: &'bump str,
     context: Arc<StringPool>,
-    bump: Arc<GrowableAtomicBump<'bump>>,
+    bump: &'bump GrowableBump<'bump>,
 ) -> ParseResult<'a, 'bump> {
     let lexer: Lexer = Lexer::new(context.clone());
-    let tokens: Tokens<'a, 'bump> = lexer.tokenize(src, file_name, bump.clone());
+    let tokens: Tokens<'a, 'bump> = lexer.tokenize(src, file_name, bump);
 
     let tokenized_source = bump.alloc_value(tokens);
 
     let mut parser = DescentParser {
         cursor: Cursor::new(tokenized_source, 0),
         string_pool: context,
-        bump: bump.clone(),
+        bump: bump,
         diag: ParserDiagnosticsContext::new(false),
         pending_close_angle: 0,
     };
 
-    let stmts: Vec<Stmt<'_, '_>, Arc<GrowableAtomicBump<'_>>> = match parser.parse_toplevel() {
+    let stmts: Vec<Stmt<'_, '_>> = match parser.parse_toplevel() {
         Ok(s) => s,
         Err(e) => {
             parser.diag.record(e);
-            Vec::new_in(bump.clone())
+            Vec::new()
         }
     };
 

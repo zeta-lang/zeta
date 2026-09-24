@@ -1,10 +1,38 @@
 package zeta::libc;
 
+// struct PthreadAttr {
+//     opaque: [128]u8,
+// }
+
+// extern "C" func pthread_create(
+//     thread: [*]mut usize,
+//     attr: [*]const PthreadAttr,
+//     start_routine: [*]const void,
+//     arg: [*]mut void,
+// ): i32;
+
+// extern "C" func pthread_join(
+//     thread: usize,
+//     retval: [*]mut [*]mut void
+// ): i32;
+
+// extern "C" func pthread_detach(thread: usize): i32;
+
+// extern "C" func pthread_self(): Pthread;
+
+// extern "C" func pthread_equal(lhs: usize, rhs: usize): i32;
+
+// extern "C" func sched_yield(): i32;
+
 extern "C" func malloc(size: usize): [*]mut void;
 extern "C" func free(ptr: [*]mut void);
 extern "C" func calloc(count: usize, size: usize): [*]mut void;
 extern "C" func realloc(ptr: [*]mut void, size: usize): [*]mut void;
-extern "C" func memset(ptr: [*]mut void, value: i32, size: usize): [*]mut void;
+extern "C" func memset(
+    ptr: [*]mut void,
+    value: i32,
+    size: usize
+): [*]mut void;
 
 extern "C" func open(path: [*]const u8, flags: i32, mode: i32): i32;
 extern "C" func close(fd: i32): i32;
@@ -15,3 +43,9 @@ extern "C" func abort(): never;
 // glibc/musl expose errno through this on Linux; per-platform __error() on
 // Darwin/BSD would need a separate extern name behind a platform cfg later.
 extern "C" func __errno_location(): [*]mut i32;
+
+extern "C" func getrandom(
+    buf: [*]mut void,
+    buflen: usize,
+    flags: u32
+): isize;

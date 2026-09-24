@@ -422,7 +422,7 @@ where
                     self.cursor.expect(TokenKind::RParen)?;
                     Ok(Pattern::EnumVariant {
                         name,
-                        bindings: self.bump.alloc_slice_immutable(&bindings),
+                        bindings: self.bump.alloc_slice(&bindings),
                     })
                 } else if self.cursor.peek() == TokenKind::LBrace {
                     self.cursor.advance(); // consume '{'
@@ -444,7 +444,7 @@ where
                     self.cursor.expect(TokenKind::RBrace)?;
                     Ok(Pattern::Struct {
                         name,
-                        fields: self.bump.alloc_slice_immutable(&fields),
+                        fields: self.bump.alloc_slice(&fields),
                     })
                 } else if qualified {
                     Ok(Pattern::EnumVariant {
@@ -469,7 +469,7 @@ where
                     }
                 }
                 self.cursor.expect(TokenKind::RParen)?;
-                Ok(Pattern::Tuple(self.bump.alloc_slice_immutable(&pats)))
+                Ok(Pattern::Tuple(self.bump.alloc_slice(&pats)))
             }
 
             // Array pattern: [a, b, c]
@@ -485,7 +485,7 @@ where
                     }
                 }
                 self.cursor.expect(TokenKind::RBracket)?;
-                Ok(Pattern::Array(self.bump.alloc_slice_immutable(&pats)))
+                Ok(Pattern::Array(self.bump.alloc_slice(&pats)))
             }
 
             other => {
@@ -560,7 +560,7 @@ where
         };
 
         Ok(self.bump.alloc_value_immutable(ir::ast::Path {
-            path: self.bump.alloc_slice_immutable(&segments),
+            path: self.bump.alloc_slice(&segments),
             member,
             span,
         }))
@@ -585,7 +585,7 @@ where
         Ok(Stmt::Module(self.bump.alloc_value_immutable(ModuleDecl {
             name,
             visibility,
-            body: self.bump.alloc_slice_immutable(&body),
+            body: self.bump.alloc_slice(&body),
             span,
         })))
     }
@@ -612,7 +612,7 @@ where
         self.cursor.expect(TokenKind::RBrace)?;
 
         Ok(Block {
-            block: self.bump.alloc_slice_immutable(&stmts),
+            block: self.bump.alloc_slice(&stmts),
             span: token.span,
         })
     }
