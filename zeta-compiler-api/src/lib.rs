@@ -997,8 +997,7 @@ where
         monomorphizer.force_instantiate_drops();
     }
 
-    /// SAFETY: same justification as `dep_graph`/`dep_graph_storage` — the
-    /// Box's heap allocation is stable across moves of `Compiler`, and
+    /// SAFETY: the Box's heap allocation is stable across moves of `Compiler`, and
     /// `GrowableBump` only mutates through its own interior mutability, so
     /// handing out a `&'bump` ref derived from `&self` is sound.
     fn scratch_bump_ref(&self) -> &'bump GrowableBump<'bump> {
