@@ -415,24 +415,46 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         if phis.is_empty() {
             return;
         }
-        for (name, _idx, dest) in phis {
-            if let Some(val) = vars.get(name).copied() {
-                let phi_ty = self.current_block_data.value_type(*dest).cloned();
-                let val_ty = self.current_block_data.value_type(val).cloned();
-                if let (Some(pt), Some(vt)) = (&phi_ty, &val_ty) {
-                    if pt != vt {
-                        panic!(
-                            "phi type mismatch: joining into block {:?} from block {:?}, \
-                             variable `{}` was typed {:?} when this join point was opened \
-                             (phi dest {:?}), but the value now bound to it here ({:?}) has \
-                             type {:?} instead, `{}` was rebound to a differently-typed \
-                             value somewhere between the join point and this edge",
-                            join_bb, from_bb, name, pt, dest, val, vt, name
-                        );
-                    }
+
+        let mut incoming: Vec<(usize, Value)> = Vec::with_capacity(phis.len());
+        for (name, idx, dest) in phis {
+            let Some(mut val) = vars.get(name).copied() else {
+                continue;
+            };
+            let phi_ty = self.current_block_data.value_type(*dest).cloned();
+            let val_ty = self.current_block_data.value_type(val).cloned();
+
+            if let (Some(pt), Some(SsaType::Pointer(inner))) = (&phi_ty, &val_ty) {
+                if &**inner == pt && from_bb == self.current_block_data.current_block {
+                    let loaded = self.current_block_data.fresh_value();
+                    self.emit(Instruction::LoadField {
+                        dest: loaded,
+                        base: Operand::Value(val),
+                        offset: 0,
+                    });
+                    self.current_block_data
+                        .value_types
+                        .insert(loaded, pt.clone());
+                    val = loaded;
                 }
             }
+
+            let val_ty = self.current_block_data.value_type(val).cloned();
+            if let (Some(pt), Some(vt)) = (&phi_ty, &val_ty) {
+                if pt != vt {
+                    panic!(
+                        "phi type mismatch: joining into block {:?} from block {:?}, \
+                         variable `{}` was typed {:?} when this join point was opened \
+                         (phi dest {:?}), but the value now bound to it here ({:?}) has \
+                         type {:?} instead, `{}` was rebound to a differently-typed \
+                         value somewhere between the join point and this edge",
+                        join_bb, from_bb, name, pt, dest, val, vt, name
+                    );
+                }
+            }
+            incoming.push((*idx, val));
         }
+
         let block = self
             .current_block_data
             .func
@@ -440,11 +462,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .iter_mut()
             .find(|b| b.id == join_bb)
             .expect("join block missing");
-        for (name, idx, _dest) in phis {
-            if let Some(val) = vars.get(name).copied() {
-                if let Instruction::Phi { incoming, .. } = &mut block.instructions[*idx] {
-                    incoming.push((from_bb, val));
-                }
+        for (idx, val) in incoming {
+            if let Instruction::Phi { incoming, .. } = &mut block.instructions[idx] {
+                incoming.push((from_bb, val));
             }
         }
     }
