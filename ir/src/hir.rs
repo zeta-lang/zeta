@@ -1204,21 +1204,9 @@ pub enum CaptureMode {
 
 #[derive(Debug, Clone, Copy)]
 pub struct HirClosureCapture<'bump> {
-    /// Synthesized env-field name (`__cap_0`, `__cap_1`, ...) — capture
-    /// paths can collide on their last segment (`a.x` and `b.x`), so this
-    /// is never derived from `source_path` itself.
     pub name: StrId,
     pub mode: CaptureMode,
-    /// Root local in the *enclosing* scope.
     pub source: StrId,
-    /// Field/index projection from `source` — e.g. `self.items[i]` is
-    /// `source: self, source_path: [Field(items), Index(Place(i))]`. Empty
-    /// = the whole variable. Reuses `HirEffectAccess`'s segment type so the
-    /// borrow checker's existing field/index disjointness reasoning (the
-    /// same machinery backing multi-place params) applies unchanged to
-    /// captures. An index that isn't a literal or another static path
-    /// (`arr[i + 1]`) never appears here — inference stops one level up
-    /// and captures the whole container instead (see `static_effect_path`).
     pub source_path: &'bump [HirEffectSegment<'bump>],
 }
 
@@ -1251,27 +1239,6 @@ pub struct ClosureLowering<'a, 'bump> {
     pub kind: ClosureKind,
 }
 
-/// Structural (syntax-only) field/index path from a local root. Shared by
-/// the type checker (capture inference, via `fv_expr`) and the hoister
-/// (closure-conversion substitution) so the two agree on what counts as
-/// "the same place" without duplicating the walk.
-///
-/// Returns `None` when `expr` isn't a static place at all (goes through a
-/// call, an opaque deref, etc.) — recursing into sub-expressions to find
-/// free variables elsewhere is the caller's job; this function only ever
-/// answers "is this one spot a static path, and if so which."
-///
-/// An index that isn't itself a numeric literal or a *field-only* static
-/// path (`arr[i + 1]`, or `arr[self.items[0]]` since that index is itself
-/// indexed) makes the *whole containing expression* not a static path
-/// (`None`), deliberately: the caller's normal recursive fallback then
-/// treats the array one level up as the free thing (captures the whole
-/// container, conservatively) rather than trying to represent an
-/// unreconstructible index. `i` itself is still found as its own free
-/// variable by that same fallback recursion, separately. The field-only
-/// restriction matches `EffectIndexKey::Place`, which stores a flat
-/// `&'bump [StrId]` field path (no room for a nested index) — the same
-/// shape `effect_index_key_to_bound` already expects.
 pub fn static_effect_path<'x, 'bump>(
     expr: &HirExpr<'x, 'bump>,
     this_id: StrId,
@@ -1304,12 +1271,6 @@ fn static_index_key<'x, 'bump>(
         HirExpr::Number(n, _) => Some(EffectIndexKey::Const(*n)),
         other => {
             let (root, path) = static_effect_path(other, this_id, bump)?;
-            // EffectIndexKey::Place stores a flat field-name path (matching
-            // effect_index_key_to_bound's own str_id_to_string walk over
-            // `path`), so an index that's itself indexed (`arr[self.items[0]]`)
-            // has no representation here — bail to None, which makes the
-            // *outer* static_effect_path stop one level up and capture the
-            // container conservatively, same as a non-static index would.
             let field_path: Vec<StrId> = path
                 .into_iter()
                 .map(|seg| match seg {
@@ -1325,16 +1286,6 @@ fn static_index_key<'x, 'bump>(
     }
 }
 
-/// True if `prefix` is a segment-wise prefix of (or equal to) `full` —
-/// `self` (empty path) is a prefix of everything under `self`; `self.items`
-/// is a prefix of `self.items[3]` but not of `self.name`. Two `Index`
-/// segments only compare equal when their keys structurally match, with one
-/// deliberate exception: any two `Dynamic` keys compare equal, since
-/// distinguishing them isn't provable anyway and treating them as the same
-/// symbolic slot is the conservative (and only sound) choice. In practice a
-/// finalized capture path never contains `Dynamic` (see `static_effect_path`
-/// above) — this exception matters only while coalescing raw scan results,
-/// before captures are finalized.
 pub fn effect_path_is_prefix(
     prefix: &[HirEffectSegment<'_>],
     full: &[HirEffectSegment<'_>],

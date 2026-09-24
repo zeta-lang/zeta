@@ -2,7 +2,7 @@ package input;
 
 import zeta::io;
 import zeta::file.FileWriter;
-import zeta::utils::array_list.ArrayList;
+import zeta::utils.ArrayList;
 import zeta::utils::linked_list.LinkedList;
 import zeta::utils::mallocator.Mallocator;
 import zeta::file.File;
@@ -1410,6 +1410,27 @@ func main(): i64 {
     }
 
     io.stdout().writeln("");
+    io.stdout().writeln("=== Generic closure tests ===");
+
+    status = test_generic_closure_capture_owned();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_generic_closure_capture_owned");
+        return status;
+    }
+
+    status = test_generic_closure_constraint();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_generic_closure_constraint");
+        return status;
+    }
+
+    status = test_generic_closure_multiple_instantiations();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_generic_closure_multiple_instantiations");
+        return status;
+    }
+
+    io.stdout().writeln("");
     io.stdout().writeln("========================================");
     io.stdout().writeln("       ALL TESTS PASSED");
     io.stdout().writeln("========================================");
@@ -1669,3 +1690,272 @@ func fill(x: &mut i64) {
 
 func consume_pair(a: &mut i64, b: &mut i64) {
 }
+
+func apply<F: func(i64): i64>(fn: F, value: i64): i64 {
+    return fn(value);
+}
+
+func test_generic_closure_constraint(): i64 {
+    io.stdout().writeln("=== Running: test_generic_closure_constraint ===");
+
+    let result: i64 = apply(
+        func(x: i64) {
+            return x * 2;
+        },
+        21
+    );
+
+    if (result != 42) {
+        io.stdout().writeln("[FAIL] closure constraint invocation returned wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] generic constrained closure");
+
+    return 0;
+}
+
+
+func test_generic_closure_multiple_instantiations(): i64 {
+    io.stdout().writeln("=== Running: test_generic_closure_multiple_instantiations ===");
+
+    let doubled: i64 = apply(
+        func(x: i64) {
+            return x * 2;
+        },
+        21
+    );
+
+    let incremented: i64 = apply(
+        func(x: i64) {
+            return x + 1;
+        },
+        41
+    );
+
+    let squared: i64 = apply(
+        func(x: i64) {
+            return x * x;
+        },
+        7
+    );
+
+    if (doubled != 42) {
+        io.stdout().writeln("[FAIL] doubled closure");
+        return 1;
+    }
+
+    if (incremented != 42) {
+        io.stdout().writeln("[FAIL] incremented closure");
+        return 2;
+    }
+
+    if (squared != 49) {
+        io.stdout().writeln("[FAIL] squared closure");
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] multiple constrained closure instantiations");
+
+    return 0;
+}
+
+func apply_droppable<F: func(): str>(fn: F): str {
+    return fn();
+}
+
+func test_generic_closure_capture_owned(): i64 {
+    io.stdout().writeln("=== Running: test_generic_closure_capture_owned ===");
+
+    let item: DroppableItem = DroppableItem {
+        tag: "clear_one"
+    };
+
+    let result: str = apply_droppable(
+        func() {
+            return item.tag;
+        }
+    );
+
+    if (result != "clear_one") {
+        io.stdout().writeln("[FAIL] captured DroppableItem had wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] owning closure capture");
+
+    return 0;
+}
+
+func apply_mut<F: func(): void>(fn: F) {
+    fn();
+    fn();
+}
+
+func call_once<F: func(): DroppableItem>(fn: F): DroppableItem {
+    return fn();
+}
+
+// FnMut: the closure mutates a captured local.
+func test_closure_fnmut_counter(): i64 {
+    io.stdout().writeln("=== Running: test_closure_fnmut_counter ===");
+
+    let mut counter: i64 = 0;
+
+    apply_mut(
+        func() {
+            counter += 1;
+        }
+    );
+
+    if (counter != 2) {
+        io.stdout().writeln("[FAIL] FnMut closure did not mutate the captured local twice");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] FnMut closure mutates captured local");
+
+    return 0;
+}
+
+// FnOnce: the closure moves an owned capture out through its return value.
+func test_closure_fnonce_moves_capture(): i64 {
+    io.stdout().writeln("=== Running: test_closure_fnonce_moves_capture ===");
+
+    let item: DroppableItem = DroppableItem { tag: "fnonce_moved" };
+
+    let taken: DroppableItem = call_once(
+        func() {
+            return item;
+        }
+    );
+
+    if (taken.tag != "fnonce_moved") {
+        io.stdout().writeln("[FAIL] FnOnce closure returned the wrong item");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] FnOnce closure moved its capture out");
+    io.stdout().writeln("Expect exactly ONE drop of 'fnonce_moved' after this line (from `taken`, not `item`)");
+
+    return 0;
+}
+
+// A closure literal inside a loop body is checked more than once.
+func test_closure_in_loop(): i64 {
+    io.stdout().writeln("=== Running: test_closure_in_loop ===");
+
+    let mut total: i64 = 0;
+    let mut i: i64 = 0;
+
+    while (i < 3) {
+        total = apply(
+            func(x: i64) {
+                return x + i;
+            },
+            total
+        );
+        i += 1;
+    }
+
+    // (0 + 0) -> 0, (0 + 1) -> 1, (1 + 2) -> 3
+    if (total != 3) {
+        io.stdout().writeln("[FAIL] closure in loop produced the wrong total");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] closure inside a loop body");
+
+    return 0;
+}
+
+// The inner closure captures `base` through the outer closure's capture.
+func test_closure_nested(): i64 {
+    io.stdout().writeln("=== Running: test_closure_nested ===");
+
+    let base: i64 = 10;
+
+    let result: i64 = apply(
+        func(x: i64) {
+            return apply(
+                func(y: i64) {
+                    return y + base;
+                },
+                x
+            );
+        },
+        5
+    );
+
+    if (result != 15) {
+        io.stdout().writeln("[FAIL] nested closure capture had the wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] nested closure capture");
+
+    return 0;
+}
+
+//
+//func test_fail_closure_use_after_move() {
+//    let item: DroppableItem = DroppableItem { tag: "x" };
+//    let taken: DroppableItem = call_once(func() { return item; });
+//    let again: DroppableItem = item; // ERROR: use of moved value 'item'
+//}
+//
+
+// ---- Pending: closures bound with `let` (not supported yet) ----
+// Written without a type annotation because an env type can't be spelled.
+//
+//func test_let_closure_no_capture(): i64 {
+//    let twice = func(x: i64) { return x * 2; };
+//    if (twice(21) != 42) {
+//        io.stdout().writeln("[FAIL] let-bound closure, no capture");
+//        return 1;
+//    }
+//    io.stdout().writeln("[PASS] let-bound closure, no capture");
+//    return 0;
+//}
+//
+//func test_let_closure_capture(): i64 {
+//    let base: i64 = 10;
+//    let add_base = func(x: i64) { return x + base; };
+//    if (add_base(5) != 15) {
+//        io.stdout().writeln("[FAIL] let-bound closure, shared capture");
+//        return 1;
+//    }
+//    io.stdout().writeln("[PASS] let-bound closure, shared capture");
+//    return 0;
+//}
+//
+//func test_let_closure_mutating(): i64 {
+//    let mut count: i64 = 0;
+//    let mut bump = func() { count += 1; };
+//    bump();
+//    bump();
+//    if (count != 2) {   // legal only because `bump` is dead here (NLL)
+//        io.stdout().writeln("[FAIL] let-bound FnMut closure");
+//        return 1;
+//    }
+//    io.stdout().writeln("[PASS] let-bound FnMut closure");
+//    return 0;
+//}
+//
+//func test_let_closure_passed_to_generic(): i64 {
+//    let base: i64 = 100;
+//    let add_base = func(x: i64) { return x + base; };
+//    if (apply(add_base, 1) != 101) {   // moves the env into apply
+//        io.stdout().writeln("[FAIL] let-bound closure passed to generic");
+//        return 1;
+//    }
+//    io.stdout().writeln("[PASS] let-bound closure passed to generic");
+//    return 0;
+//}
+//
+//func test_fail_closure_borrow_conflict() {
+//    let mut n: i64 = 0;
+//    let mut bump = func() { n += 1; };
+//    n = 5;      // ERROR: `n` is mutably borrowed by the live closure
+//    bump();
+//}

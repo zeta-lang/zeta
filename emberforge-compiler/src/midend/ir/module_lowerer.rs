@@ -196,18 +196,7 @@ where
                             if func.generics.is_none() {
                                 self.register_method_signature(func);
                             }
-                        } // None => {
-                        //     if func.generics.is_none() {
-                        //         let f = Function::from_signature(
-                        //             func,
-                        //             &self.module.structs,
-                        //             &self.module.enums,
-                        //             &self.module.interfaces,
-                        //             &self.context,
-                        //         );
-                        //         self.module.functions.insert(f.name, f);
-                        //     }
-                        // }
+                        }
                         None => {
                             if func.generics.is_none() {
                                 let f = Function::from_signature(
