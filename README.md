@@ -147,7 +147,7 @@ func main(): i64 {
     };
     let mut io_buf: [16]u8 = uninit;
     let mut reader: FileReader = rf.reader();
-    let n: usize = match (unsafe { reader.read_raw(&mut io_buf[0..16]) }) {
+    let n: usize = match (unsafe { reader.read_raw(&mut io_buf[0..<16]) }) {
         case Result.Ok { value } -> value,
         case Result.Err { error } -> 0,
     };
