@@ -293,26 +293,6 @@ where
         if let Some(b) = body {
             match b {
                 HirStmt::Block { body, span } => {
-                    // if self
-                    //     .current_block_data
-                    //     .func
-                    //     .name
-                    //     .as_str()
-                    //     .contains("push_back")
-                    //     || self
-                    //         .current_block_data
-                    //         .func
-                    //         .name
-                    //         .as_str()
-                    //         .contains("remove_back")
-                    // {
-                    //     println!(
-                    //         "HIR of {}: \n{:?}",
-                    //         self.current_block_data.func.name.clone(),
-                    //         body
-                    //     );
-                    // }
-
                     self.scope_stack.push(DropScope { locals: Vec::new() });
                     self.lower_stmt_seq(body);
 
@@ -671,26 +651,6 @@ where
     }
 
     pub(crate) fn finish(self) {
-        // if self
-        //     .current_block_data
-        //     .func
-        //     .name
-        //     .as_str()
-        //     .contains("push_back")
-        //     || self
-        //         .current_block_data
-        //         .func
-        //         .name
-        //         .as_str()
-        //         .contains("remove_back")
-        // {
-        //     for b in &self.current_block_data.func.blocks {
-        //         println!("bb{}:", b.id.0);
-        //         for i in &b.instructions {
-        //             println!("    {:?}", i);
-        //         }
-        //     }
-        // }
         self.current_block_data.finish()
     }
 }
