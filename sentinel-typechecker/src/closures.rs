@@ -649,12 +649,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.context = old_context;
         let frame = self.closure_frames.borrow_mut().pop().unwrap_or_default();
 
+        let concrete_sig_ret = sig_ret.filter(|t| !matches!(t, HirType::Generic(_)));
         let ret_ty = if ret_is_inferred {
-            match body_ty {
-                Some(HirType::Never) | None => sig_ret
-                    .filter(|t| !matches!(t, HirType::Generic(_)))
-                    .unwrap_or(HirType::Void),
-                Some(t) => t,
+            match (concrete_sig_ret, body_ty) {
+                (Some(sr), Some(t)) if !matches!(t, HirType::Never) && sr != HirType::Void => {
+                    self.recover(self.types_compatible(&sr, &t), ());
+                    sr
+                }
+                (Some(sr), _) => sr,
+                (None, Some(t)) if !matches!(t, HirType::Never) => t,
+                (None, _) => HirType::Void,
             }
         } else {
             if let Some(t) = body_ty {
