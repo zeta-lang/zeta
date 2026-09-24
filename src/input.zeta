@@ -1430,6 +1430,30 @@ func main(): i64 {
         return status;
     }
 
+    status = test_closure_fnmut_counter();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_closure_fnmut_counter");
+        return status;
+    }
+
+    status = test_closure_fnonce_moves_capture();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_closure_fnonce_moves_capture");
+        return status;
+    }
+
+    status = test_closure_in_loop();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_closure_in_loop");
+        return status;
+    }
+
+    status = test_closure_nested();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_closure_nested");
+        return status;
+    }
+
     io.stdout().writeln("");
     io.stdout().writeln("========================================");
     io.stdout().writeln("       ALL TESTS PASSED");
@@ -1905,8 +1929,7 @@ func test_closure_nested(): i64 {
 //}
 //
 
-// ---- Pending: closures bound with `let` (not supported yet) ----
-// Written without a type annotation because an env type can't be spelled.
+// closures bound with `let` (not supported yet)
 //
 //func test_let_closure_no_capture(): i64 {
 //    let twice = func(x: i64) { return x * 2; };
