@@ -1,5 +1,6 @@
 use ir::{
     hir::{HirExpr, StrId},
+    ir_conversion::lower_type_hir,
     span::SourceSpan,
     ssa_ir::{Instruction, Operand, SsaType, Value},
 };
@@ -70,6 +71,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         &mut self,
         callee: &HirExpr<'a, 'bump>,
         args: &[HirExpr<'a, 'bump>],
+        span: SourceSpan<'a>,
     ) -> Value {
         if let Some(mangled) = self.try_flatten_module_path(callee) {
             let param_types = self.param_types_of(&mangled);
@@ -89,7 +91,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 .map(|f| f.ret_type.clone())
                 .unwrap_or_else(|| {
                     panic!(
-                        "lower_call: unknown non-extern function `{:?}`, not in funcs table or global_funcs",
+                        "lower_call_expr: unknown non-extern function `{:?}`, not in funcs table or global_funcs at {span}",
                         mangled
                     )
                 });
@@ -270,6 +272,87 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let cls_name_id: Option<StrId> = maybe_cls_name_ssa
             .as_ref()
             .and_then(|ty| self.resolve_receiver_target_key(ty));
+
+        if let Some(cls) = cls_name_id {
+            eprintln!(
+                "[lower_call?] cls={} field={} resolved_via_struct_mangled_map={:?}",
+                cls,
+                field,
+                self.struct_mangled_map
+                    .get(&cls)
+                    .and_then(|m| m.get(&field))
+            );
+        }
+
+        if let Some(cls_name) = cls_name_id {
+            let field_ty: Option<SsaType> = self
+                .structs
+                .get(&cls_name)
+                .and_then(|s| s.fields.iter().find(|f| f.name == field))
+                .map(|f| lower_type_hir(&f.field_type, self.enums));
+
+            if let Some(field_ssa_ty) = field_ty {
+                match &field_ssa_ty {
+                    SsaType::FuncPointer {
+                        params,
+                        return_type,
+                    } => {
+                        let field_val = self.field_access_from_value(obj_val, field, *span);
+                        let mut operands: SmallVec<Operand, 8> = SmallVec::new();
+                        for (i, a) in args.iter().enumerate() {
+                            if params.get(i).map_or(false, Self::is_move_by_value) {
+                                self.record_arg_move(a);
+                            }
+                            operands.push(Operand::Value(self.lower_expr(a)));
+                        }
+                        let dest = self.current_block_data.fresh_value();
+                        self.emit(Instruction::Call {
+                            dest: Some(dest),
+                            func: Operand::Value(field_val),
+                            args: operands,
+                        });
+                        self.current_block_data
+                            .value_types
+                            .insert(dest, (**return_type).clone());
+                        return dest;
+                    }
+                    other => {
+                        // A generic field monomorphized to a closure environment is
+                        // called the same way a closure-typed local is: dispatch to
+                        // its registered `__call` method.
+                        let call_name = StrId(self.context.intern("__call"));
+                        let env_cls = self.resolve_receiver_target_key(other);
+                        let is_closure_env = env_cls
+                            .and_then(|key| self.struct_mangled_map.get(&key))
+                            .is_some_and(|m| m.contains_key(&call_name));
+                        if is_closure_env {
+                            let field_val = self.field_access_from_value(obj_val, field, *span);
+                            let param_types: Vec<SsaType> = env_cls
+                                .and_then(|cls| self.struct_mangled_map.get(&cls))
+                                .and_then(|mmap| mmap.get(&call_name))
+                                .and_then(|mangled| self.funcs.get(mangled))
+                                .map(|f| {
+                                    f.params.iter().skip(1).map(|(_, ty)| ty.clone()).collect()
+                                })
+                                .unwrap_or_default();
+                            let mut operands: SmallVec<Operand, 8> = SmallVec::new();
+                            operands.push(Operand::Value(field_val));
+                            for (i, a) in args.iter().enumerate() {
+                                if param_types.get(i).map_or(false, Self::is_move_by_value) {
+                                    self.record_arg_move(a);
+                                }
+                                operands.push(Operand::Value(self.lower_expr(a)));
+                            }
+                            if let Some(value) =
+                                self.emit_call_expr(call_name, field_val, &mut operands, env_cls)
+                            {
+                                return value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let param_types: Vec<SsaType> = cls_name_id
             .and_then(|cls| self.struct_mangled_map.get(&cls))
