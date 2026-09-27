@@ -2,13 +2,14 @@ use ir::{
     ast::MutabilityState,
     borrow_checker::{
         BorrowError, BorrowKind, Bound, IndexContainer, IndexTemplate, Interval, LoanId,
-        MemoryRelation, PlaceId, ReadTemplate, RefTemplate, TemplateBase, TemplateProjection,
+        MemoryRelation, PlaceId, ProvenanceId, ReadTemplate, RefTemplate, TemplateBase,
+        TemplateProjection,
     },
     errors::type_error::TypeErrorKind,
     hir::{
         AssignmentOperator, HirEffectAccess, HirEffectSegment, HirErrorHandlerPattern, HirExpr,
         HirFunc, HirParam, HirStmt, HirType, InterpolationPart, Operator, ProvenanceAnnotation,
-        ProvenancePathSegment, ProvenanceRoot, RefKind, StrId,
+        ProvenancePathSegment, ProvenanceRoot, RefKind, StrId, ThisPassingKind,
     },
     ir_hasher::{FxHashMap, HashSet},
     nll_cfg::PointId,
@@ -21,6 +22,22 @@ use crate::{
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
+    pub fn access_provenance(&self, expr: &HirExpr) -> Option<ProvenanceId> {
+        match expr {
+            HirExpr::Ident(name, _) => self.local_provenance.get(name).copied(),
+
+            HirExpr::Deref { expr, .. } => self.access_provenance(expr),
+
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                self.access_provenance(object)
+            }
+
+            HirExpr::Index { object, .. } => self.access_provenance(object),
+
+            _ => None,
+        }
+    }
+
     pub fn register_multi_place_loans(
         &mut self,
         base_expr: &HirExpr<'a, 'bump>,
@@ -77,6 +94,26 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    pub fn snapshot_closure_loan_keys(&self) -> Vec<usize> {
+        self.closure_loans.keys().copied().collect()
+    }
+
+    pub fn end_temp_closure_loans(&mut self, snap: &HashSet<usize>) {
+        let leaked: Vec<usize> = self
+            .closure_loans
+            .keys()
+            .filter(|k| !snap.contains(k))
+            .copied()
+            .collect();
+        for k in leaked {
+            if let Some(ids) = self.closure_loans.remove(&k) {
+                for id in ids {
+                    self.borrow_checker.end_loan_now(id);
+                }
+            }
+        }
+    }
+
     pub fn check_borrow_use(
         &mut self,
         expr: &HirExpr<'a, 'bump>,
@@ -86,7 +123,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some((root, path)) = self.effect_path_of(expr) {
             self.note_capture_use(root, &path, closures::UseLevel::from(kind));
         }
-        if let Err(e) = self.borrow_checker.check_use(place, kind) {
+
+        let access_provenance = self.access_provenance(expr);
+        self.check_provenance_still_valid(access_provenance);
+
+        if let Err(e) = self
+            .borrow_checker
+            .check_use(place, kind, access_provenance)
+        {
             let provenance = self.infer_provenance(expr);
             let msg = self.describe_borrow_error(&e, provenance.as_ref());
             self.record(TypeErrorKind::Generic(msg));
@@ -246,6 +290,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> String {
         let base = match err {
             BorrowError::UseAfterMove { .. } => "use of a value after it was moved".to_string(),
+            BorrowError::InvalidatedReference { .. } => {
+                "the reference's lifetime has ended because it was invalidated".to_string()
+            }
             BorrowError::MutablyBorrowed { .. } => {
                 "cannot borrow: value is already mutably borrowed".to_string()
             }
@@ -470,6 +517,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_potential_this_param_for_move(
         &mut self,
+        expr: &HirExpr<'a, 'bump>,
         args: &[HirExpr<'a, 'bump>],
         func: HirFunc<'a, 'bump>,
         params: &[HirParam<'a, 'bump>],
@@ -513,7 +561,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
             let arg_loans =
                 self.check_all_func_args(args, params, templated_base_param, Some(func));
-            self.finalize_call_loans(None, args, arg_loans, &ret_ty, template);
+
+            if let Some(loan_id) =
+                self.finalize_call_loans(None, args, arg_loans, &ret_ty, template)
+            {
+                self.call_loans.insert(Self::expr_key(expr), loan_id);
+            }
 
             return Some(ret_ty);
         }
@@ -1094,7 +1147,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some((root, path)) = self.effect_path_of(expr) {
             self.note_capture_use(root, &path, closures::UseLevel::from(kind));
         }
-        if let Err(e) = self.borrow_checker.check_use_shell(place, kind) {
+        let access_provenance = self.access_provenance(expr);
+        self.check_provenance_still_valid(access_provenance);
+
+        if let Err(e) = self
+            .borrow_checker
+            .check_use_shell(place, kind, access_provenance)
+        {
             let provenance = self.infer_provenance(expr);
             let msg = self.describe_borrow_error(&e, provenance.as_ref());
             self.record(TypeErrorKind::Generic(msg));
@@ -1450,6 +1509,271 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ))
         } else {
             None
+        }
+    }
+
+    pub fn place_is_within(&self, place: PlaceId, ancestor: PlaceId) -> bool {
+        let mut cur = Some(place);
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.borrow_checker.places.get(&p).and_then(|pl| pl.parent);
+        }
+        false
+    }
+
+    /// Every live loan on `place` or anything beneath it now points at freed memory.
+    pub fn invalidate_loans_under(&mut self, place: PlaceId, cause: StrId) {
+        let hit: Vec<ProvenanceId> = self
+            .borrow_checker
+            .active_loans
+            .values()
+            .filter(|l| self.place_is_within(l.place, place))
+            .map(|l| l.provenance_id)
+            .collect();
+        for p in hit {
+            self.invalidated_provenances.insert(p, cause);
+        }
+    }
+
+    pub fn invalidating_call_for(&self, prov: ProvenanceId) -> Option<StrId> {
+        let mut stack = vec![prov];
+        let mut seen: HashSet<ProvenanceId> = HashSet::default();
+        while let Some(p) = stack.pop() {
+            if !seen.insert(p) {
+                continue;
+            }
+            if let Some(&c) = self.invalidated_provenances.get(&p) {
+                return Some(c);
+            }
+            if let Some(pr) = self.borrow_checker.provenances.get(&p) {
+                stack.extend(pr.parents.iter().copied());
+            }
+        }
+        None
+    }
+
+    pub fn check_provenance_still_valid(&mut self, prov: Option<ProvenanceId>) {
+        let Some(prov) = prov else { return };
+        if let Some(cause) = self.invalidating_call_for(prov) {
+            self.record(TypeErrorKind::Generic(format!(
+                "the reference's lifetime has ended because it was invalidated \
+                 (`{}` may reallocate the memory it points into)",
+                str_id_to_string(cause)
+            )));
+        }
+    }
+
+    /// Type of `path` (a chain of struct fields) starting at struct `owner`.
+    fn field_type_at(&self, owner: StrId, path: &[StrId]) -> Option<HirType<'a, 'bump>> {
+        let mut cur = owner;
+        let mut ty = None;
+        for (i, seg) in path.iter().enumerate() {
+            let def = self.context.get_struct(&str_id_to_string(cur))?;
+            let f = def.fields.iter().find(|f| f.name == *seg)?;
+            ty = Some(f.field_type);
+            if i + 1 < path.len() {
+                match f.field_type {
+                    HirType::Struct { name, .. } => cur = name,
+                    _ => return None,
+                }
+            }
+        }
+        ty
+    }
+
+    /// Field paths (relative to `this`) that calling `func` may reallocate.
+    /// Built from the callee's body on demand, so it doesn't matter whether or
+    /// when the callee's module was checked.
+    pub fn analyze_invalidations(
+        &mut self,
+        owner: StrId,
+        func: &HirFunc<'a, 'bump>,
+    ) -> Vec<Vec<StrId>> {
+        let key = (owner, func.name);
+        if let Some(c) = self.invalidation_cache.get(&key) {
+            return c.clone();
+        }
+        self.invalidation_cache.insert(key, Vec::new()); // cycle guard
+        let out = self.build_invalidations(owner, func);
+        self.invalidation_cache.insert(key, out.clone());
+        out
+    }
+
+    fn build_invalidations(&mut self, owner: StrId, func: &HirFunc<'a, 'bump>) -> Vec<Vec<StrId>> {
+        let Some(body) = func.body else {
+            return Vec::new();
+        };
+        let has_this = func
+            .params
+            .is_some_and(|ps| ps.iter().any(|p| matches!(p, HirParam::This { .. })));
+        if !has_this {
+            return Vec::new();
+        }
+
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        self.collect_root_accesses_stmt(&body, self.this_id, &mut writes, &mut reads);
+
+        let mut out: Vec<Vec<StrId>> = Vec::new();
+
+        // `this.<path> = ...` where the field is an owned pointer: the old
+        // allocation dies (same rule check_assignment_expr uses in-function).
+        for (path, index) in &writes {
+            if index.is_none()
+                && !path.is_empty()
+                && matches!(
+                    self.field_type_at(owner, path),
+                    Some(HirType::OwnedPointer { .. })
+                )
+                && !out.contains(path)
+            {
+                out.push(path.clone());
+            }
+        }
+
+        // `this.method()` / `this.field.method()` show up in `reads` as a path whose
+        // last segment isn't a field. Pull in the callee's invalidations.
+        for (path, index) in &reads {
+            if index.is_some() {
+                continue;
+            }
+            let Some((last, prefix)) = path.split_last() else {
+                continue;
+            };
+            let holder = if prefix.is_empty() {
+                owner
+            } else {
+                match self.field_type_at(owner, prefix) {
+                    Some(HirType::Struct { name, .. }) => name,
+                    _ => continue,
+                }
+            };
+            if self
+                .field_type_at(holder, std::slice::from_ref(last))
+                .is_some()
+            {
+                continue; // plain field read
+            }
+            let Some(callee) = self
+                .context
+                .get_method(&str_id_to_string(holder), &last.to_string())
+                .copied()
+            else {
+                continue;
+            };
+            for sub in self.analyze_invalidations(holder, &callee) {
+                let mut full = prefix.to_vec();
+                full.extend(sub);
+                if !out.contains(&full) {
+                    out.push(full);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn apply_call_invalidations(
+        &mut self,
+        receiver: &HirExpr<'a, 'bump>,
+        owner: StrId,
+        func: &HirFunc<'a, 'bump>,
+    ) {
+        let paths = self.analyze_invalidations(owner, func);
+        if paths.is_empty() {
+            return;
+        }
+        let Some(base) = self.resolve_place(receiver) else {
+            return;
+        };
+        for path in paths {
+            let mut place = base;
+            for f in &path {
+                place = self.borrow_checker.project_field(place, *f);
+            }
+            self.borrow_checker.reallocate_place(place);
+        }
+    }
+
+    pub(crate) fn propagate_invalidations(&mut self) {
+        loop {
+            let mut changed = false;
+            let edges: Vec<(StrId, Vec<StrId>)> = self
+                .fn_this_calls
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            for (caller, callees) in edges {
+                for callee in callees {
+                    let Some(paths) = self.fn_invalidates.get(&callee).cloned() else {
+                        continue;
+                    };
+                    let entry = self.fn_invalidates.entry(caller).or_default();
+                    for p in paths {
+                        if !entry.contains(&p) {
+                            entry.push(p);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    pub fn check_receiver_ref_kind(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        kind: &ThisPassingKind,
+        method_name: &str,
+    ) {
+        let needed = match kind {
+            ThisPassingKind::RefMut | ThisPassingKind::MutSafePtr => RefKind::Unique,
+            ThisPassingKind::RefAlias => RefKind::Alias,
+            _ => return,
+        };
+        let Some((root, path)) = self.static_field_path(object) else {
+            return;
+        };
+        let Some(&held) = self.local_ref_kind.get(&root) else {
+            return;
+        };
+        // Only trust the root's kind when we're projecting through owned fields,
+        // not through a reference-typed field.
+        if !path.is_empty()
+            && matches!(
+                self.peek_type(object),
+                HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            )
+        {
+            return;
+        }
+        let ok = match (held, needed) {
+            (RefKind::Unique, _) => true,
+            (RefKind::Alias, RefKind::Alias) => true,
+            _ => false,
+        };
+        if !ok {
+            let name = str_id_to_string(root);
+            let (has, wants) = (
+                match held {
+                    RefKind::Shared => "`&`",
+                    RefKind::Alias => "`&alias`",
+                    RefKind::Unique => "`&mut`",
+                },
+                match needed {
+                    RefKind::Alias => "`&alias`",
+                    _ => "`&mut`",
+                },
+            );
+            self.record(TypeErrorKind::Generic(format!(
+                "cannot call `{}` on `{}`: it needs {} access but `{}` is only {}; \
+                 a reference cannot be upgraded",
+                method_name, name, wants, name, has
+            )));
         }
     }
 }
