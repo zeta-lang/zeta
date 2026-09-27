@@ -1,9 +1,10 @@
+use crate::ir_hasher::HashSet;
 use crate::{hir::StrId, ir_hasher::FxHashMap};
 
 use crate::borrow_checker::{
     AliasReasoner, BorrowChecker, BorrowError, BorrowKind, BorrowResult, Bound, IndexContainer,
     Interval, Loan, LoanId, MemoryRelation, Place, PlaceId, PlaceInitStatus, Projection,
-    Provenance, ProvenanceId, ProvenanceOrigin, Scope,
+    Provenance, ProvenanceId, ProvenanceOrigin, Scope, StorageId,
 };
 
 impl BorrowChecker {
@@ -30,6 +31,10 @@ impl BorrowChecker {
             index_places: FxHashMap::default(),
             pointee_origin: FxHashMap::default(),
             place_init: FxHashMap::default(),
+            storage_validity: FxHashMap::default(),
+            place_storage: FxHashMap::default(),
+            next_storage: StorageId(0),
+            provenance_storage: FxHashMap::default(),
         }
     }
 
@@ -145,6 +150,13 @@ impl BorrowChecker {
         id
     }
 
+    fn alloc_storage_id(&mut self) -> StorageId {
+        let id = self.next_storage;
+        self.next_storage.0 += 1;
+        self.storage_validity.insert(id, true);
+        id
+    }
+
     fn alloc_provenance_id(&mut self) -> ProvenanceId {
         let id = self.next_provenance;
         self.next_provenance.0 += 1;
@@ -197,7 +209,18 @@ impl BorrowChecker {
         Ok(())
     }
 
-    pub fn check_use_shell(&self, place: PlaceId, kind: BorrowKind) -> BorrowResult<()> {
+    pub fn check_use_shell(
+        &self,
+        place: PlaceId,
+        kind: BorrowKind,
+        access_provenance: Option<ProvenanceId>,
+    ) -> BorrowResult<()> {
+        if let Some(prov) = access_provenance {
+            if !self.provenance_is_valid(prov) {
+                return Err(BorrowError::InvalidatedReference { place });
+            }
+        }
+
         let root = self.place_roots[&place];
         let Some(loans) = self.root_loans.get(&root) else {
             return Ok(());
@@ -206,7 +229,10 @@ impl BorrowChecker {
         for loan_id in loans {
             let loan = &self.active_loans[loan_id];
 
-            if loan.place == place || self.place_is_ancestor(loan.place, place) {
+            let through_this_loan = access_provenance == Some(loan.provenance_id)
+                && (loan.place == place || self.place_is_ancestor(loan.place, place));
+
+            if through_this_loan {
                 continue;
             }
 
@@ -216,6 +242,7 @@ impl BorrowChecker {
 
             match self.overlaps(place, loan.place)? {
                 MemoryRelation::Disjoint => {}
+
                 MemoryRelation::Overlap | MemoryRelation::Unknown
                     if !kind.compatible_with(loan.kind) =>
                 {
@@ -224,13 +251,26 @@ impl BorrowChecker {
                         rhs: loan.place,
                     });
                 }
+
                 _ => {}
             }
         }
+
         Ok(())
     }
 
-    pub fn check_use(&self, place: PlaceId, kind: BorrowKind) -> BorrowResult<()> {
+    pub fn check_use(
+        &self,
+        place: PlaceId,
+        kind: BorrowKind,
+        access_provenance: Option<ProvenanceId>,
+    ) -> BorrowResult<()> {
+        if let Some(prov) = access_provenance {
+            if !self.provenance_is_valid(prov) {
+                return Err(BorrowError::InvalidatedReference { place });
+            }
+        }
+
         match self.place_init_status(place) {
             PlaceInitStatus::Uninit => return Err(BorrowError::UseOfUninitialized { place }),
             PlaceInitStatus::Moved => return Err(BorrowError::UseAfterMove { place }),
@@ -255,7 +295,10 @@ impl BorrowChecker {
             // lineage, so at most one active loan can ever be an
             // ancestor-or-equal of `place`, it can't be masking a different,
             // genuinely conflicting loan.
-            if loan.place == place || self.place_is_ancestor(loan.place, place) {
+            let through_this_loan = access_provenance == Some(loan.provenance_id)
+                && (loan.place == place || self.place_is_ancestor(loan.place, place));
+
+            if through_this_loan {
                 continue;
             }
 
@@ -325,6 +368,9 @@ impl BorrowChecker {
             },
         );
 
+        let storage = self.alloc_storage_id();
+
+        self.place_storage.insert(place_id, storage);
         self.local_places.insert(local, place_id);
         self.place_to_local.insert(place_id, local);
 
@@ -359,6 +405,7 @@ impl BorrowChecker {
         }
 
         let id = self.alloc_place_id();
+
         self.places.insert(
             id,
             Place {
@@ -368,6 +415,8 @@ impl BorrowChecker {
             },
         );
         let root = self.place_roots[&base];
+        let storage = self.place_storage[&base];
+        self.place_storage.insert(id, storage);
         self.place_roots.insert(id, root);
         self.index_places.insert(key, id);
         id
@@ -453,6 +502,7 @@ impl BorrowChecker {
         }
 
         let id = self.alloc_place_id();
+
         self.places.insert(
             id,
             Place {
@@ -461,9 +511,14 @@ impl BorrowChecker {
                 projection: Some(Projection::Field(field)),
             },
         );
+
         let root = self.place_roots[&base];
+        let storage = self.alloc_storage_id();
+
         self.place_roots.insert(id, root);
+        self.place_storage.insert(id, storage);
         self.field_places.insert((base, field), id);
+
         id
     }
 
@@ -474,6 +529,7 @@ impl BorrowChecker {
         }
 
         let id = self.alloc_place_id();
+
         self.places.insert(
             id,
             Place {
@@ -484,8 +540,12 @@ impl BorrowChecker {
         );
 
         let root = self.place_roots[&base];
+        let storage = self.place_storage[&base];
+
         self.place_roots.insert(id, root);
+        self.place_storage.insert(id, storage);
         self.deref_places.insert(base, id);
+
         id
     }
 
@@ -531,14 +591,17 @@ impl BorrowChecker {
 
     /// Provenance of a newly-created reference.
     pub fn derive_provenance(&mut self, place: PlaceId) -> ProvenanceId {
-        if let Some(id) = self.place_provenance.get(&place) {
-            return *id;
+        let storage = self.place_storage[&place];
+        let key = (place, storage);
+
+        if let Some(&id) = self.place_provenance.get(&key) {
+            return id;
         }
 
         let place_info = self.places[&place].clone();
 
         let (origin, parents) = match (place_info.parent, place_info.projection) {
-            (None, _) => (ProvenanceOrigin::Local(place), Vec::new()),
+            (None, _) => (ProvenanceOrigin::Local { place, storage }, Vec::new()),
 
             (Some(parent), Some(Projection::Field(field))) => {
                 let parent_prov = self.derive_provenance(parent);
@@ -588,14 +651,23 @@ impl BorrowChecker {
             },
         );
 
-        self.place_provenance.insert(place, id);
+        self.place_provenance.insert(key, id);
+        self.provenance_storage.insert(id, storage);
 
         id
     }
 
     pub fn merge_provenance(&mut self, parents: &[ProvenanceId]) -> ProvenanceId {
-        if parents.len() == 1 {
-            return parents[0];
+        let mut unique = Vec::new();
+
+        for &parent in parents {
+            if !unique.contains(&parent) {
+                unique.push(parent);
+            }
+        }
+
+        if unique.len() == 1 {
+            return unique[0];
         }
 
         let id = self.alloc_provenance_id();
@@ -605,11 +677,36 @@ impl BorrowChecker {
             Provenance {
                 id,
                 origin: ProvenanceOrigin::Merge,
-                parents: parents.to_vec(),
+                parents: unique,
             },
         );
 
         id
+    }
+
+    pub fn provenance_is_valid(&self, provenance: ProvenanceId) -> bool {
+        let mut stack = vec![provenance];
+        let mut visited = HashSet::default();
+
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+
+            let Some(prov) = self.provenances.get(&id) else {
+                return false;
+            };
+
+            if let Some(&storage) = self.provenance_storage.get(&id) {
+                if !self.storage_is_valid(storage) {
+                    return false;
+                }
+            }
+
+            stack.extend(prov.parents.iter().copied());
+        }
+
+        true
     }
 
     pub fn place(&self, id: PlaceId) -> Option<&Place> {
@@ -629,9 +726,20 @@ impl BorrowChecker {
     }
 
     pub fn invalidate_place(&mut self, place: PlaceId) {
+        let old_storage = self.place_storage[&place];
+
+        // Kill the old allocation generation.
+        self.invalidate_storage(old_storage);
+
+        // End active loans into the dead allocation.
         let mut stack = vec![place];
+        let mut affected = HashSet::default();
 
         while let Some(current) = stack.pop() {
+            if !affected.insert(current) {
+                continue;
+            }
+
             let children: Vec<_> = self
                 .places
                 .values()
@@ -640,19 +748,46 @@ impl BorrowChecker {
                 .collect();
 
             stack.extend(children);
+        }
 
-            let loans: Vec<_> = self
-                .active_loans
+        let dead_loans: Vec<LoanId> = self
+            .active_loans
+            .values()
+            .filter(|loan| affected.contains(&loan.place))
+            .map(|loan| loan.id)
+            .collect();
+
+        for loan in dead_loans {
+            self.end_loan(loan);
+        }
+
+        // Give the structural places a new allocation generation.
+        let new_storage = self.alloc_storage_id();
+
+        for current in affected {
+            self.place_storage.insert(current, new_storage);
+        }
+    }
+
+    pub fn reallocate_place(&mut self, place: PlaceId) {
+        let old_storage = self.place_storage[&place];
+        let new_storage = self.alloc_storage_id();
+
+        self.invalidate_storage(old_storage);
+
+        let mut stack = vec![place];
+
+        while let Some(current) = stack.pop() {
+            self.place_storage.insert(current, new_storage);
+
+            let children: Vec<_> = self
+                .places
                 .values()
-                .filter(|loan| loan.place == current)
-                .map(|loan| loan.id)
+                .filter(|p| p.parent == Some(current))
+                .map(|p| p.id)
                 .collect();
 
-            for loan in loans {
-                self.end_loan(loan);
-            }
-
-            self.place_provenance.remove(&current);
+            stack.extend(children);
         }
     }
 
@@ -772,6 +907,17 @@ impl BorrowChecker {
             return true;
         }
         self.is_less_than(len, index)
+    }
+
+    pub fn invalidate_storage(&mut self, storage: StorageId) {
+        self.storage_validity.insert(storage, false);
+    }
+
+    pub fn storage_is_valid(&self, storage: StorageId) -> bool {
+        self.storage_validity
+            .get(&storage)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn check_drop(&self, place: PlaceId) -> BorrowResult<()> {

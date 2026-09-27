@@ -161,7 +161,7 @@ pub struct Provenance {
 
 #[derive(Clone, Debug)]
 pub enum ProvenanceOrigin {
-    Local(PlaceId),
+    Local { place: PlaceId, storage: StorageId },
 
     Field { parent: ProvenanceId, field: StrId },
 
@@ -170,6 +170,14 @@ pub enum ProvenanceOrigin {
     Deref { parent: ProvenanceId },
 
     Merge,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct StorageId(pub u32);
+
+pub struct Storage {
+    pub id: StorageId,
+    pub valid: bool,
 }
 
 /// Flow-sensitive borrow analysis.
@@ -201,12 +209,16 @@ pub struct BorrowChecker {
     pub reasoning: AliasReasoner,
     pub scopes: Vec<Scope>,
     pub place_to_local: FxHashMap<PlaceId, StrId>,
-    pub place_provenance: FxHashMap<PlaceId, ProvenanceId>,
+    pub place_provenance: FxHashMap<(PlaceId, StorageId), ProvenanceId>,
     pub(super) field_places: FxHashMap<(PlaceId, StrId), PlaceId>,
     pub(super) deref_places: FxHashMap<PlaceId, PlaceId>,
     pub(super) index_places: FxHashMap<(PlaceId, Bound), PlaceId>,
     pub pointee_origin: FxHashMap<PlaceId, (PlaceId, Interval)>,
     pub place_init: FxHashMap<PlaceId, PlaceInitStatus>,
+    pub(super) next_storage: StorageId,
+    pub storage_validity: FxHashMap<StorageId, bool>,
+    pub place_storage: FxHashMap<PlaceId, StorageId>,
+    pub provenance_storage: FxHashMap<ProvenanceId, StorageId>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -423,4 +435,5 @@ pub enum BorrowError {
     UseOfUninitialized { place: PlaceId },
     CannotDropUninitialized { place: PlaceId },
     AliasConflict { place: PlaceId },
+    InvalidatedReference { place: PlaceId },
 }
