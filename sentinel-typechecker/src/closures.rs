@@ -83,35 +83,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    pub(super) fn mutation_path(
-        &self,
-        expr: &HirExpr<'a, 'bump>,
-    ) -> Option<(StrId, Vec<HirEffectSegment<'bump>>)> {
-        let through_ptr = |t: HirType<'a, 'bump>| {
-            matches!(
-                t,
-                HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
-            )
-        };
-        match expr {
-            HirExpr::Slice { object, .. } => {
-                if through_ptr(self.peek_type(object)) {
-                    None
-                } else {
-                    self.mutation_path(object)
-                }
-            }
-            HirExpr::Deref { expr: inner, .. } => {
-                if through_ptr(self.peek_type(inner)) {
-                    None
-                } else {
-                    self.mutation_path(inner)
-                }
-            }
-            _ => self.effect_path_of(expr),
-        }
-    }
-
     pub(super) fn effect_path_of(
         &self,
         expr: &HirExpr<'a, 'bump>,
