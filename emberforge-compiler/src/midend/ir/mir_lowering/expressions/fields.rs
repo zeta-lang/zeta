@@ -22,7 +22,18 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
 
         let obj_val = self.lower_expr_as_receiver(object);
+        self.field_access_from_value(obj_val, field, span)
+    }
 
+    /// Same as `lower_field_access_expr`, but takes an already-lowered receiver
+    /// value instead of re-lowering `object` from scratch. Use this whenever the
+    /// caller has already computed `obj_val` for the receiver.
+    pub(crate) fn field_access_from_value(
+        &mut self,
+        obj_val: Value,
+        field: StrId,
+        span: SourceSpan<'a>,
+    ) -> Value {
         if let Some(obj_ty) = self.current_block_data.value_types.get(&obj_val).cloned() {
             if let Some((offset, field_ty)) = self.resolve_slice_pseudo_field(&obj_ty, field) {
                 let dest = self.new_value();
@@ -67,17 +78,17 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name));
 
         let field_type = self
-        .structs
-        .get(&cls_name)
-        .and_then(|hir_struct| hir_struct.fields.iter().find(|f| f.name == field))
-        .map(|hir_field| lower_type_hir(&hir_field.field_type, self.enums))
-        .unwrap_or_else(|| {
-            eprintln!(
-                "WARNING: lower_field_access could not find field {:?} on struct {:?}, defaulting to I64",
-                field, cls_name
-            );
-            SsaType::I64
-        });
+            .structs
+            .get(&cls_name)
+            .and_then(|hir_struct| hir_struct.fields.iter().find(|f| f.name == field))
+            .map(|hir_field| lower_type_hir(&hir_field.field_type, self.enums))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "WARNING: lower_field_access could not find field {:?} on struct {:?}, defaulting to I64",
+                    field, cls_name
+                );
+                SsaType::I64
+            });
 
         let is_slice_field = matches!(field_type, SsaType::Slice(_))
             || matches!(field_type, SsaType::Owned(ref inner) if matches!(inner.as_ref(), SsaType::Slice(_)));
