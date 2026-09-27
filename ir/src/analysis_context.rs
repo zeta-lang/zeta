@@ -700,15 +700,11 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             | HirType::String
             | HirType::Lambda { .. }
             | HirType::Never
-            | HirType::Range { .. } => true,
+            | HirType::Range { .. }
+            | HirType::SafePointer { .. }
+            | HirType::UnsafePointer { .. } => true,
 
             HirType::Ref { ref_kind, .. } => *ref_kind != RefKind::Unique,
-            HirType::SafePointer {
-                mutability_state, ..
-            }
-            | HirType::UnsafePointer {
-                mutability_state, ..
-            } => *mutability_state != MutabilityState::Mut,
 
             HirType::Nullable(inner) => self.type_is_copy(inner),
 
