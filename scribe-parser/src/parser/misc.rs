@@ -727,6 +727,12 @@ where
                 cursor.expect(TokenKind::LParen)?;
                 let mut params: Vec<Type<'a, 'bump>> = Vec::new();
                 while cursor.peek() != TokenKind::RParen {
+                    // Named parameters are allowed for readability/documentation,
+                    // e.g. `func(arg: [*]mut void): void`, they serve no other purpose.
+                    if cursor.peek() == TokenKind::Ident && cursor.peek_n(1) == TokenKind::Colon {
+                        cursor.advance(); // consume the parameter name
+                        cursor.advance(); // consume ':'
+                    }
                     params.push(Self::parse_type_impl(bump, cursor, pending)?);
                     if cursor.peek() == TokenKind::Comma {
                         cursor.advance();
