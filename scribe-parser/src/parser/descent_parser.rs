@@ -16,7 +16,7 @@ where
     pub(crate) bump: &'bump GrowableBump<'bump>,
     pub(crate) string_pool: Arc<StringPool>,
     pub(crate) diag: ParserDiagnosticsContext<'a, 'bump>,
-    pub(crate) pending_close_angle: u8, // To prevent mismatches when closing generics between `>` and `>>` and `>>>`, etc
+    pub(crate) pending_close_angle: u8, // To prevent mismatches when closing generics between `>`, `>>`, `>>>`, etc. So that they don't get confused with bitwise/comparison operators or fail entirely.
 }
 
 impl<'a, 'bump> DescentParser<'a, 'bump>
@@ -146,6 +146,8 @@ where
                     self.parse_expr_stmt()
                 }
             }
+
+            TokenKind::Type => self.parse_type_alias_decl(visibility),
 
             TokenKind::Mut => {
                 // Check for shorthand let (ident := expr)

@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use crate::hir_lowerer::context::TypeAliasEntry;
+
 use super::context::HirLowerer;
 use ir::ast::Stmt;
 use ir::ast::{FuncDecl, Path};
@@ -277,6 +279,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .borrow_mut()
                     .insert(hir_interface.name, hir_interface);
             }
+            if let Stmt::TypeAliasDecl(alias) = stmt {
+                let mangled: StrId = self.ctx.mangle_type_name(alias.name);
+                self.ctx.type_aliases.borrow_mut().insert(
+                    mangled,
+                    TypeAliasEntry {
+                        generics: alias.generics,
+                        ty: alias.ty,
+                    },
+                );
+            }
             if let Stmt::StructDecl(struct_decl) = stmt {
                 let ty_struct = self.lower_struct_decl(**struct_decl);
                 self.ctx
@@ -305,6 +317,17 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     fn pre_register_type_names(&mut self, stmts: &[Stmt<'a, 'bump>]) {
         for stmt in stmts {
             match stmt {
+                Stmt::TypeAliasDecl(alias) => {
+                    let mangled = self.ctx.mangle_type_name(alias.name);
+                    self.ctx
+                        .type_aliases
+                        .borrow_mut()
+                        .entry(mangled)
+                        .or_insert(TypeAliasEntry {
+                            generics: alias.generics,
+                            ty: alias.ty,
+                        });
+                }
                 Stmt::StructDecl(s) => {
                     let mangled = self.ctx.mangle_type_name(s.name);
                     self.ctx
@@ -546,19 +569,32 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     for &body_stmt in module_decl.body {
                         match body_stmt {
                             Stmt::FuncDecl(f) => {
+                                let generics =
+                                    self.lower_generics_slice(f.generics.unwrap_or_default());
+                                if let Some(gs) = generics {
+                                    for g in gs {
+                                        self.add_generic_param(g.name);
+                                    }
+                                }
+
                                 let lowered_body = f.body.map(|b| self.lower_block(b));
+
+                                if let Some(gs) = generics {
+                                    for g in gs {
+                                        self.remove_generic_param(g.name);
+                                    }
+                                }
 
                                 let is_extern = matches!(
                                     f.function_metadata.extern_modifier,
                                     ir::ast::ExternModifier::Abi(_)
                                 );
-                                let is_main = self.ctx.context.resolve_string(&f.name) == "main";
+                                let is_main = f.name.eq("main");
                                 let lookup_name = if is_extern || is_main {
                                     f.name
                                 } else {
                                     self.mangle_with_module_path(f.name)
                                 };
-
                                 let mut func_binding = self.ctx.functions.borrow_mut();
                                 let func = func_binding.get_mut(&lookup_name).unwrap();
                                 func.body = lowered_body;
@@ -569,7 +605,20 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     }
                 }
                 Stmt::FuncDecl(f) => {
+                    let generics = self.lower_generics_slice(f.generics.unwrap_or_default());
+                    if let Some(gs) = generics {
+                        for g in gs {
+                            self.add_generic_param(g.name);
+                        }
+                    }
+
                     let lowered_body = f.body.map(|b| self.lower_block(b));
+
+                    if let Some(gs) = generics {
+                        for g in gs {
+                            self.remove_generic_param(g.name);
+                        }
+                    }
 
                     let is_extern = matches!(
                         f.function_metadata.extern_modifier,
@@ -583,11 +632,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     };
                     let mut func_binding = self.ctx.functions.borrow_mut();
                     let func = func_binding.get_mut(&lookup_name).unwrap();
-
                     func.body = lowered_body;
-
-                    let hir_func = Hir::Func(self.ctx.bump.alloc_value(func.clone()));
-                    items.push(hir_func);
+                    items.push(Hir::Func(self.ctx.bump.alloc_value(func.clone())));
                 }
                 other => items.push(self.lower_toplevel(*other)),
             }
@@ -646,6 +692,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub(super) fn lower_toplevel(&mut self, stmt: Stmt<'a, 'bump>) -> Hir<'a, 'bump> {
         match stmt {
+            Stmt::TypeAliasDecl(alias) => {
+                Hir::Stmt(self.ctx.bump.alloc_value_immutable(HirStmt::Block {
+                    body: &[],
+                    span: alias.span,
+                }))
+            }
             Stmt::FuncDecl(f) => {
                 let func = self.lower_func_body_from_proto(*f, None);
 

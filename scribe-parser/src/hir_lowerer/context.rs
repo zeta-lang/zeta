@@ -43,6 +43,14 @@ pub struct LoweringCtx<'a, 'bump> {
     pub named_imports: RefCell<FxHashMap<StrId, usize>>,
     pub auto_imports: Rc<RefCell<AutoImportRegistry>>,
     pub lowering_errors: RefCell<Vec<(String, SourceSpan<'a>)>>,
+    pub type_aliases: Rc<RefCell<FxHashMap<StrId, TypeAliasEntry<'a, 'bump>>>>,
+    pub(super) alias_resolution_stack: RefCell<Vec<StrId>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TypeAliasEntry<'a, 'bump> {
+    pub generics: Option<&'bump [ir::ast::Generic<'a, 'bump>]>,
+    pub ty: ir::ast::Type<'a, 'bump>,
 }
 
 impl<'a, 'bump> LoweringCtx<'a, 'bump> {
@@ -213,6 +221,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 context: context.clone(),
                 bump,
                 imported_modules: RefCell::new(FxHashMap::default()),
+                alias_resolution_stack: RefCell::new(Vec::default()),
+                type_aliases: Rc::new(RefCell::new(FxHashMap::default())),
                 dep_graph,
                 module_idx: usize::MAX,
                 struct_interfaces: registry.struct_interfaces,

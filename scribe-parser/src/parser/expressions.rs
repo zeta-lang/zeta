@@ -145,17 +145,15 @@ where
                         if self.cursor.peek() == TokenKind::LBrace && allow_struct_init {
                             // `Ident<T> { field: value, .. }`
                             lhs = self.parse_struct_init_fields(callee, type_args)?;
-                        } else {
+                        } else if self.cursor.peek() == TokenKind::LParen {
                             // `Ident<T>(args...)`
-                            self.cursor.expect(TokenKind::LParen)?;
+                            self.cursor.advance();
 
                             let mut args = Vec::new_in(self.bump.clone());
-
                             if self.cursor.peek() != TokenKind::RParen {
                                 loop {
                                     let arg = self.parse_expr_inner(0, true)?;
                                     args.push(arg);
-
                                     if !self.cursor.consume(TokenKind::Comma) {
                                         break;
                                     }
@@ -169,6 +167,25 @@ where
                                 callee,
                                 generic_args: type_args,
                                 arguments: self.bump.alloc_slice(&args),
+                                span,
+                            };
+                        } else {
+                            // A generic value referenced on its own — e.g. turbofished so it can be
+                            // cast to a function-pointer type: `invoke_impl<F, R, A> as func(..): void`.
+                            let Expr::Ident { name, span } = *callee else {
+                                let token = self.cursor.peek_token();
+                                return Err(DiagnosticError::new(
+                                    ParseErrorKind::UnexpectedToken {
+                                        expected: TokenKind::LParen,
+                                        found: token.kind,
+                                    },
+                                    token.span,
+                                ));
+                            };
+
+                            lhs = Expr::GenericIdent {
+                                name,
+                                generic_args: type_args,
                                 span,
                             };
                         }
@@ -407,7 +424,20 @@ where
         }
         matches!(
             cursor.peek(),
-            TokenKind::LParen | TokenKind::LBrace | TokenKind::Dot | TokenKind::ColonColon
+            TokenKind::LParen
+                | TokenKind::LBrace
+                | TokenKind::Dot
+                | TokenKind::ColonColon
+                // A generic value used on its own, not called or struct-inited —
+                // e.g. turbofished so it can be cast to a fn-pointer type:
+                // `invoke_impl<F, R, A> as func(..): void`, or passed/stored as
+                // a value: `f: invoke_impl<F, R, A>`.
+                | TokenKind::As
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::RParen
+                | TokenKind::RBrace
+                | TokenKind::RBracket
         )
     }
 

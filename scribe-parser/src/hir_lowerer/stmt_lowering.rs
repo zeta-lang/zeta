@@ -128,14 +128,53 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 }
             }
 
-            Stmt::FuncDecl(_)
-            | Stmt::StructDecl(_)
-            | Stmt::InterfaceDecl(_)
-            | Stmt::ImplDecl(_)
-            | Stmt::EnumDecl(_)
-            | Stmt::StateMachineDecl(_)
-            | Stmt::TypeAliasDecl(_) => {
-                panic!("Declaration statements should not appear in function bodies");
+            Stmt::FuncDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::StructDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::InterfaceDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::ImplDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::EnumDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::StateMachineDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
+            }
+
+            Stmt::TypeAliasDecl(a) => {
+                panic!(
+                    "Declaration statements should not appear in function bodies at {}",
+                    a.span
+                );
             }
 
             Stmt::Import(import_stmt) => {

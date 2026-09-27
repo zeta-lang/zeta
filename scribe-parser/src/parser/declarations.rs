@@ -551,6 +551,35 @@ where
             })
         }
     }
+
+    /// Parse `type Name = Type;` or `type Name<T> = Type;`
+    pub fn parse_type_alias_decl(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+        let token = self.cursor.expect(TokenKind::Type)?;
+        let (name, _span) = self.cursor.expect_ident()?;
+
+        let generics = if self.cursor.peek() == TokenKind::Lt {
+            self.parse_generics()?
+        } else {
+            None
+        };
+
+        self.cursor.expect(TokenKind::Assign)?;
+        let ty = self.parse_type()?;
+        self.cursor.consume(TokenKind::Semicolon);
+
+        Ok(Stmt::TypeAliasDecl(self.bump.alloc_value_immutable(
+            ir::ast::TypeAliasDecl {
+                visibility,
+                name,
+                generics,
+                ty,
+                span: token.span,
+            },
+        )))
+    }
 }
 
 fn token_to_visibility(token_kind: TokenKind) -> Visibility {

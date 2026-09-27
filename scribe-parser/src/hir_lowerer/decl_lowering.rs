@@ -344,7 +344,24 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     .structs
                     .borrow()
                     .get(&target_key)
-                    .map(|c| c.fields.iter().map(|f| f.field_type).collect())
+                    .map(|c| {
+                        let mut subs = ir::ir_hasher::FxHashMap::default();
+                        if let Some(generics) = c.generics {
+                            for (param, arg) in generics.iter().zip(self_type_args.iter()) {
+                                subs.insert(param.name, *arg);
+                            }
+                        }
+                        c.fields
+                            .iter()
+                            .map(|f| {
+                                crate::hir_lowerer::monomorphization::substitute_type(
+                                    &f.field_type,
+                                    &subs,
+                                    self.ctx.bump,
+                                )
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 HirType::Struct {
                     name: target_key,

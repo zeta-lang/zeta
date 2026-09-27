@@ -1086,8 +1086,23 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 };
                 let field_slice: &[HirType<'a, 'bump>] =
                     if let Some(ty_struct) = self.ctx.structs.borrow().get(&n) {
-                        let field_types: Vec<HirType<'a, 'bump>> =
-                            ty_struct.fields.iter().map(|f| f.field_type).collect();
+                        let mut subs = ir::ir_hasher::FxHashMap::default();
+                        if let (Some(generics), Some(targs)) = (ty_struct.generics, type_args) {
+                            for (param, arg) in generics.iter().zip(targs.iter()) {
+                                subs.insert(param.name, *arg);
+                            }
+                        }
+                        let field_types: Vec<HirType<'a, 'bump>> = ty_struct
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                crate::hir_lowerer::monomorphization::substitute_type(
+                                    &f.field_type,
+                                    &subs,
+                                    self.ctx.bump,
+                                )
+                            })
+                            .collect();
                         self.ctx.bump.alloc_slice(&field_types)
                     } else {
                         &[]
@@ -1518,8 +1533,23 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
                     }
                     let type_args_slice = self.ctx.bump.alloc_slice(&lowered_type_args);
-                    let field_types: Vec<HirType<'a, 'bump>> =
-                        ty_struct.fields.iter().map(|f| f.field_type).collect();
+                    let mut subs = ir::ir_hasher::FxHashMap::default();
+                    if let Some(generics) = ty_struct.generics {
+                        for (param, arg) in generics.iter().zip(lowered_type_args.iter()) {
+                            subs.insert(param.name, *arg);
+                        }
+                    }
+                    let field_types: Vec<HirType<'a, 'bump>> = ty_struct
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            crate::hir_lowerer::monomorphization::substitute_type(
+                                &f.field_type,
+                                &subs,
+                                self.ctx.bump,
+                            )
+                        })
+                        .collect();
                     let field_slice = self.ctx.bump.alloc_slice(&field_types);
                     return HirType::Struct {
                         name: resolved_name,
@@ -1572,11 +1602,99 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
                     }
                     let type_args_slice = self.ctx.bump.alloc_slice(&lowered_type_args);
+                    let mut subs = ir::ir_hasher::FxHashMap::default();
+                    if let Some(generics) = ty_enum.generics {
+                        for (param, arg) in generics.iter().zip(lowered_type_args.iter()) {
+                            subs.insert(param.name, *arg);
+                        }
+                    }
+                    let new_variants: Vec<ir::hir::HirEnumVariant<'a, 'bump>> = ty_enum
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            let new_fields: Vec<ir::hir::HirField<'a, 'bump>> = v
+                                .fields
+                                .iter()
+                                .map(|f| ir::hir::HirField {
+                                    name: f.name,
+                                    visibility: f.visibility,
+                                    field_type:
+                                        crate::hir_lowerer::monomorphization::substitute_type(
+                                            &f.field_type,
+                                            &subs,
+                                            self.ctx.bump,
+                                        ),
+                                })
+                                .collect();
+                            ir::hir::HirEnumVariant {
+                                name: v.name,
+                                fields: self.ctx.bump.alloc_slice(&new_fields),
+                            }
+                        })
+                        .collect();
                     return HirType::Enum {
                         name: resolved_name,
-                        variants: ty_enum.variants,
+                        variants: self.ctx.bump.alloc_slice(&new_variants),
                         type_args: type_args_slice,
                     };
+                }
+
+                if let Some(alias) = self.ctx.type_aliases.borrow().get(&resolved_name).copied() {
+                    if self
+                        .ctx
+                        .alias_resolution_stack
+                        .borrow()
+                        .contains(&resolved_name)
+                    {
+                        self.ctx.record_error(
+                            format!(
+                                "type alias `{}` is recursive (aliases cannot refer to themselves, \
+                                 directly or indirectly)",
+                                self.ctx.context.resolve_string(name),
+                            ),
+                            span,
+                        );
+                        return HirType::Unknown;
+                    }
+                    self.ctx
+                        .alias_resolution_stack
+                        .borrow_mut()
+                        .push(resolved_name);
+
+                    let declared = alias.generics.unwrap_or(&[]);
+                    for g in declared {
+                        self.add_generic_param(g.type_name);
+                    }
+                    let expanded = self.lower_type(&alias.ty, span);
+                    for g in declared {
+                        self.remove_generic_param(g.type_name);
+                    }
+
+                    self.ctx.alias_resolution_stack.borrow_mut().pop();
+
+                    if declared.is_empty() {
+                        return expanded;
+                    }
+
+                    if lowered_type_args.len() > declared.len() {
+                        self.ctx.record_error(
+                            format!(
+                                "type alias `{}` expects at most {} generic argument(s), found {}",
+                                self.ctx.context.resolve_string(name),
+                                declared.len(),
+                                lowered_type_args.len(),
+                            ),
+                            span,
+                        );
+                    }
+
+                    let mut subs: ir::ir_hasher::HashMap<StrId, HirType<'a, 'bump>> =
+                        ir::ir_hasher::HashMap::default();
+                    for (g, a) in declared.iter().zip(lowered_type_args.iter()) {
+                        subs.insert(g.type_name, *a);
+                    }
+
+                    return substitute_alias_generics(&expanded, &subs, self.ctx.bump);
                 }
 
                 let type_path = if path.is_empty() {
@@ -1821,5 +1939,127 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
         true
+    }
+}
+
+fn substitute_alias_generics<'a, 'bump>(
+    ty: &HirType<'a, 'bump>,
+    subs: &ir::ir_hasher::HashMap<StrId, HirType<'a, 'bump>>,
+    bump: &'bump GrowableBump<'bump>,
+) -> HirType<'a, 'bump> {
+    match ty {
+        HirType::Generic(name) => subs.get(name).copied().unwrap_or(*ty),
+        HirType::Ref {
+            inner,
+            ref_kind,
+            provenance,
+        } => HirType::Ref {
+            inner: bump.alloc_value(substitute_alias_generics(inner, subs, bump)),
+            ref_kind: *ref_kind,
+            provenance: *provenance,
+        },
+        HirType::SafePointer {
+            inner,
+            mutability_state,
+        } => HirType::SafePointer {
+            inner: bump.alloc_value(substitute_alias_generics(inner, subs, bump)),
+            mutability_state: *mutability_state,
+        },
+        HirType::UnsafePointer {
+            inner,
+            mutability_state,
+        } => HirType::UnsafePointer {
+            inner: bump.alloc_value(substitute_alias_generics(inner, subs, bump)),
+            mutability_state: *mutability_state,
+        },
+        HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
+            inner: bump.alloc_value(substitute_alias_generics(inner, subs, bump)),
+            allocator: *allocator,
+        },
+        HirType::Array(inner, len) => HirType::Array(
+            bump.alloc_value(substitute_alias_generics(inner, subs, bump)),
+            *len,
+        ),
+        HirType::Slice(inner) => {
+            HirType::Slice(bump.alloc_value(substitute_alias_generics(inner, subs, bump)))
+        }
+        HirType::Nullable(inner) => {
+            HirType::Nullable(bump.alloc_value(substitute_alias_generics(inner, subs, bump)))
+        }
+        HirType::Lambda {
+            params,
+            return_type,
+        } => {
+            let new_params: Vec<_> = params
+                .iter()
+                .map(|p| substitute_alias_generics(p, subs, bump))
+                .collect();
+            HirType::Lambda {
+                params: bump.alloc_slice(&new_params),
+                return_type: bump.alloc_value(substitute_alias_generics(return_type, subs, bump)),
+            }
+        }
+        HirType::Tuple(elems) => {
+            let new: Vec<_> = elems
+                .iter()
+                .map(|e| substitute_alias_generics(e, subs, bump))
+                .collect();
+            HirType::Tuple(bump.alloc_slice(&new))
+        }
+        HirType::Struct {
+            name,
+            field_types,
+            type_args,
+        } => {
+            let fields: Vec<_> = field_types
+                .iter()
+                .map(|f| substitute_alias_generics(f, subs, bump))
+                .collect();
+            let args: Vec<_> = type_args
+                .iter()
+                .map(|a| substitute_alias_generics(a, subs, bump))
+                .collect();
+            HirType::Struct {
+                name: *name,
+                field_types: bump.alloc_slice(&fields),
+                type_args: bump.alloc_slice(&args),
+            }
+        }
+        HirType::Enum {
+            name,
+            variants,
+            type_args,
+        } => {
+            let args: Vec<_> = type_args
+                .iter()
+                .map(|a| substitute_alias_generics(a, subs, bump))
+                .collect();
+            HirType::Enum {
+                name: *name,
+                variants,
+                type_args: bump.alloc_slice(&args),
+            }
+        }
+        HirType::DynInterface(name, args) => {
+            let new: Vec<_> = args
+                .iter()
+                .map(|a| substitute_alias_generics(a, subs, bump))
+                .collect();
+            HirType::DynInterface(*name, bump.alloc_slice(&new))
+        }
+        HirType::Dyn { bounds } => {
+            let new: Vec<_> = bounds
+                .iter()
+                .map(|b| substitute_alias_generics(b, subs, bump))
+                .collect();
+            HirType::Dyn {
+                bounds: bump.alloc_slice(&new),
+            }
+        }
+        HirType::Range { elem, inclusive } => HirType::Range {
+            elem: bump.alloc_value(substitute_alias_generics(elem, subs, bump)),
+            inclusive: *inclusive,
+        },
+        other => *other, // primitives, Void, This, etc. carry no generics
     }
 }
