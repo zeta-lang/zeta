@@ -1,6 +1,9 @@
 package input;
 
 import zeta::io;
+import zeta::thread::threads;
+import zeta::thread::threads.Thread;
+import zeta::thread::threads.JoinHandle;
 import zeta::file.FileWriter;
 import zeta::utils.ArrayList;
 import zeta::utils::linked_list.LinkedList;
@@ -1325,7 +1328,7 @@ func main(): i64 {
     io.stdout().writeln("");
     io.stdout().writeln("=== ArrayList tests ===");
 
-    let mut status: i64 = test_array_list_default_generic();
+   let mut status: i64 = test_array_list_default_generic();
     if (status != 0) {
         io.stdout().writeln("[FAIL] test_array_list_default_generic");
         return status;
@@ -1453,6 +1456,12 @@ func main(): i64 {
         io.stdout().writeln("[FAIL] test_closure_nested");
         return status;
     }
+
+    // status = thread_tests();
+    // if (status != 0) {
+    //     io.stdout().writeln("[FAIL] thread_tests");
+    //     return status;
+    // }
 
     io.stdout().writeln("");
     io.stdout().writeln("========================================");
@@ -1982,3 +1991,379 @@ func test_closure_nested(): i64 {
 //    n = 5;      // ERROR: `n` is mutably borrowed by the live closure
 //    bump();
 //}
+//
+
+struct ThreadDropItem {
+    tag: str,
+}
+
+impl ThreadDropItem by Drop {
+    func drop(mut this): void {
+        io.stdout().writeln("  -> [DROP] ThreadDropItem");
+        io.stdout().writeln(this.tag);
+    }
+}
+
+
+func test_thread_basic_return(): i64 {
+    io.stdout().writeln("=== Running: test_thread_basic_return ===");
+
+    let mut handle: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                return 42;
+            }
+        );
+
+    let result: i64 = handle.join();
+
+    if (result != 42) {
+        io.stdout().writeln("[FAIL] thread returned wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] basic thread return");
+
+    return 0;
+}
+
+
+func test_thread_string_return(): i64 {
+    io.stdout().writeln("=== Running: test_thread_string_return ===");
+
+    let mut handle: JoinHandle<str, Mallocator> =
+        threads.spawn(
+            func() {
+                return "hello from thread";
+            }
+        );
+
+    let result: str = handle.join();
+
+    if (result != "hello from thread") {
+        io.stdout().writeln("[FAIL] thread returned wrong string");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] thread string return");
+
+    return 0;
+}
+
+
+func test_thread_computation(): i64 {
+    io.stdout().writeln("=== Running: test_thread_computation ===");
+
+    let mut handle: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                let mut total: i64 = 0;
+                let mut i: i64 = 1;
+
+                while (i <= 100) {
+                    total += i;
+                    i += 1;
+                }
+
+                return total;
+            }
+        );
+
+    let result: i64 = handle.join();
+
+    // 1 + 2 + ... + 100 = 5050
+    if (result != 5050) {
+        io.stdout().writeln("[FAIL] thread computation returned wrong result");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] thread computation");
+
+    return 0;
+}
+
+
+func test_multiple_threads(): i64 {
+    io.stdout().writeln("=== Running: test_multiple_threads ===");
+
+    let mut h1: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                io.stdout().writeln("!!!=== Running: h1 ===!!!");
+                return 10;
+            }
+        );
+
+    let mut h2: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                io.stdout().writeln("!!!=== Running: h2 ===!!!");
+                return 20;
+            }
+        );
+
+    let mut h3: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                io.stdout().writeln("!!!=== Running: h3 ===!!!");
+                return 30;
+            }
+        );
+
+    let mut h4: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                io.stdout().writeln("!!!=== Running: h4 ===!!!");
+                return 40;
+            }
+        );
+
+    let r1: i64 = h1.join();
+    let r2: i64 = h2.join();
+    let r3: i64 = h3.join();
+    let r4: i64 = h4.join();
+
+    if (r1 != 10) {
+        io.stdout().writeln("[FAIL] thread 1 returned wrong value");
+        return 1;
+    }
+
+    if (r2 != 20) {
+        io.stdout().writeln("[FAIL] thread 2 returned wrong value");
+        return 2;
+    }
+
+    if (r3 != 30) {
+        io.stdout().writeln("[FAIL] thread 3 returned wrong value");
+        return 3;
+    }
+
+    if (r4 != 40) {
+        io.stdout().writeln("[FAIL] thread 4 returned wrong value");
+        return 4;
+    }
+
+    io.stdout().writeln("[PASS] multiple threads");
+
+    return 0;
+}
+
+
+func test_many_threads(): i64 {
+    io.stdout().writeln("=== Running: test_many_threads ===");
+
+    let mut handles: ArrayList<
+        JoinHandle<i64, Mallocator>
+    > = ArrayList.with_capacity(32); // line 2157
+
+    let mut i: i64 = 0;
+
+    while (i < 32) {
+        let value: i64 = i;
+
+        handles.push(
+            threads.spawn(
+                func() {
+                    return value * value;
+                }
+            )
+        );
+
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < 32) {
+        let result: i64 = handles.get(i as usize).join();
+        let expected: i64 = i * i;
+
+        if (result != expected) {
+            io.stdout().writeln("[FAIL] many-thread result mismatch");
+            return 1;
+        }
+
+        i += 1;
+    }
+
+    io.stdout().writeln("[PASS] 32 concurrent threads");
+
+    return 0;
+}
+
+
+func test_thread_owned_capture(): i64 {
+    io.stdout().writeln("=== Running: test_thread_owned_capture ===");
+
+    let item: ThreadDropItem =
+        ThreadDropItem {
+            tag: "thread_owned_capture",
+        };
+
+    let mut handle: JoinHandle<str, Mallocator> =
+        threads.spawn(
+            func() {
+                return item.tag;
+            }
+        );
+
+    let result: str = handle.join();
+
+    if (result != "thread_owned_capture") {
+        io.stdout().writeln("[FAIL] thread capture returned wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] thread owned capture");
+    io.stdout().writeln(
+        "Expect the captured ThreadDropItem to be dropped exactly once."
+    );
+
+    return 0;
+}
+
+
+func test_thread_fnonce_capture(): i64 {
+    io.stdout().writeln("=== Running: test_thread_fnonce_capture ===");
+
+    let item: ThreadDropItem =
+        ThreadDropItem {
+            tag: "thread_fnonce",
+        };
+
+    let mut handle: JoinHandle<ThreadDropItem, Mallocator> =
+        threads.spawn(
+            func() {
+                return item;
+            }
+        );
+
+    let result: ThreadDropItem = handle.join();
+
+    if (result.tag != "thread_fnonce") {
+        io.stdout().writeln("[FAIL] FnOnce thread returned wrong item");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] thread FnOnce ownership transfer");
+    io.stdout().writeln(
+        "Expect exactly one final drop of 'thread_fnonce'."
+    );
+
+    return 0;
+}
+
+
+func test_thread_nested_computation(): i64 {
+    io.stdout().writeln("=== Running: test_thread_nested_computation ===");
+
+    let base: i64 = 100;
+
+    let mut handle: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            func() {
+                let mut value: i64 = base;
+
+                value *= 2;
+                value += 50;
+                value -= 25;
+
+                return value;
+            }
+        );
+
+    let result: i64 = handle.join();
+
+    if (result != 225) {
+        io.stdout().writeln("[FAIL] nested computation returned wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] captured computation");
+
+    return 0;
+}
+
+
+func test_thread_repeated_spawn_join(): i64 {
+    io.stdout().writeln("=== Running: test_thread_repeated_spawn_join ===");
+
+    let mut i: i64 = 0;
+
+    while (i < 100) {
+        let value: i64 = i;
+
+        let mut handle: JoinHandle<i64, Mallocator> =
+            threads.spawn(
+                func() {
+                    return value + 1;
+                }
+            );
+
+        let result: i64 = handle.join();
+
+        if (result != value + 1) {
+            io.stdout().writeln("[FAIL] repeated spawn/join returned wrong value");
+            return 1;
+        }
+
+        i += 1;
+    }
+
+    io.stdout().writeln("[PASS] 100 spawn/join cycles");
+
+    return 0;
+}
+
+
+func thread_tests(): i64 {
+    let status1: i64 = test_thread_basic_return();
+    if (status1 != 0) {
+        return status1;
+    }
+
+    let status2: i64 = test_thread_string_return();
+    if (status2 != 0) {
+        return status2;
+    }
+
+    let status3: i64 = test_thread_computation();
+    if (status3 != 0) {
+        return status3;
+    }
+
+    let status4: i64 = test_multiple_threads();
+    if (status4 != 0) {
+        return status4;
+    }
+
+    let status5: i64 = test_many_threads();
+    if (status5 != 0) {
+        return status5;
+    }
+
+    let status6: i64 = test_thread_owned_capture();
+    if (status6 != 0) {
+        return status6;
+    }
+
+    let status7: i64 = test_thread_fnonce_capture();
+    if (status7 != 0) {
+        return status7;
+    }
+
+    let status8: i64 = test_thread_nested_computation();
+    if (status8 != 0) {
+        return status8;
+    }
+
+    let status9: i64 = test_thread_repeated_spawn_join();
+    if (status9 != 0) {
+        return status9;
+    }
+
+    io.stdout().writeln("");
+    io.stdout().writeln("=== All thread tests passed ===");
+
+    return 0;
+}
