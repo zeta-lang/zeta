@@ -1,28 +1,30 @@
 package zeta::libc;
 
-// struct PthreadAttr {
-//     opaque: [128]u8,
-// }
+type Pthread = usize;
 
-// extern "C" func pthread_create(
-//     thread: [*]mut usize,
-//     attr: [*]const PthreadAttr,
-//     start_routine: [*]const void,
-//     arg: [*]mut void,
-// ): i32;
+struct PthreadAttr {
+    opaque: [128]u8,
+}
 
-// extern "C" func pthread_join(
-//     thread: usize,
-//     retval: [*]mut [*]mut void
-// ): i32;
+extern "C" func pthread_create(
+    thread: [*]mut Pthread,
+    attr: [*]const PthreadAttr,
+    start_routine: [*]const void,
+    arg: [*]mut void,
+): i32;
 
-// extern "C" func pthread_detach(thread: usize): i32;
+extern "C" func pthread_join(
+    thread: Pthread,
+    retval: [*]mut [*]mut void
+): i32;
 
-// extern "C" func pthread_self(): Pthread;
+extern "C" func pthread_detach(thread: Pthread): i32;
 
-// extern "C" func pthread_equal(lhs: usize, rhs: usize): i32;
+extern "C" func pthread_self(): Pthread;
 
-// extern "C" func sched_yield(): i32;
+extern "C" func pthread_equal(lhs: Pthread, rhs: Pthread): i32;
+
+extern "C" func sched_yield(): i32;
 
 extern "C" func malloc(size: usize): [*]mut void;
 extern "C" func free(ptr: [*]mut void);

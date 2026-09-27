@@ -1,3 +1,83 @@
 package zeta::thread::threads;
 
-struct AS {}
+import zeta::alloc::allocator.Allocator;
+import zeta::utils::mallocator.Mallocator;
+import zeta::libc.Pthread;
+import zeta::libc;
+import zeta::debug;
+
+struct ThreadCtxHeader {
+    invoke: func(arg: [*]mut void): void,
+}
+
+// F-independent. This is the ONLY thing JoinHandle ever touches.
+struct ResultSlot<R, A: Allocator> {
+    result: ?R,
+    alloc: A,
+}
+
+// F-dependent. Only ever touched inside invoke_impl<F,R,A>.
+struct ThreadCtx<F, R, A: Allocator> {
+    header: ThreadCtxHeader,   // MUST be first field
+    func_: F,
+    slot: [*]mut ResultSlot<R, A>,
+    alloc: A,                 // needed to reclaim *this* block
+}
+
+extern "C" func thread_entry(arg: [*]mut void): [*]mut void {
+    let hdr: [*]mut ThreadCtxHeader = arg as [*]mut ThreadCtxHeader;
+    unsafe { (*hdr).invoke(arg); }
+    return null;
+}
+
+func invoke_impl<F: func(): R, R, A: Allocator>(arg: [*]mut void): void {
+    let raw: [*]mut ThreadCtx<F, R, A> = arg as [*]mut ThreadCtx<F, R, A>;
+
+    let alloc: A = unsafe { (*raw).alloc };
+    let slot: [*]mut ResultSlot<R, A> = unsafe { (*raw).slot };
+    let result: R = unsafe { (*raw).func_() };
+    unsafe { (*slot).result = result; }
+
+    let owned: ^ThreadCtx<F, R, A> = unsafe { $own(raw, alloc) }; // line 41
+}
+
+func spawn<F: func(): R, R>(f: F): JoinHandle<R, Mallocator> {
+    let alloc: Mallocator = Mallocator {};
+
+    let slot: ^ResultSlot<R, Mallocator> =
+        alloc.new(ResultSlot<R, Mallocator> { result: null, alloc });
+
+    let ctx: ^ThreadCtx<F, R, Mallocator> = alloc.new(ThreadCtx<F, R, Mallocator> {
+        header: ThreadCtxHeader {
+            invoke: invoke_impl<F, R, Mallocator> as func(arg: [*]mut void): void,
+        },
+        func_: f,
+        slot: slot as [*]mut ResultSlot<R, Mallocator>,
+        alloc,
+    });
+
+    let mut tid: Pthread = uninit;
+    let ret: i32 = unsafe {
+        libc.pthread_create(&mut tid, null, thread_entry as [*]const void, ctx as [*]mut void)
+    };
+    if (ret != 0) { debug.debug_panic("pthread_create failed"); }
+
+    return JoinHandle<R, Mallocator> { tid, slot }; // line 65
+}
+
+struct JoinHandle<R, A: Allocator> {
+    tid: Pthread,
+    slot: ^ResultSlot<R, A>,
+}
+
+impl<R, A: Allocator> JoinHandle<R, A> {
+    func join(mut this): R {
+        let mut retval: [*]mut void = uninit;
+        unsafe { libc.pthread_join(this.tid, &mut retval); }
+        let result: ?R = unsafe { (*this.slot).result };
+        if (result == null) {
+            $unreachable();
+        }
+        return result;
+    }
+}
