@@ -513,9 +513,9 @@ where
             HirExpr::Call {
                 callee,
                 args,
-                span: _,
+                span,
                 type_args: _, // Turns into None after monomorphization
-            } => self.lower_call_expr(callee, args),
+            } => self.lower_call_expr(callee, args, *span),
 
             HirExpr::InterfaceCall {
                 callee,
