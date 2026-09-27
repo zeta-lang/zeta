@@ -147,6 +147,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .retain(|_, owner| !local_names.contains(owner));
         for name in &local_names {
             self.local_provenance_place.remove(name);
+            self.local_provenance.remove(name);
             self.local_ref_kind.remove(name);
         }
         value
@@ -223,6 +224,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let snap = self.snapshot_call_loan_keys();
         let ty = self.check_expr(e);
         self.end_temp_call_loans(&snap);
+        self.end_temp_closure_loans(&snap);
         Some(ty)
     }
 
@@ -310,6 +312,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.context
             .add_variable_with_mutability(var_name, *ty, *mutable, symbol_id);
         self.borrow_checker.declare_local(*name);
+        self.move_state.clear(*name);
         self.occurrences.push((
             *span,
             *name,
@@ -355,6 +358,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.loan_owners.insert(loan_id, *name);
             if let Some(loan) = self.borrow_checker.loan(loan_id) {
                 self.local_provenance_place.insert(*name, loan.place);
+                self.local_provenance.insert(*name, loan.provenance_id);
             }
         } else if let HirExpr::Ref {
             expr: ref_target, ..
@@ -364,6 +368,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.local_provenance_place.insert(*name, place);
                 if let Some(&loan_id) = self.borrow_checker.loan_for_place(place) {
                     self.loan_owners.insert(loan_id, *name);
+                    if let Some(loan) = self.borrow_checker.loan(loan_id) {
+                        self.local_provenance.insert(*name, loan.provenance_id);
+                    }
                 }
             }
         }

@@ -2,6 +2,7 @@ use ir::{
     hir::{HirParam, HirType, StrId},
     ir_hasher::FxHashMap,
 };
+use zetaruntime::bump::GrowableBump;
 
 use crate::{str_id_to_string, TypeChecker};
 
@@ -274,22 +275,39 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 subs.entry(*name).or_insert(*actual);
             }
             HirType::Nullable(inner) => {
-                if let HirType::Nullable(actual_inner) = actual {
-                    self.unify_generic(inner, actual_inner, subs);
+                if let HirType::Nullable(a) = actual {
+                    self.unify_generic(inner, a, subs);
                 }
             }
             HirType::Array(inner, _) => {
-                if let HirType::Array(actual_inner, _) = actual {
-                    self.unify_generic(inner, actual_inner, subs);
+                if let HirType::Array(a, _) = actual {
+                    self.unify_generic(inner, a, subs);
                 }
             }
             HirType::Slice(inner) => {
-                if let HirType::Slice(actual_inner) = actual {
-                    self.unify_generic(inner, actual_inner, subs);
+                if let HirType::Slice(a) = actual {
+                    self.unify_generic(inner, a, subs);
                 }
             }
             HirType::Ref { inner, .. } => {
                 self.unify_generic(inner, Self::strip_ref(actual), subs);
+            }
+            HirType::OwnedPointer { inner, .. } => {
+                if let HirType::OwnedPointer { inner: a, .. } = actual {
+                    self.unify_generic(inner, a, subs);
+                } else {
+                    self.unify_generic(inner, actual, subs);
+                }
+            }
+            HirType::SafePointer { inner, .. } => {
+                if let HirType::SafePointer { inner: a, .. } = actual {
+                    self.unify_generic(inner, a, subs);
+                }
+            }
+            HirType::UnsafePointer { inner, .. } => {
+                if let HirType::UnsafePointer { inner: a, .. } = actual {
+                    self.unify_generic(inner, a, subs);
+                }
             }
             _ => {}
         }
@@ -313,5 +331,125 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
         subs
+    }
+}
+
+pub(crate) fn substitute_generic_type<'a, 'bump>(
+    ty: &HirType<'a, 'bump>,
+    subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
+    bump: &'bump GrowableBump<'bump>,
+) -> HirType<'a, 'bump> {
+    match ty {
+        HirType::Generic(name) => subs.get(name).copied().unwrap_or(*ty),
+
+        HirType::Ref {
+            inner,
+            ref_kind,
+            provenance,
+        } => HirType::Ref {
+            inner: bump.alloc_value(substitute_generic_type(inner, subs, bump)),
+            ref_kind: *ref_kind,
+            provenance: *provenance,
+        },
+        HirType::SafePointer {
+            inner,
+            mutability_state,
+        } => HirType::SafePointer {
+            inner: bump.alloc_value(substitute_generic_type(inner, subs, bump)),
+            mutability_state: *mutability_state,
+        },
+        HirType::UnsafePointer {
+            inner,
+            mutability_state,
+        } => HirType::UnsafePointer {
+            inner: bump.alloc_value(substitute_generic_type(inner, subs, bump)),
+            mutability_state: *mutability_state,
+        },
+        HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
+            inner: bump.alloc_value(substitute_generic_type(inner, subs, bump)),
+            allocator: *allocator,
+        },
+        HirType::Array(inner, len) => HirType::Array(
+            bump.alloc_value(substitute_generic_type(inner, subs, bump)),
+            *len,
+        ),
+        HirType::Slice(inner) => {
+            HirType::Slice(bump.alloc_value(substitute_generic_type(inner, subs, bump)))
+        }
+        HirType::Nullable(inner) => {
+            HirType::Nullable(bump.alloc_value(substitute_generic_type(inner, subs, bump)))
+        }
+        HirType::Lambda {
+            params,
+            return_type,
+        } => {
+            let new_params: Vec<_> = params
+                .iter()
+                .map(|p| substitute_generic_type(p, subs, bump))
+                .collect();
+            HirType::Lambda {
+                params: bump.alloc_slice(&new_params),
+                return_type: bump.alloc_value(substitute_generic_type(return_type, subs, bump)),
+            }
+        }
+        HirType::Tuple(elems) => {
+            let new: Vec<_> = elems
+                .iter()
+                .map(|e| substitute_generic_type(e, subs, bump))
+                .collect();
+            HirType::Tuple(bump.alloc_slice(&new))
+        }
+        HirType::Struct {
+            name,
+            field_types,
+            type_args,
+        } => {
+            let fields: Vec<_> = field_types
+                .iter()
+                .map(|f| substitute_generic_type(f, subs, bump))
+                .collect();
+            let args: Vec<_> = type_args
+                .iter()
+                .map(|a| substitute_generic_type(a, subs, bump))
+                .collect();
+            HirType::Struct {
+                name: *name,
+                field_types: bump.alloc_slice(&fields),
+                type_args: bump.alloc_slice(&args),
+            }
+        }
+        HirType::Enum {
+            name,
+            variants,
+            type_args,
+        } => {
+            let args: Vec<_> = type_args
+                .iter()
+                .map(|a| substitute_generic_type(a, subs, bump))
+                .collect();
+            HirType::Enum {
+                name: *name,
+                variants,
+                type_args: bump.alloc_slice(&args),
+            }
+        }
+        HirType::DynInterface(name, args) => {
+            let new: Vec<_> = args
+                .iter()
+                .map(|a| substitute_generic_type(a, subs, bump))
+                .collect();
+            HirType::DynInterface(*name, bump.alloc_slice(&new))
+        }
+        HirType::Dyn { bounds } => {
+            let new: Vec<_> = bounds
+                .iter()
+                .map(|b| substitute_generic_type(b, subs, bump))
+                .collect();
+            HirType::Dyn {
+                bounds: bump.alloc_slice(&new),
+            }
+        }
+
+        other => *other, // primitives etc. carry no generics
     }
 }

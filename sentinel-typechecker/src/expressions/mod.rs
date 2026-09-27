@@ -12,7 +12,6 @@ use ir::{
 };
 
 use crate::{
-    closures,
     initialization::{BareImportKind, InitNode, InitStatus, IntervalSet},
     move_state::MoveState,
     naming::{operator_symbol, str_id_to_string, type_to_string},
@@ -27,7 +26,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         target_type: &HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
         let source_type = self.check_expr(expr);
-        self.check_and_record_value_use(expr, &source_type);
+
+        let is_borrowing_ptr_cast = matches!(
+            (&source_type, target_type),
+            (
+                HirType::OwnedPointer { .. },
+                HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            )
+        );
+        if !is_borrowing_ptr_cast {
+            self.check_and_record_value_use(expr, &source_type);
+        }
+
         let result = self.check_cast_legality(&source_type, target_type);
         self.recover(result, ());
         *target_type
@@ -225,6 +235,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.recover(result, HirType::Unknown)
     }
 
+    fn is_definitely_initialized(&self, root: StrId, path: &[StrId]) -> bool {
+        let Some(node) = self.init_state.get(&root) else {
+            return true;
+        };
+        match Self::node_at_path_ref(node, path) {
+            InitNode::Whole(InitStatus::Initialized) => true,
+            InitNode::Array {
+                ranges,
+                len: Some(l),
+            } => ranges.covers_full(*l as i64),
+            _ => false,
+        }
+    }
+
+    fn format_field_path(root: StrId, path: &[StrId]) -> String {
+        let mut s = str_id_to_string(root);
+        for seg in path {
+            s.push('.');
+            s.push_str(&str_id_to_string(*seg));
+        }
+        s
+    }
+
     pub fn check_assignment_expr(
         &mut self,
         target: &&HirExpr<'a, 'bump>,
@@ -285,15 +318,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
         let value_type = self.check_expr_expected(value, &target_type);
 
-        if let Some(place) = self.resolve_place(target) {
-            self.check_borrow_use(target, place, BorrowKind::Mutable);
-            if let Some((root, path)) = self.mutation_path(target) {
-                self.note_capture_use(root, &path, closures::UseLevel::Mut);
-            }
-            if is_uninit_value {
-                self.borrow_checker.mark_place_uninit(place);
-            } else {
-                self.borrow_checker.mark_place_init(place);
+        // DISCLAIMER: This code may disallow an initialized variable to be `uninit`, should this be reverted? or not reverted, but prove when its safe?
+        if matches!(op, AssignmentOperator::Assign)
+            && matches!(target_type, HirType::OwnedPointer { .. })
+        {
+            if let HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } =
+                target
+            {
+                // kill refs into the old allocation within this function
+                if let Some(place) = self.resolve_place(target) {
+                    self.borrow_checker.reallocate_place(place);
+                }
+                // record for callers
+                if let (Some(cur), Some((root, mut path))) =
+                    (self.current_fn, self.static_field_path(object))
+                {
+                    if root == self.this_id {
+                        path.push(*field);
+                        let paths = self.fn_invalidates.entry(cur).or_default();
+                        if !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                    }
+                }
             }
         }
 
@@ -313,6 +360,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         match target {
             HirExpr::Ident(name, _) => {
+                if is_uninit_value && self.is_definitely_initialized(*name, &[]) {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "cannot assign `uninit` to `{}`: it is already initialized; \
+                         `uninit` may only be assigned to a variable that isn't initialized yet",
+                        str_id_to_string(*name)
+                    )));
+                }
                 if !matches!(value_type, HirType::Nullable(_)) {
                     self.mark_non_null(*name, &[]);
                 } else {
@@ -327,6 +381,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 if let Some((root, mut path)) = self.static_field_path(object) {
                     path.push(*field);
+                    if is_uninit_value && self.is_definitely_initialized(root, &path) {
+                        self.record(TypeErrorKind::Generic(format!(
+                            "cannot assign `uninit` to `{}`: it is already initialized; \
+                             `uninit` may only be assigned to a field that isn't initialized yet",
+                            Self::format_field_path(root, &path)
+                        )));
+                    }
                     if !matches!(value_type, HirType::Nullable(_)) {
                         self.mark_non_null(root, &path);
                     } else {
@@ -354,7 +415,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 .init_state
                                 .entry(root)
                                 .or_insert(InitNode::Whole(InitStatus::Uninitialized));
-                            if let InitNode::Array { ranges, .. } =
+                            let already_init = match Self::node_at_path_ref(root_node, &path) {
+                                InitNode::Array { ranges, .. } => ranges.contains_range(*i, *i + 1),
+                                InitNode::Whole(InitStatus::Initialized) => true,
+                                _ => false,
+                            };
+                            if already_init {
+                                self.record(TypeErrorKind::Generic(format!(
+                                    "cannot assign `uninit` to `{}[{}]`: it is already initialized; \
+                                     `uninit` may only be assigned to an element that isn't initialized yet",
+                                    str_id_to_string(root), i
+                                )));
+                            } else if let InitNode::Array { ranges, .. } =
                                 Self::node_at_path_mut(root_node, &path)
                             {
                                 let mut kept = IntervalSet::default();
@@ -379,7 +451,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 .entry(root)
                                 .or_insert(InitNode::Whole(InitStatus::Uninitialized));
                             let target_node = Self::node_at_path_mut(root_node, &path);
-                            if !matches!(target_node, InitNode::Whole(InitStatus::Initialized)) {
+                            if is_uninit_value {
+                                let already_init = matches!(
+                                    target_node,
+                                    InitNode::Whole(InitStatus::Initialized)
+                                ) || matches!(
+                                    target_node,
+                                    InitNode::Array { ranges, len: Some(l) } if ranges.covers_full(*l as i64)
+                                );
+                                if already_init {
+                                    self.record(TypeErrorKind::Generic(format!(
+                                        "cannot assign `uninit` into `{}` at a non-constant index: \
+                                         it is already fully initialized",
+                                        str_id_to_string(root)
+                                    )));
+                                }
+                            } else if !matches!(
+                                target_node,
+                                InitNode::Whole(InitStatus::Initialized)
+                            ) {
                                 *target_node = InitNode::Whole(InitStatus::Maybe);
                             }
                         }
@@ -433,6 +523,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         name: &HirExpr<'a, 'bump>,
         args: &[ir::hir::HirFieldInit<'a, 'bump>],
         type_args: &Option<&'a [HirType<'a, 'bump>]>,
+        expected: Option<&HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
         let HirExpr::Ident(struct_name_id, name_span) = name else {
             return HirType::Void;
@@ -455,7 +546,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let is_generic_decl = ty_struct.generics.is_some_and(|g| !g.is_empty());
 
-        let resolved_field_types: Vec<HirType<'a, 'bump>> = match (is_generic_decl, type_args) {
+        let inferred_type_args: Option<&'a [HirType<'a, 'bump>]> =
+            type_args.filter(|ta| !ta.is_empty()).or_else(|| {
+                if let Some(HirType::Struct {
+                    name: exp_name,
+                    type_args: exp_targs,
+                    ..
+                }) = expected
+                {
+                    if *exp_name == *struct_name_id && !exp_targs.is_empty() {
+                        return Some(*exp_targs);
+                    }
+                }
+                None
+            });
+
+        let resolved_field_types: Vec<HirType<'a, 'bump>> = match (
+            is_generic_decl,
+            inferred_type_args,
+        ) {
             (true, Some(ta)) => match self.instantiate_struct(*struct_name_id, ta) {
                 Some(fields) => fields.to_vec(),
                 None => {
@@ -488,7 +597,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             (false, None) => ty_struct.fields.iter().map(|f| f.field_type).collect(),
         };
 
-        let mut seen: std::collections::HashSet<StrId> = std::collections::HashSet::new();
+        let mut seen: HashSet<StrId> = HashSet::default();
 
         for field_init in args {
             let field_name_str = str_id_to_string(field_init.name);
@@ -548,12 +657,96 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let result_ty = HirType::Struct {
             name: *struct_name_id,
             field_types: self.context.bump.alloc_slice(&resolved_field_types),
-            type_args: type_args.unwrap_or(&[]),
+            type_args: inferred_type_args.unwrap_or(&[]),
         };
         if let Some(owner) = self.context.struct_owner(&struct_name_str) {
             self.record_item_occurrence(*name_span, *struct_name_id, result_ty, owner);
         }
         result_ty
+    }
+
+    pub fn check_generic_ident_expr(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        name: &StrId,
+        type_args: &'bump [HirType<'a, 'bump>],
+    ) -> HirType<'a, 'bump> {
+        let lookup_name = str_id_to_string(*name);
+
+        let Some(func) = self.context.get_function(&lookup_name) else {
+            self.record(TypeErrorKind::UndefinedFunction(lookup_name));
+            return HirType::Unknown;
+        };
+
+        let declared_generics = func.generics.unwrap_or(&[]);
+
+        if type_args.len() > declared_generics.len() {
+            self.record(TypeErrorKind::Generic(format!(
+                "function `{}` expects at most {} generic argument(s), found {}",
+                lookup_name,
+                declared_generics.len(),
+                type_args.len(),
+            )));
+        }
+
+        // Explicit args first, then fill remaining generics from their defaults
+        // (same pattern check_call_expr uses for the `type_args: None` case).
+        let mut subs: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
+        for (g, a) in declared_generics.iter().zip(type_args.iter()) {
+            subs.insert(g.name, *a);
+        }
+        for g in declared_generics.iter().skip(type_args.len()) {
+            match g.default_type {
+                Some(def) => {
+                    let resolved = self.substitute_type_local(&def, &subs);
+                    subs.insert(g.name, resolved);
+                }
+                None => {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "function `{}` expects {} generic argument(s), found {}",
+                        lookup_name,
+                        declared_generics.len(),
+                        type_args.len(),
+                    )));
+                    break;
+                }
+            }
+        }
+
+        let param_types: Vec<HirType<'a, 'bump>> = func
+            .params
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| p.get_type().copied())
+            .map(|pt| {
+                if subs.is_empty() {
+                    pt
+                } else {
+                    self.substitute_type_local(&pt, &subs)
+                }
+            })
+            .collect();
+
+        let unsubstituted_ret = func.return_type.unwrap_or(HirType::Void);
+        let return_type = if subs.is_empty() {
+            unsubstituted_ret
+        } else {
+            self.substitute_type_local(&unsubstituted_ret, &subs)
+        };
+
+        // Record resolved instance args, same as the enum-init path does, so
+        // downstream passes (monomorphization) know which F/R/A this call site
+        // was instantiated with.
+        let full_args: Vec<HirType<'a, 'bump>> = declared_generics
+            .iter()
+            .map(|g| subs.get(&g.name).copied().unwrap_or(HirType::Unknown))
+            .collect();
+        self.record_instance_args(expr, &full_args);
+
+        HirType::Lambda {
+            params: self.context.bump.alloc_slice(&param_types),
+            return_type: self.context.bump.alloc_value(return_type),
+        }
     }
 
     pub fn check_slice_expr(
@@ -712,27 +905,46 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_ident_expr(&mut self, name: &StrId, span: &SourceSpan<'a>) -> HirType<'a, 'bump> {
         let var_name = str_id_to_string(*name);
-        let (symbol_id, ty) = match self.context.get_variable(&var_name) {
-            Some(ty) => ty,
-            None => {
-                self.record(TypeErrorKind::UndefinedVariable(var_name.clone()));
-                (SymbolId::Local(LocalSymbolId(u32::MAX)), HirType::Unknown)
-            }
-        };
-        self.check_ident_init_read(*name, &var_name, &ty);
-        self.point_locals_used
-            .entry(self.current_point)
-            .or_default()
-            .insert(*name);
-        self.occurrences.push((
-            *span,
-            *name,
-            ty,
-            self.context.current_module_idx,
-            symbol_id,
-            false,
-        ));
-        ty
+
+        if let Some((symbol_id, ty)) = self.context.get_variable(&var_name) {
+            self.check_ident_init_read(*name, &var_name, &ty);
+            self.point_locals_used
+                .entry(self.current_point)
+                .or_default()
+                .insert(*name);
+            self.occurrences.push((
+                *span,
+                *name,
+                ty,
+                self.context.current_module_idx,
+                symbol_id,
+                false,
+            ));
+            return ty;
+        }
+
+        // Not a local: a bare identifier can also name a top-level function used
+        // as a value (a function pointer) rather than called directly.
+        if let Some(func) = self.context.get_function(&var_name) {
+            let param_types: Vec<HirType<'a, 'bump>> = func
+                .params
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|p| p.get_type().copied())
+                .collect();
+            let ty = HirType::Lambda {
+                params: self.context.bump.alloc_slice(&param_types),
+                return_type: self
+                    .context
+                    .bump
+                    .alloc_value(func.return_type.unwrap_or(HirType::Void)),
+            };
+            self.record_item_occurrence(*span, *name, ty, func.declaring_module_idx);
+            return ty;
+        }
+
+        self.record(TypeErrorKind::UndefinedVariable(var_name.clone()));
+        HirType::Unknown
     }
 
     pub fn check_zeroed_value(&mut self, ty: &HirType<'a, 'bump>) -> HirType<'a, 'bump> {
@@ -1292,19 +1504,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let ok = match (source, target) {
             (s, t) if self.is_numeric(s) && self.is_numeric(t) => true,
-
             (HirType::Boolean, t) if self.is_numeric(t) => true,
+
+            (
+                HirType::Lambda { .. },
+                HirType::SafePointer { inner: dst, .. } | HirType::UnsafePointer { inner: dst, .. },
+            ) if is_void(dst) => true,
 
             (
                 HirType::SafePointer { inner: src, .. },
                 HirType::UnsafePointer { inner: dst, .. },
             ) => pointee_compatible(src, dst),
-
             (
                 HirType::UnsafePointer { inner: src, .. },
                 HirType::SafePointer { inner: dst, .. },
             ) => pointee_compatible(src, dst),
-
             (HirType::SafePointer { inner: src, .. }, HirType::SafePointer { inner: dst, .. })
             | (
                 HirType::UnsafePointer { inner: src, .. },
@@ -1314,33 +1528,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             (HirType::Slice(src), HirType::SafePointer { inner: dst, .. }) => {
                 pointee_compatible(src, dst)
             }
-
             (HirType::Slice(src), HirType::UnsafePointer { inner: dst, .. }) => {
                 pointee_compatible(src, dst)
             }
-
             (HirType::Array(src, _), HirType::SafePointer { inner: dst, .. }) => {
                 pointee_compatible(src, dst)
             }
-
             (HirType::Array(src, _), HirType::UnsafePointer { inner: dst, .. }) => {
                 pointee_compatible(src, dst)
             }
 
             (
                 HirType::OwnedPointer { inner: owned, .. },
-                HirType::SafePointer { inner: dst, .. },
+                HirType::SafePointer { inner: dst, .. } | HirType::UnsafePointer { inner: dst, .. },
             ) => match owned {
                 HirType::Slice(src) => pointee_compatible(src, dst),
-                _ => is_void(dst),
-            },
-
-            (
-                HirType::OwnedPointer { inner: owned, .. },
-                HirType::UnsafePointer { inner: dst, .. },
-            ) => match owned {
-                HirType::Slice(src) => pointee_compatible(src, dst),
-                _ => is_void(dst),
+                _ => pointee_compatible(owned, dst),
             },
 
             (s, t) if is_ptr(s) && self.is_integer(t) => true,

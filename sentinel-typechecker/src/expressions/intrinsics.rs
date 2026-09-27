@@ -168,10 +168,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 if args.is_empty() || args.len() > 4 {
                     self.record(TypeErrorKind::Generic(format!(
-                "$own expects 1 argument (ptr), 2 (ptr, allocator or len), 3 (ptr, allocator, len), \
+                        "$own expects 1 argument (ptr), 2 (ptr, allocator or len), 3 (ptr, allocator, len), \
                          or 4 (ptr, allocator, len, cap) for owned slices, found {}",
-                args.len()
-            )));
+                         args.len()
+                    )));
                     return HirType::Unknown;
                 }
 
@@ -207,31 +207,41 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 let allocator = if let Some(alloc_expr) = alloc_arg {
                     let alloc_ty = self.check_expr(alloc_expr);
-                    self.check_and_record_value_use(alloc_expr, &alloc_ty);
                     let Some(allocator) = self.infer_provenance(alloc_expr) else {
                         self.record(TypeErrorKind::Generic(
-                    "$own's allocator argument must be a place with stable provenance (a global, `this`, a param, or a projection through them)".to_string(),
-                ));
+                            "$own's allocator argument must be a place with stable provenance (a global, `this`, a param, or a projection through them)".to_string(),
+                        ));
                         return HirType::Unknown;
                     };
 
-                    let alloc_struct_name = match Self::strip_ref(&alloc_ty) {
-                        HirType::Struct { name, .. } => str_id_to_string(*name),
-                        _ => {
-                            self.record(TypeErrorKind::Generic(
-                        "$own's allocator argument must be a struct implementing RawAllocator".to_string(),
-                    ));
-                            return HirType::Unknown;
+                    let satisfies_allocator = match Self::strip_ref(&alloc_ty) {
+                        HirType::Struct { name, .. } => {
+                            let struct_name = str_id_to_string(*name);
+                            self.context.struct_implements(&struct_name, "RawAllocator")
+                                || self.context.struct_implements(&struct_name, "Allocator")
                         }
+                        HirType::Generic(param_name) => self
+                            .current_fn
+                            .and_then(|fname| self.context.get_function(&str_id_to_string(fname)))
+                            .and_then(|f| f.generics)
+                            .and_then(|gs| gs.iter().find(|g| g.name == *param_name))
+                            .is_some_and(|g| {
+                                g.constraints.iter().any(|c| matches!(
+                                    c,
+                                    HirType::DynInterface(iface, _)
+                                        if iface.as_str() == "RawAllocator" || iface.as_str() == "Allocator"
+                                ))
+                            }),
+                        _ => false,
                     };
-                    if !self
-                        .context
-                        .struct_implements(&alloc_struct_name, "RawAllocator")
-                    {
+
+                    if !satisfies_allocator {
                         self.record(TypeErrorKind::Generic(format!(
-                            "`{}` does not implement `RawAllocator`",
-                            alloc_struct_name
+                            "$own's allocator argument must be a struct or generic type parameter implementing \
+                             `RawAllocator` or `Allocator`, found `{}`",
+                            type_to_string(&alloc_ty)
                         )));
+                        return HirType::Unknown;
                     }
 
                     if !matches!(allocator.root, ProvenanceRoot::Global { .. }) {

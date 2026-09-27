@@ -11,7 +11,7 @@ use crate::type_context::TypeContext;
 use codex_dependency_graph::DepGraph;
 use ir::analysis_context::CopyAnalysisCtx;
 use ir::auto_imports::AutoImportRegistry;
-use ir::borrow_checker::{BorrowChecker, LoanId, PlaceId, ReadTemplate, RefTemplate};
+use ir::borrow_checker::{BorrowChecker, LoanId, PlaceId, ProvenanceId, ReadTemplate, RefTemplate};
 use ir::errors::type_error::{TypeCheckResult, TypeError, TypeErrorKind};
 use ir::hir::{
     Hir, HirExpr, HirFunc, HirModule, HirParam, HirStmt, HirType, RefKind, StrId, ThisPassingKind,
@@ -108,6 +108,12 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) fn_closure_constraints: FxHashMap<StrId, HirType<'a, 'bump>>,
     pub(crate) closure_pre_subs: FxHashMap<StrId, HirType<'a, 'bump>>,
     pub(crate) closure_generic_subs: FxHashMap<StrId, HirType<'a, 'bump>>,
+    pub local_provenance: FxHashMap<StrId, ProvenanceId>,
+    pub(crate) current_fn: Option<StrId>,
+    pub(crate) fn_invalidates: FxHashMap<StrId, Vec<Vec<StrId>>>, // paths relative to `this`
+    pub(crate) fn_this_calls: FxHashMap<StrId, Vec<StrId>>,
+    pub(crate) invalidated_provenances: FxHashMap<ProvenanceId, StrId>,
+    pub(crate) invalidation_cache: FxHashMap<(StrId, StrId), Vec<Vec<StrId>>>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -164,6 +170,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             fn_closure_constraints: FxHashMap::default(),
             closure_pre_subs: FxHashMap::default(),
             closure_generic_subs: FxHashMap::default(),
+            local_provenance: FxHashMap::default(),
+            current_fn: None,
+            fn_this_calls: FxHashMap::default(),
+            fn_invalidates: FxHashMap::default(),
+            invalidated_provenances: FxHashMap::default(),
+            invalidation_cache: FxHashMap::default(),
         }
     }
 
@@ -556,9 +568,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
         }
+        self.propagate_invalidations();
     }
 
     pub fn check_function(&mut self, func: &HirFunc<'a, 'bump>) {
+        self.current_fn = Some(func.name);
         let mut func_context = self.context.create_child_scope();
 
         self.fn_closure_constraints.clear();
@@ -574,8 +588,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
+        self.local_provenance.clear();
+        self.local_provenance_place.clear();
+        self.call_loans.clear();
+        self.invalidated_provenances.clear();
         self.borrow_checker = BorrowChecker::new();
         self.borrow_checker.begin_scope();
+
+        // These are all keyed by StrId (globally-interned identifier text), not by
+        // any per-function or per-scope discriminator. Without resetting them here,
+        // a local named `alloc` or `slot` in one function leaks its move/init/
+        // non-null/ref-kind status into every other function with a same-named
+        // local or parameter, checked afterward in the same compilation unit.
+        self.move_state = MoveState::new();
+        self.init_state = FxHashMap::default();
+        self.non_null_state = FxHashMap::default();
+        self.local_ref_kind = FxHashMap::default();
 
         if let Some(params) = func.params {
             for param in params.iter() {
@@ -669,6 +697,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.check_return_provenance(func);
 
         self.borrow_checker.end_scope();
+        self.current_fn = None;
     }
 
     pub fn this_type_for_func(&self, func: &HirFunc<'a, 'bump>) -> HirType<'a, 'bump> {
@@ -801,6 +830,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expected: &HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
         match expr {
+            HirExpr::Call {
+                callee,
+                args,
+                span,
+                type_args,
+            } => self.check_call_expr(expr, callee, args, span, type_args, Some(expected)),
             HirExpr::Number(_, span) if self.is_integer(expected) => {
                 self.set_span(*span);
                 *expected
@@ -824,6 +859,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.undefined_backfill
                     .insert(Self::expr_key(expr), *expected);
                 *expected
+            }
+            HirExpr::StructInit {
+                name,
+                args,
+                type_args,
+                span,
+            } => {
+                self.set_span(*span);
+                self.check_struct_init_expr(name, args, type_args, Some(expected))
             }
             HirExpr::Uninit {
                 span,
@@ -1112,7 +1156,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 args,
                 span,
                 type_args,
-            } => self.check_call_expr(expr, callee, args, span, type_args),
+            } => self.check_call_expr(expr, callee, args, span, type_args, None),
             HirExpr::FieldAccess {
                 object,
                 field,
@@ -1128,7 +1172,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 type_args,
             } => {
                 self.set_span(*span);
-                self.check_struct_init_expr(name, args, type_args)
+                self.check_struct_init_expr(name, args, type_args, None)
             }
             HirExpr::InterfaceCall {
                 callee,
@@ -1230,7 +1274,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 self.check_array_literal_expr(elements)
             }
-            HirExpr::GenericIdent(..) => todo!(),
+            HirExpr::GenericIdent(name, type_args, span) => {
+                self.set_span(*span);
+                self.check_generic_ident_expr(expr, name, type_args)
+            }
             HirExpr::Cast {
                 expr,
                 target_type,

@@ -1,6 +1,7 @@
 use ir::{
+    ast::MutabilityState,
     errors::type_error::{TypeCheckResult, TypeErrorKind},
-    hir::{HirExpr, HirType},
+    hir::{HirExpr, HirType, RefKind},
 };
 
 use crate::{
@@ -175,6 +176,39 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
+        if let (HirType::OwnedPointer { inner: ei, .. }, HirType::OwnedPointer { inner: fi, .. }) =
+            (expected, found)
+        {
+            if self.types_structurally_equal(ei, fi) {
+                return Ok(());
+            }
+        }
+
+        if let (
+            HirType::Ref {
+                inner: ri,
+                ref_kind,
+                ..
+            },
+            HirType::SafePointer {
+                inner: pi,
+                mutability_state,
+            }
+            | HirType::UnsafePointer {
+                inner: pi,
+                mutability_state,
+            },
+        ) = (found, expected)
+        {
+            let mutability_ok = match ref_kind {
+                RefKind::Unique | RefKind::Alias => true,
+                RefKind::Shared => *mutability_state == MutabilityState::Const,
+            };
+            if mutability_ok && self.types_structurally_equal(ri, pi) {
+                return Ok(());
+            }
+        }
+
         if let (
             HirType::Ref {
                 inner: ei,
@@ -207,10 +241,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
-        if let HirType::Nullable(_) = expected {
-            if found == &HirType::Null {
-                return Ok(());
+        match expected {
+            HirType::UnsafePointer { .. } | HirType::Nullable(_) => {
+                if found == &HirType::Null {
+                    return Ok(());
+                }
             }
+            _ => {}
         }
 
         Err(TypeErrorKind::TypeMismatch {

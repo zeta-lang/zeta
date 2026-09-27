@@ -27,14 +27,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut arm_types = Vec::with_capacity(arms.len());
         let mut arm_move_states = Vec::with_capacity(arms.len());
 
+        let inval_before = self.invalidated_provenances.clone();
+        let mut inval_after = inval_before.clone();
         for arm in arms {
+            self.invalidated_provenances = inval_before.clone();
             let (arm_type, arm_move_state) =
                 self.check_match_arm(expr, arm, &scrutinee_ty, expected, &move_state_before);
+            if !matches!(arm_type, HirType::Never) {
+                inval_after.extend(self.invalidated_provenances.drain());
+            }
 
             arm_types.push(arm_type);
             arm_move_states.push(arm_move_state);
         }
 
+        self.invalidated_provenances = inval_after;
         self.move_state = arm_move_states
             .into_iter()
             .fold(move_state_before, |acc, state| {
@@ -227,16 +234,32 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.check_if_condition(cond);
 
         let move_state_before = self.move_state.clone();
+        let inval_before = self.invalidated_provenances.clone();
         let non_null_before = self.non_null_state.clone();
 
         let then_value = self.check_if_then_branch(cond, then_block, expected);
+        let then_inval = self.invalidated_provenances.clone();
         let then_move_state = self.move_state.clone();
         let then_non_null = self.non_null_state.clone();
         let then_diverges = matches!(then_value, HirType::Never);
 
         self.restore_state_for_else_branch(cond, &move_state_before, &non_null_before);
 
+        self.invalidated_provenances = inval_before;
         let else_value = self.check_if_else_branch(cond, else_block, expected);
+        let else_inval = std::mem::take(&mut self.invalidated_provenances);
+        let else_diverges = else_value
+            .as_ref()
+            .is_some_and(|t| matches!(t, HirType::Never));
+        self.invalidated_provenances = match (then_diverges, else_diverges) {
+            (true, false) => else_inval,
+            (false, true) => then_inval,
+            _ => {
+                let mut u = then_inval;
+                u.extend(else_inval);
+                u
+            }
+        };
         let else_move_state = self.move_state.clone();
         let else_non_null = self.non_null_state.clone();
 
@@ -258,6 +281,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let snap = self.snapshot_call_loan_keys();
         let cond_type = self.check_expr(cond);
         self.end_temp_call_loans(&snap);
+        self.end_temp_closure_loans(&snap);
 
         if cond_type != HirType::Boolean {
             self.record(TypeErrorKind::TypeMismatch {

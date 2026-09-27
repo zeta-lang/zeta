@@ -8,8 +8,9 @@ use ir::{
 };
 
 use crate::{
+    initialization::BareImportKind,
     naming::{str_id_to_string, type_to_string},
-    type_checker::SLICE_PRIMITIVES,
+    type_checker::{SymbolId, SLICE_PRIMITIVES},
     TypeChecker,
 };
 
@@ -175,6 +176,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let write_template: Option<Vec<bool>> = callee.map(|f| self.analyze_definite_writes(&f));
         let read_template: Option<Vec<ReadTemplate>> =
             callee.map(|f| self.analyze_read_templates(&f));
+        // An extern declaration (`extern "C" func ...;`) has no body to analyze, so the
+        // write/read templates above are empty for it. The call is already inside `unsafe`,
+        // so trust a mutable/alias pointer argument to be written through the FFI boundary
+        // rather than demanding proof we structurally can't produce.
+        let is_extern_no_body = callee.map(|f| f.body.is_none()).unwrap_or(false);
 
         for (i, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
             let param_type = param.get_type();
@@ -214,6 +220,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             write_template.as_deref(),
                             read_template.as_deref(),
                             i,
+                            is_extern_no_body,
                         );
                     let arg_type = self.check_ref_expr_deferring_init(
                         expr,
@@ -259,6 +266,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     write_template.as_deref(),
                     read_template.as_deref(),
                     i,
+                    is_extern_no_body,
                 );
                 let arg_type =
                     self.check_ref_expr_deferring_init(expr, *rk, *span, true, ignores_init);
@@ -298,7 +306,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         write_template: Option<&[bool]>,
         read_template: Option<&[ReadTemplate]>,
         i: usize,
+        is_extern_no_body: bool,
     ) -> bool {
+        if is_extern_no_body {
+            return true;
+        }
         let definitely_written = write_template
             .and_then(|t| t.get(i))
             .copied()
@@ -390,6 +402,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         args: &&[HirExpr<'a, 'bump>],
         span: &SourceSpan<'a>,
         type_args: &Option<&[HirType<'a, 'bump>]>,
+        expected: Option<&HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
         match &callee {
             HirExpr::Ident(func_name, ident_span) => {
@@ -399,7 +412,23 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if self.context.is_local_binding(&lookup_name) {
                     let callee_type = self.check_expr(callee);
                     return match callee_type {
-                        HirType::Lambda { return_type, .. } => *return_type,
+                        HirType::Lambda {
+                            params,
+                            return_type,
+                        } => {
+                            if args.len() != params.len() {
+                                self.record(TypeErrorKind::InvalidFunctionCall {
+                                    expected_args: params.len(),
+                                    found_args: args.len(),
+                                });
+                            }
+                            for (arg, pt) in args.iter().zip(params.iter()) {
+                                let arg_type = self.check_expr_expected(arg, pt);
+                                self.check_and_record_value_use(arg, &arg_type);
+                                self.recover(self.types_compatible(pt, &arg_type), ());
+                            }
+                            *return_type
+                        }
                         HirType::Generic(g) if self.fn_closure_constraints.contains_key(&g) => {
                             self.check_closure_call(g, args)
                         }
@@ -502,9 +531,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                 };
 
-                if let Some(params) = func.params {
-                    substitutions.extend(self.pre_infer_generics(Some(&func), args, params));
+                if let Some(exp) = expected {
+                    if let Some(ret) = func.return_type {
+                        self.unify_generic(&ret, exp, &mut substitutions);
+                    }
                 }
+                if let Some(params) = func.params {
+                    for (k, v) in self.pre_infer_generics(Some(&func), args, params) {
+                        substitutions.entry(k).or_insert(v);
+                    }
+                }
+
                 self.closure_pre_subs = substitutions.clone();
                 self.closure_generic_subs.clear();
 
@@ -547,7 +584,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 };
 
                 if let Some(value) =
-                    self.check_potential_this_param_for_move(args, func, params, ret_ty)
+                    self.check_potential_this_param_for_move(expr, args, func, params, ret_ty)
                 {
                     return value;
                 }
@@ -602,6 +639,79 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let name = field.as_str();
                     if SLICE_PRIMITIVES.contains(&name) {
                         return self.check_slice_primitive_call(object, elem, name, args);
+                    }
+                }
+
+                if let HirType::Struct {
+                    name: struct_name,
+                    type_args,
+                    ..
+                } = *stripped
+                {
+                    let struct_name_str = str_id_to_string(struct_name);
+                    if let Some(struct_def) = self.context.get_struct(&struct_name_str) {
+                        if let Some(field_idx) =
+                            struct_def.fields.iter().position(|f| f.name == *field)
+                        {
+                            let field_ty = if type_args.is_empty() {
+                                struct_def.fields[field_idx].field_type
+                            } else {
+                                self.instantiate_struct(struct_name, type_args)
+                                    .map(|fields| fields[field_idx])
+                                    .unwrap_or(struct_def.fields[field_idx].field_type)
+                            };
+
+                            let callable = match field_ty {
+                                HirType::Lambda {
+                                    params,
+                                    return_type,
+                                } => Some((params, return_type)),
+                                HirType::Generic(g) => {
+                                    self.fn_closure_constraints.get(&g).copied().and_then(|c| {
+                                        match c {
+                                            HirType::Lambda {
+                                                params,
+                                                return_type,
+                                            } => Some((params, return_type)),
+                                            _ => None,
+                                        }
+                                    })
+                                }
+                                _ => None,
+                            };
+
+                            if let Some((params, return_type)) = callable {
+                                self.check_bare_name_import(
+                                    self.context.struct_owner(&struct_name_str),
+                                    struct_name,
+                                    &struct_name_str,
+                                    BareImportKind::Struct,
+                                );
+                                self.occurrences.push((
+                                    *span,
+                                    *field,
+                                    field_ty,
+                                    self.context.current_module_idx,
+                                    SymbolId::Field {
+                                        struct_name,
+                                        field_name: *field,
+                                    },
+                                    false,
+                                ));
+                                if args.len() != params.len() {
+                                    self.record(TypeErrorKind::InvalidFunctionCall {
+                                        expected_args: params.len(),
+                                        found_args: args.len(),
+                                    });
+                                }
+                                for (arg, pt) in args.iter().zip(params.iter()) {
+                                    let arg_type = self.check_expr_expected(arg, pt);
+                                    self.check_and_record_value_use(arg, &arg_type);
+                                    self.recover(self.types_compatible(pt, &arg_type), ());
+                                }
+                                return *return_type;
+                            }
+                        }
                     }
                 }
 
@@ -670,6 +780,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                     (),
                                 );
                             }
+                            self.check_receiver_ref_kind(object, kind, field.as_str());
 
                             if let (ThisPassingKind::MultiPlace, Some(accesses)) =
                                 (kind, multi_place)
@@ -732,8 +843,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     HirType::Struct { type_args, .. } => type_args,
                     _ => &[],
                 };
-                let method_subs =
+                let mut method_subs =
                     self.generic_substitutions_for_struct(struct_name_id, struct_type_args);
+
+                if let Some(exp) = expected {
+                    if let Some(ret) = func.return_type {
+                        self.unify_generic(&ret, exp, &mut method_subs);
+                    }
+                }
+                if let Some(params) = func.params {
+                    let normal_params: &[HirParam<'a, 'bump>] = params.get(1..).unwrap_or(&[]);
+                    for (k, v) in self.pre_infer_generics(Some(&func), args, normal_params) {
+                        method_subs.entry(k).or_insert(v);
+                    }
+                }
 
                 let unsubstituted_ret_ty = func.return_type.unwrap_or(HirType::Void);
                 let ret_ty = if method_subs.is_empty() {
@@ -772,6 +895,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 (),
                             );
                         }
+
+                        self.check_receiver_ref_kind(object, kind, field.as_str());
 
                         if let (ThisPassingKind::MultiPlace, Some(accesses)) = (kind, multi_place) {
                             receiver_multi_place_loans =
@@ -829,14 +954,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                     let arg_loans = self.check_all_func_args(args, normal_params, None, Some(func));
 
-                    if let Some(loan_id) =
-                        self.finalize_call_loans(Some(object), args, arg_loans, &ret_ty, template)
-                    {
+                    let loan =
+                        self.finalize_call_loans(Some(object), args, arg_loans, &ret_ty, template);
+
+                    if let Some(loan_id) = loan {
                         self.call_loans.insert(Self::expr_key(expr), loan_id);
-                        for loan in receiver_multi_place_loans {
-                            self.borrow_checker.end_loan_now(loan);
-                        }
                     }
+
+                    for l in receiver_multi_place_loans {
+                        self.borrow_checker.end_loan_now(l);
+                    }
+
+                    self.apply_call_invalidations(object, struct_name_id, &func);
                 }
 
                 ret_ty
