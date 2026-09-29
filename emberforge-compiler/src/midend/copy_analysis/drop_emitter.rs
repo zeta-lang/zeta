@@ -1,11 +1,12 @@
 use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::DropMoveState;
 use crate::midend::ir::block_data::CurrentBlockData;
+use crate::midend::ir::mir_lowering::lowerer::fun_name;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
 use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::HashMap;
+use ir::ir_hasher::{FxHashMap, HashMap};
 use ir::layout::{Layout, TargetInfo, layout_of_ssa, sizeof_ssa};
 use ir::span::SourceSpan;
 use ir::ssa_ir::{
@@ -13,6 +14,7 @@ use ir::ssa_ir::{
 };
 use smallvec::SmallVec;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
@@ -271,6 +273,8 @@ pub struct DropEmitter<'x, 'a, 'bump, 'f> {
     pub enums: &'x HashMap<StrId, HirEnum<'a, 'bump>>,
     pub allocator_kind: &'x HashMap<StrId, AllocatorKind>,
     pub glue_registry: &'x DropGlueRegistry,
+    pub instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+    pub instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
 }
 
 impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
@@ -283,6 +287,8 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         enums: &'x HashMap<StrId, HirEnum<'a, 'bump>>,
         allocator_kind: &'x HashMap<StrId, AllocatorKind>,
         glue_registry: &'x DropGlueRegistry,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     ) -> Self {
         Self {
             current_block_data,
@@ -293,6 +299,8 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             enums,
             allocator_kind,
             glue_registry,
+            instantiated_functions,
+            instantiated_struct_methods,
         }
     }
 
@@ -396,13 +404,8 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
     ) -> (Value, SsaType, Option<StrId>) {
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
             Some(SsaType::User(name, _)) => *name,
-            Some(SsaType::Pointer(inner)) => match inner.as_ref() {
-                SsaType::User(name, _) => *name,
-                other => panic!(
-                    "[field_addr_on_value] pointer to non-User type: {:?}",
-                    other
-                ),
-            },
+            Some(SsaType::Pointer(inner)) => fun_name(inner),
+            Some(SsaType::Owned(inner)) => fun_name(inner),
             other => panic!(
                 "[field_addr_on_value] could not determine struct type: {:?}",
                 other
@@ -488,16 +491,30 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         method_name: &str,
         ty: &HirType,
     ) -> StrId {
-        let base = self.mangled_method_name(struct_name, method_name);
-        let suffix = type_suffix_with_pool(self.context.clone(), ty);
-        let (base_s, suffix_s) = (base.as_str(), suffix.as_str());
+        let method_id = StrId(self.context.intern(method_name));
 
-        // The map may already hold the instantiated name; don't suffix twice.
+        let from_instantiated = self
+            .instantiated_struct_methods
+            .borrow()
+            .get(&struct_name)
+            .and_then(|m| m.get(&method_id))
+            .copied();
+
+        let base =
+            from_instantiated.unwrap_or_else(|| self.mangled_method_name(struct_name, method_name));
+
+        let suffix = type_suffix_with_pool(self.context.clone(), ty);
+
+        if let Some(&concrete) = self.instantiated_functions.borrow().get(&(base, suffix)) {
+            return concrete;
+        }
+
+        let (base_s, suffix_s) = (base.as_str(), suffix.as_str());
         if base_s.ends_with(suffix_s) {
             return base;
         }
-        // Match monomorphize_function, which joins with '_'.
-        StrId(intern_fmt!(self.context, "{}_{}", base_s, suffix_s))
+        let final_name = StrId(intern_fmt!(self.context, "{}_{}", base_s, suffix_s));
+        final_name
     }
 
     pub fn struct_name_of_value(&self, v: Value) -> Option<StrId> {
