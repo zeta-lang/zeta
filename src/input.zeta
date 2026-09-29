@@ -1,7 +1,7 @@
 package input;
 
 import zeta::io;
-import zeta::thread::threads;
+import zeta::thread::threads; // threads.spawn
 import zeta::thread::threads.Thread;
 import zeta::thread::threads.JoinHandle;
 import zeta::file.FileWriter;
@@ -1457,11 +1457,11 @@ func main(): i64 {
         return status;
     }
 
-    // status = thread_tests();
-    // if (status != 0) {
-    //     io.stdout().writeln("[FAIL] thread_tests");
-    //     return status;
-    // }
+    status = thread_tests();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] thread_tests");
+        return status;
+    }
 
     io.stdout().writeln("");
     io.stdout().writeln("========================================");
