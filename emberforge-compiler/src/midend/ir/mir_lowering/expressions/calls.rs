@@ -273,17 +273,6 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .as_ref()
             .and_then(|ty| self.resolve_receiver_target_key(ty));
 
-        if let Some(cls) = cls_name_id {
-            eprintln!(
-                "[lower_call?] cls={} field={} resolved_via_struct_mangled_map={:?}",
-                cls,
-                field,
-                self.struct_mangled_map
-                    .get(&cls)
-                    .and_then(|m| m.get(&field))
-            );
-        }
-
         if let Some(cls_name) = cls_name_id {
             let field_ty: Option<SsaType> = self
                 .structs
