@@ -56,6 +56,7 @@ pub struct Compiler<'a, 'bump> {
     #[allow(unused)] // Avoids a UB
     lowerer_bump: Box<GrowableBump<'bump>>,
     source_roots: Vec<PathBuf>,
+    env_structs: FxHashMap<StrId, StrId>,
 }
 
 impl<'a, 'bump> Compiler<'a, 'bump>
@@ -115,6 +116,7 @@ where
             codegen_hir_modules: HashMap::default(),
             loaded_sources: HashMap::default(),
             source_roots: Vec::default(),
+            env_structs: FxHashMap::default(),
         })
     }
 
@@ -432,16 +434,20 @@ where
         let checked_hir = self.hir_modules[&module_idx];
 
         let hoister = LambdaHoister::new(
-            lowerer.ctx.bump, // was &lowerer.ctx.bump
+            lowerer.ctx.bump,
             self.pool.clone(),
             checked_hir.name,
             self.type_checker.borrow().closure_table().clone(),
+            module_idx,
         );
         let (hoisted_module, env_to_fn) = hoister.run(checked_hir);
 
+        self.env_structs
+            .extend(env_to_fn.iter().map(|(&k, &v)| (k, v)));
+
         let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            lowerer.ctx.bump, // was &lowerer.ctx.bump
+            lowerer.ctx.bump,
             self.registry.functions.clone(),
             &mut lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -964,7 +970,7 @@ where
             self.registry.instantiated_struct_origins.clone(),
             self.registry.instantiated_enums.clone(),
             self.registry.instantiated_enum_origins.clone(),
-            FxHashMap::default(),
+            self.env_structs.clone(),
         );
 
         monomorphizer.force_instantiate_allocator_frees();
@@ -991,7 +997,7 @@ where
             self.registry.instantiated_struct_origins.clone(),
             self.registry.instantiated_enums.clone(),
             self.registry.instantiated_enum_origins.clone(),
-            FxHashMap::default(),
+            self.env_structs.clone(),
         );
 
         monomorphizer.force_instantiate_drops();
