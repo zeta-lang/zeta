@@ -1721,13 +1721,15 @@ impl Backend for CraneliftBackend {
 
             let resolved_name = self.context.resolve_string(&*name);
 
-            let linkage = if matches!(
+            let has_body = !func.blocks.is_empty() && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
+            let is_extern_abi = matches!(
                 func.function_metadata.extern_modifier,
                 ExternModifier::Abi(_)
-            ) {
-                Linkage::Import
-            } else {
-                Linkage::Local
+            );
+            let linkage = match (is_extern_abi, has_body) {
+                (true, false) => Linkage::Import,
+                (true, true) => Linkage::Export,
+                (false, _) => Linkage::Local,
             };
 
             let (actual_name, linkage) = if resolved_name == "main" && !self.main_emitted {
@@ -1758,7 +1760,12 @@ impl Backend for CraneliftBackend {
             if func.name.eq("main") && !self.func_ids.contains_key(&func.name) {
                 continue;
             }
-            if let ExternModifier::Abi(_) = func.function_metadata.extern_modifier {
+            let has_body = !func.blocks.is_empty() && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
+            let is_true_extern = matches!(
+                func.function_metadata.extern_modifier,
+                ExternModifier::Abi(_)
+            ) && !has_body;
+            if is_true_extern {
                 self.emit_extern(func);
             } else if !func.name.eq("main") {
                 self.emit_function(func);

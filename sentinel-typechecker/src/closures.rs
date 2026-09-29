@@ -134,7 +134,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    fn describe_path(&self, source: StrId, path: &[HirEffectSegment<'bump>]) -> String {
+    pub fn describe_path(&self, source: StrId, path: &[HirEffectSegment<'bump>]) -> String {
         let mut s = str_id_to_string(source);
         for seg in path {
             match seg {

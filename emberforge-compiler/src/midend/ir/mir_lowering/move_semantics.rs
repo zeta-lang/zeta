@@ -52,6 +52,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         expr: &HirExpr<'a, 'bump>,
     ) -> Option<hir::ProvenanceAnnotation<'bump>> {
         match expr {
+            HirExpr::Block { body, .. } => match body.last() {
+                Some(HirStmt::Expr(e)) => self.infer_allocator_from_expr(e),
+                _ => None,
+            },
             HirExpr::Intrinsic {
                 kind: IntrinsicKind::Own,
                 args,
@@ -333,6 +337,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         self.enums,
                         self.allocator_kind,
                         self.glue_registry,
+                        self.instantiated_functions.clone(),
+                        self.instantiated_struct_methods.clone(),
                     );
 
                     match &drop_kind {
@@ -559,6 +565,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.enums,
             self.allocator_kind,
             self.glue_registry,
+            self.instantiated_functions.clone(),
+            self.instantiated_struct_methods.clone(),
         );
         emitter.emit_owned_chain_field_drops(
             struct_name,
@@ -637,6 +645,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             kind: DropKind::Undroppable,
         });
 
+        if initialized {
+            return;
+        }
         let needs_flags = match rest {
             Some(r) => self.array_needs_flags(name, r),
             None => true,
@@ -681,9 +692,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 HirExpr::Binary { left, right, .. } | HirExpr::Comparison { left, right, .. } => {
                     expr_touches(name, left) || expr_touches(name, right)
                 }
-                HirExpr::Ref { expr, .. }
-                | HirExpr::Deref { expr, .. }
-                | HirExpr::Cast { expr, .. } => expr_touches(name, expr),
+                HirExpr::Ref { .. } => false,
+                HirExpr::Deref { expr, .. } | HirExpr::Cast { expr, .. } => {
+                    expr_touches(name, expr)
+                }
                 HirExpr::Slice {
                     object, start, end, ..
                 } => {
@@ -727,7 +739,6 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 _ => false,
             }
         }
-
         pub(super) fn stmt_touches(name: StrId, stmt: &HirStmt) -> bool {
             match stmt {
                 HirStmt::Expr(e) => expr_touches(name, e),
@@ -869,6 +880,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                                     self.enums,
                                     self.allocator_kind,
                                     self.glue_registry,
+                                    self.instantiated_functions.clone(),
+                                    self.instantiated_struct_methods.clone(),
                                 );
                                 emitter.emit_partial_struct_field_drops(
                                     name,
@@ -918,6 +931,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     self.enums,
                     self.allocator_kind,
                     self.glue_registry,
+                    self.instantiated_functions.clone(),
+                    self.instantiated_struct_methods.clone(),
                 );
                 emitter.emit_owned_pointer_drop(
                     local_name,
@@ -1109,6 +1124,18 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     }
 
     pub(super) fn emit_drops_for_return(&mut self, span: SourceSpan<'a>) {
+        for (i, scope) in self.scope_stack.iter().enumerate() {
+            for l in &scope.locals {
+                eprintln!(
+                    "[ret-drop] scope {} local {:?} kind {:?} whole_moved={} in_var_map={}",
+                    i,
+                    l.name,
+                    l.kind,
+                    self.drop_state.is_whole_moved(l.name),
+                    self.var_map.contains_key(&l.name),
+                );
+            }
+        }
         for scope in self.scope_stack.clone().iter().rev() {
             self.emit_scope_drops(scope, span);
         }
@@ -1285,6 +1312,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.enums,
             self.allocator_kind,
             self.glue_registry,
+            self.instantiated_functions.clone(),
+            self.instantiated_struct_methods.clone(),
         );
         emitter.emit_element_drop(drop_kind, addr, &mut resolver, span);
     }
@@ -1331,6 +1360,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     self.enums,
                     self.allocator_kind,
                     self.glue_registry,
+                    self.instantiated_functions.clone(),
+                    self.instantiated_struct_methods.clone(),
                 );
                 match &drop_kind {
                     DropKind::OwnedPointer {

@@ -17,8 +17,9 @@ pub struct LambdaHoister<'a, 'bump> {
     module_name: StrId,
     hoisted: Vec<Hir<'a, 'bump>>,
     closures: FxHashMap<usize, ClosureLowering<'a, 'bump>>,
-    capture_frames: Vec<Vec<(StrId, Vec<HirEffectSegment<'bump>>, HirExpr<'a, 'bump>)>>,
+    capture_frames: Vec<FxHashMap<(StrId, Vec<HirEffectSegment<'bump>>), HirExpr<'a, 'bump>>>,
     env_to_fn: FxHashMap<StrId, StrId>,
+    module_idx: usize,
 }
 
 impl<'a, 'bump> LambdaHoister<'a, 'bump> {
@@ -27,6 +28,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         context: Arc<StringPool>,
         module_name: StrId,
         closures: FxHashMap<usize, ClosureLowering<'a, 'bump>>,
+        module_idx: usize,
     ) -> Self {
         Self {
             bump,
@@ -37,6 +39,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             closures,
             capture_frames: Vec::new(),
             env_to_fn: FxHashMap::default(),
+            module_idx,
         }
     }
 
@@ -92,6 +95,9 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         let Some(body) = func.body else {
             return func;
         };
+        if self.closures.is_empty() {
+            return func;
+        }
         let new_body = self.rewrite_stmt(body);
         HirFunc {
             body: Some(new_body),
@@ -105,16 +111,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         path: &[HirEffectSegment<'bump>],
     ) -> Option<HirExpr<'a, 'bump>> {
         let frame = self.capture_frames.last()?;
-        frame
-            .iter()
-            .find(|(r, p, _)| {
-                *r == root
-                    && p.len() == path.len()
-                    && p.iter()
-                        .zip(path.iter())
-                        .all(|(a, b)| ir::hir::effect_segment_eq(a, b))
-            })
-            .map(|(_, _, repl)| *repl)
+        frame.get(&(root, path.to_vec())).copied()
     }
 
     fn rewrite_stmt(&mut self, stmt: HirStmt<'a, 'bump>) -> HirStmt<'a, 'bump> {
@@ -686,13 +683,13 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
     ) -> HirExpr<'a, 'bump> {
         let key = body as *const HirStmt<'a, 'bump> as usize;
 
-        let Some(closure) = self.closures.get(&key) else {
+        let Some(closure) = self.closures.remove(&key) else {
             return self.hoist_plain_lambda(params, return_type, body, span);
         };
-        let closure = closure.clone();
 
         let env_ident = StrId::from_static("__env");
-        let mut frame = Vec::with_capacity(closure.captures.len());
+        let mut frame: FxHashMap<(StrId, Vec<HirEffectSegment<'bump>>), HirExpr<'a, 'bump>> =
+            FxHashMap::with_capacity_and_hasher(closure.captures.len(), Default::default());
         for cap in &closure.captures {
             let field_access = HirExpr::FieldAccess {
                 object: self.bump.alloc_value(HirExpr::Ident(env_ident, span)),
@@ -706,7 +703,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     span,
                 },
             };
-            frame.push((cap.source, cap.source_path.to_vec(), access));
+            frame.insert((cap.source, cap.source_path.to_vec()), access);
         }
 
         self.capture_frames.push(frame);
@@ -751,7 +748,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             return_type: Some(closure.ret_ty),
             body: Some(rewritten_body),
             unmangled_name: closure.fn_name,
-            declaring_module_idx: 0,
+            declaring_module_idx: self.module_idx,
             impl_target: None,
             span,
         };
@@ -855,7 +852,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             return_type: Some(return_type),
             body: Some(inner_rewritten_body),
             unmangled_name: synthetic_name,
-            declaring_module_idx: 0,
+            declaring_module_idx: self.module_idx,
             impl_target: None,
             span,
         };
@@ -867,9 +864,13 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
     }
 
     fn fresh_lambda_name(&mut self) -> StrId {
-        let module_str = self.context.resolve_string(&self.module_name);
-        let name = format!("__lambda_{}_{}", module_str, self.counter);
+        let name = zetaruntime::intern_fmt!(
+            self.context,
+            "__lambda_{}_{}",
+            self.context.resolve_string(&self.module_name),
+            self.counter
+        );
         self.counter += 1;
-        StrId(self.context.intern(&name))
+        StrId(name)
     }
 }

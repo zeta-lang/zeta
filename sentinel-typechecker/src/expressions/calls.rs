@@ -404,6 +404,27 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         type_args: &Option<&[HirType<'a, 'bump>]>,
         expected: Option<&HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
+        if let HirExpr::FieldAccess { .. } = &**callee {
+            let fty = self.peek_type(callee);
+            if let HirType::Lambda {
+                params,
+                return_type,
+            } = *Self::strip_ref(&fty)
+            {
+                if args.len() != params.len() {
+                    self.record(TypeErrorKind::InvalidFunctionCall {
+                        expected_args: params.len(),
+                        found_args: args.len(),
+                    });
+                }
+                for (a, pt) in args.iter().zip(params.iter()) {
+                    let at = self.check_expr_expected(a, pt);
+                    self.recover(self.types_compatible(pt, &at), ());
+                }
+                return *return_type;
+            }
+        }
+
         match &callee {
             HirExpr::Ident(func_name, ident_span) => {
                 self.set_span(*ident_span);

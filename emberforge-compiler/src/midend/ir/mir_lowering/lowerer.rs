@@ -5,12 +5,13 @@ use crate::midend::ir::mir_lowering::LoopCtx;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, StrId};
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::{HashMap, HashSet};
+use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::ssa_ir::{
     AllocatorKind, BasicBlock, BlockId, Function, Instruction, Operand, SsaType, Value,
 };
 use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
@@ -70,6 +71,8 @@ pub struct FunctionLowerer<'f, 'a, 'bump> {
     pub(super) narrowed_fields: HashMap<(StrId, Vec<StrId>), Value>,
     pub(super) nullable_owned_locals: HashMap<StrId, HirType<'a, 'bump>>,
     pub(super) array_flags: HashMap<StrId, (Value, usize)>,
+    pub(super) instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+    pub(super) instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
 }
 
 impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump>
@@ -101,6 +104,8 @@ where
         module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
         constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -127,6 +132,8 @@ where
             module_import_aliases,
             module_named_imports,
             constants,
+            instantiated_functions,
+            instantiated_struct_methods,
         )
     }
 
@@ -155,6 +162,8 @@ where
         module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
         constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -181,6 +190,8 @@ where
             module_import_aliases,
             module_named_imports,
             constants,
+            instantiated_functions,
+            instantiated_struct_methods,
         )
     }
 
@@ -209,6 +220,8 @@ where
         module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
         constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     ) -> Result<Self, std::alloc::AllocError> {
         let mut var_map = HashMap::default();
         let mut value_types = HashMap::default();
@@ -286,6 +299,8 @@ where
             narrowed_fields: HashMap::default(),
             array_flags: HashMap::default(),
             nullable_owned_locals: HashMap::default(),
+            instantiated_functions,
+            instantiated_struct_methods,
         })
     }
 
@@ -358,9 +373,10 @@ where
                 value,
                 catch_pattern,
                 else_block,
+                span,
                 ..
             } => {
-                self.handle_let_stmt(rest, name, ty, value, catch_pattern, else_block);
+                self.handle_let_stmt(rest, name, ty, value, catch_pattern, else_block, *span);
             }
 
             HirStmt::Return(expr, span) => {

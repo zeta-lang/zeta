@@ -27,6 +27,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         value: &HirExpr<'a, 'bump>,
         catch_pattern: &Option<HirErrorHandlerPattern<'a, 'bump>>,
         else_block: &Option<&HirStmt<'a, 'bump>>,
+        span: SourceSpan<'a>,
     ) {
         self.record_move_if_any(value);
         let expected_ssa = lower_type_hir(ty, self.enums);
@@ -63,7 +64,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     panic!(
                         "owned-pointer local `{}` has no allocator annotation on its \
                                 declared type, and its initializer isn't a `$own(..)` call \
-                                the allocator can be recovered from",
+                                the allocator can be recovered from at {span}",
                         name
                     )
                 })

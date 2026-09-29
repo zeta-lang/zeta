@@ -6,7 +6,7 @@ use ir::hir::{
     ThisPassingKind,
 };
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::{HashMap, HashSet};
+use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::ssa_ir::{AllocatorKind, Function, Module, SsaType};
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -51,6 +51,8 @@ where
     module_import_aliases: HashMap<usize, HashMap<StrId, usize>>,
     module_named_imports: HashMap<usize, HashMap<StrId, usize>>,
     constants: HashMap<StrId, HirExpr<'a, 'bump>>,
+    instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+    instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
 }
 
 impl<'a, 'cx, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'bump, 'g>
@@ -65,6 +67,8 @@ where
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
         glue_registry: &'a DropGlueRegistry,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     ) -> Self {
         let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
@@ -105,6 +109,8 @@ where
             allocator_kind: HashMap::default(),
             glue_registry,
             bump: GrowableBump::new(4096, 8),
+            instantiated_functions,
+            instantiated_struct_methods,
         }
     }
 
@@ -189,11 +195,12 @@ where
                 match item {
                     Hir::Func(func) => match func.impl_target {
                         Some(struct_name) => {
-                            self.struct_mangled_map
-                                .entry(struct_name)
-                                .or_insert_with(|| HashMap::default())
-                                .insert(func.unmangled_name, func.name);
                             if func.generics.is_none() {
+                                let map = self
+                                    .struct_mangled_map
+                                    .entry(struct_name)
+                                    .or_insert_with(|| HashMap::default());
+                                map.insert(func.unmangled_name, func.name);
                                 self.register_method_signature(func);
                             }
                         }
@@ -222,11 +229,12 @@ where
                     Hir::Impl(impl_block) => {
                         if let Some(methods) = impl_block.methods {
                             for method in methods {
-                                self.struct_mangled_map
-                                    .entry(impl_block.target)
-                                    .or_insert_with(|| HashMap::default())
-                                    .insert(method.unmangled_name, method.name);
                                 if method.generics.is_none() && impl_block.generics.is_none() {
+                                    let map = self
+                                        .struct_mangled_map
+                                        .entry(impl_block.target)
+                                        .or_insert_with(|| HashMap::default());
+                                    map.insert(method.unmangled_name, method.name);
                                     self.register_method_signature(method);
                                 }
                             }
@@ -266,6 +274,9 @@ where
             &self.allocator_kind,
             self.context.clone(),
             &owned_structs,
+            self.instantiated_functions.clone(),
+            self.instantiated_struct_methods.clone(),
+            &self.bump,
         ) {
             self.module.functions.insert(name, func);
         }
@@ -543,6 +554,8 @@ where
             &self.module_import_aliases,
             &self.module_named_imports,
             &self.constants,
+            self.instantiated_functions.clone(),
+            self.instantiated_struct_methods.clone(),
         )
         .unwrap();
         fl.lower_body(hir_fn.body);

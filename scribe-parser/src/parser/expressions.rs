@@ -170,8 +170,6 @@ where
                                 span,
                             };
                         } else {
-                            // A generic value referenced on its own — e.g. turbofished so it can be
-                            // cast to a function-pointer type: `invoke_impl<F, R, A> as func(..): void`.
                             let Expr::Ident { name, span } = *callee else {
                                 let token = self.cursor.peek_token();
                                 return Err(DiagnosticError::new(
@@ -428,10 +426,6 @@ where
                 | TokenKind::LBrace
                 | TokenKind::Dot
                 | TokenKind::ColonColon
-                // A generic value used on its own, not called or struct-inited —
-                // e.g. turbofished so it can be cast to a fn-pointer type:
-                // `invoke_impl<F, R, A> as func(..): void`, or passed/stored as
-                // a value: `f: invoke_impl<F, R, A>`.
                 | TokenKind::As
                 | TokenKind::Comma
                 | TokenKind::Semicolon

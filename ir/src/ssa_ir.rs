@@ -15,6 +15,11 @@ impl SsaType {
         matches!(self, SsaType::Pointer(_) | SsaType::Owned(_))
     }
 
+    /// Anything that lives in a pointer-sized register.
+    pub fn is_pointer_like(&self) -> bool {
+        self.is_pointer() || matches!(self, SsaType::FuncPointer { .. })
+    }
+
     pub fn as_pointer(&self) -> Option<&SsaType> {
         match self {
             SsaType::Pointer(inner) | SsaType::Owned(inner) => Some(inner),
@@ -651,15 +656,13 @@ pub fn cast_kind(src: &SsaType, dst: &SsaType) -> CastKind {
         return if db > sb { FloatExtend } else { FloatTruncate };
     }
 
-    if src.is_pointer() && dst.is_pointer() {
+    if src.is_pointer_like() && dst.is_pointer_like() {
         return Bitcast;
     }
-
-    if src.is_pointer() && dst.is_integer() {
+    if src.is_pointer_like() && dst.is_integer() {
         return PtrToInt;
     }
-
-    if src.is_integer() && dst.is_pointer() {
+    if src.is_integer() && dst.is_pointer_like() {
         return IntToPtr;
     }
 

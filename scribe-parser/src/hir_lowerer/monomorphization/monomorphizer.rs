@@ -15,6 +15,12 @@ use ir::hir::{Hir, HirFunc, HirModule, HirParam, HirType, StrId};
 use ir::ir_hasher::FxHashMap;
 use zetaruntime::string_pool::StringPool;
 
+pub(crate) struct FnScope<'a, 'bump> {
+    variables: FxHashMap<StrId, HirType<'a, 'bump>>,
+    params: FxHashMap<StrId, HirType<'a, 'bump>>,
+    ret: Option<HirType<'a, 'bump>>,
+}
+
 pub struct Monomorphizer<'a, 'bump, 'ctx> {
     pub(crate) instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     pub(crate) instantiated_structs: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
@@ -99,6 +105,15 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let mut new_items: Vec<Hir<'a, 'bump>> = Vec::with_capacity(module.items.len());
 
         for item in module.items {
+            if let Hir::Func(f) = item {
+                let mut functions = self.functions.borrow_mut();
+                if !functions.contains_key(&f.name) {
+                    functions.insert(f.name, (**f).clone());
+                }
+            }
+        }
+
+        for item in module.items {
             match item {
                 Hir::Func(f) => {
                     let mut new_func = (*f).clone();
@@ -107,12 +122,19 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             let prev_module_idx = self.ctx.module_idx;
                             self.ctx.module_idx = f.declaring_module_idx;
 
-                            let prev_return_type =
-                                self.current_return_type.replace(new_func.return_type);
-                            let new_body = self.monomorphize_stmt(&body, &empty_subs);
-                            self.current_return_type.replace(prev_return_type);
-                            new_func.body = Some(*self.bump.alloc_value_immutable(new_body));
+                            let this_ty = f.impl_target.map(|name| HirType::Struct {
+                                name,
+                                field_types: &[],
+                                type_args: &[],
+                            });
+                            let prev_this = self.current_this.replace(this_ty);
+                            let scope = self.enter_fn_scope(new_func.params, new_func.return_type);
 
+                            let new_body = self.monomorphize_stmt(&body, &empty_subs);
+
+                            self.exit_fn_scope(scope);
+                            self.current_this.replace(prev_this);
+                            new_func.body = Some(*self.bump.alloc_value_immutable(new_body));
                             self.ctx.module_idx = prev_module_idx;
                         }
                     }
@@ -172,7 +194,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     let mut new_impl = (*i).clone();
                     if new_impl.generics.is_none() {
                         if let Some(methods) = new_impl.methods {
-                            let mut new_methods = Vec::new();
+                            let mut new_methods = Vec::with_capacity(methods.len());
                             for m in methods.iter() {
                                 if m.generics.is_some() {
                                     continue;
@@ -229,10 +251,17 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                             substitute_type(&ret_ty, &empty_subs, &self.bump)
                                         });
 
-                                        let prev_return_type =
-                                            self.current_return_type.replace(return_type_for_body);
+                                        let this_ty = HirType::Struct {
+                                            name: new_impl.target,
+                                            field_types: &[],
+                                            type_args: &[],
+                                        };
+                                        let prev_this = self.current_this.replace(Some(this_ty));
+                                        let scope =
+                                            self.enter_fn_scope(nm.params, return_type_for_body);
                                         let new_body = self.monomorphize_stmt(&body, &empty_subs);
-                                        self.current_return_type.replace(prev_return_type);
+                                        self.exit_fn_scope(scope);
+                                        self.current_this.replace(prev_this);
 
                                         nm.body = Some(*self.bump.alloc_value_immutable(new_body));
                                         nm.return_type = return_type_for_body.map(|ty| {
@@ -294,6 +323,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             }
         }
 
+        #[cfg(debug_assertions)]
         if let Some((bad_param, bad_ty)) = substitutions
             .iter()
             .find(|(_, ty)| contains_unresolved_generic(ty))
@@ -301,9 +331,19 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             panic!(
                 "cannot monomorphize `{}`: substitution for type parameter `{}` is still generic ({:?}). \
                  This means an unresolved generic leaked into `substitutions` from an outer scope \
-                 without being resolved via `substitute_type(_, outer_subs, ...)` first.",
-                func.name, bad_param, bad_ty
+                 without being resolved via `substitute_type(_, outer_subs, ...)` first at function {}",
+                func.name, bad_param, bad_ty, func.span
             );
+        }
+
+        let orig_name = func.name.clone();
+        let suffix = suffix_for_subs(self.context.clone(), substitutions);
+        let key = (orig_name.clone(), suffix.clone());
+        {
+            let instantiated_functions = self.instantiated_functions.borrow();
+            if let Some(existing) = instantiated_functions.get(&key) {
+                return Some(*existing);
+            }
         }
 
         let mut new_func = func.clone();
@@ -315,17 +355,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 if let HirType::Struct { name, .. } = peel_to_struct(self_ty) {
                     new_func.impl_target = Some(*name);
                 }
-            }
-        }
-
-        let suffix = suffix_for_subs(self.context.clone(), substitutions);
-        let orig_name = new_func.name.clone();
-
-        let key = (orig_name.clone(), suffix.clone());
-        {
-            let instantiated_functions = self.instantiated_functions.borrow();
-            if let Some(existing) = instantiated_functions.get(&key) {
-                return Some(*existing);
             }
         }
 
@@ -354,6 +383,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
         let prev_params = self.current_params.replace(param_map);
         let prev_return_type = self.current_return_type.replace(new_func.return_type);
+        let prev_variable_types = std::mem::take(&mut *self.ctx.variable_types.borrow_mut());
 
         if let Some(body) = new_func.body {
             let new_body = self.monomorphize_stmt(&body, substitutions);
@@ -362,6 +392,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
         self.current_params.replace(prev_params);
         self.current_return_type.replace(prev_return_type);
+        *self.ctx.variable_types.borrow_mut() = prev_variable_types;
 
         self.functions
             .borrow_mut()
@@ -372,5 +403,36 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .insert(key, new_name);
 
         Some(new_name)
+    }
+
+    fn params_map(params: Option<&[HirParam<'a, 'bump>]>) -> FxHashMap<StrId, HirType<'a, 'bump>> {
+        let mut m = FxHashMap::default();
+        for p in params.into_iter().flatten() {
+            if let HirParam::Normal {
+                name, param_type, ..
+            } = p
+            {
+                m.insert(*name, *param_type);
+            }
+        }
+        m
+    }
+
+    pub(crate) fn enter_fn_scope(
+        &self,
+        params: Option<&[HirParam<'a, 'bump>]>,
+        ret: Option<HirType<'a, 'bump>>,
+    ) -> FnScope<'a, 'bump> {
+        FnScope {
+            variables: std::mem::take(&mut *self.ctx.variable_types.borrow_mut()),
+            params: self.current_params.replace(Self::params_map(params)),
+            ret: self.current_return_type.replace(ret),
+        }
+    }
+
+    pub(crate) fn exit_fn_scope(&self, s: FnScope<'a, 'bump>) {
+        *self.ctx.variable_types.borrow_mut() = s.variables;
+        self.current_params.replace(s.params);
+        self.current_return_type.replace(s.ret);
     }
 }

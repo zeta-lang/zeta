@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirExpr, HirMatchArm, HirStmt, HirType, StrId},
+    hir::{HirExpr, HirMatchArm, HirModuleAccess, HirStmt, HirType, StrId},
     ir_hasher::{FxHashMap, HashMap},
 };
 
@@ -167,6 +167,26 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
     }
 
+    pub(crate) fn access_qualifier_is_module(&self, acc: &HirModuleAccess<'a, 'bump>) -> bool {
+        let Some((&last, module_path)) = acc.path.split_last() else {
+            return false;
+        };
+        if self.ctx.structs.borrow().contains_key(&last) {
+            return false;
+        }
+        let resolved = self.ctx.resolve_type_path_name(module_path, last, acc.span);
+        if self.ctx.structs.borrow().contains_key(&resolved) {
+            return false;
+        }
+        self.ctx.imported_modules.borrow().contains_key(&last)
+            || self
+                .ctx
+                .dep_graph
+                .borrow()
+                .resolve_module_path(acc.path)
+                .is_some()
+    }
+
     pub(crate) fn try_monomorphize_assoc_call<'subs>(
         &self,
         value: &HirExpr<'a, 'bump>,
@@ -196,6 +216,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             return None;
         }
 
+        if self.access_qualifier_is_module(acc) {
+            return None;
+        }
+
         let (&struct_name, module_path) = acc.path.split_last().unwrap_or_else(|| {
             panic!(
                 "try_monomorphize_assoc_call: empty module path in static call `.{}` at {span}",
@@ -214,7 +238,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     "[try_monomorphize_assoc_call] resolve_type_path_name resolved bare name `{}` \
                  to `{}` (using ctx.module_idx = {}) at {span}, but no struct is registered \
                  under that key at all.",
-                    struct_name, resolved, self.ctx.module_idx,
+                    struct_name, resolved, self.ctx.module_idx
                 );
             }
             resolved
@@ -310,7 +334,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
         let mut inner_subs: FxHashMap<StrId, HirType> = FxHashMap::default();
         for (p, a) in type_params.iter().zip(expected_targs.iter()) {
-            let resolved = substitute_type(a, outer_subs, &self.bump);
+            let resolved = self
+                .instantiate_type_recursively(substitute_type(a, outer_subs, &self.bump), *span);
             if contains_unresolved_generic(&resolved) {
                 panic!(
                     "try_monomorphize_assoc_call: type argument `{:?}` for parameter `{}` in \

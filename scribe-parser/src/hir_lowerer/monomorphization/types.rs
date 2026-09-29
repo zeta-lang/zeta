@@ -166,6 +166,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         if type_args.is_empty() {
             return ty;
         }
+
+        let normalized_args: Vec<HirType> = type_args
+            .iter()
+            .map(|a| self.instantiate_type_recursively(*a, span))
+            .collect();
+        let normalized_args = self.bump.alloc_slice(&normalized_args);
+
         match instantiate_struct_for_types(
             self.ctx,
             &self.instantiated_structs,
@@ -173,7 +180,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             &self.instantiated_enums,
             &self.instantiated_enum_origins,
             *name,
-            type_args,
+            normalized_args,
             &self.bump,
         ) {
             Some(new_struct) => {
@@ -189,7 +196,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 "instantiate_struct_ty_if_needed: failed to instantiate `{}` with type args {:?} at {span}; \
                  this struct type would otherwise be silently left un-renamed, which produces \
                  confusing 'unknown struct' failures much later in MIR lowering. Please open an issue if you see this error message.",
-                name, type_args
+                name, normalized_args
             ),
         }
     }
@@ -210,9 +217,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         };
 
         if type_args.is_empty() {
-            let origin: Option<(StrId, Vec<HirType<'a, 'bump>>)> =
-                self.instantiated_struct_origins.borrow().get(name).cloned();
-
+            let origin = self.instantiated_struct_origins.borrow().get(name).cloned();
             if let Some((origin_name, origin_targs)) = origin {
                 let targs_slice = self.bump.alloc_slice(&origin_targs);
                 let generic_ty = HirType::Struct {

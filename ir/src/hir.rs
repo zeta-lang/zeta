@@ -139,6 +139,8 @@ pub enum IntrinsicKind {
     Unreachable,
     Reinterpret,
     Replace,
+    Leak,
+    FnPtr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

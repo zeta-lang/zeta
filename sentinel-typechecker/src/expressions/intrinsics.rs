@@ -15,6 +15,77 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         args: &&[HirExpr<'a, 'bump>],
     ) -> HirType<'a, 'bump> {
         match kind {
+            IntrinsicKind::FnPtr => {
+                let t = self.check_expr(&args[0]);
+                let HirType::Struct { name, .. } = t else {
+                    self.record(TypeErrorKind::Generic("$fn_ptr expects a closure".into()));
+                    return HirType::Unknown;
+                };
+                let Some(lowering) = self.closure_table.values().find(|c| c.env_name == name)
+                else {
+                    self.record(TypeErrorKind::Generic("$fn_ptr expects a closure".into()));
+                    return HirType::Unknown;
+                };
+                if !lowering.captures.is_empty() {
+                    let desc = self.describe_path(
+                        lowering.captures[0].source,
+                        lowering.captures[0].source_path,
+                    );
+                    self.record(TypeErrorKind::Generic(format!(
+                        "`$fn_ptr` requires a non-capturing closure, but it captures `{}`",
+                        desc
+                    )));
+                    return HirType::Unknown;
+                }
+                HirType::Lambda {
+                    params: self.context.bump.alloc_slice(&lowering.param_tys),
+                    return_type: self.context.bump.alloc_value(lowering.ret_ty),
+                }
+            }
+            IntrinsicKind::Leak => {
+                if !type_args.is_empty() {
+                    self.record(TypeErrorKind::Generic(
+                        "$leak takes no type arguments".to_string(),
+                    ));
+                }
+                if !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                        "$leak requires an unsafe block: it gives up ownership without running \
+                     drop glue or freeing, so the caller becomes responsible for the allocation"
+                            .to_string(),
+                    ));
+                }
+                if args.len() != 1 {
+                    self.record(TypeErrorKind::InvalidFunctionCall {
+                        expected_args: 1,
+                        found_args: args.len(),
+                    });
+                    return HirType::Unknown;
+                }
+
+                let arg_ty = self.check_expr(&args[0]);
+                // Records the move, so the source local is not dropped at scope exit.
+                self.check_and_record_value_use(&args[0], &arg_ty);
+
+                match &arg_ty {
+                    HirType::OwnedPointer { inner, .. } => match **inner {
+                        // ^[T] -> [T]
+                        HirType::Slice(elem) => HirType::Slice(elem),
+                        // ^T -> [*]mut T
+                        pointee => HirType::UnsafePointer {
+                            inner: self.context.bump.alloc_value(pointee),
+                            mutability_state: ir::ast::MutabilityState::Mut,
+                        },
+                    },
+                    other => {
+                        self.record(TypeErrorKind::Generic(format!(
+                            "$leak expects an owned pointer `^T`, found `{}` type {other:?}",
+                            type_to_string(&arg_ty)
+                        )));
+                        HirType::Unknown
+                    }
+                }
+            }
             IntrinsicKind::Replace => {
                 if !type_args.is_empty() {
                     self.record(TypeErrorKind::Generic(

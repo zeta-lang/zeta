@@ -29,6 +29,8 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("unreachable", IntrinsicKind::Unreachable),
     ("reinterpret", IntrinsicKind::Reinterpret),
     ("replace", IntrinsicKind::Replace),
+    ("leak", IntrinsicKind::Leak),
+    ("fn_ptr", IntrinsicKind::FnPtr),
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -1755,7 +1757,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ref_kind,
                 provenance: ast_provenance,
             } => {
-                let inner = self.ctx.bump.alloc_value(self.lower_type(inner, span));
+                let lowered_inner = self.lower_type(inner, span);
+                // `&func(..)` is just a function pointer.
+                if matches!(lowered_inner, HirType::Lambda { .. }) {
+                    return lowered_inner;
+                }
+                let inner = self.ctx.bump.alloc_value(lowered_inner);
                 HirType::Ref {
                     inner,
                     ref_kind: Self::lower_ref_kind(*ref_kind),

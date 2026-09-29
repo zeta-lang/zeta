@@ -1,3 +1,5 @@
+use core::panic;
+
 use ir::{
     hir::{AssignmentOperator, HirExpr, HirType, IntrinsicKind, StrId},
     ir_conversion::lower_type_hir,
@@ -115,6 +117,49 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         use ir::ssa_ir::IntrinsicOp;
 
         match kind {
+            IntrinsicKind::FnPtr => {
+                panic!("fn_ptr intrinsic is not supported");
+            }
+            IntrinsicKind::Leak => {
+                // Mark `ctx` moved so emit_scope_drops skips it, and clear array flags if any.
+                self.record_arg_move(&args[0]);
+
+                let mut src = self.lower_expr(&args[0]);
+                let mut src_ty = self.current_block_data.value_types[&src].clone();
+
+                let dst_ty = match &src_ty {
+                    // ^[T]: take the data pointer (word 0), like lower_cast_expr does
+                    SsaType::Owned(inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
+                        let SsaType::Slice(elem) = inner.as_ref() else {
+                            unreachable!()
+                        };
+                        let ptr = self.current_block_data.fresh_value();
+                        self.emit(Instruction::LoadField {
+                            dest: ptr,
+                            base: Operand::Value(src),
+                            offset: 0,
+                        });
+                        let ptr_ty = SsaType::Pointer(Box::new((**elem).clone()));
+                        self.current_block_data
+                            .value_types
+                            .insert(ptr, ptr_ty.clone());
+                        src = ptr;
+                        src_ty = ptr_ty.clone();
+                        ptr_ty
+                    }
+                    SsaType::Owned(inner) => SsaType::Pointer(inner.clone()),
+                    other => panic!("$leak: expected owned pointer, got {:?}", other),
+                };
+
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::Cast {
+                    dest,
+                    value: Operand::Value(src),
+                    kind: cast_kind(&src_ty, &dst_ty),
+                });
+                self.current_block_data.value_types.insert(dest, dst_ty);
+                dest
+            }
             IntrinsicKind::Replace => {
                 let place_expr: &HirExpr<'a, 'bump> = match &args[0] {
                     HirExpr::Ref { expr, .. } => expr,
