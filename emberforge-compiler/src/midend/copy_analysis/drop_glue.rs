@@ -1,15 +1,20 @@
-use crate::midend::copy_analysis::drop_emitter::{AllocatorResolver, DropEmitter};
+use crate::midend::copy_analysis::drop_emitter::{
+    AllocatorResolver, DropEmitter, find_allocator_field,
+};
 use crate::midend::ir::block_data::CurrentBlockData;
 use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
 use ir::ir_conversion::lower_type_hir;
-use ir::ir_hasher::HashMap;
+use ir::ir_hasher::{FxHashMap, HashMap};
 use ir::registry::global_registry::GlobalRegistry;
 use ir::span::SourceSpan;
 use ir::ssa_ir::{
     AllocatorKind, BasicBlock, BlockId, Function, Instruction, Operand, SsaType, Value,
 };
 use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
@@ -170,6 +175,9 @@ impl DropGlueBuilder {
         allocator_kind: &HashMap<StrId, AllocatorKind>,
         context: Arc<StringPool>,
         struct_names_owned_by_this_module: &[StrId],
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> Vec<(StrId, Function)> {
         struct_names_owned_by_this_module
             .iter()
@@ -183,6 +191,9 @@ impl DropGlueBuilder {
                     allocator_kind,
                     context.clone(),
                     name,
+                    instantiated_functions.clone(),
+                    instantiated_struct_methods.clone(),
+                    bump,
                 )
             })
             .collect()
@@ -197,6 +208,9 @@ impl DropGlueBuilder {
         allocator_kind: &HashMap<StrId, AllocatorKind>,
         context: Arc<StringPool>,
         struct_name: StrId,
+        instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
+        instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> Option<(StrId, Function)> {
         let glue_name = glue_registry.glue_name_for(struct_name)?;
 
@@ -272,19 +286,49 @@ impl DropGlueBuilder {
                     }
                 }
                 HirType::OwnedPointer { inner, allocator } => {
-                    let allocator = allocator.unwrap_or_else(|| {
-                        panic!(
-                            "build_one: owned-pointer field {}.{} has no allocator",
-                            struct_name, field.name
-                        )
-                    });
+                    let resolved: Option<ProvenanceAnnotation<'bump>> =
+                        (*allocator).or_else(|| {
+                            find_allocator_field(structs, allocator_kind, struct_name)
+                                .map(|owner_field| ProvenanceAnnotation {
+                                    root: hir::ProvenanceRoot::ThisRoot,
+                                    path: bump.alloc_slice(&[hir::ProvenancePathSegment::Field(
+                                        owner_field,
+                                    )]),
+                                })
+                                .or_else(|| {
+                                    let pointee_name = match **inner {
+                                        HirType::Struct { name, .. } => Some(name),
+                                        _ => None,
+                                    }?;
+                                    let alloc_field = find_allocator_field(
+                                        structs,
+                                        allocator_kind,
+                                        pointee_name,
+                                    )?;
+                                    Some(ProvenanceAnnotation {
+                                        root: hir::ProvenanceRoot::ThisRoot,
+                                        path: bump.alloc_slice(&[
+                                            hir::ProvenancePathSegment::Field(field.name),
+                                            hir::ProvenancePathSegment::Deref,
+                                            hir::ProvenancePathSegment::Field(alloc_field),
+                                        ]),
+                                    })
+                                })
+                        });
 
-                    field_drops.push(FieldDrop::OwnedPointer {
-                        offset,
-                        pointee: inner.drop_kind(),
-                        pointee_ty: **inner,
-                        allocator,
-                    });
+                    match resolved {
+                        Some(allocator) => field_drops.push(FieldDrop::OwnedPointer {
+                            offset,
+                            pointee: inner.drop_kind(),
+                            pointee_ty: **inner,
+                            allocator,
+                        }),
+                        None => panic!(
+                            "build_one: owned-pointer field {}.{} has no allocator, and none could be \
+                             inferred from an allocator field on `{}` or on its pointee `{:?}`",
+                            struct_name, field.name, struct_name, **inner,
+                        ),
+                    }
                 }
                 _ => {}
             }
@@ -299,6 +343,8 @@ impl DropGlueBuilder {
             enums,
             allocator_kind,
             glue_registry,
+            instantiated_functions.clone(),
+            instantiated_struct_methods.clone(),
         );
         let mut resolver = GlueAllocatorResolver;
 
