@@ -598,12 +598,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     let else_scope = self.scope_stack.pop().unwrap();
                     self.emit_scope_drops(&else_scope, span);
                 }
+                live_drop.push(self.drop_state.clone());
                 let tail = self.current_block_data.current_block;
                 let vars = self.var_map.clone();
                 self.emit(Instruction::Jump { target: merge_bb });
                 Some((tail, vars))
             }
         } else {
+            live_drop.push(drop_before.clone());
             Some((pre_if_bb, vars_before))
         };
 
@@ -613,8 +615,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.current_block_data.push_block(merge_bb);
             self.current_block_data.switch_to(merge_bb);
             self.merge_var_maps(live_branches);
-            if let Some(j) = DropMoveState::join_all(live_drop) {
-                self.drop_state = j;
+            match DropMoveState::join_all(live_drop) {
+                Some(j) => self.drop_state = j,
+                None => self.drop_state = drop_before.clone(),
             }
         }
     }
