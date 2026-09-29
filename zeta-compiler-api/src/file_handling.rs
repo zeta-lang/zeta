@@ -62,7 +62,8 @@ pub fn collect_extern_c_names<'a, 'bump>(
                 if matches!(
                     f.function_metadata.extern_modifier,
                     ir::ast::ExternModifier::Abi(_)
-                ) {
+                ) && f.body.is_none()
+                {
                     externs.insert(f.name);
                 }
             }
@@ -184,6 +185,8 @@ pub(crate) fn emit_all<'a, 'bump>(
         dep_graph,
         0, // sentinel, it's overwritten
         &glue_registry,
+        registry.instantiated_functions.clone(),
+        registry.struct_methods.clone(),
     )
     .lower_all_modules(hir_modules, compilation_order);
 
