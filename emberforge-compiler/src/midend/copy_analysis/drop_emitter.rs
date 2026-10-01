@@ -456,7 +456,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             _ => None,
         };
 
-        let field_ty = lower_type_hir(&hir_field.field_type, self.enums);
+        let field_ty = lower_type_hir(&hir_field.field_type, self.enums, self.structs);
 
         let addr = self.current_block_data.fresh_value();
         self.emit(Instruction::FieldAddr {
@@ -551,7 +551,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         ptr_val: Value,
     ) {
         let (data_ptr, size_v, align_v) = if let HirType::Slice(inner) = pointee_ty {
-            let elem_ssa = lower_type_hir(inner, self.enums);
+            let elem_ssa = lower_type_hir(inner, self.enums, self.structs);
             let Layout {
                 size: elem_size,
                 align: elem_align,
@@ -611,7 +611,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
 
             (data_ptr, total_size_v, align_v)
         } else {
-            let query_ty = lower_type_hir(pointee_ty, self.enums);
+            let query_ty = lower_type_hir(pointee_ty, self.enums, self.structs);
             let size_v = self.current_block_data.fresh_value();
             self.emit(Instruction::Intrinsic {
                 dest: Some(size_v),
@@ -785,7 +785,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     });
                     self.current_block_data
                         .value_types
-                        .insert(loaded, lower_type_hir(pointee_ty, self.enums));
+                        .insert(loaded, lower_type_hir(pointee_ty, self.enums, self.structs));
                     loaded
                 };
                 self.emit_owned_pointer_drop(
@@ -899,7 +899,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     });
                     self.current_block_data
                         .value_types
-                        .insert(loaded, lower_type_hir(pointee_ty, self.enums));
+                        .insert(loaded, lower_type_hir(pointee_ty, self.enums, self.structs));
                     loaded
                 };
                 self.emit_owned_pointer_drop(
@@ -951,7 +951,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 field, cls_name, param
             );
         }
-        let field_ty = lower_type_hir(known_field_ty, self.enums);
+        let field_ty = lower_type_hir(known_field_ty, self.enums, self.structs);
 
         let addr = self.current_block_data.fresh_value();
         self.emit(Instruction::FieldAddr {
@@ -996,16 +996,22 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 pointee_ty,
                 allocator,
             } => {
-                let loaded = self.current_block_data.fresh_value();
-                self.emit(Instruction::Load {
-                    dest: loaded,
-                    ptr: Operand::Value(elem_addr),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(loaded, lower_type_hir(pointee_ty, self.enums));
+                let ptr_val = if matches!(pointee_ty, HirType::Slice(_)) {
+                    elem_addr
+                } else {
+                    let pointee_ssa = lower_type_hir(pointee_ty, self.enums, self.structs);
+                    let loaded = self.current_block_data.fresh_value();
+                    self.emit(Instruction::Load {
+                        dest: loaded,
+                        ptr: Operand::Value(elem_addr),
+                    });
+                    self.current_block_data
+                        .value_types
+                        .insert(loaded, SsaType::Owned(Box::new(pointee_ssa)));
+                    loaded
+                };
                 self.emit_owned_pointer_drop(
-                    None, pointee, pointee_ty, allocator, loaded, false, None, resolver, span,
+                    None, pointee, pointee_ty, allocator, ptr_val, false, None, resolver, span,
                 );
             }
             DropKind::Slice {
@@ -1067,12 +1073,12 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         resolver: &mut R,
         span: SourceSpan<'a>,
     ) {
-        let head_ssa = lower_type_hir(&chain.head_field_ty, self.enums);
+        let head_ssa = lower_type_hir(&chain.head_field_ty, self.enums, self.structs);
         if head_ssa.is_tagged_nullable() {
             return; // only pointer-optimized nullables / plain owned pointers
         }
-        let link_ssa = lower_type_hir(&chain.link_field_ty, self.enums);
-        let node_ssa = lower_type_hir(&chain.node_ty, self.enums);
+        let link_ssa = lower_type_hir(&chain.link_field_ty, self.enums, self.structs);
+        let node_ssa = lower_type_hir(&chain.node_ty, self.enums, self.structs);
         let node_ptr_ty = SsaType::Pointer(Box::new(node_ssa));
 
         // every node came from the same allocator.
@@ -1222,7 +1228,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 let Some(&off) = node_offsets.get(&f.name) else {
                     continue;
                 };
-                let fty = lower_type_hir(&f.field_type, enums);
+                let fty = lower_type_hir(&f.field_type, enums, structs);
                 let faddr = self.current_block_data.fresh_value();
                 self.emit(Instruction::FieldAddr {
                     dest: faddr,
@@ -1276,7 +1282,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             return;
         }
 
-        let elem_ssa = lower_type_hir(element_ty, self.enums);
+        let elem_ssa = lower_type_hir(element_ty, self.enums, self.structs);
         let elem_size = sizeof_ssa(&elem_ssa, TargetInfo { ptr_bytes: 8 })
             .expect("slice element type has no known size");
 

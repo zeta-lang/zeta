@@ -47,7 +47,7 @@ pub struct DropGlueRegistry {
 
 impl DropGlueRegistry {
     pub fn new<'a, 'bump>(registry: &GlobalRegistry<'a, 'bump>, context: Arc<StringPool>) -> Self {
-        let drop_iface = StrId(context.thread_local().intern("Drop"));
+        let drop_iface = StrId::from_static("Drop");
 
         let struct_names: Vec<StrId> = {
             let structs = registry.structs.borrow();
@@ -249,7 +249,7 @@ impl DropGlueBuilder {
 
         let mut cbd = CurrentBlockData::new(&mut func, entry_bb, 1usize, 1usize, value_types);
 
-        let drop_method_name = StrId(context.thread_local().intern("drop"));
+        let drop_method_name = StrId::from_static("drop");
         if let Some(mangled_drop) = struct_mangled_map
             .get(&struct_name)
             .and_then(|m| m.get(&drop_method_name))
@@ -263,6 +263,9 @@ impl DropGlueBuilder {
 
         let mut field_drops: Vec<FieldDrop<'a, 'bump>> = Vec::new();
         for field in hir_struct.fields.iter() {
+            if field.manual {
+                continue;
+            }
             let offset = offsets
                 .and_then(|m| m.get(&field.name))
                 .copied()
@@ -373,7 +376,7 @@ impl DropGlueBuilder {
                     pointee_ty,
                     allocator,
                 } => {
-                    let field_ssa_ty = lower_type_hir(&pointee_ty, enums);
+                    let field_ssa_ty = lower_type_hir(&pointee_ty, enums, structs);
                     let field_addr = emitter.current_block_data.fresh_value();
                     emitter.current_block_data.value_types.insert(
                         field_addr,
@@ -396,7 +399,7 @@ impl DropGlueBuilder {
                         emitter
                             .current_block_data
                             .value_types
-                            .insert(loaded, field_ssa_ty);
+                            .insert(loaded, SsaType::Owned(Box::new(field_ssa_ty)));
                         loaded
                     };
 

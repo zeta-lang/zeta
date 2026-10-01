@@ -249,7 +249,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .structs
             .get(&cls_name)
             .and_then(|hc| hc.fields.iter().find(|f| f.name == field))
-            .map(|f| lower_type_hir(&f.field_type, self.enums))
+            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
             .unwrap_or(SsaType::I64);
 
         let addr = self.current_block_data.fresh_value();
