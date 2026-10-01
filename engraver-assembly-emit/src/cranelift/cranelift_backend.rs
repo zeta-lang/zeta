@@ -776,14 +776,31 @@ impl CraneliftBackend {
 
                     builder.ins().return_(&[sret_ptr]);
                 } else {
+                    let ret_ty = clif_type(&func.ret_type);
+
                     let rv = match value {
                         Some(Operand::Value(v)) => {
                             let var = var_map.get(v).expect("ret references undefined value");
-                            builder.use_var(*var)
+                            let val = builder.use_var(*var);
+
+                            let actual_ty = builder.func.dfg.value_type(val);
+
+                            if actual_ty == ret_ty {
+                                val
+                            } else if actual_ty.bits() < ret_ty.bits() {
+                                builder.ins().uextend(ret_ty, val)
+                            } else if actual_ty.bits() > ret_ty.bits() {
+                                builder.ins().ireduce(ret_ty, val)
+                            } else {
+                                self.coerce_bitcast(builder, val, ret_ty)
+                            }
                         }
-                        Some(Operand::ConstInt(i)) => builder.ins().iconst(types::I64, *i),
-                        _ => builder.ins().iconst(types::I64, 0),
+
+                        Some(Operand::ConstInt(i)) => builder.ins().iconst(ret_ty, *i),
+
+                        _ => builder.ins().iconst(ret_ty, 0),
                     };
+
                     builder.ins().return_(&[rv]);
                 }
             }
@@ -1721,7 +1738,8 @@ impl Backend for CraneliftBackend {
 
             let resolved_name = self.context.resolve_string(&*name);
 
-            let has_body = !func.blocks.is_empty() && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
+            let has_body = !func.blocks.is_empty()
+                && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
             let is_extern_abi = matches!(
                 func.function_metadata.extern_modifier,
                 ExternModifier::Abi(_)
@@ -1760,7 +1778,8 @@ impl Backend for CraneliftBackend {
             if func.name.eq("main") && !self.func_ids.contains_key(&func.name) {
                 continue;
             }
-            let has_body = !func.blocks.is_empty() && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
+            let has_body = !func.blocks.is_empty()
+                && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
             let is_true_extern = matches!(
                 func.function_metadata.extern_modifier,
                 ExternModifier::Abi(_)

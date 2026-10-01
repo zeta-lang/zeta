@@ -557,8 +557,8 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             registry,
             enums,
             enums_by_module,
-            copy_iface: StrId(context.intern("Copy")),
-            drop_iface: StrId(context.intern("Drop")),
+            copy_iface: StrId::from_static("Copy"),
+            drop_iface: StrId::from_static("Drop"),
             is_copy: FxHashMap::default(),
         }
     }
