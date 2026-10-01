@@ -81,7 +81,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         });
                         let field_ty = hir_struct
                             .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
-                            .map(|f| lower_type_hir(&f.field_type, self.enums))
+                            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
                             .unwrap_or(SsaType::I64);
                         let field_val = self.current_block_data.fresh_value();
                         if Self::is_aggregate_ssa_type(&field_ty) {
@@ -155,7 +155,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let target = TargetInfo { ptr_bytes: 8 };
                 let mut cursor = 0usize;
                 for vf in variant_def.fields.iter() {
-                    let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums);
+                    let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums, self.structs);
                     let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
                     cursor = Self::align_up(cursor, align);
 
@@ -262,7 +262,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     .value_types
                     .insert(lit, SsaType::String);
 
-                let streq_fn = StrId(self.context.thread_local().intern("__zeta_streq"));
+                let streq_fn = StrId::from_static("__zeta_streq");
                 let cmp = self.current_block_data.fresh_value();
                 self.emit(Instruction::Call {
                     dest: Some(cmp),
@@ -499,7 +499,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         });
                         let field_ty = hir_struct
                             .and_then(|s| s.fields.iter().find(|f| f.name == *field_name))
-                            .map(|f| lower_type_hir(&f.field_type, self.enums))
+                            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
                             .unwrap_or(SsaType::I64);
 
                         let field_val = self.current_block_data.fresh_value();
@@ -547,7 +547,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     let target = TargetInfo { ptr_bytes: 8 };
                     let mut cursor = 0usize;
                     for vf in variant_def.fields.iter() {
-                        let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums);
+                        let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums, self.structs);
                         let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
                         cursor = Self::align_up(cursor, align);
 
@@ -614,7 +614,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let target = TargetInfo { ptr_bytes: 8 };
                 let mut cursor = 0usize;
                 for (&binding_name, field) in bindings.iter().zip(variant_def.fields.iter()) {
-                    let field_ssa_ty = lower_type_hir(&field.field_type, self.enums);
+                    let field_ssa_ty = lower_type_hir(&field.field_type, self.enums, self.structs);
                     let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
                     cursor = Self::align_up(cursor, align);
 
@@ -784,6 +784,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             return self.unit_value();
         }
 
+        self.patch_diverging_edges(&mut incoming, &ty);
         let result = self.current_block_data.fresh_value();
         self.emit(Instruction::Phi {
             dest: result,

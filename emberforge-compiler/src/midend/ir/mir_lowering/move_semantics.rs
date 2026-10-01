@@ -208,7 +208,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     }
 
     pub(super) fn retype_as_owned(&mut self, val: Value, owned_hir: &HirType<'a, 'bump>) -> Value {
-        let owned_ssa = lower_type_hir(owned_hir, self.enums);
+        let owned_ssa = lower_type_hir(owned_hir, self.enums, self.structs);
         let dest = self.new_value();
         self.emit(Instruction::Cast {
             dest,
@@ -969,7 +969,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             return;
         }
 
-        let elem_ssa_ty = lower_type_hir(&element_ty, self.enums);
+        let elem_ssa_ty = lower_type_hir(&element_ty, self.enums, self.structs);
 
         let ptr_v = self.current_block_data.fresh_value();
         self.emit(Instruction::LoadField {
@@ -1124,18 +1124,19 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     }
 
     pub(super) fn emit_drops_for_return(&mut self, span: SourceSpan<'a>) {
-        for (i, scope) in self.scope_stack.iter().enumerate() {
-            for l in &scope.locals {
-                eprintln!(
-                    "[ret-drop] scope {} local {:?} kind {:?} whole_moved={} in_var_map={}",
-                    i,
-                    l.name,
-                    l.kind,
-                    self.drop_state.is_whole_moved(l.name),
-                    self.var_map.contains_key(&l.name),
-                );
-            }
-        }
+        // #[cfg(debug_assertions)]
+        // for (i, scope) in self.scope_stack.iter().enumerate() {
+        //     for l in &scope.locals {
+        //         eprintln!(
+        //             "[ret-drop] scope {} local {:?} kind {:?} whole_moved={} in_var_map={}",
+        //             i,
+        //             l.name,
+        //             l.kind,
+        //             self.drop_state.is_whole_moved(l.name),
+        //             self.var_map.contains_key(&l.name),
+        //         );
+        //     }
+        // }
         for scope in self.scope_stack.clone().iter().rev() {
             self.emit_scope_drops(scope, span);
         }
@@ -1328,6 +1329,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         nullable_owned: Option<HirType<'_, '_>>,
         f: &ir::hir::HirField<'_, '_>,
     ) {
+        if f.manual {
+            return;
+        }
         let drop_kind = if nullable_owned.is_some() {
             DropKind::Undroppable // already handled above
         } else {
@@ -1344,7 +1348,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 });
                 self.current_block_data.value_types.insert(
                     field_addr,
-                    SsaType::Pointer(Box::new(lower_type_hir(&f.field_type, self.enums))),
+                    SsaType::Pointer(Box::new(lower_type_hir(
+                        &f.field_type,
+                        self.enums,
+                        self.structs,
+                    ))),
                 );
                 let mut resolver = FnAllocatorResolver {
                     var_map: &self.var_map,
@@ -1387,11 +1395,12 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                                 dest: old_ptr,
                                 ptr: Operand::Value(field_addr),
                             });
-                            let pointee_ssa = lower_type_hir(pointee_ty, emitter.enums);
+                            let pointee_ssa =
+                                lower_type_hir(pointee_ty, emitter.enums, emitter.structs);
                             emitter
                                 .current_block_data
                                 .value_types
-                                .insert(old_ptr, pointee_ssa);
+                                .insert(old_ptr, SsaType::Owned(Box::new(pointee_ssa)));
                             emitter.emit_owned_pointer_drop(
                                 None,
                                 pointee,

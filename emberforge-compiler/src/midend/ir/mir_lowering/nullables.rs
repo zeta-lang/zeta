@@ -106,7 +106,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         match expected {
             Some(HirType::Nullable(inner)) => {
-                let inner_ssa = lower_type_hir(inner, self.enums);
+                let inner_ssa = lower_type_hir(inner, self.enums, self.structs);
 
                 if inner_ssa.is_pointer() {
                     // Pointer-optimized nullable: null is just 0.
