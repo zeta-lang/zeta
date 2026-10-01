@@ -800,6 +800,7 @@ mod tests {
             else_block: None,
             is_static: false,
             span: dummy_span(),
+            manual: false,
         }));
 
         let stmts: &[Stmt] = &[Stmt::Let(let_stmt)];

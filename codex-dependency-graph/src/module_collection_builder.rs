@@ -47,9 +47,9 @@ fn extract_symbol_info(stmt: &Stmt<'_, '_>, pool: &StringPool) -> (StrId, StrId)
         Stmt::ImplDecl(i) => (
             i.target
                 .struct_name()
-                .unwrap_or_else(|| StrId(pool.thread_local().intern("<anon>"))),
+                .unwrap_or_else(|| StrId::from_static("<anon>")),
             kind("impl"),
         ),
-        _ => (StrId(pool.thread_local().intern("<anon>")), kind("unknown")),
+        _ => (StrId::from_static("<anon>"), kind("unknown")),
     }
 }

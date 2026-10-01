@@ -333,11 +333,11 @@ impl DepGraph {
         match expr {
             Expr::This { .. } => self.current_self_type,
             Expr::Ident { name, .. } => self.current_locals.get(name).copied(),
-            Expr::String { .. } => Some(StrId(pool.thread_local().intern("str"))),
-            Expr::Number { .. } => Some(StrId(pool.thread_local().intern("i64"))),
-            Expr::Decimal { .. } => Some(StrId(pool.thread_local().intern("f64"))),
-            Expr::Boolean { .. } => Some(StrId(pool.thread_local().intern("bool"))),
-            Expr::Char { .. } => Some(StrId(pool.thread_local().intern("char"))),
+            Expr::String { .. } => Some(StrId::from_static("str")),
+            Expr::Number { .. } => Some(StrId::from_static("i64")),
+            Expr::Decimal { .. } => Some(StrId::from_static("f64")),
+            Expr::Boolean { .. } => Some(StrId::from_static("bool")),
+            Expr::Char { .. } => Some(StrId::from_static("char")),
             Expr::StructInit { callee, .. } => match callee {
                 Expr::Ident { name, .. } => Some(*name),
                 _ => None,
