@@ -2015,11 +2015,11 @@ func test_thread_basic_return(): i64 {
             }
         );
 
-    let result: i64 = handle.join();
+    let result: i64 = handle.join().unwrap();
 
     if (result != 42) {
         io.stdout().writeln("[FAIL] thread returned wrong value");
-        return 1;
+        return result;
     }
 
     io.stdout().writeln("[PASS] basic thread return");
@@ -2038,7 +2038,7 @@ func test_thread_string_return(): i64 {
             }
         );
 
-    let result: str = handle.join();
+    let result: str = handle.join().unwrap();
 
     if (result != "hello from thread") {
         io.stdout().writeln("[FAIL] thread returned wrong string");
@@ -2069,7 +2069,7 @@ func test_thread_computation(): i64 {
             }
         );
 
-    let result: i64 = handle.join();
+    let result: i64 = handle.join().unwrap();
 
     // 1 + 2 + ... + 100 = 5050
     if (result != 5050) {
@@ -2118,10 +2118,10 @@ func test_multiple_threads(): i64 {
             }
         );
 
-    let r1: i64 = h1.join();
-    let r2: i64 = h2.join();
-    let r3: i64 = h3.join();
-    let r4: i64 = h4.join();
+    let r1: i64 = h1.join().unwrap();
+    let r2: i64 = h2.join().unwrap();
+    let r3: i64 = h3.join().unwrap();
+    let r4: i64 = h4.join().unwrap();
 
     if (r1 != 10) {
         io.stdout().writeln("[FAIL] thread 1 returned wrong value");
@@ -2154,20 +2154,15 @@ func test_many_threads(): i64 {
 
     let mut handles: ArrayList<
         JoinHandle<i64, Mallocator>
-    > = ArrayList.with_capacity(32); // line 2157
+    > = ArrayList.with_capacity(32);
 
     let mut i: i64 = 0;
 
     while (i < 32) {
         let value: i64 = i;
 
-        handles.push(
-            threads.spawn(
-                func() {
-                    return value * value;
-                }
-            )
-        );
+        let h: JoinHandle<i64, Mallocator> = threads.spawn(move func() { return value * value; });
+        handles.push(h);
 
         i += 1;
     }
@@ -2175,7 +2170,7 @@ func test_many_threads(): i64 {
     i = 0;
 
     while (i < 32) {
-        let result: i64 = handles.get(i as usize).join();
+        let result: i64 = handles.get(i as usize).join().unwrap();
         let expected: i64 = i * i;
 
         if (result != expected) {
@@ -2202,12 +2197,12 @@ func test_thread_owned_capture(): i64 {
 
     let mut handle: JoinHandle<str, Mallocator> =
         threads.spawn(
-            func() {
+            move func() {
                 return item.tag;
             }
         );
 
-    let result: str = handle.join();
+    let result: str = handle.join().unwrap();
 
     if (result != "thread_owned_capture") {
         io.stdout().writeln("[FAIL] thread capture returned wrong value");
@@ -2233,12 +2228,12 @@ func test_thread_fnonce_capture(): i64 {
 
     let mut handle: JoinHandle<ThreadDropItem, Mallocator> =
         threads.spawn(
-            func() {
+            move func() {
                 return item;
             }
         );
 
-    let result: ThreadDropItem = handle.join();
+    let result: ThreadDropItem = handle.join().unwrap();
 
     if (result.tag != "thread_fnonce") {
         io.stdout().writeln("[FAIL] FnOnce thread returned wrong item");
@@ -2272,7 +2267,7 @@ func test_thread_nested_computation(): i64 {
             }
         );
 
-    let result: i64 = handle.join();
+    let result: i64 = handle.join().unwrap();
 
     if (result != 225) {
         io.stdout().writeln("[FAIL] nested computation returned wrong value");
@@ -2300,7 +2295,7 @@ func test_thread_repeated_spawn_join(): i64 {
                 }
             );
 
-        let result: i64 = handle.join();
+        let result: i64 = handle.join().unwrap();
 
         if (result != value + 1) {
             io.stdout().writeln("[FAIL] repeated spawn/join returned wrong value");
@@ -2317,6 +2312,12 @@ func test_thread_repeated_spawn_join(): i64 {
 
 
 func thread_tests(): i64 {
+    let status10: i64 = test_env_sizeof();
+    if (status10 != 0) {
+        return status10;
+    }
+
+
     let status1: i64 = test_thread_basic_return();
     if (status1 != 0) {
         return status1;
@@ -2361,9 +2362,26 @@ func thread_tests(): i64 {
     if (status9 != 0) {
         return status9;
     }
-
     io.stdout().writeln("");
     io.stdout().writeln("=== All thread tests passed ===");
 
+    return 0;
+}
+
+func probe<F: func(): i64>(f: F): i64 {
+    return $sizeof<F>() as i64;
+}
+
+func test_env_sizeof(): i64 {
+    io.stdout().writeln("");
+    io.stdout().writeln("=== test_env_sizeof ===");
+
+    let v: i64 = 7;
+    if (probe(move func() { return v; }) != 8) {
+        io.stdout().writeln("[FAIL] env sizeof != 8");
+        return 1;
+    } else {
+        io.stdout().writeln("[PASS] env sizeof == 8");
+    }
     return 0;
 }
