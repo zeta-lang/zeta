@@ -72,15 +72,15 @@ where
     ) -> Self {
         let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
-        let nullable_enum_name = StrId(context.thread_local().intern("__nullable"));
+        let nullable_enum_name = StrId::from_static("__nullable");
         let mut nullable_tags = HashMap::default();
-        nullable_tags.insert(StrId(context.thread_local().intern("null")), 0usize);
-        nullable_tags.insert(StrId(context.thread_local().intern("some")), 1usize);
+        nullable_tags.insert(StrId::from_static("null"), 0usize);
+        nullable_tags.insert(StrId::from_static("some"), 1usize);
         enum_variant_tags.insert(nullable_enum_name, nullable_tags);
 
-        let throws_enum_name = StrId(context.thread_local().intern("__throws"));
+        let throws_enum_name = StrId::from_static("__throws");
         let mut throws_tags = HashMap::default();
-        throws_tags.insert(StrId(context.thread_local().intern("__success")), 0usize);
+        throws_tags.insert(StrId::from_static("__success"), 0usize);
         enum_variant_tags.insert(throws_enum_name, throws_tags);
 
         Self {
@@ -158,8 +158,17 @@ where
 
         for &idx in compilation_order {
             for item in hir_modules[idx].items {
-                if let Hir::Struct(ty_struct) = item {
-                    self.register_struct(*ty_struct);
+                if let Hir::Struct(s) = item {
+                    self.register_struct(*s); // only insert + mangled_map entry
+                }
+            }
+        }
+        for &idx in compilation_order {
+            for item in hir_modules[idx].items {
+                if let Hir::Struct(s) = item {
+                    if s.generics.is_none() {
+                        self.compute_field_offsets(s);
+                    }
                 }
             }
         }
@@ -190,6 +199,8 @@ where
             self.module_named_imports.insert(idx, named);
         }
 
+        let mut ambiguous: HashSet<(StrId, StrId)> = HashSet::default();
+
         for &idx in compilation_order {
             for item in hir_modules[idx].items {
                 match item {
@@ -200,7 +211,15 @@ where
                                     .struct_mangled_map
                                     .entry(struct_name)
                                     .or_insert_with(|| HashMap::default());
-                                map.insert(func.unmangled_name, func.name);
+                                map.insert(func.name, func.name); // exact lookup always works
+                                match map.get(&func.unmangled_name).copied() {
+                                    Some(prev) if prev != func.name => {
+                                        ambiguous.insert((struct_name, func.unmangled_name));
+                                    }
+                                    _ => {
+                                        map.insert(func.unmangled_name, func.name);
+                                    }
+                                }
                                 self.register_method_signature(func);
                             }
                         }
@@ -217,7 +236,7 @@ where
 
                                 // Closure fns are callable through their env: `env.__call(args)`.
                                 if let Some(env) = Self::closure_env_of(func) {
-                                    let call = StrId(self.context.thread_local().intern("__call"));
+                                    let call = StrId::from_static("__call");
                                     self.struct_mangled_map
                                         .entry(env)
                                         .or_insert_with(|| HashMap::default())
@@ -315,12 +334,18 @@ where
             }
         }
 
+        for (s, m) in &ambiguous {
+            if let Some(map) = self.struct_mangled_map.get_mut(s) {
+                map.remove(m);
+            }
+        }
+
         self.module
     }
 
     fn compute_allocator_kinds(&mut self) {
-        let allocator_iface = StrId(self.context.thread_local().intern("Allocator"));
-        let raw_allocator_iface = StrId(self.context.thread_local().intern("RawAllocator"));
+        let allocator_iface = StrId::from_static("Allocator");
+        let raw_allocator_iface = StrId::from_static("RawAllocator");
 
         for (&struct_name, ifaces) in self.struct_interfaces.iter() {
             if ifaces.contains(&allocator_iface) {
@@ -348,8 +373,6 @@ where
         if hir_struct.generics.is_some() {
             return;
         }
-
-        self.compute_field_offsets(hir_struct);
 
         self.struct_mangled_map
             .entry(hir_struct.name)
@@ -387,7 +410,7 @@ where
                             param_type,
                             span: _,
                             multi_place: _,
-                        } => lower_type_hir(&param_type, &self.enums),
+                        } => lower_type_hir(&param_type, &self.enums, &self.module.structs),
                         HirParam::This {
                             kind,
                             span: _,
@@ -401,7 +424,7 @@ where
                 let ret = m
                     .return_type
                     .as_ref()
-                    .map(|t| lower_type_hir(t, &self.enums))
+                    .map(|t| lower_type_hir(t, &self.enums, &self.module.structs))
                     .unwrap_or(SsaType::Void);
                 methods.push((m.unmangled_name.clone(), param_types, ret));
                 slot_map.insert(m.unmangled_name.clone(), slot);
@@ -433,7 +456,18 @@ where
         let mut current_offset = 0usize;
 
         for f in hir_struct.fields.iter() {
-            let field_ssa_ty = lower_type_hir(&f.field_type, &self.enums);
+            let field_ssa_ty = lower_type_hir(&f.field_type, &self.enums, &self.module.structs);
+            if let SsaType::User(n, fs) = &field_ssa_ty {
+                if fs.is_empty() {
+                    if let Some(def) = self.module.structs.get(n) {
+                        assert!(
+                            def.fields.is_empty(),
+                            "struct `{n}` lowered as ZST but has fields"
+                        );
+                    }
+                }
+            }
+
             let layout =
                 ir::layout::layout_of_ssa(&field_ssa_ty, ir::layout::TargetInfo { ptr_bytes: 8 })
                     .unwrap_or_else(|e| {
