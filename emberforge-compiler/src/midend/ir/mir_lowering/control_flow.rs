@@ -162,8 +162,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let result = if ty == SsaType::Void {
             self.unit_value()
         } else {
-            let result = self.current_block_data.fresh_value();
-            let mut incoming = SmallVec::new();
+            let mut incoming: SmallVec<(BlockId, Value), 4> = SmallVec::new();
             if !then_terminated {
                 incoming.push((then_end, then_val));
             }
@@ -171,13 +170,21 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 incoming.push((else_end, else_val));
             }
             let ty = self.reconcile_phi_type(&incoming, span);
-            self.emit(Instruction::Phi {
-                dest: result,
-                incoming,
-            });
-            self.current_block_data
-                .value_types
-                .insert(result, ty.clone());
+
+            let result = if ty == SsaType::Void {
+                self.unit_value()
+            } else {
+                self.patch_diverging_edges(&mut incoming, &ty);
+                let result = self.current_block_data.fresh_value();
+                self.emit(Instruction::Phi {
+                    dest: result,
+                    incoming,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(result, ty.clone());
+                result
+            };
             result
         };
 
@@ -881,7 +888,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 HirExpr::Null(_) => self.lower_null_as(self.return_type),
                 _ => match self.return_type {
                     Some(ref rt) => {
-                        let expected = lower_type_hir(rt, self.enums);
+                        let expected = lower_type_hir(rt, self.enums, self.structs);
                         let v = self.lower_expr_expected(e, &expected);
                         self.coerce_into_tagged_nullable(v, &expected)
                     }
@@ -930,8 +937,31 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             }
         }
 
-        let first = types[0].clone();
-        for (i, ((bb, v), t)) in incoming.iter().zip(types.iter()).enumerate().skip(1) {
+        if let Some(real_ty) = types
+            .iter()
+            .find(|t| !matches!(t, SsaType::Null | SsaType::Void))
+            .cloned()
+        {
+            if Self::null_compatible_with(&real_ty) {
+                for t in types.iter_mut() {
+                    if *t == SsaType::Null {
+                        *t = real_ty.clone();
+                    }
+                }
+            }
+        }
+
+        // A diverging arm (e.g. a call to `debug_panic`) has no value and types as Void;
+        // it must not decide, or conflict with, the merged type.
+        let first = types
+            .iter()
+            .find(|t| **t != SsaType::Void)
+            .cloned()
+            .unwrap_or(SsaType::Void);
+        for (i, ((bb, v), t)) in incoming.iter().zip(types.iter()).enumerate() {
+            if *t == SsaType::Void && first != SsaType::Void {
+                continue;
+            }
             if *t != first {
                 panic!(
                     "phi type mismatch at {span}: incoming edge 0 has type {:?}, but edge {} \
@@ -941,6 +971,49 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             }
         }
         first
+    }
+
+    pub(super) fn patch_diverging_edges(
+        &mut self,
+        incoming: &mut [(BlockId, Value)],
+        ty: &SsaType,
+    ) {
+        if *ty == SsaType::Void {
+            return;
+        }
+        for (bb, v) in incoming.iter_mut() {
+            if self.current_block_data.value_type(*v) != Some(&SsaType::Void) {
+                continue;
+            }
+            let dummy = self.current_block_data.fresh_value();
+            // Aggregates are represented by address, so use a null pointer (this shape
+            // already goes through your backend for `?T` pointer nulls); scalars use Undef.
+            let instr = if Self::is_aggregate_ssa_type(ty) {
+                Instruction::Const {
+                    dest: dummy,
+                    ty: SsaType::Pointer(Box::new(ty.clone())),
+                    value: Operand::ConstInt(0),
+                }
+            } else {
+                Instruction::Undef {
+                    dest: dummy,
+                    ty: ty.clone(),
+                }
+            };
+            let block = self
+                .current_block_data
+                .func
+                .blocks
+                .iter_mut()
+                .find(|b| b.id == *bb)
+                .expect("phi predecessor block missing");
+            let at = block.instructions.len().saturating_sub(1); // before the arm's Jump
+            block.instructions.insert(at, instr);
+            self.current_block_data
+                .value_types
+                .insert(dummy, ty.clone());
+            *v = dummy;
+        }
     }
 
     pub(super) fn lower_block_value(&mut self, stmts: &[HirStmt<'a, 'bump>]) -> Value {
