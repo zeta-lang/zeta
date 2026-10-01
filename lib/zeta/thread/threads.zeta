@@ -11,12 +11,6 @@ struct ThreadCtxHeader {
     invoke: &func(arg: [*]mut void): void,
 }
 
-// F-independent. This is the ONLY thing JoinHandle ever touches.
-struct ResultSlot<R, A: Allocator> {
-    result: ?R,
-    alloc: A,
-}
-
 // F-dependent. Only ever touched inside invoke_impl<F,R,A>.
 struct ThreadCtx<F, R, A: Allocator> {
     header: ThreadCtxHeader,   // MUST be first field
@@ -25,48 +19,40 @@ struct ThreadCtx<F, R, A: Allocator> {
     alloc: A,                 // needed to reclaim *this* block
 }
 
-extern "C" func thread_entry(arg: [*]mut void): [*]mut void {
-    io.stdout().writeln("thread_entry: entered");
+struct ResultSlot<R, A: Allocator> {
+    manual result: ?R,
+    alloc: A,
+}
 
+struct JoinHandleInner<R, A: Allocator> {
+    tid: Pthread,
+    slot: ^ResultSlot<R, A>,
+}
+
+struct JoinHandle<R, A: Allocator> {
+    manual inner: JoinHandleInner<R, A>,
+}
+
+extern "C" func thread_entry(arg: [*]mut void): [*]mut void {
     let hdr: [*]mut ThreadCtxHeader = arg as [*]mut ThreadCtxHeader;
 
-    io.stdout().writeln("thread_entry: got header");
-
     unsafe { (*hdr).invoke(arg); }
-
-    io.stdout().writeln("thread_entry: calling invoke");
 
     return null;
 }
 
 func invoke_impl<F: func(): R, R, A: Allocator>(arg: [*]mut void): void {
-    io.stdout().writeln("invoke: entered");
-
     let raw: [*]mut ThreadCtx<F, R, A> = arg as [*]mut ThreadCtx<F, R, A>;
 
     let alloc: A = unsafe { (*raw).alloc };
 
-    io.stdout().writeln("invoke: got alloc");
-
     let slot: [*]mut ResultSlot<R, A> = unsafe { (*raw).slot };
-
-    io.stdout().writeln("invoke: got slot");
-    io.stdout().writeln("invoke: calling func");
 
     let result: R = unsafe { (*raw).func_() };
 
-    io.stdout().writeln("invoke: func returned");
-    io.stdout().writeln("invoke: storing result");
-
     unsafe { (*slot).result = result; }
 
-    io.stdout().writeln("invoke: result stored");
-    io.stdout().writeln("invoke: calling $own");
-
     let owned: ^ThreadCtx<F, R, A> = unsafe { $own(raw, alloc) };
-
-    io.stdout().writeln("invoke: $own returned");
-    io.stdout().writeln("invoke: leaving");
 }
 
 func reclaim_ctx<F: func(): R, R>(raw: [*]mut void, alloc: Mallocator): void {
@@ -75,8 +61,6 @@ func reclaim_ctx<F: func(): R, R>(raw: [*]mut void, alloc: Mallocator): void {
 }
 
 func spawn<F: func(): R, R>(f: F): JoinHandle<R, Mallocator> {
-    io.stdout().writeln("spawn: before pthread_create");
-
     let alloc: Mallocator = Mallocator {};
 
     let slot: ^ResultSlot<R, Mallocator> =
@@ -98,8 +82,6 @@ func spawn<F: func(): R, R>(f: F): JoinHandle<R, Mallocator> {
         libc.pthread_create(&mut tid, null, thread_entry as [*]const void, raw_ctx)
     };
 
-    io.stdout().writeln("spawn: after pthread_create");
-
     if (ret != 0) {
         // the thread never ran, so we still own the block
         let back: ^ThreadCtx<F, R, Mallocator> =
@@ -114,37 +96,44 @@ func spawn<F: func(): R, R>(f: F): JoinHandle<R, Mallocator> {
     }
 
     return JoinHandle<R, Mallocator> {
-        tid,
-        slot,
+        inner: JoinHandleInner<R, Mallocator> {
+            tid,
+            slot,
+        },
     };
 }
 
-struct JoinHandle<R, A: Allocator> {
-    tid: Pthread,
-    slot: ^ResultSlot<R, A>,
-}
-
 impl<R, A: Allocator> JoinHandle<R, A> {
-    func join(mut this): R {
-        io.stdout().writeln("join: calling pthread_join");
-
+    func join(mut this): Result<R, i32> {
         let mut retval: [*]mut void = uninit;
+        let ret: i32 = unsafe { libc.pthread_join(this.inner.tid, &mut retval) };
 
-        unsafe {
-            libc.pthread_join(this.tid, &mut retval);
+        if (ret != 0) {
+            return Result.Err { error: ret };
         }
 
-        io.stdout().writeln("join: pthread_join returned");
-        io.stdout().writeln("join: reading result");
-
-        let result: ?R = unsafe { (*this.slot).result };
-
-        io.stdout().writeln("join: returning result");
-
+        let result: ?R = unsafe { (*this.inner.slot).result };
         if (result == null) {
             $unreachable();
         }
 
-        return result;
+        unsafe { $drop_in_place(&mut this.inner); }
+
+        $mem_forget(this);
+
+        return Result.Ok { value: result };
+    }
+}
+
+// TODO: this is UB and causes a segfault, yet to know why
+// impl<R, A: Allocator> JoinHandle<R, A> by Drop {
+//     func drop(mut this) {
+//         unsafe { libc.pthread_detach(this.inner.tid) }
+//     }
+// }
+
+impl<R, A: Allocator> JoinHandleInner<R, A> by Drop {
+    func drop(mut this) {
+        unsafe { libc.pthread_detach(this.tid) }
     }
 }
