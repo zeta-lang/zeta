@@ -22,3 +22,20 @@ public interface Clone {
 public interface Drop {
     func drop(mut this): void;
 }
+
+// Explicit equality. There is intentionally no operator-overload mechanism
+// here; callers use `.eq()` / `.ne()`.
+//
+// For example:
+//     a.eq(b)
+//     a.ne(b)
+// public interface PartialEq {
+//     func eq(&this, other: &this): bool;
+//     func ne(&this, other: &this): bool;
+// }
+
+// Marker meaning equality is an equivalence relation for this type.
+//
+// A type implementing Eq should also implement PartialEq.
+public interface Eq {
+}
