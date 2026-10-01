@@ -168,19 +168,18 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
     }
 
     func skip(&mut this, count: usize): Result<usize, IOError> {
-        //let mut remaining: usize = count;
-        //let mut chunk: [4096]u8 = undefined;
-        //while (remaining > 0) {
-        //    let want: usize = if (remaining < 4096) { remaining } else { 4096 };
-        //    let n: usize = match (unsafe { this.read_raw(chunk[0..want]) }) {
-        //        case Result.Ok { value } -> value,
-        //        case Result.Err { error } -> return Result.Err { error },
-        //    };
-        //    if (n == 0) { break; }
-        //    remaining -= n;
-        //}
-        //return Result.Ok { value: count - remaining };
-        return Result.Ok { value: count };
+        let mut remaining: usize = count;
+        let mut chunk: [4096]u8 = undefined;
+        while (remaining > 0) {
+            let want: usize = if (remaining < 4096) { remaining } else { 4096 };
+            let n: usize = match (unsafe { this.read_raw(chunk[0..<want]) }) {
+                case Result.Ok { value } -> value,
+                case Result.Err { error } -> return Result.Err { error },
+            };
+            if (n == 0) { break; }
+            remaining -= n;
+        }
+        return Result.Ok { value: count - remaining };
     }
 
     func read_to_end<A: Allocator>(&mut this, out: &ArrayList<u8, A>): Result<usize, IOError> {
