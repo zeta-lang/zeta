@@ -9,7 +9,7 @@ use smallvec::smallvec;
 impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     /// Emits a call to the runtime's `__zeta_memset(ptr, value, size)`.
     pub(super) fn emit_memset(&mut self, ptr: Value, value: i64, size: usize) {
-        let memset_fn = StrId(self.context.intern("__zeta_memset"));
+        let memset_fn = StrId::from_static("__zeta_memset");
 
         let val_v = self.current_block_data.fresh_value();
         self.emit(Instruction::Const {
@@ -54,7 +54,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
     /// `__zeta_memcpy(dst, src, size_bytes)`
     pub(super) fn emit_memcpy(&mut self, dst: Value, src: Value, size: Value) {
-        let f = StrId(self.context.intern("__zeta_memcpy"));
+        let f = StrId::from_static("__zeta_memcpy");
         self.emit(Instruction::Call {
             dest: None,
             func: Operand::FunctionRef(f),

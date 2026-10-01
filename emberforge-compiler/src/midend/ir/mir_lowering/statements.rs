@@ -28,9 +28,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         catch_pattern: &Option<HirErrorHandlerPattern<'a, 'bump>>,
         else_block: &Option<&HirStmt<'a, 'bump>>,
         span: SourceSpan<'a>,
+        manual: bool,
     ) {
         self.record_move_if_any(value);
-        let expected_ssa = lower_type_hir(ty, self.enums);
+        let expected_ssa = lower_type_hir(ty, self.enums, self.structs);
         let mut val = self.lower_expr_expected(value, &expected_ssa);
 
         if let Some(pat) = catch_pattern {
@@ -44,6 +45,47 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         self.drop_state.reset_local(*name);
         self.array_flags.remove(name);
 
+        if !manual {
+            self.add_to_scope_stack_for_drops(name, ty, value, span);
+        }
+
+        if matches!(value, HirExpr::Uninit { .. }) {
+            self.drop_state.mark_whole_uninit(*name);
+            if let HirType::Struct {
+                name: struct_name, ..
+            } = ty
+            {
+                if let Some(hir_struct) = self.structs.get(struct_name) {
+                    for f in hir_struct.fields.iter() {
+                        self.drop_state.mark_field_uninit(*name, f.name);
+                    }
+                }
+            }
+        } else if let HirExpr::StructInit { args, .. } = value {
+            for fi in args.iter() {
+                if matches!(fi.value, HirExpr::Uninit { .. }) {
+                    self.drop_state.mark_field_uninit(*name, fi.name);
+                }
+            }
+        }
+
+        if !manual {
+            self.register_array_drop_local(
+                *name,
+                &expected_ssa,
+                !matches!(value, HirExpr::Uninit { .. }),
+                rest,
+            );
+        }
+    }
+
+    fn add_to_scope_stack_for_drops(
+        &mut self,
+        name: &StrId,
+        ty: &HirType<'a, 'bump>,
+        value: &HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) {
         if let HirType::Struct {
             name: struct_name, ..
         } = ty
@@ -83,32 +125,5 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.nullable_owned_locals.insert(*name, owned_ty);
             self.drop_state.mark_whole_initialized(*name);
         }
-
-        if matches!(value, HirExpr::Uninit { .. }) {
-            self.drop_state.mark_whole_uninit(*name);
-            if let HirType::Struct {
-                name: struct_name, ..
-            } = ty
-            {
-                if let Some(hir_struct) = self.structs.get(struct_name) {
-                    for f in hir_struct.fields.iter() {
-                        self.drop_state.mark_field_uninit(*name, f.name);
-                    }
-                }
-            }
-        } else if let HirExpr::StructInit { args, .. } = value {
-            for fi in args.iter() {
-                if matches!(fi.value, HirExpr::Uninit { .. }) {
-                    self.drop_state.mark_field_uninit(*name, fi.name);
-                }
-            }
-        }
-
-        self.register_array_drop_local(
-            *name,
-            &expected_ssa,
-            !matches!(value, HirExpr::Uninit { .. }),
-            rest,
-        );
     }
 }
