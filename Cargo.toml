@@ -12,9 +12,6 @@ strip = "debuginfo"
 lto = "thin"
 codegen-units = 1
 
-[profile.debug]
-codegen-backend = "cranelift"
-
 [build]
 jobs = 12
 rustflags = ["-Zthreads=8"]
