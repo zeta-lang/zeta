@@ -269,6 +269,7 @@ where
                     default_value,
                     multi_place,
                     span,
+                    manual: false,
                 }))
             };
 

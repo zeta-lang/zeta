@@ -762,6 +762,9 @@ fn keyword_or_ident(text: &str) -> TokenKind {
         "char" => TokenKind::Char,
         "str" => TokenKind::Str,
         "bool" => TokenKind::Boolean,
+        "move" => TokenKind::Move,
+        "manual" => TokenKind::Manual,
+
         _ => TokenKind::Ident,
     }
 }

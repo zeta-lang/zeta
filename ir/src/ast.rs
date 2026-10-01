@@ -87,6 +87,7 @@ where
     pub catch_pattern: Option<ErrorHandlerPattern<'a, 'bump>>,
     pub else_block: Option<&'bump Block<'a, 'bump>>,
     pub span: SourceSpan<'a>,
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,6 +153,7 @@ where
     pub field_type: Type<'a, 'bump>,
     pub visibility: Visibility,
     pub span: SourceSpan<'a>,
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,6 +328,7 @@ where
     pub default_value: Option<Expr<'a, 'bump>>,
     pub multi_place: Option<&'bump [EffectAccess<'a, 'bump>]>,
     pub span: SourceSpan<'a>,
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Copy, Default)]
@@ -506,6 +509,7 @@ where
         span: SourceSpan<'a>,
     },
     Lambda {
+        is_move: bool,
         modifiers: Option<LambdaModifier>,
         params: &'bump [LambdaParam<'a, 'bump>],
         return_type: Option<Type<'a, 'bump>>,

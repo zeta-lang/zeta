@@ -31,6 +31,8 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("replace", IntrinsicKind::Replace),
     ("leak", IntrinsicKind::Leak),
     ("fn_ptr", IntrinsicKind::FnPtr),
+    ("drop_in_place", IntrinsicKind::DropInPlace),
+    ("mem_forget", IntrinsicKind::MemForget),
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -117,7 +119,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 {
                     let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
                         path: self.ctx.bump.alloc_slice(&[*name]),
-                        member: StrId(self.ctx.context.intern("")),
+                        member: StrId::from_static(""),
                         span: *span,
                     });
                     HirExpr::ModuleAccess(access)
@@ -603,6 +605,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
             Expr::This { span } => HirExpr::This { span: *span },
             Expr::Lambda {
+                is_move,
                 modifiers,
                 params,
                 return_type,
@@ -633,6 +636,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let body_ref = self.ctx.bump.alloc_value_immutable(lowered_body);
 
                 HirExpr::Lambda {
+                    is_move: *is_move,
                     modifier: *modifiers,
                     params: params_slice,
                     return_type: ret_ref,
@@ -643,7 +647,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             Expr::ModulePath { segments, span } => {
                 let access = self.ctx.bump.alloc_value_immutable(HirModuleAccess {
                     path: self.ctx.bump.alloc_slice(segments),
-                    member: StrId(self.ctx.context.intern("")),
+                    member: StrId::from_static(""),
                     span: *span,
                 });
                 HirExpr::ModuleAccess(access)
@@ -1626,6 +1630,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                                             &subs,
                                             self.ctx.bump,
                                         ),
+                                    manual: f.manual,
                                 })
                                 .collect();
                             ir::hir::HirEnumVariant {

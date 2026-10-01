@@ -138,21 +138,18 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
         SsaType::Interface(_str_id) => todo!(),
         SsaType::Nullable(inner) => {
             if inner.is_pointer() {
-                // Zero-cost: same size as the pointer itself, 0 = null.
                 layout_of_ssa(inner, target)
             } else {
-                // Tagged union: 1-byte discriminant + payload, payload aligned
-                // after the tag. Layout: [tag: u8][padding][payload: T]
-                let payload_size = sizeof_ssa(inner, target)?;
-                let payload_align = alignof_ssa(inner, target)?;
-                let tag_size = 1usize;
-                let padded_offset = round_up_to_align(tag_size, payload_align);
+                let p = layout_of_ssa(inner, target)?;
+                let off = round_up_to_align(1, p.align.max(1));
+                let align = p.align.max(8);
                 Ok(Layout {
-                    size: padded_offset + payload_size,
-                    align: 8,
+                    size: round_up_to_align(off + p.size, align),
+                    align,
                 })
             }
         }
+
         SsaType::Array(ssa_type, length) => Ok(Layout {
             size: sizeof_ssa(ssa_type, TargetInfo { ptr_bytes: 8 })? * length,
             align: 8,
@@ -177,4 +174,8 @@ pub fn round_up_to_align(offset: usize, align: usize) -> usize {
         "alignment must be a power of two, got {align}"
     );
     (offset + align - 1) & !(align - 1)
+}
+
+pub fn nullable_payload_offset(inner: &SsaType, target: TargetInfo) -> Result<usize, LayoutError> {
+    Ok(round_up_to_align(1, alignof_ssa(inner, target)?.max(1)))
 }

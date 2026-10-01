@@ -201,6 +201,70 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
     }
 
+    fn resolve_method_for_enum(
+        &self,
+        name: StrId,
+        type_args: &[HirType<'a, 'bump>],
+        method_name: StrId,
+        call_type_args: Option<&[HirType<'a, 'bump>]>,
+        outer_subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
+    ) -> Option<StrId> {
+        // An instantiated enum (`Result_i64_i32`) maps back to its template + args.
+        let (origin, targs): (StrId, Vec<HirType<'a, 'bump>>) = if type_args.is_empty() {
+            self.instantiated_enum_origins
+                .borrow()
+                .get(&name)
+                .cloned()
+                .unwrap_or((name, Vec::new()))
+        } else {
+            (
+                name,
+                type_args
+                    .iter()
+                    .map(|t| substitute_type(t, outer_subs, &self.bump))
+                    .collect(),
+            )
+        };
+
+        let base_method_name = *self
+            .ctx
+            .struct_methods
+            .borrow()
+            .get(&origin)?
+            .get(&method_name)?;
+        let base_func = self.functions.borrow().get(&base_method_name)?.clone();
+        let Some(type_params) = base_func.generics else {
+            return Some(base_method_name);
+        };
+
+        // impl-level generics come first (see `merge_generics`), method-level follow.
+        let mut inner_subs: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
+        for (p, a) in type_params.iter().zip(targs.iter()) {
+            inner_subs.insert(p.name, *a);
+        }
+        if let Some(cta) = call_type_args {
+            for (p, a) in type_params.iter().skip(targs.len()).zip(cta.iter()) {
+                inner_subs.insert(p.name, substitute_type(a, outer_subs, &self.bump));
+            }
+        }
+        if inner_subs.len() != type_params.len() {
+            return None;
+        }
+
+        let this_ty = self.instantiate_type_recursively(
+            HirType::Enum {
+                name: origin,
+                variants: &[],
+                type_args: self.bump.alloc_slice(&targs),
+            },
+            SourceSpan::default(),
+        );
+        let prev = self.current_this.replace(Some(this_ty));
+        let result = self.monomorphize_function(&base_func, &inner_subs);
+        self.current_this.replace(prev);
+        result
+    }
+
     pub(crate) fn resolve_method_for_type(
         &self,
         struct_ty: &HirType<'a, 'bump>,
@@ -209,6 +273,18 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         outer_subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
     ) -> Option<StrId> {
         let struct_ty = peel_to_struct(struct_ty);
+        if let HirType::Enum {
+            name, type_args, ..
+        } = struct_ty
+        {
+            return self.resolve_method_for_enum(
+                *name,
+                type_args,
+                method_name,
+                call_type_args,
+                outer_subs,
+            );
+        }
         let HirType::Struct {
             name, type_args, ..
         } = struct_ty
@@ -362,6 +438,27 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
     pub(crate) fn concrete_type_of(&self, expr: &HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
         match expr {
+            HirExpr::StructInit {
+                name, type_args, ..
+            } => {
+                let HirExpr::Ident(n, _) = &**name else {
+                    return None;
+                };
+                Some(HirType::Struct {
+                    name: self.resolve_struct_key(*n),
+                    field_types: &[],
+                    type_args: type_args.unwrap_or(&[]),
+                })
+            }
+            HirExpr::Call { callee, .. } => match &**callee {
+                HirExpr::Ident(name, _) => self
+                    .functions
+                    .borrow()
+                    .get(name)
+                    .and_then(|f| f.return_type)
+                    .filter(|t| !contains_unresolved_generic(t)),
+                _ => None,
+            },
             HirExpr::This { .. } => *self.current_this.borrow(),
             HirExpr::Ident(name, _) => self
                 .current_params
@@ -499,6 +596,21 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             name: new_enum.name,
             type_args: &[],
             variants: new_enum.variants,
+        }
+    }
+
+    pub fn closure_env_type(&self, env_name: StrId) -> HirType<'a, 'bump> {
+        let field_types: Vec<HirType<'a, 'bump>> = self
+            .ctx
+            .structs
+            .borrow()
+            .get(&env_name)
+            .map(|s| s.fields.iter().map(|f| f.field_type).collect())
+            .unwrap_or_default();
+        HirType::Struct {
+            name: env_name,
+            field_types: self.bump.alloc_slice(&field_types),
+            type_args: &[],
         }
     }
 }

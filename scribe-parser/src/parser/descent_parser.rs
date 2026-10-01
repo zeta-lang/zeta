@@ -84,7 +84,7 @@ where
 
             TokenKind::Public => {
                 self.cursor.advance();
-                self.parse_stmt(Visibility::Private)
+                self.parse_stmt(Visibility::Public)
             }
 
             TokenKind::Private => {

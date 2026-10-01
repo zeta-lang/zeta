@@ -165,7 +165,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         let (imports, items, pkg_name) = self.lower_function_bodies(stmts);
 
         HirModule {
-            name: pkg_name.unwrap_or_else(|| StrId(self.ctx.context.intern("root"))),
+            name: pkg_name.unwrap_or_else(|| StrId::from_static("root")),
             imports: self.ctx.bump.alloc_slice(&imports),
             items: self.ctx.bump.alloc_slice(&items),
         }
@@ -772,14 +772,14 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ImplTargetKind::UserType,
             )),
             TypeKind::AnySlice => Some((
-                StrId(self.ctx.context.intern("slice")),
+                StrId::from_static("slice"),
                 ImplTargetKind::Slice { element: None },
             )),
             TypeKind::Slice { inner } | TypeKind::Array { inner, .. } => {
                 let elem_key = self.slice_element_key(inner, span);
                 let key = match elem_key {
                     Some(e) => StrId(intern_fmt!(self.ctx.context, "slice_{}", e)),
-                    None => StrId(self.ctx.context.intern("slice")),
+                    None => StrId::from_static("slice"),
                 };
                 Some((key, ImplTargetKind::Slice { element: elem_key }))
             }

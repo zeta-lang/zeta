@@ -128,7 +128,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 type_args,
                 span,
             } => {
-                // Debug: trace calls involving StructInit args (likely closures passed to generic funcs)
                 if let (HirExpr::Ident(func_name, ident_span), None) = (&**callee, type_args) {
                     let maybe_func = self.functions.borrow().get(func_name).cloned();
                     if let Some(func) = maybe_func {
@@ -170,14 +169,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                             if self.env_structs.contains_key(env_name)
                                                 && is_closure_param
                                             {
-                                                inner_subs.insert(
-                                                    *g,
-                                                    HirType::Struct {
-                                                        name: *env_name,
-                                                        field_types: &[],
-                                                        type_args: &[],
-                                                    },
-                                                );
+                                                inner_subs
+                                                    .insert(*g, self.closure_env_type(*env_name));
                                             }
                                         }
                                     }
@@ -274,11 +267,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                                 {
                                                     inner_subs.insert(
                                                         *g,
-                                                        HirType::Struct {
-                                                            name: *env_name,
-                                                            field_types: &[],
-                                                            type_args: &[],
-                                                        },
+                                                        self.closure_env_type(*env_name),
                                                     );
                                                 }
                                             }
@@ -345,7 +334,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
                     if let Some(concrete_recv_ty) = self.concrete_type_of(&new_object) {
                         let concrete_recv_ty = peel_to_struct_owned(concrete_recv_ty);
-                        if matches!(concrete_recv_ty, HirType::Struct { .. }) {
+                        if matches!(
+                            concrete_recv_ty,
+                            HirType::Struct { .. } | HirType::Enum { .. }
+                        ) {
                             if let Some(concrete_method_name) = self.resolve_method_for_type(
                                 &concrete_recv_ty,
                                 *field,
@@ -559,6 +551,31 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 span,
             } => {
                 let new_object = self.monomorphize_expr(object, subs);
+                #[cfg(debug_assertions)]
+                if let Some(recv) = self.concrete_type_of(&new_object) {
+                    if let HirType::Struct { name: rn, .. } = peel_to_struct_owned(recv) {
+                        let origin = self
+                            .instantiated_struct_origins
+                            .borrow()
+                            .get(&rn)
+                            .map(|(o, _)| *o)
+                            .unwrap_or(rn);
+                        let is_generic_method = self
+                            .ctx
+                            .struct_methods
+                            .borrow()
+                            .get(&origin)
+                            .and_then(|m| m.get(field))
+                            .and_then(|n| self.functions.borrow().get(n).cloned())
+                            .map_or(false, |f| f.generics.map_or(false, |g| !g.is_empty()));
+                        if is_generic_method {
+                            panic!(
+                                "monomorphize_expr: generic method `{}` on `{}` left uninstantiated at {span}",
+                                field, origin
+                            );
+                        }
+                    }
+                }
                 HirExpr::FieldAccess {
                     object: self.bump.alloc_value_immutable(new_object),
                     field: *field,
@@ -895,8 +912,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub fn force_instantiate_drops(&self) {
-        let drop_iface = StrId(self.context.intern("Drop"));
-        let drop_method_name = StrId(self.context.intern("drop"));
+        let drop_iface = StrId::from_static("Drop");
+        let drop_method_name = StrId::from_static("drop");
         let origins: Vec<(StrId, Vec<HirType<'a, 'bump>>)> = self
             .instantiated_struct_origins
             .borrow()
@@ -972,16 +989,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         {
             return None; // bare template type: let the old path handle it
         }
-
-        let new_args: Vec<HirFieldInit> = args
-            .iter()
-            .map(|a| HirFieldInit {
-                name: a.name,
-                name_span: a.name_span,
-                value: self.monomorphize_expr(&a.value, outer_subs),
-            })
-            .collect();
-        let args_slice = self.bump.alloc_slice(&new_args);
 
         let new_struct_name = if expected_targs.is_empty() {
             *expected_struct_name
@@ -1115,8 +1122,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub fn force_instantiate_allocator_frees(&self) {
-        let free_method_name = StrId(self.context.intern("free"));
-        let allocator_iface = StrId(self.context.intern("Allocator"));
+        let free_method_name = StrId::from_static("free");
+        let allocator_iface = StrId::from_static("Allocator");
 
         let mut needed: Vec<(StrId, HirType<'a, 'bump>)> = Vec::new();
 
@@ -1577,6 +1584,42 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             HirType::UnsafePointer { inner, .. } => {
                 if let HirType::UnsafePointer { inner: c, .. } = concrete {
                     Self::unify_generic(inner, c, type_params, inner_subs);
+                }
+            }
+            HirType::Struct {
+                name: dn,
+                type_args: da,
+                ..
+            } => {
+                if let HirType::Struct {
+                    name: an,
+                    type_args: aa,
+                    ..
+                } = concrete
+                {
+                    if dn == an {
+                        for (d, a) in da.iter().zip(aa.iter()) {
+                            Self::unify_generic(d, a, type_params, inner_subs);
+                        }
+                    }
+                }
+            }
+            HirType::Enum {
+                name: dn,
+                type_args: da,
+                ..
+            } => {
+                if let HirType::Enum {
+                    name: an,
+                    type_args: aa,
+                    ..
+                } = concrete
+                {
+                    if dn == an {
+                        for (d, a) in da.iter().zip(aa.iter()) {
+                            Self::unify_generic(d, a, type_params, inner_subs);
+                        }
+                    }
                 }
             }
             _ => {}

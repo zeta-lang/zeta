@@ -4,7 +4,10 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
-use zetaruntime::{intern_fmt, string_pool::StringPool};
+use zetaruntime::{
+    intern_fmt,
+    string_pool::{StringPool, VmString},
+};
 
 pub const fn lower_visibility(visibility: &ast::Visibility) -> hir::Visibility {
     match visibility {
@@ -29,14 +32,14 @@ pub const fn lower_cmp_operator(op: ast::Op) -> Operator {
 
 pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
     StrId(match ty {
-        HirType::I32 => pool.intern("i32"),
-        HirType::I64 => pool.intern("i64"),
-        HirType::U32 => pool.intern("u32"),
-        HirType::U64 => pool.intern("u64"),
-        HirType::F32 => pool.intern("f32"),
-        HirType::F64 => pool.intern("f64"),
-        HirType::String => pool.intern("str"),
-        HirType::Boolean => pool.intern("boolean"),
+        HirType::I32 => VmString::from_static("i32"),
+        HirType::I64 => VmString::from_static("i64"),
+        HirType::U32 => VmString::from_static("u32"),
+        HirType::U64 => VmString::from_static("u64"),
+        HirType::F32 => VmString::from_static("f32"),
+        HirType::F64 => VmString::from_static("f64"),
+        HirType::String => VmString::from_static("str"),
+        HirType::Boolean => VmString::from_static("boolean"),
         HirType::Struct {
             name, type_args, ..
         } => {
@@ -60,13 +63,13 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             "[type_suffix_with_pool] unresolved generic parameter `{}` reached name mangling",
             name
         ),
-        HirType::Void => pool.intern("void"),
-        HirType::I8 => pool.intern("i8"),
-        HirType::I16 => pool.intern("i16"),
-        HirType::U8 => pool.intern("u8"),
-        HirType::U16 => pool.intern("u16"),
-        HirType::I128 => pool.intern("i128"),
-        HirType::U128 => pool.intern("u128"),
+        HirType::Void => VmString::from_static("void"),
+        HirType::I8 => VmString::from_static("i8"),
+        HirType::I16 => VmString::from_static("i16"),
+        HirType::U8 => VmString::from_static("u8"),
+        HirType::U16 => VmString::from_static("u16"),
+        HirType::I128 => VmString::from_static("i128"),
+        HirType::U128 => VmString::from_static("u128"),
 
         HirType::SafePointer {
             inner,
@@ -138,9 +141,9 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
              should have been substituted with the concrete receiver type first"
         ),
 
-        HirType::Null => pool.intern("null"),
+        HirType::Null => VmString::from_static("null"),
 
-        HirType::Char => pool.intern("char"),
+        HirType::Char => VmString::from_static("char"),
 
         HirType::Unknown => unreachable!(
             "[type_suffix_with_pool] HirType::Unknown reached name mangling, \
@@ -184,8 +187,8 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             intern_fmt!(pool, "slice_{}", pool.resolve_string(&inner_suf))
         }
 
-        HirType::Usize => pool.intern("usize"),
-        HirType::Isize => pool.intern("isize"),
+        HirType::Usize => VmString::from_static("usize"),
+        HirType::Isize => VmString::from_static("isize"),
 
         HirType::DynInterface(name, type_args) => {
             if type_args.is_empty() {
@@ -221,7 +224,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             }
         }
 
-        HirType::Never => pool.intern("never"),
+        HirType::Never => VmString::from_static("never"),
 
         HirType::Range { elem, inclusive } => {
             let elem_suf = type_suffix_with_pool(pool.clone(), elem);

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use ir::ast::{ExternModifier, FuncSafety, InlineModifier, Visibility};
 use ir::hir::{
-    CaptureMode, ClosureLowering, EffectIndexKey, FuncModifiers, Hir, HirEffectSegment, HirExpr,
-    HirField, HirFieldInit, HirFunc, HirLambdaParam, HirModule, HirParam, HirStmt, HirStruct,
-    HirType, RefKind, StrId, static_effect_path,
+    CaptureMode, ClosureKind, ClosureLowering, EffectIndexKey, FuncModifiers, Hir,
+    HirEffectSegment, HirExpr, HirField, HirFieldInit, HirFunc, HirLambdaParam, HirModule,
+    HirParam, HirStmt, HirStruct, HirType, RefKind, StrId, static_effect_path,
 };
 use ir::ir_hasher::FxHashMap;
 use zetaruntime::bump::GrowableBump;
@@ -125,6 +125,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 catch_pattern,
                 else_block,
                 span,
+                manual,
             } => {
                 let new_value = self.rewrite_expr(value);
                 let new_else = else_block.map(|e| {
@@ -140,6 +141,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     catch_pattern,
                     else_block: new_else,
                     span,
+                    manual,
                 }
             }
             HirStmt::Return(Some(expr), span) => {
@@ -483,6 +485,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 return_type,
                 body,
                 span,
+                ..
             } => self.hoist_lambda(params, *return_type, body, span),
 
             HirExpr::Binary {
@@ -711,7 +714,12 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         self.capture_frames.pop();
 
         let env_param_ty = match closure.kind {
-            ir::hir::ClosureKind::FnOnce => closure.env_ty,
+            ClosureKind::FnOnce => closure.env_ty,
+            ClosureKind::FnMut => HirType::Ref {
+                inner: self.bump.alloc_value(closure.env_ty),
+                ref_kind: RefKind::Unique,
+                provenance: None,
+            },
             _ => HirType::Ref {
                 inner: self.bump.alloc_value(closure.env_ty),
                 ref_kind: RefKind::Shared,
@@ -735,6 +743,13 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         }
         let params_slice = self.bump.alloc_slice(&hir_params);
 
+        let ret_ty =
+            if matches!(closure.ret_ty, HirType::Void) && !matches!(return_type, HirType::Void) {
+                return_type
+            } else {
+                closure.ret_ty
+            };
+
         let synthetic_func = HirFunc {
             name: closure.fn_name,
             function_metadata: FuncModifiers {
@@ -745,7 +760,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             },
             generics: None,
             params: Some(params_slice),
-            return_type: Some(closure.ret_ty),
+            return_type: Some(ret_ty),
             body: Some(rewritten_body),
             unmangled_name: closure.fn_name,
             declaring_module_idx: self.module_idx,
@@ -767,6 +782,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 name: cap.name,
                 field_type: *ty,
                 visibility: Visibility::Private,
+                manual: false,
             })
             .collect();
         let env_struct = HirStruct {

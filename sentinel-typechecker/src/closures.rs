@@ -432,6 +432,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         &self,
         frame: &ClosureFrame<'bump>,
         span: SourceSpan<'a>,
+        is_move: bool,
     ) -> (
         Vec<HirClosureCapture<'bump>>,
         Vec<HirType<'a, 'bump>>,
@@ -442,11 +443,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let (mut any_move, mut any_mut) = (false, false);
 
         for (i, (root, path, usage)) in frame.entries.iter().enumerate() {
-            let mode = match usage.level {
-                UseLevel::Read => CaptureMode::ByRef(RefKind::Shared),
-                UseLevel::Alias => CaptureMode::ByRef(RefKind::Alias),
-                UseLevel::Mut => CaptureMode::ByRef(RefKind::Unique),
-                UseLevel::Move => CaptureMode::ByValue,
+            let mode = if is_move {
+                CaptureMode::ByValue
+            } else {
+                match usage.level {
+                    UseLevel::Read => CaptureMode::ByRef(RefKind::Shared),
+                    UseLevel::Alias => CaptureMode::ByRef(RefKind::Alias),
+                    UseLevel::Mut => CaptureMode::ByRef(RefKind::Unique),
+                    UseLevel::Move => CaptureMode::ByValue,
+                }
             };
             any_move |= usage.level == UseLevel::Move;
             any_mut |= usage.mutated;
@@ -540,10 +545,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return_type,
             body,
             span,
+            is_move,
             ..
         } = expr
         else {
-            unreachable!("check_lambda on a non-lambda");
+            unreachable!()
         };
         self.set_span(*span);
         let declared_ret: HirType<'a, 'bump> = **return_type;
@@ -584,6 +590,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     if as_closure {
                         self.record(TypeErrorKind::TypeCannotBeInferred);
                     }
+
                     HirType::Unknown
                 }
             };
@@ -656,7 +663,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        let (captures, field_tys, kind) = self.finalize_captures(&frame, *span);
+        let (captures, field_tys, kind) = self.finalize_captures(&frame, *span, *is_move);
 
         if !as_closure {
             for c in &captures {
@@ -666,6 +673,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                      constrained by `func(..)` to use a closure",
                     desc
                 )));
+            }
+            if *is_move {
+                for (i, c) in captures.iter().enumerate() {
+                    if frame.entries[i].2.level == UseLevel::Move {
+                        continue; // body already recorded the move
+                    }
+                    let place = self.expr_from_path(c.source, c.source_path, *span);
+                    self.check_and_record_value_use(&place, &field_tys[i]);
+                }
             }
             return HirType::Lambda {
                 params: self.context.bump.alloc_slice(&param_tys),

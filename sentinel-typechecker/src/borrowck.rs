@@ -1724,6 +1724,63 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn is_pointer_like(ty: &HirType<'a, 'bump>) -> bool {
+        matches!(
+            ty,
+            HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+        )
+    }
+
+    /// Does `expr` name a place that lives behind a reference or pointer, directly or
+    /// through owned field/index projections?
+    fn place_is_behind_borrow(&mut self, expr: &HirExpr<'a, 'bump>) -> bool {
+        match expr {
+            HirExpr::Ident(name, _) => self.local_ref_kind.contains_key(name),
+            HirExpr::This { .. } => self.local_ref_kind.contains_key(&self.this_id),
+            HirExpr::Deref { expr: inner, .. } => {
+                Self::is_pointer_like(&self.peek_type(inner)) || self.place_is_behind_borrow(inner)
+            }
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                Self::is_pointer_like(&self.peek_type(object))
+                    || self.place_is_behind_borrow(object)
+            }
+            HirExpr::Index { object, .. } => {
+                let oty = self.peek_type(object);
+                Self::is_pointer_like(&oty)
+                    || matches!(oty, HirType::Slice(_))
+                    || self.place_is_behind_borrow(object)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn check_move_receiver_not_borrowed(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        method_name: &str,
+    ) {
+        if self.in_unsafe() {
+            return; // manual ownership is the programmer's job inside unsafe
+        }
+        let (value_ty, auto_deref) = match self.peek_type(object) {
+            HirType::Ref { inner, .. }
+            | HirType::SafePointer { inner, .. }
+            | HirType::UnsafePointer { inner, .. } => (*inner, true),
+            other => (other, false),
+        };
+        if self.copy_analysis.borrow().type_is_copy(&value_ty) {
+            return;
+        }
+        if auto_deref || self.place_is_behind_borrow(object) {
+            self.record(TypeErrorKind::Generic(format!(
+                "cannot call `{}` on a value behind a reference: it takes `this` by value, \
+                 which would move `{}` out of borrowed content",
+                method_name,
+                type_to_string(&value_ty)
+            )));
+        }
+    }
+
     pub fn check_receiver_ref_kind(
         &mut self,
         object: &HirExpr<'a, 'bump>,
@@ -1731,6 +1788,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         method_name: &str,
     ) {
         let needed = match kind {
+            ThisPassingKind::Move | ThisPassingKind::MoveMut => {
+                self.check_move_receiver_not_borrowed(object, method_name);
+                return;
+            }
             ThisPassingKind::RefMut | ThisPassingKind::MutSafePtr => RefKind::Unique,
             ThisPassingKind::RefAlias => RefKind::Alias,
             _ => return,

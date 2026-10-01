@@ -50,7 +50,7 @@ impl StrId {
         self.0
     }
 
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         unsafe { from_utf8_unchecked(std::slice::from_raw_parts(self.offset, self.length)) }
     }
 
@@ -141,6 +141,8 @@ pub enum IntrinsicKind {
     Replace,
     Leak,
     FnPtr,
+    DropInPlace,
+    MemForget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -286,6 +288,7 @@ where
     pub name: StrId,
     pub field_type: HirType<'a, 'bump>,
     pub visibility: Visibility,
+    pub manual: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -478,6 +481,7 @@ where
         catch_pattern: Option<HirErrorHandlerPattern<'a, 'bump>>,
         else_block: Option<&'bump HirStmt<'a, 'bump>>,
         span: SourceSpan<'a>,
+        manual: bool,
     },
     Const(&'bump ConstStmt<'a, 'bump>),
     Return(Option<&'bump HirExpr<'a, 'bump>>, SourceSpan<'a>),
@@ -694,6 +698,7 @@ where
     },
     ModuleAccess(&'bump HirModuleAccess<'a, 'bump>),
     Lambda {
+        is_move: bool,
         modifier: Option<LambdaModifier>,
         params: &'bump [HirLambdaParam<'a, 'bump>],
         return_type: &'a HirType<'a, 'bump>,

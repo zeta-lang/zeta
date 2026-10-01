@@ -752,9 +752,11 @@ where
                 })
             }
 
-            TokenKind::Suspend | TokenKind::Nosuspend | TokenKind::Blocking | TokenKind::Func => {
-                self.parse_lambda()
-            }
+            TokenKind::Move
+            | TokenKind::Suspend
+            | TokenKind::Nosuspend
+            | TokenKind::Blocking
+            | TokenKind::Func => self.parse_lambda(),
 
             _ => Err(DiagnosticError::new(
                 ParseErrorKind::UnexpectedToken {
@@ -778,6 +780,7 @@ where
 
     fn parse_lambda(&mut self) -> Result<Expr<'a, 'bump>, DiagnosticError<'a>> {
         let start_span = self.cursor.peek_token().span;
+        let is_move = self.cursor.consume(TokenKind::Move);
 
         let modifiers: Option<LambdaModifier> = match self.cursor.peek() {
             TokenKind::Suspend => {
@@ -839,6 +842,7 @@ where
         let span = start_span.merge(fn_token.span);
 
         Ok(Expr::Lambda {
+            is_move,
             modifiers,
             params: self.bump.alloc_slice(&params),
             return_type,

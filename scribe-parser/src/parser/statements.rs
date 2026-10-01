@@ -12,12 +12,16 @@ impl<'a, 'bump> DescentParser<'a, 'bump>
 where
     'bump: 'a,
 {
+    pub fn eat_manual_modifier(&mut self) -> bool {
+        self.cursor.consume(TokenKind::Manual)
+    }
+
     pub fn expect_binding_name(
         &mut self,
     ) -> Result<(StrId, ir::span::SourceSpan<'a>), DiagnosticError<'a>> {
         if self.cursor.peek() == TokenKind::Underscore {
             let tok = self.cursor.bump();
-            Ok((StrId(self.string_pool.intern_bytes(b"_")), tok.span))
+            Ok((StrId::from_static("_"), tok.span))
         } else {
             self.cursor.expect_ident()
         }
@@ -38,6 +42,7 @@ where
         let token = self.cursor.expect(TokenKind::Let)?;
 
         let is_mut = self.cursor.consume(TokenKind::Mut);
+        let is_manual = self.eat_manual_modifier();
         let (name, _span) = self.expect_binding_name()?;
 
         let type_annotation = if self.cursor.consume(TokenKind::Colon) {
@@ -103,6 +108,7 @@ where
             catch_pattern,
             else_block,
             span: token.span,
+            manual: is_manual,
         };
 
         Ok(Stmt::Let(self.bump.alloc_value_immutable(let_stmt)))
@@ -110,6 +116,7 @@ where
 
     pub fn parse_shorthand_let_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let mutable = self.cursor.consume(TokenKind::Mut);
+        let is_manual = self.eat_manual_modifier();
         let (name, span) = self.expect_binding_name()?;
         self.cursor.expect(TokenKind::ColonAssign)?;
         let value = self.parse_expr(0)?;
@@ -139,6 +146,7 @@ where
             catch_pattern,
             else_block,
             span,
+            manual: is_manual,
         };
 
         Ok(Stmt::Let(self.bump.alloc_value_immutable(let_stmt)))

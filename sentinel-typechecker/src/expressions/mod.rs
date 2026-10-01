@@ -1014,6 +1014,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let is_generic_decl = enum_def.generics.is_some_and(|g| !g.is_empty());
 
+        let mut infer_subs: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
+        if is_generic_decl && type_args.is_none() {
+            let generics = enum_def.generics.unwrap_or(&[]);
+            if let Some(HirType::Enum {
+                name: exp_name,
+                type_args: exp_targs,
+                ..
+            }) = expected
+            {
+                if exp_name == enum_name {
+                    for (g, t) in generics.iter().zip(exp_targs.iter()) {
+                        if !matches!(t, HirType::Unknown | HirType::Generic(_)) {
+                            infer_subs.insert(g.name, *t);
+                        }
+                    }
+                }
+            }
+        }
+
         let resolved_field_types: Vec<HirType<'a, 'bump>> = match (is_generic_decl, type_args) {
             (true, Some(ta)) => match self.instantiate_enum(*enum_name, ta) {
                 Some(variants) => variants
@@ -1031,13 +1050,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     variant_def.fields.iter().map(|f| f.field_type).collect()
                 }
             },
-            (true, None) => {
-                self.record(TypeErrorKind::Generic(format!(
-                    "enum `{}` is generic and requires explicit type arguments, e.g. `{}<Type>::{}(..)`",
-                    enum_name_str, enum_name_str, variant_name,
-                )));
-                variant_def.fields.iter().map(|f| f.field_type).collect()
-            }
+            (true, None) => variant_def
+                .fields
+                .iter()
+                .map(|f| self.substitute_type_local(&f.field_type, &infer_subs))
+                .collect(),
             (false, Some(_)) => {
                 self.record(TypeErrorKind::Generic(format!(
                     "enum `{}` is not generic; no type arguments expected",
@@ -1056,10 +1073,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let mut arg_types: Vec<HirType<'a, 'bump>> = Vec::with_capacity(args.len());
-        for (arg, field_type) in args.iter().zip(resolved_field_types.iter()) {
-            let arg_type = self.check_expr_expected(arg, field_type);
+        let mut deferred: Vec<usize> = Vec::new(); // args whose field type still has an unresolved generic
+        for (i, (arg, field_type)) in args.iter().zip(resolved_field_types.iter()).enumerate() {
+            let still_generic =
+                is_generic_decl && type_args.is_none() && matches!(field_type, HirType::Generic(_));
+            let arg_type = if still_generic {
+                self.check_expr(arg)
+            } else {
+                self.check_expr_expected(arg, field_type)
+            };
             self.check_and_record_value_use(arg, &arg_type);
-            self.recover(self.types_compatible(field_type, &arg_type), ());
+            if still_generic {
+                deferred.push(i);
+            } else {
+                self.recover(self.types_compatible(field_type, &arg_type), ());
+            }
             arg_types.push(arg_type);
         }
 
@@ -1071,20 +1099,30 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ta
         } else if is_generic_decl {
             let generics = enum_def.generics.unwrap_or(&[]);
-            let mut subs: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
+            let mut subs = infer_subs; // expected-derived entries take priority
             for (declared_field, actual_ty) in variant_def.fields.iter().zip(arg_types.iter()) {
                 self.unify_generic(&declared_field.field_type, actual_ty, &mut subs);
             }
-            if let Some(HirType::Enum {
-                name: exp_name,
-                type_args: exp_targs,
-                ..
-            }) = expected
-            {
-                if exp_name == enum_name {
-                    for (g, exp_ty) in generics.iter().zip(exp_targs.iter()) {
-                        subs.entry(g.name).or_insert(*exp_ty);
-                    }
+            let unresolved: Vec<&str> = generics
+                .iter()
+                .filter(|g| !subs.contains_key(&g.name))
+                .map(|g| g.name.as_str())
+                .collect();
+            if !unresolved.is_empty() {
+                self.record(TypeErrorKind::Generic(format!(
+                    "enum `{}` is generic and its type argument(s) {} could not be inferred; \
+                     add explicit type arguments, e.g. `{}<Type>::{}(..)`",
+                    enum_name_str,
+                    unresolved.join(", "),
+                    enum_name_str,
+                    variant_name,
+                )));
+            }
+            // Late compat check for args whose field type was a bare generic.
+            for i in deferred {
+                let want = self.substitute_type_local(&variant_def.fields[i].field_type, &subs);
+                if !matches!(want, HirType::Generic(_)) {
+                    self.recover(self.types_compatible(&want, &arg_types[i]), ());
                 }
             }
             let inferred: Vec<HirType<'a, 'bump>> = generics
@@ -1096,17 +1134,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             &[]
         };
 
-        debug_assert!(
-            !final_type_args
-                .iter()
-                .any(|t| matches!(t, HirType::Unknown)),
-            "enum `{}::{}` resolved with an Unknown type argument ({:?}); a variant whose fields \
-             don't mention every generic parameter needs the constructor's expected type threaded \
-             in via check_expr_expected/check_enum_init's `expected` param.",
-            enum_name_str,
-            variant_name,
-            final_type_args
-        );
+        if type_args.is_none() && !final_type_args.is_empty() {
+            self.record_instance_args(expr, final_type_args);
+        }
 
         HirType::Enum {
             name: *enum_name,
@@ -1504,6 +1534,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let ok = match (source, target) {
             (s, t) if self.is_numeric(s) && self.is_numeric(t) => true,
+            (HirType::Char, t) if self.is_numeric(t) => true,
             (HirType::Boolean, t) if self.is_numeric(t) => true,
 
             (

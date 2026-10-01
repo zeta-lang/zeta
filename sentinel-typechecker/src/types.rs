@@ -43,6 +43,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return true;
         }
         match (a, b) {
+            (Nullable(inner), n_b) => self.types_structurally_equal(inner, n_b),
+            (n_a, Nullable(inner)) => self.types_structurally_equal(n_a, inner),
             (
                 Struct {
                     name: na,

@@ -154,7 +154,7 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
 
         let path_str = path
             .iter()
-            .map(|s| self.context.resolve_string(s).to_string())
+            .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("::");
         self.record_error(
@@ -162,10 +162,7 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
                 "cannot resolve type path `{}::{}`: no module is registered for path `{}`, \
                  and `{}` is not an imported module alias. Check for a missing `import` or \
                  a module that hasn't been compiled yet.",
-                path_str,
-                self.context.resolve_string(&name),
-                path_str,
-                self.context.resolve_string(&alias),
+                path_str, &name, path_str, &alias,
             ),
             span,
         );

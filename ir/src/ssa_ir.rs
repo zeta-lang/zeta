@@ -7,6 +7,18 @@ use crate::ir_conversion::lower_type_hir;
 use crate::ir_hasher::HashMap;
 
 impl SsaType {
+    pub fn is_stored_inline(&self) -> bool {
+        match self {
+            SsaType::User(..)
+            | SsaType::Enum { .. }
+            | SsaType::Tuple(_)
+            | SsaType::Array(..)
+            | SsaType::Slice(_) => true,
+            SsaType::Owned(i) => matches!(i.as_ref(), SsaType::Slice(_)),
+            t => t.is_tagged_nullable(),
+        }
+    }
+
     pub fn ptr_to(inner: SsaType) -> Self {
         SsaType::Pointer(Box::new(inner))
     }
@@ -53,29 +65,23 @@ impl SsaType {
         matches!(
             self,
             SsaType::I8
-                | SsaType::U8
                 | SsaType::I16
-                | SsaType::U16
                 | SsaType::I32
-                | SsaType::U32
                 | SsaType::I64
+                | SsaType::U8
+                | SsaType::U16
+                | SsaType::U32
                 | SsaType::U64
-                | SsaType::I128
-                | SsaType::U128
                 | SsaType::Isize
                 | SsaType::Usize
+                | SsaType::Char
         )
     }
 
     pub fn is_signed_integer(&self) -> bool {
         matches!(
             self,
-            SsaType::I8
-                | SsaType::I16
-                | SsaType::I32
-                | SsaType::I64
-                | SsaType::I128
-                | SsaType::Isize
+            SsaType::I8 | SsaType::I16 | SsaType::I32 | SsaType::I64 | SsaType::Isize
         )
     }
 
@@ -94,6 +100,8 @@ impl SsaType {
             SsaType::I128 | SsaType::U128 => 128,
 
             SsaType::Isize | SsaType::Usize => 64, // target for now
+
+            SsaType::Char => 32,
 
             _ => return None,
         })
@@ -428,7 +436,9 @@ impl Function {
                             _ => SsaType::Pointer(Box::new(inner)),
                         }
                     }
-                    HirParam::Normal { param_type, .. } => lower_type_hir(param_type, enums),
+                    HirParam::Normal { param_type, .. } => {
+                        lower_type_hir(param_type, enums, structs)
+                    }
                 };
 
                 value_types.insert(v, ty.clone());
@@ -436,7 +446,11 @@ impl Function {
             }
         }
 
-        let ret_type = lower_type_hir(hir_fn.return_type.as_ref().unwrap_or(&HirType::Void), enums);
+        let ret_type = lower_type_hir(
+            hir_fn.return_type.as_ref().unwrap_or(&HirType::Void),
+            enums,
+            structs,
+        );
 
         Function {
             name: hir_fn.name,
@@ -495,7 +509,7 @@ impl Function {
                 let field_types: Vec<SsaType> = elem_struct
                     .fields
                     .iter()
-                    .map(|f| lower_type_hir(&f.field_type, enums))
+                    .map(|f| lower_type_hir(&f.field_type, enums, structs))
                     .collect();
                 return SsaType::Slice(Box::new(SsaType::User(elem_id, field_types)));
             }

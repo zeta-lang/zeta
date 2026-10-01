@@ -87,6 +87,7 @@ pub fn substitute_type<'a, 'subs, 'bump>(
                             name: f.name,
                             visibility: f.visibility,
                             field_type: substitute_type(&f.field_type, subs, bump),
+                            manual: f.manual,
                         })
                         .collect();
                     HirEnumVariant {

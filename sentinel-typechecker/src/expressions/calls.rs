@@ -490,158 +490,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 );
                 self.check_name_import_visibility(*func_name, &lookup_name);
 
-                let mut substitutions: FxHashMap<StrId, HirType<'a, 'bump>> = match func.generics {
-                    Some(tp) if !tp.is_empty() => match type_args {
-                        Some(ta) => {
-                            let mut full_args = ta.to_vec();
-                            if full_args.len() < tp.len() {
-                                let mut temp_map = FxHashMap::default();
-                                for (&p, &a) in tp.iter().zip(full_args.iter()) {
-                                    temp_map.insert(p.name, a);
-                                }
-                                let start = full_args.len();
-                                for param in &tp[start..] {
-                                    if let Some(ref def_ty) = param.default_type {
-                                        let resolved =
-                                            self.substitute_type_local(def_ty, &temp_map);
-                                        temp_map.insert(param.name, resolved);
-                                        full_args.push(resolved);
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            if full_args.len() != tp.len() {
-                                self.record(TypeErrorKind::Generic(format!(
-                                    "function `{}` expects {} type argument(s), found {}",
-                                    lookup_name,
-                                    tp.len(),
-                                    ta.len()
-                                )));
-                            }
-                            let mut map = FxHashMap::default();
-                            tp.iter()
-                                .zip(full_args.iter())
-                                .map(|(&p, &a)| (p, a))
-                                .for_each(|(p, a)| {
-                                    map.insert(p.name, a);
-                                });
-                            map
-                        }
-                        None => {
-                            // Apply defaults where they exist; everything else is left for
-                            // inference and verified after the arguments have been checked.
-                            let mut temp_map = FxHashMap::default();
-                            for param in tp.iter() {
-                                if let Some(ref def_ty) = param.default_type {
-                                    let resolved = self.substitute_type_local(def_ty, &temp_map);
-                                    temp_map.insert(param.name, resolved);
-                                }
-                            }
-                            temp_map
-                        }
-                    },
-                    _ => {
-                        if type_args.is_some() {
-                            self.record(TypeErrorKind::Generic(format!(
-                                "function `{}` is not generic; no type arguments expected",
-                                lookup_name
-                            )));
-                        }
-                        FxHashMap::default()
-                    }
-                };
-
-                if let Some(exp) = expected {
-                    if let Some(ret) = func.return_type {
-                        self.unify_generic(&ret, exp, &mut substitutions);
-                    }
-                }
-                if let Some(params) = func.params {
-                    for (k, v) in self.pre_infer_generics(Some(&func), args, params) {
-                        substitutions.entry(k).or_insert(v);
-                    }
-                }
-
-                self.closure_pre_subs = substitutions.clone();
-                self.closure_generic_subs.clear();
-
-                let expected_args = func.params.map(|p| p.len()).unwrap_or(0);
-                if args.len() != expected_args {
-                    self.record(TypeErrorKind::InvalidFunctionCall {
-                        expected_args,
-                        found_args: args.len(),
-                    });
-                }
-
-                let Some(params) = func.params else {
-                    let ret_ty = func.return_type.unwrap_or(HirType::Void);
-                    if type_args.is_none() {
-                        self.check_generics_inferred(
-                            &func,
-                            &substitutions,
-                            &lookup_name,
-                            *ident_span,
-                        );
-                    }
-                    return if substitutions.is_empty() {
-                        ret_ty
-                    } else {
-                        self.substitute_type_local(&ret_ty, &substitutions)
-                    };
-                };
-
-                let params = if substitutions.is_empty() {
-                    params
-                } else {
-                    self.substitute_params_local(params, &substitutions)
-                };
-
-                let unsubstituted_ret_ty = func.return_type.unwrap_or(HirType::Void);
-                let ret_ty = if substitutions.is_empty() {
-                    unsubstituted_ret_ty
-                } else {
-                    self.substitute_type_local(&unsubstituted_ret_ty, &substitutions)
-                };
-
-                if let Some(value) =
-                    self.check_potential_this_param_for_move(expr, args, func, params, ret_ty)
-                {
-                    return value;
-                }
-
-                let read_templates = self.analyze_read_templates(&func);
-                for (arg_idx, arg) in args.iter().enumerate() {
-                    if let HirExpr::Ref {
-                        expr: inner,
-                        ref_kind: RefKind::Shared,
-                        ..
-                    } = arg
-                    {
-                        if let Some(template) = read_templates.get(arg_idx) {
-                            self.check_call_arg_read_effects(inner, template, args);
-                        }
-                    }
-                }
-
-                let arg_loans = self.check_all_func_args(args, params, None, Some(func));
-
-                substitutions.extend(std::mem::take(&mut self.closure_generic_subs));
-                if type_args.is_none() {
-                    self.check_generics_inferred(&func, &substitutions, &lookup_name, *ident_span);
-                }
-                let ret_ty = if substitutions.is_empty() {
-                    ret_ty
-                } else {
-                    self.substitute_type_local(&ret_ty, &substitutions)
-                };
-
-                if !self.return_type_may_alias(&ret_ty) {
-                    for loan in arg_loans {
-                        self.borrow_checker.end_loan_now(loan);
-                    }
-                }
-                ret_ty
+                self.check_resolved_function_call(
+                    expr,
+                    func,
+                    &lookup_name,
+                    *ident_span,
+                    args,
+                    type_args,
+                    expected,
+                )
             }
 
             HirExpr::FieldAccess {
@@ -861,11 +718,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
 
                 let struct_type_args: &[HirType<'a, 'bump>] = match stripped {
-                    HirType::Struct { type_args, .. } => type_args,
+                    HirType::Struct { type_args, .. } | HirType::Enum { type_args, .. } => {
+                        type_args
+                    }
                     _ => &[],
                 };
                 let mut method_subs =
-                    self.generic_substitutions_for_struct(struct_name_id, struct_type_args);
+                    self.generic_substitutions_for_type(struct_name_id, struct_type_args);
 
                 if let Some(exp) = expected {
                     if let Some(ret) = func.return_type {
@@ -1105,6 +964,32 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 self.check_module_path_imported(access.path);
 
+                if free_func.is_some() && func.generics.is_some_and(|g| !g.is_empty()) {
+                    let display = format!(
+                        "{}.{}",
+                        access
+                            .path
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                        member_name
+                    );
+                    let ret_ty = self.check_resolved_function_call(
+                        expr,
+                        func,
+                        &display,
+                        access.span,
+                        args,
+                        type_args,
+                        expected,
+                    );
+                    if let Some(midx) = resolved_module_idx {
+                        self.record_item_occurrence(access.span, access.member, ret_ty, midx);
+                    }
+                    return ret_ty;
+                }
+
                 let expected_args = func.params.map(|p| p.len()).unwrap_or(0);
                 if args.len() != expected_args {
                     self.record(TypeErrorKind::InvalidFunctionCall {
@@ -1167,6 +1052,159 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
         }
+    }
+
+    fn check_resolved_function_call(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        func: HirFunc<'a, 'bump>,
+        display_name: &str,
+        span: SourceSpan<'a>,
+        args: &&[HirExpr<'a, 'bump>],
+        type_args: &Option<&[HirType<'a, 'bump>]>,
+        expected: Option<&HirType<'a, 'bump>>,
+    ) -> HirType<'a, 'bump> {
+        let mut substitutions: FxHashMap<StrId, HirType<'a, 'bump>> = match func.generics {
+            Some(tp) if !tp.is_empty() => match type_args {
+                Some(ta) => {
+                    let mut full_args = ta.to_vec();
+                    if full_args.len() < tp.len() {
+                        let mut temp_map = FxHashMap::default();
+                        for (&p, &a) in tp.iter().zip(full_args.iter()) {
+                            temp_map.insert(p.name, a);
+                        }
+                        let start = full_args.len();
+                        for param in &tp[start..] {
+                            if let Some(ref def_ty) = param.default_type {
+                                let resolved = self.substitute_type_local(def_ty, &temp_map);
+                                temp_map.insert(param.name, resolved);
+                                full_args.push(resolved);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if full_args.len() != tp.len() {
+                        self.record(TypeErrorKind::Generic(format!(
+                            "function `{}` expects {} type argument(s), found {}",
+                            display_name,
+                            tp.len(),
+                            ta.len()
+                        )));
+                    }
+                    let mut map = FxHashMap::default();
+                    for (&p, &a) in tp.iter().zip(full_args.iter()) {
+                        map.insert(p.name, a);
+                    }
+                    map
+                }
+                None => {
+                    let mut temp_map = FxHashMap::default();
+                    for param in tp.iter() {
+                        if let Some(ref def_ty) = param.default_type {
+                            let resolved = self.substitute_type_local(def_ty, &temp_map);
+                            temp_map.insert(param.name, resolved);
+                        }
+                    }
+                    temp_map
+                }
+            },
+            _ => {
+                if type_args.is_some() {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "function `{}` is not generic; no type arguments expected",
+                        display_name
+                    )));
+                }
+                FxHashMap::default()
+            }
+        };
+
+        if let Some(exp) = expected {
+            if let Some(ret) = func.return_type {
+                self.unify_generic(&ret, exp, &mut substitutions);
+            }
+        }
+        if let Some(params) = func.params {
+            for (k, v) in self.pre_infer_generics(Some(&func), args, params) {
+                substitutions.entry(k).or_insert(v);
+            }
+        }
+
+        self.closure_pre_subs = substitutions.clone();
+        self.closure_generic_subs.clear();
+
+        let expected_args = func.params.map(|p| p.len()).unwrap_or(0);
+        if args.len() != expected_args {
+            self.record(TypeErrorKind::InvalidFunctionCall {
+                expected_args,
+                found_args: args.len(),
+            });
+        }
+
+        let Some(params) = func.params else {
+            let ret_ty = func.return_type.unwrap_or(HirType::Void);
+            if type_args.is_none() {
+                self.check_generics_inferred(&func, &substitutions, display_name, span);
+            }
+            return if substitutions.is_empty() {
+                ret_ty
+            } else {
+                self.substitute_type_local(&ret_ty, &substitutions)
+            };
+        };
+
+        let params = if substitutions.is_empty() {
+            params
+        } else {
+            self.substitute_params_local(params, &substitutions)
+        };
+
+        let unsubstituted_ret_ty = func.return_type.unwrap_or(HirType::Void);
+        let ret_ty = if substitutions.is_empty() {
+            unsubstituted_ret_ty
+        } else {
+            self.substitute_type_local(&unsubstituted_ret_ty, &substitutions)
+        };
+
+        if let Some(value) =
+            self.check_potential_this_param_for_move(expr, args, func, params, ret_ty)
+        {
+            return value;
+        }
+
+        let read_templates = self.analyze_read_templates(&func);
+        for (arg_idx, arg) in args.iter().enumerate() {
+            if let HirExpr::Ref {
+                expr: inner,
+                ref_kind: RefKind::Shared,
+                ..
+            } = arg
+            {
+                if let Some(template) = read_templates.get(arg_idx) {
+                    self.check_call_arg_read_effects(inner, template, args);
+                }
+            }
+        }
+
+        let arg_loans = self.check_all_func_args(args, params, None, Some(func));
+
+        substitutions.extend(std::mem::take(&mut self.closure_generic_subs));
+        if type_args.is_none() {
+            self.check_generics_inferred(&func, &substitutions, display_name, span);
+        }
+        let ret_ty = if substitutions.is_empty() {
+            ret_ty
+        } else {
+            self.substitute_type_local(&ret_ty, &substitutions)
+        };
+
+        if !self.return_type_may_alias(&ret_ty) {
+            for loan in arg_loans {
+                self.borrow_checker.end_loan_now(loan);
+            }
+        }
+        ret_ty
     }
 
     pub fn check_slice_primitive_call(
@@ -1364,6 +1402,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 self.resolve_default_interface_method(*name, &struct_name_str, method_name)
             }
+            HirType::Enum { name, .. } => try_name(name.to_string()),
             HirType::Slice(elem) | HirType::Array(elem, _) => {
                 if let Some(elem_name) = self.builtin_element_name(elem) {
                     if let Some(hit) = try_name(format!("slice_{}", elem_name)) {

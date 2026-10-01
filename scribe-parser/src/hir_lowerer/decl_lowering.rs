@@ -189,6 +189,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 name: p.name,
                 field_type: self.lower_type(&p.type_annotation, p.span),
                 visibility: lower_visibility(&p.visibility),
+                manual: p.manual,
             },
             Param::This(_) => panic!("`this` parameter is not allowed in a struct"),
         }
@@ -439,6 +440,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             name: f.name,
                             field_type,
                             visibility: lower_visibility(&f.visibility),
+                            manual: f.manual,
                         }
                     })
                     .collect();

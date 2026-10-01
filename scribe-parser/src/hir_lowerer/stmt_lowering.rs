@@ -422,6 +422,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             catch_pattern,
             else_block,
             span: l.span,
+            manual: l.manual,
         }
     }
 }

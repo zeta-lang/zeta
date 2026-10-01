@@ -58,6 +58,7 @@ where
                     Visibility::Public
                 };
 
+                let manual = self.eat_manual_modifier();
                 let (field_name, field_span) = self.cursor.expect_ident()?;
                 self.cursor.expect(TokenKind::Colon)?;
                 let field_type = self.parse_type()?;
@@ -97,6 +98,7 @@ where
                     field_type,
                     visibility: field_vis,
                     span: field_span,
+                    manual,
                 });
 
                 self.cursor.consume(TokenKind::Comma);
@@ -115,6 +117,7 @@ where
                         default_value: None,
                         multi_place: None,
                         span: f.span,
+                        manual: f.manual,
                     }))
                 })
                 .collect();
@@ -260,6 +263,8 @@ where
             };
 
             let peeked_token = self.cursor.peek_token();
+            let manual = self.eat_manual_modifier();
+
             let field_type = self.parse_type()?;
 
             let unmerged_mp_span = self.cursor.peek_token().span;
@@ -304,6 +309,7 @@ where
                     default_value: None,
                     multi_place: None,
                     span: peeked_token.span,
+                    manual,
                 }),
             ));
 
@@ -528,6 +534,7 @@ where
                     _ => Visibility::Public,
                 };
 
+                let manual = self.eat_manual_modifier();
                 let (field_name, field_span) = self.cursor.expect_ident()?;
                 self.cursor.expect(TokenKind::Colon)?;
                 let field_type = self.parse_type()?;
@@ -537,6 +544,7 @@ where
                     field_type,
                     visibility,
                     span: field_span,
+                    manual,
                 });
                 if !self.cursor.consume(TokenKind::Comma) {
                     break;

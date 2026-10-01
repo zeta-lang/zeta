@@ -118,6 +118,43 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 Hir::Func(f) => {
                     let mut new_func = (*f).clone();
                     if new_func.generics.is_none() {
+                        if let Some(params) = new_func.params {
+                            let new_params: Vec<HirParam> = params
+                                .iter()
+                                .map(|p| match p {
+                                    HirParam::Normal {
+                                        name,
+                                        param_type,
+                                        multi_place,
+                                        span,
+                                    } => {
+                                        let s =
+                                            substitute_type(param_type, &empty_subs, &self.bump);
+                                        HirParam::Normal {
+                                            name: *name,
+                                            param_type: self.instantiate_type_recursively(s, *span),
+                                            multi_place: *multi_place,
+                                            span: *span,
+                                        }
+                                    }
+                                    HirParam::This {
+                                        kind,
+                                        span,
+                                        multi_place,
+                                    } => HirParam::This {
+                                        kind: *kind,
+                                        span: *span,
+                                        multi_place: *multi_place,
+                                    },
+                                })
+                                .collect();
+                            new_func.params = Some(self.bump.alloc_slice(&new_params));
+                        }
+                        new_func.return_type = new_func.return_type.map(|rt| {
+                            let s = substitute_type(&rt, &empty_subs, &self.bump);
+                            self.instantiate_type_recursively(s, new_func.span)
+                        });
+
                         if let Some(body) = new_func.body {
                             let prev_module_idx = self.ctx.module_idx;
                             self.ctx.module_idx = f.declaring_module_idx;
@@ -336,6 +373,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             );
         }
 
+        let normalized: FxHashMap<StrId, HirType<'a, 'bump>> = substitutions
+            .iter()
+            .map(|(k, v)| (*k, self.instantiate_type_recursively(*v, func.span)))
+            .collect();
+        let substitutions = &normalized;
+
         let orig_name = func.name.clone();
         let suffix = suffix_for_subs(self.context.clone(), substitutions);
         let key = (orig_name.clone(), suffix.clone());
@@ -352,7 +395,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         if new_func.impl_target.is_some() {
             let cur_self = *self.current_this.borrow();
             if let Some(ref self_ty) = cur_self {
-                if let HirType::Struct { name, .. } = peel_to_struct(self_ty) {
+                if let HirType::Struct { name, .. } | HirType::Enum { name, .. } =
+                    peel_to_struct(self_ty)
+                {
                     new_func.impl_target = Some(*name);
                 }
             }

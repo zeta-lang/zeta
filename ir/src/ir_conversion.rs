@@ -1,5 +1,5 @@
 use crate::{
-    hir::{AssignmentOperator, HirEnum, HirType, Operator, StrId},
+    hir::{AssignmentOperator, HirEnum, HirStruct, HirType, Operator, StrId},
     ir_hasher::HashMap,
     ssa_ir::{BinOp, SsaType},
 };
@@ -21,7 +21,20 @@ pub fn assign_op_to_bin_op(op: AssignmentOperator) -> BinOp {
     bin_op
 }
 
-pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> SsaType {
+pub fn lower_type_hir(
+    ty: &HirType,
+    enums: &HashMap<StrId, HirEnum<'_, '_>>,
+    structs: &HashMap<StrId, HirStruct<'_, '_>>,
+) -> SsaType {
+    lower_type_hir_inner(ty, enums, structs, &mut Vec::new())
+}
+
+fn lower_type_hir_inner(
+    ty: &HirType,
+    enums: &HashMap<StrId, HirEnum<'_, '_>>,
+    structs: &HashMap<StrId, HirStruct<'_, '_>>,
+    in_progress: &mut Vec<StrId>,
+) -> SsaType {
     match ty {
         HirType::I8 => SsaType::I8,
         HirType::I16 => SsaType::I16,
@@ -39,18 +52,53 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
         HirType::String => SsaType::String,
 
         HirType::Struct {
-            name,
-            field_types: args,
-            ..
+            name, field_types, ..
         } => {
-            let lowered_args: Vec<SsaType> =
-                args.iter().map(|arg| lower_type_hir(arg, enums)).collect();
-            SsaType::User(*name, lowered_args)
+            // Already expanding this struct further up the stack: we're behind a
+            // pointer (the only legal way to recurse). Pointer layout never looks
+            // at the pointee's fields, so stop here.
+            if in_progress.contains(name) {
+                return SsaType::User(*name, Vec::new());
+            }
+
+            match structs.get(name).filter(|s| s.generics.is_none()) {
+                // Registry is authoritative: ignore whatever `field_types` the
+                // HirType happened to carry (often `&[]`).
+                Some(def) => {
+                    in_progress.push(*name);
+                    let mut fields = Vec::with_capacity(def.fields.len());
+                    for f in def.fields.iter() {
+                        fields.push(lower_type_hir_inner(
+                            &f.field_type,
+                            enums,
+                            structs,
+                            in_progress,
+                        ));
+                    }
+                    in_progress.pop();
+                    SsaType::User(*name, fields)
+                }
+                // Not registered yet: fall back to what the type carries.
+                None => {
+                    let mut fields = Vec::with_capacity(field_types.len());
+                    for t in field_types.iter() {
+                        fields.push(lower_type_hir_inner(t, enums, structs, in_progress));
+                    }
+                    SsaType::User(*name, fields)
+                }
+            }
         }
 
         HirType::DynInterface(name, _args) => SsaType::Interface(*name),
 
         HirType::Enum { name, .. } => {
+            if in_progress.contains(name) {
+                // Behind a pointer; the layout never looks at the payload.
+                return SsaType::Enum {
+                    name: *name,
+                    variants: Vec::new(),
+                };
+            }
             let hir_enum = enums.get(name).unwrap_or_else(|| {
                 println!("enums: {:#?}", enums.keys().collect::<Vec<_>>());
                 panic!(
@@ -60,16 +108,18 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
                     name
                 )
             });
+            in_progress.push(*name);
             let variants = hir_enum
                 .variants
                 .iter()
                 .map(|v| {
                     v.fields
                         .iter()
-                        .map(|f| lower_type_hir(&f.field_type, enums))
+                        .map(|f| lower_type_hir_inner(&f.field_type, enums, structs, in_progress))
                         .collect()
                 })
                 .collect();
+            in_progress.pop();
             SsaType::Enum {
                 name: *name,
                 variants,
@@ -96,18 +146,29 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
                         None => SsaType::Pointer(Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_type_hir(inner, enums))),
+                _ => SsaType::Pointer(Box::new(lower_pointee(inner, enums, structs, in_progress))),
             }
         }
-        HirType::OwnedPointer { inner, .. } => {
-            SsaType::Owned(Box::new(lower_type_hir(inner, enums)))
-        }
+        HirType::OwnedPointer { inner, .. } => SsaType::Owned(Box::new(lower_type_hir_inner(
+            *inner,
+            enums,
+            structs,
+            in_progress,
+        ))),
         HirType::Lambda {
             params,
             return_type,
         } => SsaType::FuncPointer {
-            params: params.iter().map(|p| lower_type_hir(p, enums)).collect(),
-            return_type: Box::new(lower_type_hir(return_type, enums)),
+            params: params
+                .iter()
+                .map(|p| lower_type_hir_inner(p, enums, structs, in_progress))
+                .collect(),
+            return_type: Box::new(lower_type_hir_inner(
+                return_type,
+                enums,
+                structs,
+                in_progress,
+            )),
         },
         HirType::Generic(name) => panic!(
             "[lower_type_hir] unsubstituted generic parameter `{}` reached MIR lowering; \
@@ -139,10 +200,20 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
                         None => SsaType::Pointer(Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_type_hir(inner, enums))),
+                _ => SsaType::Pointer(Box::new(lower_type_hir_inner(
+                    inner,
+                    enums,
+                    structs,
+                    in_progress,
+                ))),
             }
         }
-        HirType::Nullable(hir_type) => SsaType::Nullable(Box::new(lower_type_hir(hir_type, enums))),
+        HirType::Nullable(hir_type) => SsaType::Nullable(Box::new(lower_type_hir_inner(
+            hir_type,
+            enums,
+            structs,
+            in_progress,
+        ))),
         HirType::Dyn { bounds } => {
             let iface = bounds.iter().find_map(|b| match b {
                 HirType::DynInterface(name, _) => Some(*name),
@@ -154,18 +225,26 @@ pub fn lower_type_hir(ty: &HirType, enums: &HashMap<StrId, HirEnum<'_, '_>>) -> 
             }
         }
         HirType::Unknown => unreachable!(),
-        HirType::Tuple(args) => {
-            SsaType::Tuple(args.iter().map(|arg| lower_type_hir(arg, enums)).collect())
-        }
-        HirType::Array(hir_type, length) => {
-            SsaType::Array(Box::new(lower_type_hir(hir_type, enums)), *length)
-        }
-        HirType::Slice(hir_type) => SsaType::Slice(Box::new(lower_type_hir(hir_type, enums))),
+        HirType::Tuple(args) => SsaType::Tuple(
+            args.iter()
+                .map(|arg| lower_type_hir_inner(arg, enums, structs, in_progress))
+                .collect(),
+        ),
+        HirType::Array(hir_type, length) => SsaType::Array(
+            Box::new(lower_type_hir_inner(hir_type, enums, structs, in_progress)),
+            *length,
+        ),
+        HirType::Slice(hir_type) => SsaType::Slice(Box::new(lower_type_hir_inner(
+            hir_type,
+            enums,
+            structs,
+            in_progress,
+        ))),
         HirType::Usize => SsaType::Usize,
         HirType::Isize => SsaType::Isize,
         HirType::Never => SsaType::Void,
         HirType::Range { elem, inclusive: _ } => {
-            let elem_ssa = lower_type_hir(elem, enums);
+            let elem_ssa = lower_type_hir_inner(elem, enums, structs, in_progress);
             SsaType::Tuple(vec![elem_ssa.clone(), elem_ssa])
         }
     }
@@ -192,5 +271,21 @@ pub fn lower_operator_bin(operator: &Operator) -> BinOp {
         Operator::ShiftLeft => BinOp::ShiftLeft,
         Operator::ShiftRight => BinOp::ShiftRight,
         _ => todo!("Handle when a non-binary operation is passed here"),
+    }
+}
+
+fn lower_pointee(
+    ty: &HirType,
+    enums: &HashMap<StrId, HirEnum<'_, '_>>,
+    structs: &HashMap<StrId, HirStruct<'_, '_>>,
+    ip: &mut Vec<StrId>,
+) -> SsaType {
+    match ty {
+        HirType::Struct { name, .. } => SsaType::User(*name, Vec::new()),
+        HirType::Enum { name, .. } => SsaType::Enum {
+            name: *name,
+            variants: Vec::new(),
+        },
+        other => lower_type_hir_inner(other, enums, structs, ip),
     }
 }

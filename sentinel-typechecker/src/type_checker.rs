@@ -751,6 +751,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
                 is_static: _,
                 catch_pattern: _,
+                ..
             } => {
                 self.set_span(*span);
                 self.check_let_stmt(name, ty, value, mutable, else_block, span)

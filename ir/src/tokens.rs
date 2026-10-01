@@ -376,6 +376,8 @@ pub enum TokenKind {
     Undefined,
     As,
     Uninit,
+    Move,
+    Manual,
 
     // ===== Types =====
     U8,
@@ -650,6 +652,8 @@ impl fmt::Display for TokenKind {
             Never => "never",
             Dollar => "$",
             Octal => "o",
+            Move => "move",
+            Manual => "manual",
         };
         f.write_str(s)
     }

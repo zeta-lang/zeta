@@ -309,8 +309,64 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.unify_generic(inner, a, subs);
                 }
             }
+            HirType::Struct {
+                name: dn,
+                type_args: da,
+                ..
+            } => {
+                if let HirType::Struct {
+                    name: an,
+                    type_args: aa,
+                    ..
+                } = actual
+                {
+                    if dn == an {
+                        for (d, a) in da.iter().zip(aa.iter()) {
+                            self.unify_generic(d, a, subs);
+                        }
+                    }
+                }
+            }
+            HirType::Enum {
+                name: dn,
+                type_args: da,
+                ..
+            } => {
+                if let HirType::Enum {
+                    name: an,
+                    type_args: aa,
+                    ..
+                } = actual
+                {
+                    if dn == an {
+                        for (d, a) in da.iter().zip(aa.iter()) {
+                            self.unify_generic(d, a, subs);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    pub fn generic_substitutions_for_type(
+        &self,
+        name: StrId,
+        args: &[HirType<'a, 'bump>],
+    ) -> FxHashMap<StrId, HirType<'a, 'bump>> {
+        let mut m = self.generic_substitutions_for_struct(name, args);
+        if m.is_empty() && !args.is_empty() {
+            if let Some(gs) = self
+                .context
+                .get_enum(&name.to_string())
+                .and_then(|e| e.generics)
+            {
+                for (g, a) in gs.iter().zip(args.iter()) {
+                    m.insert(g.name, *a);
+                }
+            }
+        }
+        m
     }
 
     pub fn generic_substitutions_for_struct(
