@@ -1,9 +1,206 @@
 package zeta::strings;
 
+import zeta::result.Result;
+
+public struct Utf8Decode {
+    value: u32,
+    width: usize,
+}
+
+struct Split {
+    remaining: str,
+    delimiter: u8,
+    finished: bool,
+}
+
+impl Split {
+    func next(&mut this): ?str {
+        if (this.finished) {
+            return null;
+        }
+
+        let bytes: &[]u8 = this.remaining.as_bytes();
+
+        for (let i: usize = 0; i < bytes.len; i += 1) {
+            if (bytes[i] == this.delimiter) {
+                let part: str = this.remaining.get_slice(0, i);
+
+                if (i + 1 == bytes.len) {
+                    this.finished = true;
+                }
+                else {
+                    this.remaining =
+                        this.remaining.get_slice(i + 1, bytes.len);
+                }
+
+                return part;
+            }
+        }
+
+        this.finished = true;
+        return this.remaining;
+    }
+}
+
+func decode_utf8_first(s: str): Result<Utf8Decode, bool> {
+    let bytes: &[]u8 = s.as_bytes();
+
+    if (bytes.len == 0) {
+        return Result.Err { error: false };
+    }
+
+    let b0: u8 = bytes[0];
+
+    // ASCII.
+    if (b0 < 0x80) {
+        return Result.Ok {
+            value: Utf8Decode {
+                value: b0 as u32,
+                width: 1,
+            },
+        };
+    }
+
+    // 2-byte sequence.
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if (bytes.len < 2) {
+            return Result.Err { error: false };
+        }
+
+        let b1: u8 = bytes[1];
+
+        if ((b1 & 0xC0) != 0x80) {
+            return Result.Err { error: false };
+        }
+
+        let value: u32 =
+            (((b0 & 0x1F) as u32) << 6) |
+            ((b1 & 0x3F) as u32);
+
+        return Result.Ok {
+            value: Utf8Decode {
+                value,
+                width: 2,
+            },
+        };
+    }
+
+    // 3-byte sequence.
+    if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if (bytes.len < 3) {
+            return Result.Err { error: false };
+        }
+
+        let b1: u8 = bytes[1];
+        let b2: u8 = bytes[2];
+
+        if ((b1 & 0xC0) != 0x80 ||
+            (b2 & 0xC0) != 0x80) {
+            return Result.Err { error: false };
+        }
+
+        // Reject overlong encodings and UTF-16 surrogate range.
+        if (b0 == 0xE0 && b1 < 0xA0) {
+            return Result.Err { error: false };
+        }
+
+        if (b0 == 0xED && b1 >= 0xA0) {
+            return Result.Err { error: false };
+        }
+
+        let value: u32 =
+            (((b0 & 0x0F) as u32) << 12) |
+            (((b1 & 0x3F) as u32) << 6) |
+            ((b2 & 0x3F) as u32);
+
+        return Result.Ok {
+            value: Utf8Decode {
+                value,
+                width: 3,
+            },
+        };
+    }
+
+    // 4-byte sequence.
+    if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if (bytes.len < 4) {
+            return Result.Err { error: false };
+        }
+
+        let b1: u8 = bytes[1];
+        let b2: u8 = bytes[2];
+        let b3: u8 = bytes[3];
+
+        if ((b1 & 0xC0) != 0x80 ||
+            (b2 & 0xC0) != 0x80 ||
+            (b3 & 0xC0) != 0x80) {
+            return Result.Err { error: false };
+        }
+
+        if (b0 == 0xF0 && b1 < 0x90) {
+            return Result.Err { error: false };
+        }
+
+        if (b0 == 0xF4 && b1 >= 0x90) {
+            return Result.Err { error: false };
+        }
+
+        let value: u32 =
+            (((b0 & 0x07) as u32) << 18) |
+            (((b1 & 0x3F) as u32) << 12) |
+            (((b2 & 0x3F) as u32) << 6) |
+            ((b3 & 0x3F) as u32);
+
+        return Result.Ok {
+            value: Utf8Decode {
+                value,
+                width: 4,
+            },
+        };
+    }
+
+    return Result.Err { error: false };
+}
+
+func ascii_lower(byte: u8): u8 {
+    if (byte >= ('A' as u8) && byte <= ('Z' as u8)) {
+        return byte + 32;
+    }
+
+    return byte;
+}
+
 impl str {
     unsafe func from_utf8(bytes: &[]u8): Result<str, Utf8ConversionError> {
         return Result.Ok { value: "" };
     }
+    func from_utf8(bytes: &[]u8): Result<str, Utf8ConversionError> {
+        let mut offset: usize = 0;
+
+        while (offset < bytes.len) {
+            let remainder: str = unsafe {
+                str.from_utf8_unchecked(bytes[offset..<bytes.len])
+            };
+
+            match (decode_utf8_first(remainder)) {
+                case Result.Ok { value } -> {
+                    offset += value.width;
+                },
+                case Result.Err { error } -> {
+                    return Result.Err {
+                        error: Utf8ConversionError {},
+                    };
+                },
+            }
+        }
+
+        unsafe {
+            return Result.Ok {
+                value: str.from_utf8_unchecked(bytes),
+            };
+        }
+    }
+
     unsafe func from_utf8_unchecked(bytes: &[]u8): str {
         return "";
     }
@@ -14,6 +211,171 @@ impl str {
             let data_ptr: [*]const u8 = $reinterpret<[*]const u8>($reinterpret<usize>(this) + 8);
             return data_ptr[0..<len];
         }
+    }
+
+    func get(&this, index: usize): ?u8 {
+        if (index >= this.len()) {
+            return null;
+        }
+
+        let bytes: &[]u8 = this.as_bytes();
+        return bytes[index];
+    }
+
+    func get_slice(&this, start: usize, end: usize): str {
+        let bytes: &[]u8 = this.as_bytes();
+        return unsafe { str.from_utf8_unchecked(bytes[start..<end]) };
+    }
+
+    func is_empty(&this): bool {
+        return this.len() == 0;
+    }
+
+    func len(&this): usize {
+        return unsafe { *($reinterpret<[*]const usize>(this)) };
+    }
+
+    func trim_start(&this): str {
+        let bytes: &[]u8 = this.as_bytes();
+
+        let mut start: usize = 0;
+
+        while (start < bytes.len) {
+            let b: u8 = bytes[start];
+
+            if (b != (' ' as u8) &&
+                b != ('\t' as u8) &&
+                b != ('\n' as u8) &&
+                b != ('\r' as u8)) {
+                break;
+            }
+
+            start += 1;
+        }
+
+        return this[start..<bytes.len];
+    }
+
+    func trim_end(&this): str {
+        let bytes: &[]u8 = this.as_bytes();
+
+        let mut end: usize = bytes.len;
+
+        while (end > 0) {
+            let b: u8 = bytes[end - 1];
+
+            if (b != (' ' as u8) &&
+                b != ('\t' as u8) &&
+                b != ('\n' as u8) &&
+                b != ('\r' as u8)) {
+                break;
+            }
+
+            end -= 1;
+        }
+
+        return this[0..<end];
+    }
+
+    func trim(&this): str {
+        return this.trim_start().trim_end();
+    }
+
+    func starts_with(&this, prefix: str): bool {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = prefix.as_bytes();
+
+        if (b.len > a.len) {
+            return false;
+        }
+
+        for (let i: usize = 0; i < b.len; i += 1) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    func ends_with(&this, suffix: str): bool {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = suffix.as_bytes();
+
+        if (b.len > a.len) {
+            return false;
+        }
+
+        let start: usize = a.len - b.len;
+
+        for (let i: usize = 0; i < b.len; i += 1) {
+            if (a[start + i] != b[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    func contains(&this, needle: str): bool {
+        return this.find(needle) != null;
+    }
+
+    func find(&this, needle: str): ?usize {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = needle.as_bytes();
+
+        if (b.len == 0) {
+            return 0;
+        }
+
+        if (b.len > a.len) {
+            return null;
+        }
+
+        let last: usize = a.len - b.len;
+
+        for (let i: usize = 0; i <= last; i += 1) {
+            let mut matched: bool = true;
+
+            for (let j: usize = 0; j < b.len; j += 1) {
+                if (a[i + j] != b[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if (matched) {
+                return i;
+            }
+        }
+
+        return null;
+    }
+
+    func eq_ignore_ascii_case(&this, other: str): bool {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = other.as_bytes();
+
+        if (a.len != b.len) {
+            return false;
+        }
+
+        for (let i: usize = 0; i < a.len; i += 1) {
+            if (ascii_lower(a[i]) != ascii_lower(b[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    func split(&this, delimiter: u8): Split {
+        return Split {
+            remaining: this,
+            delimiter,
+            finished: false,
+        };
     }
 }
 
