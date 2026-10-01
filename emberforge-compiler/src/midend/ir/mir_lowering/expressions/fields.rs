@@ -81,7 +81,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .structs
             .get(&cls_name)
             .and_then(|hir_struct| hir_struct.fields.iter().find(|f| f.name == field))
-            .map(|hir_field| lower_type_hir(&hir_field.field_type, self.enums))
+            .map(|hir_field| lower_type_hir(&hir_field.field_type, self.enums, self.structs))
             .unwrap_or_else(|| {
                 eprintln!(
                     "WARNING: lower_field_access could not find field {:?} on struct {:?}, defaulting to I64",
@@ -90,19 +90,24 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 SsaType::I64
             });
 
-        let is_slice_field = matches!(field_type, SsaType::Slice(_))
-            || matches!(field_type, SsaType::Owned(ref inner) if matches!(inner.as_ref(), SsaType::Slice(_)));
-
-        if is_slice_field {
+        if field_type.is_stored_inline() {
             let addr = self.new_value();
             self.emit(Instruction::FieldAddr {
                 dest: addr,
                 base: Operand::Value(obj_val),
                 offset,
             });
-            self.current_block_data
-                .value_types
-                .insert(addr, SsaType::Pointer(Box::new(field_type)));
+
+            // A tagged nullable is represented *as* the pointer to its tag+payload
+            // slot, so the value must carry the Nullable type itself. Wrapping it in
+            // Pointer(..) hides it from every nullable-aware path (null checks,
+            // unwrap/narrowing, store_field_value's memcpy branch).
+            let addr_ty = if field_type.is_tagged_nullable() {
+                field_type
+            } else {
+                SsaType::Pointer(Box::new(field_type))
+            };
+            self.current_block_data.value_types.insert(addr, addr_ty);
             return addr;
         }
 
@@ -239,6 +244,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                                     SsaType::Pointer(Box::new(lower_type_hir(
                                         &f.field_type,
                                         self.enums,
+                                        self.structs,
                                     ))),
                                 );
                                 self.emit_nullable_owned_field_overwrite_drop(

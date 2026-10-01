@@ -60,7 +60,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .map(|v| {
                 v.fields
                     .iter()
-                    .map(|f| lower_type_hir(&f.field_type, enums))
+                    .map(|f| lower_type_hir(&f.field_type, enums, self.structs))
                     .collect()
             })
             .collect();
@@ -78,11 +78,6 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         let field_tys = lowered_variants[tag].clone();
         let (offsets, _) = Self::payload_layout(&field_tys);
-        let max_payload = lowered_variants
-            .iter()
-            .map(|tys| Self::payload_layout(tys).1)
-            .max()
-            .unwrap_or(0);
 
         let mut inits = Vec::with_capacity(args.len());
         for (arg, fty) in args.iter().zip(field_tys.iter()) {
@@ -102,7 +97,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let obj = self.current_block_data.fresh_value();
         self.emit(Instruction::StackAlloc {
             dest: obj,
-            ty: SsaType::Array(Box::new(SsaType::I8), 8 + max_payload),
+            ty: SsaType::Enum {
+                name: resolved_enum_name,
+                variants: lowered_variants.clone(),
+            },
             count: 1,
         });
         self.current_block_data.value_types.insert(
@@ -161,7 +159,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let field_types: Vec<SsaType> = hir_struct
             .fields
             .iter()
-            .map(|f| lower_type_hir(&f.field_type, self.enums))
+            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
             .collect();
 
         let mut inits: Vec<(StrId, SsaType, FieldInitVal)> = Vec::with_capacity(args.len());

@@ -106,7 +106,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                     // Closure call: the local's type is a hoisted `__closure_env_N` struct,
                     // whose call fn is registered as its `__call` method.
-                    let call_name = StrId(self.context.intern("__call"));
+                    let call_name = StrId::from_static("__call");
                     let is_closure = ptr_ty
                         .as_ref()
                         .and_then(|ty| match ty {
@@ -198,8 +198,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     ) -> Value {
         if let HirExpr::Ident(scope_name, _) = object {
             if !self.var_map.contains_key(scope_name) {
-                let mangled_struct_name =
-                    self.resolve_static_receiver_struct_name(*scope_name, field);
+                let mangled_struct_name = self
+                    .resolve_static_receiver_struct_name(*scope_name, field)
+                    .or_else(|| self.primitive_type_key(*scope_name));
 
                 let direct_name: Option<StrId> = mangled_struct_name
                     .and_then(|cls| self.struct_mangled_map.get(&cls))
@@ -221,13 +222,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     .map(|f| f.params.iter().map(|(_, ty)| ty.clone()).collect())
                     .unwrap_or_default();
 
-                let mut operands: SmallVec<Operand, 8> = SmallVec::new();
-                for (i, a) in args.iter().enumerate() {
-                    if Self::is_move_by_value(param_types.get(i).unwrap()) {
-                        self.record_arg_move(a);
-                    }
-                    operands.push(Operand::Value(self.lower_expr(a)));
-                }
+                let operands = self.lower_call_args(args, &param_types, 0);
 
                 let dest: Value = self.current_block_data.fresh_value();
                 self.emit(Instruction::Call {
@@ -278,7 +273,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 .structs
                 .get(&cls_name)
                 .and_then(|s| s.fields.iter().find(|f| f.name == field))
-                .map(|f| lower_type_hir(&f.field_type, self.enums));
+                .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs));
 
             if let Some(field_ssa_ty) = field_ty {
                 match &field_ssa_ty {
@@ -309,7 +304,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         // A generic field monomorphized to a closure environment is
                         // called the same way a closure-typed local is: dispatch to
                         // its registered `__call` method.
-                        let call_name = StrId(self.context.intern("__call"));
+                        let call_name = StrId::from_static("__call");
                         let env_cls = self.resolve_receiver_target_key(other);
                         let is_closure_env = env_cls
                             .and_then(|key| self.struct_mangled_map.get(&key))
@@ -389,6 +384,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     ) -> Value {
         let struct_key = self
             .resolve_static_receiver_struct_name(type_name, method)
+            .or_else(|| self.primitive_type_key(type_name))
             .or_else(|| {
                 let type_module_idx = self
                     .module_named_imports
@@ -673,5 +669,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .value_types
             .insert(dest, SsaType::I64);
         dest
+    }
+
+    fn primitive_type_key(&self, name: StrId) -> Option<StrId> {
+        const PRIMS: &[&str] = &[
+            "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+            "f32", "f64", "bool", "char", "str",
+        ];
+        PRIMS.contains(&name.as_str()).then_some(name)
     }
 }

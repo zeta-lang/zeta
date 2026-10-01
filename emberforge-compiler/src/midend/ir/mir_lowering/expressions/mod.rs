@@ -59,7 +59,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let mut src = self.lower_expr(expr);
 
         let mut src_ty = self.current_block_data.value_types[&src].clone();
-        let dst_ty = lower_type_hir(target_type, self.enums);
+        let dst_ty = lower_type_hir(target_type, self.enums, self.structs);
 
         if dst_ty.is_pointer() {
             match &src_ty {
@@ -389,6 +389,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     }
 
     pub(crate) fn lower_expr_as_receiver_raw(&mut self, object: &HirExpr<'a, 'bump>) -> Value {
+        if let HirExpr::Deref { expr, .. } = object {
+            let p = self.lower_expr(expr);
+            return self.auto_unwrap_receiver(p);
+        }
+
         if let HirExpr::Ident(name, _) = object {
             if let Some(&v) = self.var_map.get(name) {
                 if matches!(
@@ -516,7 +521,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         .fields
                         .iter()
                         .find(|f| f.name == field)
-                        .map(|f| lower_type_hir(&f.field_type, self.enums));
+                        .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs));
                 }
                 SsaType::Pointer(i) | SsaType::Owned(i) => ty = i.as_ref(),
                 _ => return None,
@@ -579,11 +584,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         self.emit_memcpy(dst, val, n);
                     }
                     _ => {
-                        // plain `T` into a `T?` slot: write tag = some, then the payload
-                        let payload_align = alignof_ssa(inner, target).unwrap_or_else(|e| {
-                            panic!("failed to compute alignment for nullable payload: {:?}", e)
-                        });
-                        let payload_offset = offset + round_up_to_align(1, payload_align);
+                        let payload_offset = offset
+                            + ir::layout::nullable_payload_offset(inner, target)
+                                .unwrap_or_else(|e| panic!("nullable payload offset: {:?}", e));
                         self.store_const_u8(base, offset, 1);
                         self.store_field_value(base, payload_offset, inner, val);
                     }
@@ -625,6 +628,29 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     value: Operand::Value(word),
                 });
             }
+            return;
+        }
+
+        if matches!(
+            field_ty,
+            SsaType::User(..) | SsaType::Enum { .. } | SsaType::Tuple(_) | SsaType::Array(..)
+        ) {
+            let size = ir::layout::sizeof_ssa(field_ty, TargetInfo { ptr_bytes: 8 })
+                .expect("store_field_value: aggregate has no known size");
+            if size == 0 {
+                return; // ZST (Mallocator {}, capture-less closure env): nothing to store
+            }
+            let dst = self.field_addr(base, offset, field_ty);
+            let n = self.current_block_data.fresh_value();
+            self.emit(Instruction::Const {
+                dest: n,
+                ty: SsaType::Usize,
+                value: Operand::ConstInt(size as i64),
+            });
+            self.current_block_data
+                .value_types
+                .insert(n, SsaType::Usize);
+            self.emit_memcpy(dst, val, n);
             return;
         }
 
