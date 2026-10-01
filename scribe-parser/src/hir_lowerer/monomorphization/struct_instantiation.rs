@@ -84,6 +84,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
                     name: field.name,
                     visibility: field.visibility,
                     field_type: new_field_type,
+                    manual: field.manual,
                 });
             }
             new_variants.push(HirEnumVariant {
@@ -240,6 +241,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
                 name: field.name,
                 visibility: field.visibility,
                 field_type: new_field_type,
+                manual: field.manual,
             });
         }
         new_struct.fields = bump.alloc_slice(&new_fields);

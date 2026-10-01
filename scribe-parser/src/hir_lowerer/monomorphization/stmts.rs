@@ -81,6 +81,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 catch_pattern,
                 else_block,
                 span,
+                manual,
             } => {
                 let subd_ty = substitute_type(ty, substitutions, &self.bump);
 
@@ -102,6 +103,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     catch_pattern: *catch_pattern,
                     else_block: *else_block,
                     span: *span,
+                    manual: *manual,
                 }
             }
             HirStmt::Return(opt, span) => {
