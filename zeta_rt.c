@@ -15,3 +15,8 @@ long long __zeta_streq(const unsigned char *a, const unsigned char *b) {
 void *__zeta_memset(void *dst, int value, unsigned long long size) {
     return __builtin_memset(dst, value, size);
 }
+
+
+void *__zeta_memcpy(void *dst, void *src, unsigned long long size) {
+    return __builtin_memcpy(dst, src, size);
+}
