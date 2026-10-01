@@ -374,9 +374,19 @@ where
                 catch_pattern,
                 else_block,
                 span,
+                manual,
                 ..
             } => {
-                self.handle_let_stmt(rest, name, ty, value, catch_pattern, else_block, *span);
+                self.handle_let_stmt(
+                    rest,
+                    name,
+                    ty,
+                    value,
+                    catch_pattern,
+                    else_block,
+                    *span,
+                    *manual,
+                );
             }
 
             HirStmt::Return(expr, span) => {
@@ -439,7 +449,7 @@ where
             self.var_map.insert(name.clone(), v);
             self.current_block_data
                 .value_types
-                .insert(v, lower_type_hir(&ty, self.enums));
+                .insert(v, lower_type_hir(&ty, self.enums, self.structs));
         }
 
         for (name, ty) in locals.iter().copied() {
@@ -447,7 +457,7 @@ where
             self.var_map.insert(name.clone(), v);
             self.current_block_data
                 .value_types
-                .insert(v, lower_type_hir(&ty, self.enums));
+                .insert(v, lower_type_hir(&ty, self.enums, self.structs));
         }
     }
 
@@ -511,7 +521,7 @@ where
             } => self.lower_struct_init(name, args, *span),
 
             HirExpr::Undefined { span: _, ty } => {
-                let ssa_ty = lower_type_hir(ty, self.enums);
+                let ssa_ty = lower_type_hir(ty, self.enums, self.structs);
                 self.lower_zeroed_value(&ssa_ty)
             }
 
@@ -634,22 +644,23 @@ where
                 v
             }
             HirExpr::Uninit { span: _, ty } => {
-                let ssa_ty = lower_type_hir(ty, self.enums);
+                let ssa_ty = lower_type_hir(ty, self.enums, self.structs);
                 self.lower_uninit_value(&ssa_ty)
             }
         }
     }
 
     pub(super) fn is_aggregate_ssa_type(ty: &SsaType) -> bool {
-        matches!(
-            ty,
+        match ty {
             SsaType::User(..)
-                | SsaType::Enum { .. }
-                | SsaType::Tuple(_)
-                | SsaType::Array(..)
-                | SsaType::Slice(_)
-                | SsaType::Owned(_)
-        )
+            | SsaType::Enum { .. }
+            | SsaType::Tuple(_)
+            | SsaType::Array(..)
+            | SsaType::Slice(_)
+            | SsaType::Owned(_) => true,
+            t @ SsaType::Nullable(_) => t.is_tagged_nullable(),
+            _ => false,
+        }
     }
 
     pub(super) fn value_type(&self, v: Value) -> Option<&SsaType> {
@@ -667,6 +678,16 @@ where
     }
 
     pub(crate) fn finish(self) {
+        // let n = self.current_block_data.func.name.as_str();
+        // if n.contains("threads") {
+        //     println!("{}'s MIR:", n);
+        //     for b in &self.current_block_data.func.blocks {
+        //         println!("bb{}:", b.id.0);
+        //         for i in &b.instructions {
+        //             println!("    {:?}", i);
+        //         }
+        //     }
+        // }
         self.current_block_data.finish()
     }
 }

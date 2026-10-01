@@ -1,7 +1,7 @@
 use ir::{
     borrow_checker::BorrowKind,
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirType, IntrinsicKind, ProvenanceRoot},
+    hir::{HirExpr, HirType, IntrinsicKind, ProvenanceRoot, RefKind},
 };
 
 use crate::{naming::type_to_string, str_id_to_string, TypeChecker};
@@ -85,6 +85,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         HirType::Unknown
                     }
                 }
+            }
+            IntrinsicKind::MemForget => {
+                if !type_args.is_empty() {
+                    self.record(TypeErrorKind::Generic(
+                        "$mem_forget takes no type arguments".to_string(),
+                    ));
+                }
+                if args.len() != 1 {
+                    self.record(TypeErrorKind::InvalidFunctionCall {
+                        expected_args: 1,
+                        found_args: args.len(),
+                    });
+                    return HirType::Void;
+                }
+                let ty = self.check_expr(&args[0]);
+                // Records the move, so the source is neither used again nor dropped at scope exit.
+                self.check_and_record_value_use(&args[0], &ty);
+                HirType::Void
             }
             IntrinsicKind::Replace => {
                 if !type_args.is_empty() {
@@ -532,6 +550,64 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected: "u32".to_string(),
                         found: type_to_string(&val_ty),
                     });
+                }
+                HirType::Void
+            }
+            IntrinsicKind::DropInPlace => {
+                if type_args.len() > 1 {
+                    self.record(TypeErrorKind::Generic(
+                        "$drop_in_place takes at most one type argument".to_string(),
+                    ));
+                }
+                if !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                        "$drop_in_place requires an unsafe block: it runs the destructor of whatever the \
+                         pointer refers to, and the caller must guarantee the value is initialized and \
+                         never dropped again"
+                            .to_string(),
+                    ));
+                }
+                if args.len() != 1 {
+                    self.record(TypeErrorKind::InvalidFunctionCall {
+                        expected_args: 1,
+                        found_args: args.len(),
+                    });
+                    return HirType::Void;
+                }
+
+                let ptr_ty = self.check_expr(&args[0]);
+                let pointee = match &ptr_ty {
+                    HirType::UnsafePointer {
+                        inner,
+                        mutability_state,
+                    }
+                    | HirType::SafePointer {
+                        inner,
+                        mutability_state,
+                    } if matches!(mutability_state, ir::ast::MutabilityState::Mut) => **inner,
+                    HirType::Ref {
+                        inner,
+                        ref_kind: RefKind::Unique | RefKind::Alias,
+                        ..
+                    } => **inner,
+                    HirType::OwnedPointer { .. } => {
+                        self.record(TypeErrorKind::Generic(
+                            "$drop_in_place cannot take an owned pointer `^T`: its scope would free it \
+                             again. Pass `&mut` / `[*]mut` to the pointee"
+                                .to_string(),
+                        ));
+                        return HirType::Void;
+                    }
+                    other => {
+                        self.record(TypeErrorKind::Generic(format!(
+                            "$drop_in_place expects a `[*]mut T` or `&mut T`, found `{}`",
+                            type_to_string(other)
+                        )));
+                        return HirType::Void;
+                    }
+                };
+                if let Some(t) = type_args.first() {
+                    self.recover(self.types_compatible(t, &pointee), ());
                 }
                 HirType::Void
             }

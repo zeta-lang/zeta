@@ -1,7 +1,7 @@
 use core::panic;
 
 use ir::{
-    hir::{AssignmentOperator, HirExpr, HirType, IntrinsicKind, StrId},
+    hir::{AssignmentOperator, DropKind, HirExpr, HirType, IntrinsicKind, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
     span::SourceSpan,
@@ -117,6 +117,25 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         use ir::ssa_ir::IntrinsicOp;
 
         match kind {
+            IntrinsicKind::DropInPlace => {
+                let ptr = self.lower_expr(&args[0]);
+                let kind = match type_args.first() {
+                    Some(t) => t.drop_kind(),
+                    None => {
+                        let pointee = match self.value_type(ptr).cloned() {
+                            Some(SsaType::Pointer(inner)) => *inner,
+                            Some(other) => other,
+                            None => SsaType::Void,
+                        };
+                        match pointee {
+                            SsaType::User(name, _) => DropKind::Type(name),
+                            _ => DropKind::Undroppable,
+                        }
+                    }
+                };
+                self.emit_indexed_element_drop(&kind, ptr, span);
+                ptr
+            }
             IntrinsicKind::FnPtr => {
                 panic!("fn_ptr intrinsic is not supported");
             }
@@ -175,7 +194,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     .get(&src)
                     .cloned()
                     .expect("$reinterpret: source value has no known type");
-                let target_ty = lower_type_hir(&type_args[0], self.enums);
+                let target_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
 
                 if src_ty == target_ty {
                     src
@@ -193,14 +212,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             }
             IntrinsicKind::Unreachable => {
                 let msg = self.current_block_data.fresh_value();
-                let msg_str = self
-                    .context
-                    .thread_local()
-                    .intern("entered unreachable code");
+                let msg_str = StrId::from_static("entered unreachable code");
                 self.emit(Instruction::Const {
                     dest: msg,
                     ty: SsaType::String,
-                    value: Operand::ConstString(StrId(msg_str)),
+                    value: Operand::ConstString(msg_str),
                 });
                 self.current_block_data
                     .value_types
@@ -215,7 +231,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 dest
             }
             IntrinsicKind::SizeOf | IntrinsicKind::AlignOf | IntrinsicKind::TypeName => {
-                let query_ty = lower_type_hir(&type_args[0], self.enums);
+                let query_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
                 let op = match kind {
                     IntrinsicKind::SizeOf => IntrinsicOp::SizeOf,
                     IntrinsicKind::AlignOf => IntrinsicOp::AlignOf,
@@ -309,14 +325,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                 self.current_block_data.switch_to(panic_bb);
                 let msg = self.current_block_data.fresh_value();
-                let msg_str = self
-                    .context
-                    .thread_local()
-                    .intern("alignment assertion failed");
+                let msg_str = StrId::from_static("alignment assertion failed");
                 self.emit(Instruction::Const {
                     dest: msg,
                     ty: SsaType::String,
-                    value: Operand::ConstString(StrId(msg_str)),
+                    value: Operand::ConstString(msg_str),
                 });
                 self.current_block_data
                     .value_types
@@ -324,6 +337,19 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 self.emit_debug_panic(msg);
 
                 self.current_block_data.switch_to(cont_bb);
+                let dest = self.current_block_data.fresh_value();
+                self.current_block_data
+                    .value_types
+                    .insert(dest, SsaType::Void);
+                dest
+            }
+
+            IntrinsicKind::MemForget => {
+                // Mark moved so emit_scope_drops skips it, then evaluate and discard.
+                // No instruction is needed: the forgetting is the absence of a drop.
+                self.record_arg_move(&args[0]);
+                let _ = self.lower_expr(&args[0]);
+
                 let dest = self.current_block_data.fresh_value();
                 self.current_block_data
                     .value_types
@@ -397,10 +423,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                     None => {
                         let owned_ty = SsaType::Owned(Box::new(pointee_ty));
-                        self.current_block_data
-                            .value_types
-                            .insert(ptr_val, owned_ty);
-                        ptr_val
+                        let dest = self.current_block_data.fresh_value();
+                        self.emit(Instruction::Cast {
+                            dest,
+                            value: Operand::Value(ptr_val),
+                            kind: cast_kind(&ptr_ty, &owned_ty),
+                        });
+                        self.current_block_data.value_types.insert(dest, owned_ty);
+                        dest
                     }
                 }
             }
