@@ -1,0 +1,252 @@
+package zeta::parse;
+
+import zeta::string.String;
+import zeta::utils::mallocator.Mallocator;
+
+public enum ParseErrorKind {
+    EmptyInput,
+    InvalidDigit,
+    InvalidSign,
+    InvalidBoolean,
+    InvalidCharacter,
+    InvalidUtf8,
+    Overflow,
+    InvalidFormat,
+    UnexpectedEnd,
+    UnexpectedCharacter,
+    TrailingCharacters,
+}
+
+public struct ParseError {
+    kind: ParseErrorKind,
+    position: usize,
+}
+
+// public interface Parse {
+//     // String -> type.
+//     func parse(s: str): Result<this, ParseError>;
+// }
+
+public interface ToString {
+    // Type -> String.
+    func to_string(&this): String<Mallocator>;
+}
+
+// func digit_value(byte: u8): ?u8 {
+//     if (byte >= ('0' as u8) && byte <= ('9' as u8)) {
+//         return byte - ('0' as u8);
+//     }
+//
+//     if (byte >= ('a' as u8) && byte <= ('f' as u8)) {
+//         return byte - ('a' as u8) + 10;
+//     }
+//
+//     if (byte >= ('A' as u8) && byte <= ('F' as u8)) {
+//         return byte - ('A' as u8) + 10;
+//     }
+//
+//     return null;
+// }
+//
+// func parse_u64_radix(s: str, radix: u8): Result<u64, ParseError> {
+//     let input: &[]u8 = s.trim().as_bytes();
+//
+//     if (input.len == 0) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.EmptyInput,
+//                 position: 0,
+//             },
+//         };
+//     }
+//
+//     let mut start: usize = 0;
+//
+//     // Optional 0x / 0o / 0b prefixes.
+//     if (input.len >= 2 && input[0] == ('0' as u8)) {
+//         if (radix == 16 &&
+//             (input[1] == ('x' as u8) || input[1] == ('X' as u8))) {
+//             start = 2;
+//         }
+//         else if (radix == 8 &&
+//             (input[1] == ('o' as u8) || input[1] == ('O' as u8))) {
+//             start = 2;
+//         }
+//         else if (radix == 2 &&
+//             (input[1] == ('b' as u8) || input[1] == ('B' as u8))) {
+//             start = 2;
+//         }
+//     }
+//
+//     if (start == input.len) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.InvalidDigit,
+//                 position: start,
+//             },
+//         };
+//     }
+//
+//     let mut value: u64 = 0;
+//     let mut i: usize = start;
+//
+//     while (i < input.len) {
+//         let digit: u8 = match (digit_value(input[i])) {
+//             case value -> value,
+//             case null -> {
+//                 return Result.Err {
+//                     error: ParseError {
+//                         kind: ParseErrorKind.InvalidDigit,
+//                         position: i,
+//                     },
+//                 };
+//             },
+//         };
+//
+//         if (digit >= radix) {
+//             return Result.Err {
+//                 error: ParseError {
+//                     kind: ParseErrorKind.InvalidDigit,
+//                     position: i,
+//                 },
+//             };
+//         }
+//
+//         // UINT64_MAX = 0xffffffffffffffff
+//         let max: u64 = 0xffffffffffffffff;
+//
+//         if (value > (max - (digit as u64)) / (radix as u64)) {
+//             return Result.Err {
+//                 error: ParseError {
+//                     kind: ParseErrorKind.Overflow,
+//                     position: i,
+//                 },
+//             };
+//         }
+//
+//         value = value * (radix as u64) + digit as u64;
+//         i += 1;
+//     }
+//
+//     return Result.Ok { value };
+// }
+//
+// func parse_u64(s: str): Result<u64, ParseError> {
+//     let input: str = s.trim();
+//
+//     let bytes: &[]u8 = input.as_bytes();
+//
+//     if (bytes.len == 0) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.EmptyInput,
+//                 position: 0,
+//             },
+//         };
+//     }
+//
+//     if (bytes[0] == ('+' as u8)) {
+//         input = input.get_slice(1, bytes.len);
+//     }
+//     else if (bytes[0] == ('-' as u8)) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.InvalidSign,
+//                 position: 0,
+//             },
+//         };
+//     }
+//
+//     let trimmed_bytes: &[]u8 = input.as_bytes();
+//
+//     let radix: u8 =
+//         if (trimmed_bytes.len >= 2 &&
+//             trimmed_bytes[0] == ('0' as u8) &&
+//             (trimmed_bytes[1] == ('x' as u8) || trimmed_bytes[1] == ('X' as u8))) {
+//             16
+//         }
+//         else if (trimmed_bytes.len >= 2 &&
+//             trimmed_bytes[0] == ('0' as u8) &&
+//             (trimmed_bytes[1] == ('b' as u8) || trimmed_bytes[1] == ('B' as u8))) {
+//             2
+//         }
+//         else if (trimmed_bytes.len >= 2 &&
+//             trimmed_bytes[0] == ('0' as u8) &&
+//             (trimmed_bytes[1] == ('o' as u8) || trimmed_bytes[1] == ('O' as u8))) {
+//             8
+//         }
+//         else {
+//             10
+//         };
+//
+//     return parse_u64_radix(input, radix);
+// }
+//
+// func parse_i64(s: str): Result<i64, ParseError> {
+//     let input: str = s.trim();
+//     let bytes: &[]u8 = input.as_bytes();
+//
+//     if (bytes.len == 0) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.EmptyInput,
+//                 position: 0,
+//             },
+//         };
+//     }
+//
+//     let mut negative: bool = false;
+//     let mut digits: str = input;
+//
+//     if (bytes[0] == ('-' as u8)) {
+//         negative = true;
+//         digits = input.get_slice(1, bytes.len);
+//     }
+//     else if (bytes[0] == ('+' as u8)) {
+//         digits = input.get_slice(1, bytes.len);
+//     }
+//
+//     if (digits.as_bytes().len == 0) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.InvalidSign,
+//                 position: 1,
+//             },
+//         };
+//     }
+//
+//     let magnitude: u64 = match (parse_u64(digits)) {
+//         case Result.Ok { value } -> value,
+//         case Result.Err { error } -> return Result.Err { error },
+//     };
+//
+//     // Positive i64 max.
+//     if (!negative) {
+//         if (magnitude > 0x7fffffffffffffff) {
+//             return Result.Err {
+//                 error: ParseError {
+//                     kind: ParseErrorKind.Overflow,
+//                     position: bytes.len,
+//                 },
+//             };
+//         }
+//
+//         return Result.Ok { value: magnitude as i64 };
+//     }
+//
+//     // Absolute value of INT64_MIN.
+//     if (magnitude > 0x8000000000000000) {
+//         return Result.Err {
+//             error: ParseError {
+//                 kind: ParseErrorKind.Overflow,
+//                 position: bytes.len,
+//             },
+//         };
+//     }
+//
+//     if (magnitude == 0x8000000000000000) {
+//         return Result.Ok { value: -9223372036854775807i64 - 1i64 };
+//     }
+//
+//     return Result.Ok { value: -(magnitude as i64) };
+// }
