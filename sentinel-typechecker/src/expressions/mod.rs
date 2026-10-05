@@ -2,30 +2,55 @@ pub mod calls;
 pub mod intrinsics;
 
 use ir::{
-    borrow_checker::BorrowKind,
+    ast::MutabilityState,
+    borrow_checker::{BorrowKind, LoanId},
     errors::type_error::{TypeCheckResult, TypeErrorKind},
     hir::{
-        AssignmentOperator, HirExpr, HirMatchArm, HirStmt, HirType, Operator, StrId, Visibility,
+        AssignmentOperator, HirExpr, HirMatchArm, HirStmt, HirType, Operator, RefKind, StrId,
+        Visibility,
     },
     ir_hasher::{FxHashMap, HashSet},
     span::SourceSpan,
 };
 
 use crate::{
+    TypeChecker,
     initialization::{BareImportKind, InitNode, InitStatus, IntervalSet},
     move_state::MoveState,
     naming::{operator_symbol, str_id_to_string, type_to_string},
-    type_checker::{LocalSymbolId, SymbolId},
-    TypeChecker,
+    type_checker::SymbolId,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
+    fn loan_on(&mut self, e: &HirExpr<'a, 'bump>) -> Option<LoanId> {
+        let p = self.resolve_place(e)?;
+        self.borrow_checker.loan_for_place(p).copied()
+    }
+
     pub fn check_cast_expr(
         &mut self,
         expr: &HirExpr<'a, 'bump>,
         target_type: &HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
+        let to_raw = matches!(
+            target_type,
+            HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+        );
+        let ref_operand = match expr {
+            HirExpr::Ref { expr: inner, .. } if to_raw => Some(*inner),
+            _ => None,
+        };
+        let before = ref_operand.and_then(|i| self.loan_on(i));
+
         let source_type = self.check_expr(expr);
+
+        if let Some(inner) = ref_operand {
+            if let Some(loan) = self.loan_on(inner) {
+                if Some(loan) != before {
+                    self.borrow_checker.end_loan_now(loan);
+                }
+            }
+        }
 
         let is_borrowing_ptr_cast = matches!(
             (&source_type, target_type),
@@ -71,9 +96,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         index: &&HirExpr<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
         let object_ty = self.check_expr_suppressed(object);
-        let index_ty = self.check_expr(index);
+        let index_ty = self.check_expr_expected(index, &HirType::Usize);
 
-        self.recover(self.types_compatible(&HirType::I64, &index_ty), ());
+        self.recover(self.types_compatible(&HirType::Usize, &index_ty), ());
 
         if let Some((root, path)) = self.static_field_path(object) {
             if let Some(node) = self.init_state.get(&root).cloned() {
@@ -223,14 +248,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    pub fn check_binary_expr(
+        &mut self,
+        left: &&HirExpr<'a, 'bump>,
+        op: &Operator,
+        right: &&HirExpr<'a, 'bump>,
+    ) -> HirType<'a, 'bump> {
+        let (left_type, right_type) = self.check_operands(left, right);
+        let result = self.check_binary_op(&left_type, op, &right_type);
+        self.recover(result, HirType::Unknown)
+    }
+
     pub fn check_comparison_expr(
         &mut self,
         left: &&HirExpr<'a, 'bump>,
         op: &Operator,
         right: &&HirExpr<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
-        let left_type = self.check_expr(left);
-        let right_type = self.check_expr(right);
+        let (left_type, right_type) = self.check_operands(left, right);
         let result = self.check_binary_op(&left_type, op, &right_type);
         self.recover(result, HirType::Unknown)
     }
@@ -303,18 +338,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             type_to_string(&value_type)
                         )));
                     }
-                    if !matches!(op, AssignmentOperator::Assign) {
-                        self.record(TypeErrorKind::Generic(
-                            "`.len` only supports plain assignment, not compound assignment"
-                                .to_string(),
-                        ));
-                    }
                     return HirType::Usize;
                 }
             }
         }
 
         let target_type = self.check_expr_as_place(target);
+
+        if let Some(place) = self.resolve_place(target) {
+            self.check_borrow_use(target, place, BorrowKind::Mutable);
+        }
+
+        if let HirExpr::Ident(name, ..) = target {
+            self.move_state.clear(*name);
+        }
+
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
         let value_type = self.check_expr_expected(value, &target_type);
 
@@ -446,31 +484,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             }
                         }
                         _ => {
-                            let root_node = self
-                                .init_state
-                                .entry(root)
-                                .or_insert(InitNode::Whole(InitStatus::Uninitialized));
-                            let target_node = Self::node_at_path_mut(root_node, &path);
+                            let fully_init = self.is_definitely_initialized(root, &path);
                             if is_uninit_value {
-                                let already_init = matches!(
-                                    target_node,
-                                    InitNode::Whole(InitStatus::Initialized)
-                                ) || matches!(
-                                    target_node,
-                                    InitNode::Array { ranges, len: Some(l) } if ranges.covers_full(*l as i64)
-                                );
-                                if already_init {
+                                if fully_init {
                                     self.record(TypeErrorKind::Generic(format!(
                                         "cannot assign `uninit` into `{}` at a non-constant index: \
                                          it is already fully initialized",
                                         str_id_to_string(root)
                                     )));
                                 }
-                            } else if !matches!(
-                                target_node,
-                                InitNode::Whole(InitStatus::Initialized)
-                            ) {
-                                *target_node = InitNode::Whole(InitStatus::Maybe);
+                            } else if !fully_init {
+                                if let Some(root_node) = self.init_state.get_mut(&root) {
+                                    *Self::node_at_path_mut(root_node, &path) =
+                                        InitNode::Whole(InitStatus::Maybe);
+                                }
                             }
                         }
                     }
@@ -768,6 +795,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
         match *Self::strip_ref(&object_ty) {
             HirType::Array(inner, _) | HirType::Slice(inner) => HirType::Slice(inner),
+            HirType::UnsafePointer { inner, .. } => {
+                if !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                        "slicing a `[*]T` requires an unsafe block".into(),
+                    ));
+                }
+                HirType::Slice(inner)
+            }
+            HirType::String => HirType::String,
             _ => {
                 self.record(TypeErrorKind::Generic(format!(
                     "cannot slice type `{}`",
@@ -834,6 +870,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         arms: &&[HirMatchArm<'a, 'bump>],
     ) -> HirType<'a, 'bump> {
         let scrutinee_ty = self.check_expr(expr);
+        let scrutinee_ty = match scrutinee_ty {
+            HirType::Ref { inner, .. } => *inner,
+            t => t,
+        };
 
         self.check_match_exhaustiveness(&scrutinee_ty, arms);
 
@@ -891,20 +931,48 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.join_value_types(&arm_types)
     }
 
-    pub fn check_binary_expr(
+    fn is_lit(e: &HirExpr<'a, 'bump>) -> bool {
+        matches!(e, HirExpr::Number(..) | HirExpr::Decimal(..))
+    }
+
+    fn check_operands(
         &mut self,
-        left: &&HirExpr<'a, 'bump>,
-        op: &Operator,
-        right: &&HirExpr<'a, 'bump>,
-    ) -> HirType<'a, 'bump> {
-        let left_type = self.check_expr(left);
-        let right_type = self.check_expr(right);
-        let result = self.check_binary_op(&left_type, op, &right_type);
-        self.recover(result, HirType::Unknown)
+        l: &HirExpr<'a, 'bump>,
+        r: &HirExpr<'a, 'bump>,
+    ) -> (HirType<'a, 'bump>, HirType<'a, 'bump>) {
+        match (Self::is_lit(l), Self::is_lit(r)) {
+            (true, false) => {
+                let rt = self.check_expr(r);
+                (self.check_expr_expected(l, &rt), rt)
+            }
+            (false, true) => {
+                let lt = self.check_expr(l);
+                let rt = self.check_expr_expected(r, &lt);
+                (lt, rt)
+            }
+            _ => (self.check_expr(l), self.check_expr(r)),
+        }
+    }
+
+    fn lookup_module_const(&self, name: StrId) -> Option<HirType<'a, 'bump>> {
+        let cur = self.context.current_module_idx;
+        if let Some(t) = self.module_consts.get(&cur).and_then(|m| m.get(&name)) {
+            return Some(*t);
+        }
+        let imp = self.imports_by_module.get(&cur)?;
+        let mut mods: Vec<usize> = imp.named.get(&name).copied().into_iter().collect();
+        mods.extend(imp.modules.iter().copied());
+        mods.extend(imp.wildcard.iter().copied());
+        mods.into_iter()
+            .find_map(|m| self.module_consts.get(&m)?.get(&name).copied())
     }
 
     pub fn check_ident_expr(&mut self, name: &StrId, span: &SourceSpan<'a>) -> HirType<'a, 'bump> {
         let var_name = str_id_to_string(*name);
+
+        if let Some(ty) = self.lookup_module_const(*name) {
+            return ty;
+        }
 
         if let Some((symbol_id, ty)) = self.context.get_variable(&var_name) {
             self.check_ident_init_read(*name, &var_name, &ty);
@@ -1025,7 +1093,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             {
                 if exp_name == enum_name {
                     for (g, t) in generics.iter().zip(exp_targs.iter()) {
-                        if !matches!(t, HirType::Unknown | HirType::Generic(_)) {
+                        let rigid =
+                            matches!(t, HirType::Generic(n) if self.generic_bounds.contains_key(n));
+                        if !matches!(t, HirType::Unknown | HirType::Generic(_)) || rigid {
                             infer_subs.insert(g.name, *t);
                         }
                     }
@@ -1145,27 +1215,54 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn builtin_slice_field(ty: &HirType<'a, 'bump>, field: StrId) -> Option<HirType<'a, 'bump>> {
+        let (mut t, mut owned) = (*ty, false);
+        loop {
+            match t {
+                HirType::Ref { inner, .. } | HirType::SafePointer { inner, .. } => t = *inner,
+                HirType::OwnedPointer { inner, .. } => {
+                    owned = matches!(*inner, HirType::Slice(_));
+                    t = *inner;
+                }
+                _ => break,
+            }
+        }
+        match (t, field.as_str()) {
+            (HirType::Slice(_) | HirType::Array(..), "len") => Some(HirType::Usize),
+            (HirType::Slice(_), "cap") if owned => Some(HirType::Usize),
+            (HirType::Slice(e), "ptr") => Some(HirType::UnsafePointer {
+                inner: e,
+                mutability_state: ir::ast::MutabilityState::Mut,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn check_field_access_expr(
         &mut self,
         object: &HirExpr<'a, 'bump>,
         field: StrId,
     ) -> HirType<'a, 'bump> {
         let obj_type = self.check_expr_suppressed(object);
-        let mut stripped = *Self::strip_ref(&obj_type);
+        if let Some(t) = Self::builtin_slice_field(&obj_type, field) {
+            return t;
+        }
 
+        let mut stripped = *Self::strip_ref(&obj_type);
         if let HirType::Nullable(inner) = stripped {
-            if let Some((root, path)) = self.static_field_path(object) {
-                if self.is_non_null(root, &path) {
-                    stripped = *inner;
+            match self.static_field_path(object) {
+                Some((root, path)) if self.is_non_null(root, &path) => {
+                    stripped = *Self::strip_ref(inner)
+                }
+                _ => {
+                    self.record(TypeErrorKind::Generic(
+                        "field access on a possibly-null value; check for null first".into(),
+                    ));
+                    return HirType::Unknown;
                 }
             }
         }
-
-        if let HirType::Slice(_) | HirType::Array(_, _) = stripped {
-            if str_id_to_string(field) == "len" {
-                return HirType::Usize;
-            }
-        }
+        let stripped = Self::peel_indirections(stripped);
 
         let HirType::Struct {
             name: struct_name,
@@ -1245,10 +1342,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> TypeCheckResult<'a, HirType<'a, 'bump>> {
         use Operator::*;
 
+        if matches!(op, Add | Subtract)
+            && matches!(left, HirType::UnsafePointer { .. })
+            && self.is_integer(right)
+        {
+            return Ok(*left);
+        }
+
         match op {
             Add | Subtract | Multiply | Divide | Modulo => {
                 if self.is_numeric(left) && self.is_numeric(right) {
-                    Ok(*left)
+                    // `0 - x` with a float `x` should yield the float type.
+                    let is_float =
+                        |t: &HirType<'a, 'bump>| matches!(t, HirType::F32 | HirType::F64);
+                    Ok(if is_float(right) && !is_float(left) {
+                        *right
+                    } else {
+                        *left
+                    })
                 } else {
                     Err(TypeErrorKind::InvalidBinaryOp {
                         op: operator_symbol(op),
@@ -1260,6 +1371,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
 
             Equals | NotEquals => {
+                if matches!((left, right), (HirType::Generic(a), HirType::Generic(b)) if a == b) {
+                    return Ok(HirType::Boolean);
+                }
+
                 if self.is_comparable(left) && self.is_comparable(right) {
                     Ok(HirType::Boolean)
                 } else if self.is_reference_like(left)
@@ -1405,7 +1520,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             Visibility::Public => true,
             Visibility::Private => self.context.current_module_idx == declaring_module_idx,
             Visibility::Module => {
-                todo!("Implement visibility check for the module itself, similar to how Rust crates work")
+                todo!(
+                    "Implement visibility check for the module itself, similar to how Rust crates work"
+                )
             }
             Visibility::Internal => {
                 let dep_graph = self.context.dep_graph.borrow();
@@ -1425,13 +1542,38 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn field_receiver_type(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        obj_type: &HirType<'a, 'bump>,
+    ) -> Option<HirType<'a, 'bump>> {
+        let mut t = *Self::strip_ref(obj_type);
+        if let HirType::Nullable(inner) = t {
+            match self.static_field_path(object) {
+                Some((root, path)) if self.is_non_null(root, &path) => t = *Self::strip_ref(inner),
+                _ => {
+                    self.record(TypeErrorKind::Generic(
+                        "field access on a possibly-null value; check for null first".into(),
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(Self::peel_indirections(t))
+    }
+
     pub fn check_field_access_no_init_check(
         &mut self,
         object: &HirExpr<'a, 'bump>,
         field: StrId,
     ) -> HirType<'a, 'bump> {
         let obj_type = self.check_expr_suppressed(object);
-        let mut stripped = *Self::strip_ref(&obj_type);
+        if let Some(t) = Self::builtin_slice_field(&obj_type, field) {
+            return t;
+        }
+        let Some(mut stripped) = self.field_receiver_type(object, &obj_type) else {
+            return HirType::Unknown;
+        };
 
         if let HirType::Nullable(inner) = stripped {
             if let Some((root, path)) = self.static_field_path(object) {
@@ -1536,6 +1678,32 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             (s, t) if self.is_numeric(s) && self.is_numeric(t) => true,
             (HirType::Char, t) if self.is_numeric(t) => true,
             (HirType::Boolean, t) if self.is_numeric(t) => true,
+
+            (
+                HirType::Ref {
+                    inner: src,
+                    ref_kind,
+                    ..
+                },
+                HirType::SafePointer {
+                    inner: dst,
+                    mutability_state,
+                }
+                | HirType::UnsafePointer {
+                    inner: dst,
+                    mutability_state,
+                },
+            ) => {
+                let mut_ok =
+                    *ref_kind != RefKind::Shared || *mutability_state == MutabilityState::Const;
+                mut_ok
+                    && match &**src {
+                        HirType::Array(e, _) | HirType::Slice(e) => {
+                            pointee_compatible(e, dst) || pointee_compatible(src, dst)
+                        }
+                        _ => pointee_compatible(src, dst),
+                    }
+            }
 
             (
                 HirType::Lambda { .. },
