@@ -47,7 +47,7 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
         node.prev = tail;
         tail.next = node;
 
-        this.tail = tail.next;
+        this.tail = &alias *tail.next;
         this.len += 1;
     }
 
