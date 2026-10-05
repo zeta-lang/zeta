@@ -46,26 +46,32 @@ struct Mallocator {}
 
 impl Mallocator by Allocator {
     func alloc<T>(&this): ^T {
-        let ptr: [*]mut u8 = this.alloc_raw(
-            $sizeof<T>(),
-            $alignof<T>()
-        );
+        let ptr: [*]mut u8 = unsafe {
+            this.alloc_raw(
+                $sizeof<T>(),
+                $alignof<T>()
+            )
+        };
 
         return $own(ptr as [*]mut T, this);
     }
 
     func calloc<T>(&this, count: usize): ^[]T {
-        let ptr: [*]mut u8 = this.calloc_raw(count, $sizeof<T>(), $alignof<T>());
+        let ptr: [*]mut u8 = unsafe {
+            this.calloc_raw(count, $sizeof<T>(), $alignof<T>())
+        };
         return $own(ptr as [*]mut T, this, 0, count);
     }
 
     func realloc<T>(&this, value: ^[]T, new_capacity: usize): ^[]T {
-        let ptr: [*]mut u8 = this.realloc_raw(
-            value as [*]mut u8,
-            value.cap * $sizeof<T>(),
-            new_capacity * $sizeof<T>(),
-            $alignof<T>()
-        );
+        let ptr: [*]mut u8 = unsafe {
+            this.realloc_raw(
+                value as [*]mut u8,
+                value.cap * $sizeof<T>(),
+                new_capacity * $sizeof<T>(),
+                $alignof<T>()
+            )
+        };
         return $own(ptr as [*]mut T, this, value.len, new_capacity);
     }
 
@@ -76,11 +82,13 @@ impl Mallocator by Allocator {
     }
 
     func free<T>(&this, value: ^T) {
-        this.free_raw(
-            value as [*]mut u8,
-            $sizeof<T>(),
-            $alignof<T>()
-        );
+        unsafe {
+            this.free_raw(
+                value as [*]mut u8,
+                $sizeof<T>(),
+                $alignof<T>()
+            );
+        }
     }
 
     func free_slice<T>(
@@ -88,11 +96,13 @@ impl Mallocator by Allocator {
         value: ^[]T,
         capacity: usize
     ) {
-        this.free_raw(
-            value as [*]mut u8,
-            capacity * $sizeof<T>(),
-            $alignof<T>()
-        );
+        unsafe {
+            this.free_raw(
+                value as [*]mut u8,
+                capacity * $sizeof<T>(),
+                $alignof<T>()
+            );
+        }
     }
 
     unsafe func alloc_raw(
