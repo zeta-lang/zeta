@@ -10,5 +10,4 @@ pub mod pattern_matching;
 pub mod statements;
 pub mod zt_runtime;
 
-pub use control_flow::LoopCtx;
 pub use lowerer::FunctionLowerer;

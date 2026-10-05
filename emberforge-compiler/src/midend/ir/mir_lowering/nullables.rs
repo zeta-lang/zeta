@@ -7,7 +7,7 @@ use ir::{
 
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn coerce_into_tagged_nullable(&mut self, val: Value, expected: &SsaType) -> Value {
         if !expected.is_tagged_nullable() {
             return val; // pointer-optimized nullables share bits with the pointer
@@ -33,7 +33,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
     pub(super) fn null_compatible_with(ty: &SsaType) -> bool {
         match ty {
-            SsaType::Pointer(_) => true,
+            SsaType::Pointer(_, _) => true,
             SsaType::Nullable(inner) => inner.is_pointer(),
             _ => false,
         }
@@ -85,7 +85,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let Some(pointee) = field_ty.nullable_pointer_repr() else {
             return val;
         };
-        let ptr_ty = SsaType::Pointer(Box::new(pointee.clone()));
+        let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee.clone()));
         match self.value_type(val).cloned() {
             Some(SsaType::Nullable(_)) | Some(SsaType::Null) => {
                 let dest = self.new_value();
@@ -167,7 +167,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             // pointer we want, just re-typed without the Nullable wrapper.
             let pointee = pointee.clone();
             let dest = self.current_block_data.fresh_value();
-            let ptr_ty = SsaType::Pointer(Box::new(pointee));
+            let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee));
             self.emit(Instruction::Cast {
                 dest,
                 value: Operand::Value(val),
@@ -384,7 +384,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             SsaType::Nullable(inner)
                 if matches!(
                     inner.as_ref(),
-                    SsaType::Pointer(_) | SsaType::Owned(_) | SsaType::User(_, _)
+                    SsaType::Pointer(_, _) | SsaType::Owned(_) | SsaType::User(_, _,  _)
                 ) =>
             {
                 self.unwrap_known_nonnull(val, &ty)

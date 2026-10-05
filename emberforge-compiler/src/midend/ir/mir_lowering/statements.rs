@@ -5,13 +5,13 @@ use ir::{
 };
 
 use crate::midend::{
-    copy_analysis::drop_tracking::{DropLocal, DropScope},
+    copy_analysis::drop_tracking::{DropLocal, DropScope, ScopeAction},
     ir::mir_lowering::FunctionLowerer,
 };
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn handle_block_stmt(&mut self, body: &[HirStmt<'a, 'bump>], span: SourceSpan<'a>) {
-        self.scope_stack.push(DropScope { locals: Vec::new() });
+        self.scope_stack.push(DropScope::default());
         self.lower_stmt_seq(body);
         let scope = self.scope_stack.pop().unwrap();
         if !self.block_terminated() {
@@ -92,10 +92,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         {
             if self.glue_registry.is_droppable(*struct_name) || self.struct_owns_chain(*struct_name)
             {
-                self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
-                    name: *name,
-                    kind: DropKind::Type(*struct_name),
-                });
+                self.scope_stack
+                    .last_mut()
+                    .unwrap()
+                    .actions
+                    .push(ScopeAction::DropLocal(DropLocal {
+                        name: *name,
+                        kind: DropKind::Type(*struct_name),
+                    }));
             }
         } else if let HirType::OwnedPointer { allocator, .. } = ty {
             let drop_kind = if allocator.is_some() {
@@ -112,16 +116,20 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 })
             };
 
-            self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
-                name: *name,
-                kind: drop_kind,
-            });
+            self.scope_stack
+                .last_mut()
+                .unwrap()
+                .actions
+                .push(ScopeAction::DropLocal(DropLocal {
+                    name: *name,
+                    kind: drop_kind,
+                }));
         } else if let Some((kind, owned_ty)) = self.nullable_owned_drop_kind(ty, value) {
             self.scope_stack
                 .last_mut()
                 .unwrap()
-                .locals
-                .push(DropLocal { name: *name, kind });
+                .actions
+                .push(ScopeAction::DropLocal(DropLocal { name: *name, kind }));
             self.nullable_owned_locals.insert(*name, owned_ty);
             self.drop_state.mark_whole_initialized(*name);
         }

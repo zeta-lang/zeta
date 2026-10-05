@@ -2,7 +2,7 @@ use ir::{
     hir::{HirEnum, HirExpr, HirMatchArm, HirPattern, HirStmt, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
-    span::SourceSpan,
+    span::{self, SourceSpan},
     ssa_ir::{BinOp, BlockId, Instruction, Operand, SsaType, Value},
 };
 
@@ -13,20 +13,21 @@ use crate::midend::{
     ir::mir_lowering::FunctionLowerer,
 };
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn lower_pattern_test(
         &mut self,
         pattern: &HirPattern<'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
+        span: SourceSpan<'a>,
     ) -> Option<Value> {
         if let Some(ty) = scrutinee_ty {
             if matches!(ty, SsaType::Nullable(_)) && Self::pattern_needs_nonnull(pattern) {
-                return self.lower_nullable_inner_test(pattern, scrutinee, ty);
+                return self.lower_nullable_inner_test(pattern, scrutinee, ty, span);
             }
         }
         match pattern {
-            HirPattern::Wildcard | HirPattern::Ident(_) => None,
+            HirPattern::Wildcard | HirPattern::Ident(..) => None,
 
             HirPattern::Array(elems) => {
                 let SsaType::Array(elem_ty, _) = scrutinee_ty.expect(
@@ -47,9 +48,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         base: Operand::Value(scrutinee),
                         offset: (i as i64 * elem_size) as usize,
                     });
-                    self.current_block_data
-                        .value_types
-                        .insert(addr, SsaType::Pointer(Box::new(elem_ty.clone())));
+                    self.current_block_data.value_types.insert(
+                        addr,
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(elem_ty.clone()),
+                        ),
+                    );
 
                     let elem_val = self.current_block_data.fresh_value();
                     self.emit(Instruction::Load {
@@ -60,7 +65,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         .value_types
                         .insert(elem_val, elem_ty.clone());
 
-                    if let Some(cond) = self.lower_pattern_test(elem_pat, elem_val, Some(&elem_ty))
+                    if let Some(cond) =
+                        self.lower_pattern_test(elem_pat, elem_val, Some(&elem_ty), span)
                     {
                         combined = Some(self.and_conds(combined, cond));
                     }
@@ -101,7 +107,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             .value_types
                             .insert(field_val, field_ty.clone());
                         if let Some(cond) =
-                            self.lower_pattern_test(field_pat, field_val, Some(&field_ty))
+                            self.lower_pattern_test(field_pat, field_val, Some(&field_ty), span)
                         {
                             combined = Some(self.and_conds(combined, cond));
                         }
@@ -112,11 +118,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
                 panic!(
                     "lower_pattern_test: `{}` is neither a known struct nor is the scrutinee ({:?}) \
-                     an enum",
+                     an enum at {span}",
                     name, scrutinee_ty
                 );
             });
-                let hir_enum = self.resolve_enum_for_variant(enum_name, name);
+                let hir_enum = self.resolve_enum_for_variant(enum_name);
                 let (expected_tag, variant_def) = hir_enum
                     .variants
                     .iter()
@@ -179,7 +185,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             .value_types
                             .insert(field_val, field_ssa_ty.clone());
                         if let Some(cond) =
-                            self.lower_pattern_test(field_pat, field_val, Some(&field_ssa_ty))
+                            self.lower_pattern_test(field_pat, field_val, Some(&field_ssa_ty), span)
                         {
                             combined = self.and_conds(result, cond);
                             result = Some(combined);
@@ -197,7 +203,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let mut combined: Option<Value> = None;
                 let mut always_matches = false;
                 for alt in alts.iter() {
-                    match self.lower_pattern_test(alt, scrutinee, scrutinee_ty) {
+                    match self.lower_pattern_test(alt, scrutinee, scrutinee_ty, span) {
                         None => always_matches = true,
                         Some(cond) => combined = Some(self.or_conds(combined, cond)),
                     }
@@ -262,7 +268,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     .value_types
                     .insert(lit, SsaType::String);
 
-                let streq_fn = StrId::from_static("__zeta_streq");
+                let streq_fn = StrId::from_static("str_zeta_strings_eq");
                 let cmp = self.current_block_data.fresh_value();
                 self.emit(Instruction::Call {
                     dest: Some(cmp),
@@ -283,7 +289,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     variant, scrutinee_ty
                 );
             });
-                let hir_enum = self.resolve_enum_for_variant(enum_name, variant);
+                let hir_enum = self.resolve_enum_for_variant(enum_name);
 
                 let expected_tag = hir_enum
                     .variants
@@ -329,7 +335,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let zero_cost_pointee: Option<SsaType> = if let Some(p) = ty.nullable_pointer_repr()
                 {
                     Some(p.clone())
-                } else if let SsaType::Pointer(inner) = ty {
+                } else if let SsaType::Pointer(_, inner) = ty {
                     Some((**inner).clone())
                 } else {
                     None
@@ -339,12 +345,19 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     let zero = self.current_block_data.fresh_value();
                     self.emit(Instruction::Const {
                         dest: zero,
-                        ty: SsaType::Pointer(Box::new(pointee_ty.clone())),
+                        ty: SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(pointee_ty.clone()),
+                        ),
                         value: Operand::ConstInt(0),
                     });
-                    self.current_block_data
-                        .value_types
-                        .insert(zero, SsaType::Pointer(Box::new(pointee_ty)));
+                    self.current_block_data.value_types.insert(
+                        zero,
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(pointee_ty),
+                        ),
+                    );
 
                     let cmp = self.current_block_data.fresh_value();
                     self.emit(Instruction::Binary {
@@ -388,8 +401,51 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 }
             }
 
-            HirPattern::Tuple(_) => {
-                todo!("tuple patterns aren't implemented upstream in lower_pattern either")
+            HirPattern::Tuple(elems) => {
+                // A tuple pattern matches element-by-element at packed layout offsets.
+                let field_types: Vec<SsaType> = match scrutinee_ty {
+                    Some(SsaType::Tuple(fs)) => fs.clone(),
+                    // If we don't have type info yet, fall back to i64 for each slot.
+                    _ => vec![SsaType::I64; elems.len()],
+                };
+
+                let target = TargetInfo { ptr_bytes: 8 };
+                let mut combined: Option<Value> = None;
+                let mut cursor = 0usize;
+
+                for (i, elem_pat) in elems.iter().enumerate() {
+                    let fty = field_types.get(i).cloned().unwrap_or(SsaType::I64);
+                    let falign = ir::layout::alignof_ssa(&fty, target).unwrap_or(8);
+                    cursor = (cursor + falign - 1) & !(falign - 1);
+
+                    let elem_val = self.current_block_data.fresh_value();
+                    if Self::is_aggregate_ssa_type(&fty) {
+                        self.emit(Instruction::FieldAddr {
+                            dest: elem_val,
+                            base: Operand::Value(scrutinee),
+                            offset: cursor,
+                        });
+                    } else {
+                        self.emit(Instruction::LoadField {
+                            dest: elem_val,
+                            base: Operand::Value(scrutinee),
+                            offset: cursor,
+                        });
+                    }
+                    self.current_block_data
+                        .value_types
+                        .insert(elem_val, fty.clone());
+
+                    if let Some(cond) =
+                        self.lower_pattern_test(elem_pat, elem_val, Some(&fty), span)
+                    {
+                        combined = Some(self.and_conds(combined, cond));
+                    }
+
+                    let fsize = ir::layout::sizeof_ssa(&fty, target).unwrap_or(8);
+                    cursor += fsize;
+                }
+                combined
             }
         }
     }
@@ -401,9 +457,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let mut curr = ty?;
         loop {
             match curr {
-                SsaType::Enum { name, .. } => return Some(name),
-                SsaType::User(name, _) => return Some(name),
-                SsaType::Pointer(inner) | SsaType::Owned(inner) | SsaType::Nullable(inner) => {
+                SsaType::Enum {
+                    name,
+                    unmangled_name: _,
+                    ..
+                } => return Some(name),
+                SsaType::User(name, _, _) => return Some(name),
+                SsaType::Pointer(_, inner) | SsaType::Owned(inner) | SsaType::Nullable(inner) => {
                     curr = inner.as_ref();
                 }
                 _ => return None,
@@ -411,17 +471,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
     }
 
-    pub(super) fn resolve_enum_for_variant(
-        &self,
-        enum_name: &StrId,
-        variant: &StrId,
-    ) -> &HirEnum<'a, 'bump> {
+    pub(super) fn resolve_enum_for_variant(&self, enum_name: &StrId) -> &HirEnum<'a, 'bump> {
         self.enums.get(enum_name).unwrap_or_else(|| {
             println!("All enums: {:?}", self.enums.keys().collect::<Vec<_>>());
-            panic!(
-                "[resolve_enum_for_variant] unknown enum {}.{}",
-                enum_name, variant
-            )
+            panic!("[resolve_enum_for_variant] unknown enum {}", enum_name)
         })
     }
 
@@ -442,7 +495,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             }
         }
         match pattern {
-            HirPattern::Ident(name) => {
+            HirPattern::Ident(name, _) => {
                 let bound = match scrutinee_ty {
                     Some(ty) if matches!(ty, SsaType::Nullable(_)) => {
                         self.unwrap_known_nonnull(scrutinee, ty)
@@ -469,9 +522,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         base: Operand::Value(scrutinee),
                         offset: (i as i64 * elem_size) as usize,
                     });
-                    self.current_block_data
-                        .value_types
-                        .insert(addr, SsaType::Pointer(Box::new(elem_ty.clone())));
+                    self.current_block_data.value_types.insert(
+                        addr,
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(elem_ty.clone()),
+                        ),
+                    );
 
                     let elem_val = self.current_block_data.fresh_value();
                     self.emit(Instruction::Load {
@@ -531,7 +588,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     );
                 });
 
-                    let hir_enum = self.resolve_enum_for_variant(enum_name, name);
+                    let hir_enum = self.resolve_enum_for_variant(enum_name);
                     let variant_def = hir_enum
                         .variants
                         .iter()
@@ -597,7 +654,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     variant, scrutinee_ty
                 );
             });
-                let hir_enum = self.resolve_enum_for_variant(enum_name, variant);
+                let hir_enum = self.resolve_enum_for_variant(enum_name);
                 let variant_def = hir_enum.variants.iter().find(|v| v.name == *variant)
                 .unwrap_or_else(|| panic!(
                     "bind_pattern: enum `{}` has no variant `{}`; the type checker should have caught this",
@@ -639,6 +696,45 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                     let size = ir::layout::sizeof_ssa(&field_ssa_ty, target).unwrap_or(8);
                     cursor += size;
+                }
+            }
+            HirPattern::Tuple(elems) => {
+                // Mirror the same offset arithmetic used in lower_tuple_expr.
+                let field_types: Vec<SsaType> = match scrutinee_ty {
+                    Some(SsaType::Tuple(fs)) => fs.clone(),
+                    _ => vec![SsaType::I64; elems.len()],
+                };
+
+                let target = TargetInfo { ptr_bytes: 8 };
+                let mut cursor = 0usize;
+
+                for (i, elem_pat) in elems.iter().enumerate() {
+                    let fty = field_types.get(i).cloned().unwrap_or(SsaType::I64);
+                    let falign = ir::layout::alignof_ssa(&fty, target).unwrap_or(8);
+                    cursor = (cursor + falign - 1) & !(falign - 1);
+
+                    let elem_val = self.current_block_data.fresh_value();
+                    if Self::is_aggregate_ssa_type(&fty) {
+                        self.emit(Instruction::FieldAddr {
+                            dest: elem_val,
+                            base: Operand::Value(scrutinee),
+                            offset: cursor,
+                        });
+                    } else {
+                        self.emit(Instruction::LoadField {
+                            dest: elem_val,
+                            base: Operand::Value(scrutinee),
+                            offset: cursor,
+                        });
+                    }
+                    self.current_block_data
+                        .value_types
+                        .insert(elem_val, fty.clone());
+
+                    self.bind_pattern(elem_pat, elem_val, Some(&fty));
+
+                    let fsize = ir::layout::sizeof_ssa(&fty, target).unwrap_or(8);
+                    cursor += fsize;
                 }
             }
             _ => {}
@@ -686,7 +782,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             };
 
             let pattern_cond =
-                self.lower_pattern_test(&arm.pattern, scrutinee_val, scrutinee_ty.as_ref());
+                self.lower_pattern_test(&arm.pattern, scrutinee_val, scrutinee_ty.as_ref(), span);
 
             let cond = match (pattern_cond, arm.guard) {
                 (Some(pc), Some(guard_expr)) => {
@@ -737,7 +833,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.var_map = vars_before.clone();
             self.current_block_data.switch_to(body_bb);
             self.narrowed_fields = narrowed_before.clone();
-            self.scope_stack.push(DropScope { locals: Vec::new() });
+            self.scope_stack.push(DropScope::default());
             self.bind_pattern(&arm.pattern, scrutinee_val, scrutinee_ty.as_ref());
             let prior_null_arm = arms[..arm_idx]
                 .iter()
@@ -799,12 +895,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         pattern: &HirPattern<'bump>,
         scrutinee: Value,
         ty: &SsaType,
+        span: SourceSpan<'a>,
     ) -> Option<Value> {
         let SsaType::Nullable(inner) = ty else {
             unreachable!()
         };
         let is_null = self
-            .lower_pattern_test(&HirPattern::Null, scrutinee, Some(ty))
+            .lower_pattern_test(&HirPattern::Null, scrutinee, Some(ty), span)
             .expect("null test always yields a condition");
 
         let check_bb = self.current_block_data.new_block();
@@ -820,7 +917,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         // non-null: only here is it safe to unwrap and look inside
         self.current_block_data.switch_to(check_bb);
         let unwrapped = self.unwrap_known_nonnull(scrutinee, ty);
-        let inner_cond = match self.lower_pattern_test(pattern, unwrapped, Some(&**inner)) {
+        let inner_cond = match self.lower_pattern_test(pattern, unwrapped, Some(&**inner), span) {
             Some(c) => c,
             None => {
                 let t = self.current_block_data.fresh_value();
@@ -895,7 +992,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     pub(super) fn pattern_needs_nonnull(pattern: &HirPattern<'bump>) -> bool {
         !matches!(
             pattern,
-            HirPattern::Null | HirPattern::Wildcard | HirPattern::Ident(_) | HirPattern::Or(_)
+            HirPattern::Null | HirPattern::Wildcard | HirPattern::Ident(..) | HirPattern::Or(_)
         )
     }
 }

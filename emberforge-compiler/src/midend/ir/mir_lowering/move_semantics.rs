@@ -13,12 +13,12 @@ use smallvec::SmallVec;
 use crate::midend::{
     copy_analysis::{
         drop_emitter::{DropEmitter, FnAllocatorResolver, is_struct_owns_chain},
-        drop_tracking::{DropLocal, DropScope, Tri, record_move_if_any},
+        drop_tracking::{DropLocal, DropScope, ScopeAction, Tri, record_move_if_any},
     },
     ir::mir_lowering::FunctionLowerer,
 };
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn recover_owned_pointer_drop_kind(
         &self,
         declared_ty: &HirType<'a, 'bump>,
@@ -109,10 +109,12 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
             HirExpr::Ident(name, _) => {
                 for scope in self.scope_stack.iter().rev() {
-                    for local in scope.locals.iter().rev() {
-                        if local.name == *name {
-                            if let DropKind::OwnedPointer { allocator, .. } = &local.kind {
-                                return Some(allocator.clone());
+                    for action in scope.actions.iter() {
+                        if let ScopeAction::DropLocal(local) = action {
+                            if local.name == *name {
+                                if let DropKind::OwnedPointer { allocator, .. } = &local.kind {
+                                    return Some(allocator.clone());
+                                }
                             }
                         }
                     }
@@ -192,7 +194,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let mut ty = self.current_block_data.value_types.get(&obj_val)?;
         loop {
             match ty {
-                SsaType::User(name, _) => {
+                SsaType::User(name, _, _) => {
                     return self
                         .structs
                         .get(name)?
@@ -201,7 +203,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         .find(|f| f.name == *field)
                         .map(|f| f.field_type);
                 }
-                SsaType::Pointer(i) | SsaType::Owned(i) | SsaType::Nullable(i) => ty = i.as_ref(),
+                SsaType::Pointer(_, i) | SsaType::Owned(i) | SsaType::Nullable(i) => {
+                    ty = i.as_ref()
+                }
                 _ => return None,
             }
         }
@@ -225,7 +229,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         object: &HirExpr<'a, 'bump>,
     ) -> DropKind<'a, 'bump> {
         match elem_ty {
-            SsaType::User(struct_name, _) => {
+            SsaType::User(struct_name, _, _) => {
                 if self.glue_registry.is_droppable(*struct_name) {
                     DropKind::Type(*struct_name)
                 } else {
@@ -237,9 +241,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     let this_id = StrId::from_static("this");
                     let inner_val = *self.var_map.get(&this_id).unwrap_or(&Value(0));
                     let cls_name = match self.current_block_data.value_types.get(&inner_val) {
-                        Some(SsaType::User(name, _)) => Some(*name),
-                        Some(SsaType::Pointer(inner)) => match inner.as_ref() {
-                            SsaType::User(name, _) => Some(*name),
+                        Some(SsaType::User(name, _, _)) => Some(*name),
+                        Some(SsaType::Pointer(_, inner)) => match inner.as_ref() {
+                            SsaType::User(name, _, _) => Some(*name),
                             _ => None,
                         },
                         _ => None,
@@ -312,7 +316,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             dest: loaded,
                             ptr: Operand::Value(var_val),
                         });
-                        if let Some(SsaType::Pointer(inner)) =
+                        if let Some(SsaType::Pointer(_, inner)) =
                             self.current_block_data.value_types.get(&var_val).cloned()
                         {
                             self.current_block_data.value_types.insert(loaded, *inner);
@@ -413,7 +417,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 AssignmentOperator::Assign => rhs,
                 _ => {
                     let pointee_ty = match self.current_block_data.value_types.get(&var_val) {
-                        Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                        Some(SsaType::Pointer(_, inner)) => (**inner).clone(),
                         other => {
                             panic!("promoted local `{}` isn't pointer-typed: {:?}", name, other)
                         }
@@ -508,30 +512,47 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         self.scope_stack
             .iter()
             .rev()
-            .flat_map(|s| s.locals.iter())
-            .find(|l| l.name == name)
-            .map(|l| l.kind.clone())
+            .flat_map(|s| s.actions.iter())
+            .find_map(|a| match a {
+                ScopeAction::DropLocal(l) if l.name == name => Some(l.kind.clone()),
+                _ => None,
+            })
     }
 
     pub(super) fn emit_scope_drops(&mut self, scope: &DropScope<'a, 'bump>, span: SourceSpan<'a>) {
-        for local in scope.locals.iter().rev() {
-            let Some(&val) = self.var_map.get(&local.name) else {
-                continue;
-            };
-            if matches!(local.kind, DropKind::Undroppable) {
-                self.emit_array_local_drops(local.name, val, span);
-                continue;
-            }
-            if self.drop_state.is_whole_moved(local.name) {
-                continue;
-            }
-            let Some(&val) = self.var_map.get(&local.name) else {
-                continue;
-            };
-            if let Some(owned_ty) = self.nullable_owned_locals.get(&local.name).copied() {
-                self.emit_nullable_owned_drop(&local.kind, owned_ty, val, Some(local.name), span);
-            } else {
-                self.emit_drop_for_kind(&local.kind, val, Some(local.name), span);
+        // Iterate in reverse (LIFO) order; defers run before drops for same scope.
+        for action in scope.actions.iter().rev() {
+            match action {
+                ScopeAction::Defer(stmt) => {
+                    // Inline the deferred statement right here.
+                    self.lower_stmt(stmt);
+                }
+                ScopeAction::DropLocal(local) => {
+                    let Some(&val) = self.var_map.get(&local.name) else {
+                        continue;
+                    };
+                    if matches!(local.kind, DropKind::Undroppable) {
+                        self.emit_array_local_drops(local.name, val, span);
+                        continue;
+                    }
+                    if self.drop_state.is_whole_moved(local.name) {
+                        continue;
+                    }
+                    let Some(&val) = self.var_map.get(&local.name) else {
+                        continue;
+                    };
+                    if let Some(owned_ty) = self.nullable_owned_locals.get(&local.name).copied() {
+                        self.emit_nullable_owned_drop(
+                            &local.kind,
+                            owned_ty,
+                            val,
+                            Some(local.name),
+                            span,
+                        );
+                    } else {
+                        self.emit_drop_for_kind(&local.kind, val, Some(local.name), span);
+                    }
+                }
             }
         }
     }
@@ -633,17 +654,21 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let SsaType::Array(elem, len) = ssa else {
             return;
         };
-        let SsaType::User(elem_struct, _) = elem.as_ref() else {
+        let SsaType::User(elem_struct, _, _) = elem.as_ref() else {
             return;
         };
         if !(self.glue_registry.is_droppable(*elem_struct) || self.struct_owns_chain(*elem_struct))
         {
             return;
         }
-        self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
-            name,
-            kind: DropKind::Undroppable,
-        });
+        self.scope_stack
+            .last_mut()
+            .unwrap()
+            .actions
+            .push(ScopeAction::DropLocal(DropLocal {
+                name,
+                kind: DropKind::Undroppable,
+            }));
 
         if initialized {
             return;
@@ -811,7 +836,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let Some(SsaType::Array(elem, len)) = self.value_type(val).cloned() else {
             return;
         };
-        let SsaType::User(elem_struct, _) = elem.as_ref() else {
+        let SsaType::User(elem_struct, _, _) = elem.as_ref() else {
             return;
         };
         if !(self.glue_registry.is_droppable(*elem_struct) || self.struct_owns_chain(*elem_struct))
@@ -833,9 +858,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 base: Operand::Value(val),
                 offset: i * elem_size,
             });
-            self.current_block_data
-                .value_types
-                .insert(addr, SsaType::Pointer(Box::new((*elem).clone())));
+            self.current_block_data.value_types.insert(
+                addr,
+                SsaType::Pointer(
+                    ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                    Box::new((*elem).clone()),
+                ),
+            );
             match status {
                 Tri::Yes => self.emit_indexed_element_drop(&kind, addr, span),
                 Tri::Maybe => {
@@ -977,9 +1006,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             base: Operand::Value(slice_val),
             offset: 0,
         });
-        self.current_block_data
-            .value_types
-            .insert(ptr_v, SsaType::Pointer(Box::new(elem_ssa_ty.clone())));
+        self.current_block_data.value_types.insert(
+            ptr_v,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ssa_ty.clone()),
+            ),
+        );
 
         let len_v = self.current_block_data.fresh_value();
         self.emit(Instruction::LoadField {
@@ -1072,9 +1105,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             left: Operand::Value(ptr_v),
             right: Operand::Value(offset_v),
         });
-        self.current_block_data
-            .value_types
-            .insert(elem_addr, SsaType::Pointer(Box::new(elem_ssa_ty.clone())));
+        self.current_block_data.value_types.insert(
+            elem_addr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ssa_ty.clone()),
+            ),
+        );
 
         let elem_val = self.current_block_data.fresh_value();
         self.emit(Instruction::Load {
@@ -1148,15 +1185,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         span: SourceSpan<'a>,
     ) {
         for i in (depth_at_loop_entry..self.scope_stack.len()).rev() {
-            let scope =
-                std::mem::replace(&mut self.scope_stack[i], DropScope { locals: Vec::new() });
+            let scope = std::mem::replace(&mut self.scope_stack[i], DropScope::default());
             self.emit_scope_drops(&scope, span);
             self.scope_stack[i] = scope;
         }
     }
 
     pub(super) fn is_move_by_value(ty: &SsaType) -> bool {
-        matches!(ty, SsaType::User(_, _) | SsaType::Owned(_))
+        matches!(ty, SsaType::User(_, _, _) | SsaType::Owned(_))
     }
 
     pub(super) fn nullable_owned_drop_kind(
@@ -1197,7 +1233,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             return;
         };
         let loaded_ty = match self.value_type(field_addr).cloned() {
-            Some(SsaType::Pointer(inner)) => *inner,
+            Some(SsaType::Pointer(_, inner)) => *inner,
             _ => return,
         };
         let old = self.new_value();
@@ -1225,7 +1261,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .nullable_pointer_repr()
             .cloned()
             .expect("`?^T` local isn't pointer-optimized");
-        let ptr_ty = SsaType::Pointer(Box::new(pointee));
+        let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee));
 
         let zero = self.new_value();
         self.emit(Instruction::Const {
@@ -1270,7 +1306,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         if !prior_null_arm {
             return;
         }
-        let (HirExpr::Ident(src, _), HirPattern::Ident(binding)) = (scrutinee, pattern) else {
+        let (HirExpr::Ident(src, _), HirPattern::Ident(binding, _)) = (scrutinee, pattern) else {
             return;
         };
         let Some(owned_ty) = self.nullable_owned_locals.get(src).copied() else {
@@ -1286,10 +1322,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         self.drop_state.mark_whole_moved(*src);
         let owned = self.retype_as_owned(bound, &owned_ty);
         self.var_map.insert(*binding, owned);
-        self.scope_stack.last_mut().unwrap().locals.push(DropLocal {
-            name: *binding,
-            kind,
-        });
+        self.scope_stack
+            .last_mut()
+            .unwrap()
+            .actions
+            .push(ScopeAction::DropLocal(DropLocal {
+                name: *binding,
+                kind,
+            }));
         self.drop_state.mark_whole_initialized(*binding);
     }
 
@@ -1348,11 +1388,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 });
                 self.current_block_data.value_types.insert(
                     field_addr,
-                    SsaType::Pointer(Box::new(lower_type_hir(
-                        &f.field_type,
-                        self.enums,
-                        self.structs,
-                    ))),
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(lower_type_hir(&f.field_type, self.enums, self.structs)),
+                    ),
                 );
                 let mut resolver = FnAllocatorResolver {
                     var_map: &self.var_map,
