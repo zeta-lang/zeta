@@ -36,6 +36,12 @@ impl<const N: usize> Write for SmallVecWriter<N> {
         self.buf.extend_from_slice(s.as_bytes());
         Ok(())
     }
+
+    #[inline(always)]
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.buf.push(c as u8);
+        Ok(())
+    }
 }
 
 #[derive(Default, Clone, Copy)]
