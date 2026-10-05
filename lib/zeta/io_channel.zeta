@@ -13,4 +13,19 @@ interface ReadChannel {
 
 interface WriteChannel {
     unsafe func write_raw(&mut this, bytes: &[]u8): Result<usize, IOError>;
+
+    func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
+        let mut written: usize = 0;
+        while (written < bytes.len) {
+            let n: usize = match (unsafe { this.write_raw(bytes[written..<bytes.len]) }) {
+                case Result.Ok { value } -> value,
+                case Result.Err { error } -> return Result.Err { error },
+            };
+            if (n == 0) {
+                return Result.Err { error: IOError.WriteZero };
+            }
+            written += n;
+        }
+        return Result.Ok { value: written };
+    }
 }
