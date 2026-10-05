@@ -1,6 +1,7 @@
 pub mod alias_reasoner_pass;
 pub mod analysis_context;
 pub mod ast;
+pub mod attributes;
 pub mod auto_imports;
 pub mod borrow_checker;
 pub mod borrow_checking_pass;
