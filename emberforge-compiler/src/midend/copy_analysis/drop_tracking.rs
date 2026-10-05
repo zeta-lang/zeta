@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use ir::{
-    hir::{DropKind, HirExpr, StrId},
+    hir::{DropKind, HirExpr, HirStmt, StrId},
     ir_hasher::HashMap,
 };
 
@@ -12,8 +12,14 @@ pub struct DropLocal<'a, 'bump> {
 }
 
 #[derive(Clone, Debug)]
+pub enum ScopeAction<'a, 'bump> {
+    DropLocal(DropLocal<'a, 'bump>),
+    Defer(&'bump HirStmt<'a, 'bump>),
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct DropScope<'a, 'bump> {
-    pub locals: Vec<DropLocal<'a, 'bump>>,
+    pub actions: Vec<ScopeAction<'a, 'bump>>,
 }
 
 /// A fact that may hold on some paths but not others.
@@ -83,7 +89,6 @@ pub struct DropMoveState<'a, 'bump> {
 }
 
 impl<'a, 'bump> DropMoveState<'a, 'bump> {
-    /// New binding (also handles shadowing): forget everything about this name.
     pub fn reset_local(&mut self, name: StrId) {
         self.locals.remove(&name);
     }
@@ -200,9 +205,11 @@ pub(crate) fn local_is_droppable<'a, 'bump>(
     scope_stack
         .iter()
         .rev()
-        .flat_map(|s| s.locals.iter())
-        .find(|l| l.name == name)
-        .map(|l| l.kind.clone())
+        .flat_map(|s| s.actions.iter())
+        .find_map(|a| match a {
+            ScopeAction::DropLocal(l) if l.name == name => Some(l.kind.clone()),
+            _ => None,
+        })
 }
 
 pub fn record_move_if_any<'a, 'bump>(

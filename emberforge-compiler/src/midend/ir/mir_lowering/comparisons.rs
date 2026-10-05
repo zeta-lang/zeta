@@ -7,7 +7,7 @@ use ir::{
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 use smallvec::smallvec;
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn lower_tagged_nullable_eq(
         &mut self,
         nullable: Value,
@@ -87,6 +87,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         // RHS
         self.current_block_data.switch_to(rhs_bb);
         let rhs = self.lower_expr(right);
+        let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 
         // FALSE
@@ -108,7 +109,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         self.emit(Instruction::Phi {
             dest: result,
-            incoming: smallvec![(rhs_bb, rhs), (false_bb, false_val),],
+            incoming: smallvec![(rhs_end, rhs), (false_bb, false_val)],
         });
 
         self.current_block_data
@@ -150,9 +151,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         // RHS
         self.current_block_data.switch_to(rhs_bb);
-
         let rhs = self.lower_expr(right);
-
+        let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 
         // MERGE
@@ -162,7 +162,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         self.emit(Instruction::Phi {
             dest: result,
-            incoming: smallvec![(true_bb, true_val), (rhs_bb, rhs),],
+            incoming: smallvec![(true_bb, true_val), (rhs_end, rhs)],
         });
 
         self.current_block_data
@@ -223,7 +223,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         let pointee: Option<SsaType> = if let Some(p) = ty.nullable_pointer_repr() {
             Some(p.clone())
-        } else if let SsaType::Pointer(inner) = &ty {
+        } else if let SsaType::Pointer(_, inner) = &ty {
             Some((**inner).clone())
         } else {
             None
@@ -244,7 +244,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     loaded
                 }
             };
-            let ptr_ty = SsaType::Pointer(Box::new(pointee));
+            let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee));
             let zero = self.current_block_data.fresh_value();
             self.emit(Instruction::Const {
                 dest: zero,

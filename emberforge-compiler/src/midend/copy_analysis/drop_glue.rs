@@ -46,7 +46,7 @@ pub struct DropGlueRegistry {
 }
 
 impl DropGlueRegistry {
-    pub fn new<'a, 'bump>(registry: &GlobalRegistry<'a, 'bump>, context: Arc<StringPool>) -> Self {
+    pub fn new<'a, 'bump>(registry: GlobalRegistry<'a, 'bump>, context: Arc<StringPool>) -> Self {
         let drop_iface = StrId::from_static("Drop");
 
         let struct_names: Vec<StrId> = {
@@ -222,7 +222,7 @@ impl DropGlueBuilder {
         });
         let offsets = struct_field_offsets.get(&struct_name);
 
-        let this_ty = SsaType::Pointer(Box::new(SsaType::User(struct_name, vec![])));
+        let this_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::User(struct_name, struct_name, vec![])));
         let this_val = Value(0);
         let this_operand = Operand::Value(this_val);
 
@@ -358,7 +358,7 @@ impl DropGlueBuilder {
                     emitter
                         .current_block_data
                         .value_types
-                        .insert(field_ptr, SsaType::Pointer(Box::new(SsaType::Void)));
+                        .insert(field_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Void)));
                     emitter.emit(Instruction::FieldAddr {
                         dest: field_ptr,
                         base: this_operand.clone(),
@@ -380,7 +380,7 @@ impl DropGlueBuilder {
                     let field_addr = emitter.current_block_data.fresh_value();
                     emitter.current_block_data.value_types.insert(
                         field_addr,
-                        SsaType::Pointer(Box::new(SsaType::Owned(Box::new(field_ssa_ty.clone())))),
+                        SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Owned(Box::new(field_ssa_ty.clone())))),
                     );
                     emitter.emit(Instruction::FieldAddr {
                         dest: field_addr,

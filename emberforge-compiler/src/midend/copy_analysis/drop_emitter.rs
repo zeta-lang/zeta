@@ -353,7 +353,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                         ptr: Operand::Value(base),
                     });
                     let pointee_ty = match self.current_block_data.value_types.get(&base) {
-                        Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                        Some(SsaType::Pointer(_, inner)) => (**inner).clone(),
                         other => {
                             panic!("[resolve_allocator_value] Deref of non-pointer {:?}", other)
                         }
@@ -386,7 +386,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                         ptr: Operand::Value(base),
                     });
                     let pointee_ty = match self.current_block_data.value_types.get(&base) {
-                        Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                        Some(SsaType::Pointer(_, inner)) => (**inner).clone(),
                         other => panic!("[apply_provenance_path] Deref of non-pointer {:?}", other),
                     };
                     self.current_block_data.value_types.insert(dest, pointee_ty);
@@ -403,8 +403,8 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         field: StrId,
     ) -> (Value, SsaType, Option<StrId>) {
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _)) => *name,
-            Some(SsaType::Pointer(inner)) => fun_name(inner),
+            Some(SsaType::User(name, _, _)) => *name,
+            Some(SsaType::Pointer(_, inner)) => fun_name(inner),
             Some(SsaType::Owned(inner)) => fun_name(inner),
             other => panic!(
                 "[field_addr_on_value] could not determine struct type: {:?}",
@@ -464,9 +464,13 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             base: Operand::Value(obj_val),
             offset,
         });
-        self.current_block_data
-            .value_types
-            .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
+        self.current_block_data.value_types.insert(
+            addr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(field_ty.clone()),
+            ),
+        );
 
         (addr, field_ty, known_name)
     }
@@ -519,9 +523,9 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
 
     pub fn struct_name_of_value(&self, v: Value) -> Option<StrId> {
         match self.current_block_data.value_types.get(&v)? {
-            SsaType::User(name, _) => Some(*name),
-            SsaType::Pointer(inner) => match inner.as_ref() {
-                SsaType::User(name, _) => Some(*name),
+            SsaType::User(name, _, _) => Some(*name),
+            SsaType::Pointer(_, inner) => match inner.as_ref() {
+                SsaType::User(name, _, _) => Some(*name),
                 _ => None,
             },
             _ => None,
@@ -564,9 +568,10 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 base: Operand::Value(ptr_val),
                 offset: 0,
             });
-            self.current_block_data
-                .value_types
-                .insert(data_ptr, SsaType::Pointer(Box::new(elem_ssa)));
+            self.current_block_data.value_types.insert(
+                data_ptr,
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ssa)),
+            );
 
             let cap_v = self.current_block_data.fresh_value();
             self.emit(Instruction::LoadField {
@@ -925,9 +930,9 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         known_field_ty: &HirType<'a, 'bump>,
     ) -> (Value, SsaType) {
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _)) => *name,
-            Some(SsaType::Pointer(inner)) => match inner.as_ref() {
-                SsaType::User(name, _) => *name,
+            Some(SsaType::User(name, _, _)) => *name,
+            Some(SsaType::Pointer(_, inner)) => match inner.as_ref() {
+                SsaType::User(name, _, _) => *name,
                 other => panic!("[field_addr_typed] pointer to non-User type: {:?}", other),
             },
             other => panic!(
@@ -959,9 +964,13 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             base: Operand::Value(obj_val),
             offset,
         });
-        self.current_block_data
-            .value_types
-            .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
+        self.current_block_data.value_types.insert(
+            addr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(field_ty.clone()),
+            ),
+        );
 
         (addr, field_ty)
     }
@@ -1079,7 +1088,8 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         }
         let link_ssa = lower_type_hir(&chain.link_field_ty, self.enums, self.structs);
         let node_ssa = lower_type_hir(&chain.node_ty, self.enums, self.structs);
-        let node_ptr_ty = SsaType::Pointer(Box::new(node_ssa));
+        let node_ptr_ty =
+            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(node_ssa));
 
         // every node came from the same allocator.
         let (alloc_val, known_name) = match &chain.allocator {
@@ -1107,9 +1117,13 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             base: Operand::Value(base),
             offset: chain.head_offset,
         });
-        self.current_block_data
-            .value_types
-            .insert(head_addr, SsaType::Pointer(Box::new(head_ssa.clone())));
+        self.current_block_data.value_types.insert(
+            head_addr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(head_ssa.clone()),
+            ),
+        );
         let head = self.current_block_data.fresh_value();
         self.emit(Instruction::Load {
             dest: head,
@@ -1180,9 +1194,13 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             base: Operand::Value(node),
             offset: chain.link_offset,
         });
-        self.current_block_data
-            .value_types
-            .insert(link_addr, SsaType::Pointer(Box::new(link_ssa.clone())));
+        self.current_block_data.value_types.insert(
+            link_addr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(link_ssa.clone()),
+            ),
+        );
         let next_raw = self.current_block_data.fresh_value();
         self.emit(Instruction::Load {
             dest: next_raw,
@@ -1235,9 +1253,10 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     base: Operand::Value(node),
                     offset: off,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(faddr, SsaType::Pointer(Box::new(fty)));
+                self.current_block_data.value_types.insert(
+                    faddr,
+                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(fty)),
+                );
                 self.emit_element_drop(&kind, faddr, &mut node_resolver, span);
             }
         }
@@ -1292,9 +1311,13 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             base: Operand::Value(fat_ptr_addr),
             offset: 0,
         });
-        self.current_block_data
-            .value_types
-            .insert(data_ptr, SsaType::Pointer(Box::new(elem_ssa.clone())));
+        self.current_block_data.value_types.insert(
+            data_ptr,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ssa.clone()),
+            ),
+        );
 
         let len_v = self.current_block_data.fresh_value();
         self.emit(Instruction::LoadField {
@@ -1379,9 +1402,10 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             left: Operand::Value(data_ptr),
             right: Operand::Value(byte_off),
         });
-        self.current_block_data
-            .value_types
-            .insert(elem_addr, SsaType::Pointer(Box::new(elem_ssa)));
+        self.current_block_data.value_types.insert(
+            elem_addr,
+            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ssa)),
+        );
 
         self.emit_element_drop(element_kind, elem_addr, resolver, span);
 
@@ -1437,7 +1461,14 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             let field_ptr = self.current_block_data.fresh_value();
             self.current_block_data.value_types.insert(
                 field_ptr,
-                SsaType::Pointer(Box::new(SsaType::User(*field_struct_name, vec![]))),
+                SsaType::Pointer(
+                    ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                    Box::new(SsaType::User(
+                        *field_struct_name,
+                        *field_struct_name,
+                        vec![],
+                    )),
+                ),
             );
             self.emit(Instruction::FieldAddr {
                 dest: field_ptr,
