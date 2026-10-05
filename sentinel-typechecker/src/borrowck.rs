@@ -16,9 +16,9 @@ use ir::{
 };
 
 use crate::{
-    closures,
+    TypeChecker, closures,
     naming::{provenance_to_string, type_to_string},
-    str_id_to_string, TypeChecker,
+    str_id_to_string,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -256,7 +256,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let loan_id = self
             .loan_owners
             .iter()
-            .find(|(_, &owner)| owner == *name)
+            .find(|(_, owner)| **owner == *name)
             .map(|(&id, _)| id)?;
         self.borrow_checker.loan(loan_id).map(|loan| loan.place)
     }
@@ -561,6 +561,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
             let arg_loans =
                 self.check_all_func_args(args, params, templated_base_param, Some(func));
+            self.apply_callee_concurrency(&func, args);
 
             if let Some(loan_id) =
                 self.finalize_call_loans(None, args, arg_loans, &ret_ty, template)
