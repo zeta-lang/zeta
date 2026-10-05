@@ -5,8 +5,10 @@ use ir::hir::{
     Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, HirType, StrId,
     ThisPassingKind,
 };
+use ir::hir_utils::hir_contains_this;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
+use ir::registry::global_registry::GlobalRegistry;
 use ir::ssa_ir::{AllocatorKind, Function, Module, SsaType};
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -16,11 +18,12 @@ use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
-pub struct MirModuleLowerer<'a, 'cx, 'bump, 'g>
+pub struct MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
 where
     'bump: 'a,
     'bump: 'cx,
     'cx: 'a,
+    'r: 'a,
 {
     pub module: Module<'a, 'bump>,
 
@@ -44,7 +47,7 @@ where
     pub dep_graph: &'a RefCell<DepGraph>,
     pub module_idx: usize,
     g_phantom_data: PhantomData<&'g ()>,
-    glue_registry: &'a DropGlueRegistry,
+    glue_registry: DropGlueRegistry,
     allocator_kind: HashMap<StrId, AllocatorKind>,
     bump: GrowableBump<'bump>,
     interface_default_methods: HashMap<StrId, HashMap<StrId, HirFunc<'a, 'bump>>>,
@@ -53,22 +56,25 @@ where
     constants: HashMap<StrId, HirExpr<'a, 'bump>>,
     instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+    registry: GlobalRegistry<'r, 'bump>,
 }
 
-impl<'a, 'cx, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'bump, 'g>
+impl<'a, 'cx, 'r, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
 where
     'bump: 'a,
     'bump: 'cx,
     'cx: 'a,
+    'r: 'a,
 {
     pub fn new(
         context: Arc<StringPool>,
         extern_c_names: Rc<HashSet<StrId>>,
         dep_graph: &'a RefCell<DepGraph>,
         module_idx: usize,
-        glue_registry: &'a DropGlueRegistry,
+        glue_registry: DropGlueRegistry,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        registry: GlobalRegistry<'r, 'bump>,
     ) -> Self {
         let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
@@ -111,6 +117,7 @@ where
             bump: GrowableBump::new(4096, 8),
             instantiated_functions,
             instantiated_struct_methods,
+            registry,
         }
     }
 
@@ -285,7 +292,7 @@ where
             })
             .collect();
         for (name, func) in DropGlueBuilder::build_all(
-            self.glue_registry,
+            &self.glue_registry,
             &self.module.structs,
             &self.module.enums,
             &self.struct_mangled_map,
@@ -383,6 +390,14 @@ where
             .insert(hir_struct.name, hir_struct.clone());
     }
 
+    fn lower_iface_ty(&self, t: &HirType<'a, 'bump>) -> SsaType {
+        if hir_contains_this(t) {
+            SsaType::Dyn // implementer-specific; erased in the vtable signature
+        } else {
+            lower_type_hir(t, &self.enums, &self.module.structs)
+        }
+    }
+
     fn lower_interface(&mut self, hir_iface: &HirInterface<'a, 'bump>) {
         let iface_id = self.interface_id_map.len();
         self.interface_id_map.insert(hir_iface.name, iface_id);
@@ -410,21 +425,21 @@ where
                             param_type,
                             span: _,
                             multi_place: _,
-                        } => lower_type_hir(&param_type, &self.enums, &self.module.structs),
+                        } => self.lower_iface_ty(&param_type),
                         HirParam::This {
                             kind,
                             span: _,
                             multi_place: _,
                         } => match kind {
                             ThisPassingKind::Move | ThisPassingKind::MoveMut => SsaType::Dyn,
-                            _ => SsaType::Pointer(Box::new(SsaType::Dyn)),
+                            _ => SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Dyn)),
                         },
                     })
                     .collect::<Vec<_>>();
                 let ret = m
                     .return_type
                     .as_ref()
-                    .map(|t| lower_type_hir(t, &self.enums, &self.module.structs))
+                    .map(|t| self.lower_iface_ty(t))
                     .unwrap_or(SsaType::Void);
                 methods.push((m.unmangled_name.clone(), param_types, ret));
                 slot_map.insert(m.unmangled_name.clone(), slot);
@@ -457,7 +472,7 @@ where
 
         for f in hir_struct.fields.iter() {
             let field_ssa_ty = lower_type_hir(&f.field_type, &self.enums, &self.module.structs);
-            if let SsaType::User(n, fs) = &field_ssa_ty {
+            if let SsaType::User(n, _,  fs) = &field_ssa_ty {
                 if fs.is_empty() {
                     if let Some(def) = self.module.structs.get(n) {
                         assert!(
@@ -557,7 +572,7 @@ where
     }
 
     fn lower_function_body(&mut self, hir_fn: &HirFunc<'a, 'bump>) {
-        let mut function = self
+        let mut function: Function = self
             .module
             .functions
             .remove(&hir_fn.name)
@@ -580,7 +595,7 @@ where
             &self.extern_c_names,
             self.dep_graph,
             self.module_idx,
-            self.glue_registry,
+            &self.glue_registry,
             &self.allocator_kind,
             &self.interface_methods,
             &self.bump,
@@ -590,12 +605,13 @@ where
             &self.constants,
             self.instantiated_functions.clone(),
             self.instantiated_struct_methods.clone(),
+            self.registry.clone(), // here
         )
         .unwrap();
         fl.lower_body(hir_fn.body);
         fl.finish();
 
-        self.module.functions.insert(hir_fn.name, function);
+        self.module.functions.insert(hir_fn.name, function); // cannot borrow self.module.functions as mutable because it is also borrowed as immutable
     }
 
     /// A hoisted closure fn is named `__closure_fn_N` and takes its env first:
