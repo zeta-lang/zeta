@@ -1,3 +1,4 @@
+use crate::attributes::{AttrTarget, KnownKind};
 use crate::hir::{HirEnum, HirExpr, HirFunc, HirInterface, HirStruct, HirType, StrId};
 use crate::ir_hasher::FxHashMap;
 use std::{cell::RefCell, rc::Rc};
@@ -40,7 +41,8 @@ pub struct GlobalRegistry<'a, 'bump> {
     pub instantiated_enum_origins: Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
     pub struct_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
     pub enum_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
-    owned_by_module: Rc<RefCell<FxHashMap<StrId, ModuleSymbols>>>, // key = module name StrId
+    owned_by_module: Rc<RefCell<FxHashMap<StrId, ModuleSymbols>>>,
+    pub known: Rc<RefCell<FxHashMap<(KnownKind, StrId), AttrTarget>>>,
 }
 
 impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
@@ -61,6 +63,7 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
             struct_owner_module: Rc::new(RefCell::new(FxHashMap::default())),
             enum_owner_module: Rc::new(RefCell::new(FxHashMap::default())),
             instantiated_functions: Rc::new(RefCell::new(FxHashMap::default())),
+            known: Rc::new(RefCell::new(FxHashMap::default())),
         }
     }
 
