@@ -8,8 +8,8 @@ use ir::{
 };
 
 use crate::{
-    initialization::BindingMode, move_state::MoveState, naming::type_to_string, str_id_to_string,
-    type_checker::NonNullState, TypeChecker,
+    TypeChecker, initialization::BindingMode, move_state::MoveState, naming::type_to_string,
+    str_id_to_string, type_checker::NonNullState,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -20,6 +20,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expected: Option<&HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
         let scrutinee_ty = self.check_expr(expr);
+        let scrutinee_ty = match scrutinee_ty {
+            HirType::Ref { inner, .. } => *inner,
+            t => t,
+        };
 
         self.check_match_exhaustiveness(&scrutinee_ty, arms);
 
@@ -27,19 +31,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut arm_types = Vec::with_capacity(arms.len());
         let mut arm_move_states = Vec::with_capacity(arms.len());
 
+        let ob_branch = self.begin_obligation_branch();
+        let mut ob_arms = Vec::with_capacity(arms.len());
+
         let inval_before = self.invalidated_provenances.clone();
         let mut inval_after = inval_before.clone();
         for arm in arms {
             self.invalidated_provenances = inval_before.clone();
+            self.restore_obligations(&ob_branch);
             let (arm_type, arm_move_state) =
                 self.check_match_arm(expr, arm, &scrutinee_ty, expected, &move_state_before);
-            if !matches!(arm_type, HirType::Never) {
+            let diverges = matches!(arm_type, HirType::Never);
+            ob_arms.push((self.end_obligation_arm(&ob_branch), diverges));
+            if !diverges {
                 inval_after.extend(self.invalidated_provenances.drain());
             }
 
             arm_types.push(arm_type);
-            arm_move_states.push(arm_move_state);
+            if !diverges {
+                arm_move_states.push(arm_move_state);
+            }
         }
+
+        self.join_obligation_arms(ob_branch, ob_arms);
 
         self.invalidated_provenances = inval_after;
         self.move_state = arm_move_states
@@ -48,7 +62,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 MoveState::join(&acc, &state)
             });
 
-        self.join_value_types(&arm_types)
+        self.join_branch_types(&arm_types, expected)
     }
 
     pub fn check_match_arm(
@@ -199,11 +213,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .loan_owners
             .iter()
             .filter(|(_, owner)| local_names.contains(owner))
-            .filter(|(_, &owner)| match after_point {
-                Some(point) => !self.local_used_after(point, owner),
+            .filter(|(_, owner)| match after_point {
+                Some(point) => !self.local_used_after(point, **owner),
                 None => !body[(statement_index + 1)..]
                     .iter()
-                    .any(|stmt| self.stmt_references_local(stmt, owner)),
+                    .any(|stmt| self.stmt_references_local(stmt, **owner)),
             })
             .map(|(&loan_id, _)| loan_id)
             .collect();
@@ -236,17 +250,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let move_state_before = self.move_state.clone();
         let inval_before = self.invalidated_provenances.clone();
         let non_null_before = self.non_null_state.clone();
+        let ob_branch = self.begin_obligation_branch();
 
         let then_value = self.check_if_then_branch(cond, then_block, expected);
         let then_inval = self.invalidated_provenances.clone();
         let then_move_state = self.move_state.clone();
         let then_non_null = self.non_null_state.clone();
         let then_diverges = matches!(then_value, HirType::Never);
+        let then_ob = self.end_obligation_arm(&ob_branch);
+        self.restore_obligations(&ob_branch);
 
         self.restore_state_for_else_branch(cond, &move_state_before, &non_null_before);
 
         self.invalidated_provenances = inval_before;
         let else_value = self.check_if_else_branch(cond, else_block, expected);
+        let else_ob = self.end_obligation_arm(&ob_branch);
         let else_inval = std::mem::take(&mut self.invalidated_provenances);
         let else_diverges = else_value
             .as_ref()
@@ -263,18 +281,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let else_move_state = self.move_state.clone();
         let else_non_null = self.non_null_state.clone();
 
+        self.join_obligation_arms(
+            ob_branch,
+            vec![(then_ob, then_diverges), (else_ob, else_diverges)],
+        );
+
         self.join_if_branch_states(
             then_move_state,
             else_move_state,
             then_non_null,
             else_non_null,
             then_diverges,
-            else_value
-                .as_ref()
-                .is_some_and(|ty| matches!(ty, HirType::Never)),
+            else_diverges,
         );
 
-        else_value.map(|else_type| self.join_value_types(&[then_value, else_type]))
+        else_value.map(|else_type| self.join_branch_types(&[then_value, else_type], expected))
     }
 
     pub fn check_if_condition(&mut self, cond: &HirExpr<'a, 'bump>) {
@@ -424,7 +445,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         then_diverges: bool,
         else_diverges: bool,
     ) {
-        self.move_state = MoveState::join(&then_move_state, &else_move_state);
+        self.move_state = match (then_diverges, else_diverges) {
+            (true, false) => else_move_state,
+            (false, true) => then_move_state,
+            _ => MoveState::join(&then_move_state, &else_move_state),
+        };
 
         self.non_null_state = match (then_diverges, else_diverges) {
             (true, false) => else_non_null,
@@ -455,7 +480,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         match pattern {
-            HirPattern::Ident(name) => {
+            HirPattern::Ident(name, is_mut) => {
                 let var_name = str_id_to_string(*name);
                 let symbol_id = self.mint_symbol_id();
                 let bound_ty = self.bind_leaf_type(*scrutinee_ty, mode, scrutinee_provenance);
@@ -464,7 +489,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         var_name: var_name.clone(),
                     });
                 }
-                self.context.add_variable(var_name, bound_ty, symbol_id);
+                self.context
+                    .add_variable_with_mutability(var_name, bound_ty, *is_mut, symbol_id);
 
                 self.borrow_checker.declare_local(*name);
 
@@ -512,12 +538,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 let Some(variant_def) = def.variants.iter().find(|v| v.name == *variant) else {
                     return;
                 };
-                for (binding_name, field) in bindings.iter().zip(variant_def.fields.iter()) {
+                let field_tys = self
+                    .enum_variant_field_types(scrutinee_ty, *variant)
+                    .unwrap_or_default();
+                for (i, (binding_name, field)) in
+                    bindings.iter().zip(variant_def.fields.iter()).enumerate()
+                {
+                    let field_ty = field_tys.get(i).copied().unwrap_or(field.field_type);
                     let var_name = str_id_to_string(*binding_name);
                     let symbol_id = self.mint_symbol_id();
                     let field_provenance =
                         Self::extend_provenance(scrutinee_provenance, field.name, &self.context);
-                    let bound_ty = self.bind_leaf_type(field.field_type, mode, field_provenance);
+                    let bound_ty = self.bind_leaf_type(field_ty, mode, field_provenance);
                     if self.context.get_variable(&var_name).is_some() {
                         self.record(TypeErrorKind::VariableAlreadyExists {
                             var_name: var_name.clone(),
@@ -570,12 +602,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let Some(variant_def) = def.variants.iter().find(|v| v.name == *name) else {
                         return;
                     };
+                    let field_tys = self
+                        .enum_variant_field_types(scrutinee_ty, *name)
+                        .unwrap_or_default();
                     for (field_name, sub_pattern) in fields.iter() {
-                        let Some(field_def) =
-                            variant_def.fields.iter().find(|f| f.name == *field_name)
+                        let Some(idx) = variant_def
+                            .fields
+                            .iter()
+                            .position(|f| f.name == *field_name)
                         else {
                             continue;
                         };
+                        let field_ty = field_tys
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(variant_def.fields[idx].field_type);
                         let field_provenance = Self::extend_provenance(
                             scrutinee_provenance,
                             *field_name,
@@ -583,7 +624,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         );
                         self.register_pattern_bindings(
                             sub_pattern,
-                            &field_def.field_type,
+                            &field_ty,
                             mode,
                             field_provenance,
                             scrutinee_place,
@@ -671,7 +712,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         match pattern {
-            HirPattern::Ident(name) => {
+            HirPattern::Ident(name, _) => {
                 out.push((*name, *scrutinee_ty));
             }
 
@@ -691,8 +732,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 let Some(variant_def) = def.variants.iter().find(|v| v.name == *variant) else {
                     return;
                 };
-                for (binding_name, field) in bindings.iter().zip(variant_def.fields.iter()) {
-                    out.push((*binding_name, field.field_type));
+                let field_tys = self
+                    .enum_variant_field_types(scrutinee_ty, *variant)
+                    .unwrap_or_default();
+                for (i, (binding_name, field)) in
+                    bindings.iter().zip(variant_def.fields.iter()).enumerate()
+                {
+                    out.push((
+                        *binding_name,
+                        field_tys.get(i).copied().unwrap_or(field.field_type),
+                    ));
                 }
             }
 
@@ -727,13 +776,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let Some(variant_def) = def.variants.iter().find(|v| v.name == *name) else {
                         return;
                     };
+                    let field_tys = self
+                        .enum_variant_field_types(scrutinee_ty, *name)
+                        .unwrap_or_default();
                     for (field_name, sub_pattern) in fields.iter() {
-                        let Some(field_def) =
-                            variant_def.fields.iter().find(|f| f.name == *field_name)
+                        let Some(idx) = variant_def
+                            .fields
+                            .iter()
+                            .position(|f| f.name == *field_name)
                         else {
                             continue;
                         };
-                        self.collect_pattern_bindings(sub_pattern, &field_def.field_type, out);
+                        let field_ty = field_tys
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(variant_def.fields[idx].field_type);
+                        self.collect_pattern_bindings(sub_pattern, &field_ty, out);
                     }
                 }
                 HirType::Struct {
@@ -862,7 +920,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
 
-            HirPattern::Ident(_) | HirPattern::Wildcard => {}
+            HirPattern::Ident(_, _) | HirPattern::Wildcard => {}
 
             HirPattern::Tuple(patterns) => match scrutinee_ty {
                 HirType::Tuple(elems) => {
@@ -930,6 +988,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                     let mut seen: std::collections::HashSet<StrId> =
                         std::collections::HashSet::new();
+                    let field_tys = self
+                        .enum_variant_field_types(scrutinee_ty, *name)
+                        .unwrap_or_default();
                     for (field_name, sub_pattern) in fields.iter() {
                         if !seen.insert(*field_name) {
                             self.record(TypeErrorKind::Generic(format!(
@@ -938,8 +999,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             )));
                             continue;
                         }
-                        let Some(field_def) =
-                            variant_def.fields.iter().find(|f| f.name == *field_name)
+                        let Some(idx) = variant_def
+                            .fields
+                            .iter()
+                            .position(|f| f.name == *field_name)
                         else {
                             self.record(TypeErrorKind::Generic(format!(
                                 "variant `{}::{}` has no field `{}`",
@@ -949,7 +1012,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             )));
                             continue;
                         };
-                        self.check_pattern_against_type(sub_pattern, &field_def.field_type);
+                        let field_ty = field_tys
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(variant_def.fields[idx].field_type);
+                        self.check_pattern_against_type(sub_pattern, &field_ty);
                     }
 
                     let missing: Vec<&str> = variant_def
@@ -1117,7 +1184,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let has_catch_all = arms.iter().any(|arm| {
             arm.guard.is_none()
-                && matches!(arm.pattern, HirPattern::Wildcard | HirPattern::Ident(_))
+                && matches!(arm.pattern, HirPattern::Wildcard | HirPattern::Ident(_, _))
         });
         if has_catch_all {
             return;
@@ -1208,18 +1275,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn join_value_types(&mut self, branches: &[HirType<'a, 'bump>]) -> HirType<'a, 'bump> {
+        let nullable = |s: &Self, t: HirType<'a, 'bump>| match t {
+            HirType::Nullable(_) | HirType::Null => t,
+            _ => HirType::Nullable(s.context.bump.alloc_value(t)),
+        };
         let mut result: Option<HirType<'a, 'bump>> = None;
         for ty in branches {
             if matches!(ty, HirType::Never) {
                 continue;
             }
-            match result {
-                None => result = Some(*ty),
-                Some(expected) => {
-                    let check = self.types_compatible(&expected, ty);
-                    self.recover(check, ());
+            result = Some(match result {
+                None => *ty,
+                Some(HirType::Null) if !matches!(ty, HirType::Null) => nullable(self, *ty),
+                Some(prev) if matches!(ty, HirType::Null) => nullable(self, prev),
+                Some(prev) => {
+                    let c = self.types_compatible(&prev, ty);
+                    self.recover(c, ());
+                    prev
                 }
-            }
+            });
         }
         result.unwrap_or(HirType::Never)
     }
@@ -1231,11 +1305,70 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 Some(rk) => BindingMode::ByRef(*rk),
                 None => BindingMode::ByValue,
             },
+
             HirExpr::Ident(name, _) => match self.local_ref_kind.get(name) {
                 Some(rk) => BindingMode::ByRef(*rk),
                 None => BindingMode::ByValue,
             },
             _ => BindingMode::ByValue,
+        }
+    }
+
+    pub fn join_branch_types(
+        &mut self,
+        branches: &[HirType<'a, 'bump>],
+        expected: Option<&HirType<'a, 'bump>>,
+    ) -> HirType<'a, 'bump> {
+        if expected.is_some() {
+            return self.join_value_types(branches);
+        }
+
+        let prev = self.suppress_errors;
+        self.suppress_errors = true;
+        let joined = self.join_value_types(branches);
+        self.suppress_errors = prev;
+        joined
+    }
+
+    pub fn enum_variant_field_types(
+        &self,
+        enum_ty: &HirType<'a, 'bump>,
+        variant: StrId,
+    ) -> Option<Vec<HirType<'a, 'bump>>> {
+        let HirType::Enum {
+            name,
+            type_args,
+            variants,
+        } = enum_ty
+        else {
+            return None;
+        };
+
+        if !type_args.is_empty() {
+            if let Some(inst) = self.instantiate_enum(*name, type_args) {
+                return inst
+                    .iter()
+                    .find(|(n, _)| *n == variant)
+                    .map(|(_, fields)| fields.to_vec());
+            }
+        }
+
+        variants
+            .iter()
+            .find(|v| v.name == variant)
+            .map(|v| v.fields.iter().map(|f| f.field_type).collect())
+    }
+
+    pub fn peel_indirections(mut t: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
+        while let HirType::Ref { inner, .. } = t {
+            t = *inner;
+        }
+        t
+    }
+    pub fn peel_nullable<'x>(t: &'x HirType<'a, 'bump>) -> &'x HirType<'a, 'bump> {
+        match t {
+            HirType::Nullable(i) => i,
+            _ => t,
         }
     }
 }

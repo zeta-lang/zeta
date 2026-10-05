@@ -1,3 +1,5 @@
+use crate::auto_traits::AutoTrait;
+
 use super::*;
 use ir::{
     borrow_checker::{BorrowKind, IndexContainer, Interval, LoanId},
@@ -18,6 +20,21 @@ pub(super) enum UseLevel {
     Alias,
     Mut,
     Move,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosureCaptureMode {
+    Move,
+    Shared,
+    Unique,
+    Alias,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClosureCapture<'a, 'bump> {
+    pub name: StrId,
+    pub ty: HirType<'a, 'bump>,
+    pub mode: ClosureCaptureMode,
 }
 
 impl From<BorrowKind> for UseLevel {
@@ -352,7 +369,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.fv_expr(right, bound, out);
             }
             HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. } => {
-                self.fv_expr(callee, bound, out);
+                match &**callee {
+                    // `recv.method(..)`: the callee names a method, not a field path.
+                    // Capture the receiver; do not record `recv.method` as a place.
+                    HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                        self.fv_expr(object, bound, out);
+                    }
+                    other => self.fv_expr(other, bound, out),
+                }
                 for a in args.iter() {
                     self.fv_expr(a, bound, out);
                 }
@@ -845,5 +869,62 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn closure_table(&self) -> &FxHashMap<usize, ClosureLowering<'a, 'bump>> {
         &self.closure_table
+    }
+
+    /// Free-variable scan over in-scope locals. Over-approximates when the closure
+    /// shadows an outer name.
+    pub fn infer_closure_captures(
+        &mut self,
+        lambda: &HirExpr<'a, 'bump>,
+    ) -> Vec<ClosureCapture<'a, 'bump>> {
+        let HirExpr::Lambda { body, span, .. } = lambda else {
+            return Vec::new();
+        };
+        let Some(lowering) = self.closure_table.get(&Self::stmt_key(body)) else {
+            return Vec::new();
+        };
+        let caps: Vec<_> = lowering
+            .captures
+            .iter()
+            .map(|c| (c.source, c.source_path, c.mode))
+            .collect();
+
+        caps.into_iter()
+            .map(|(source, path, mode)| {
+                let place_expr = self.expr_from_path(source, path, *span);
+                let ty = self.peek_type(&place_expr);
+                let mode = match mode {
+                    CaptureMode::ByValue => ClosureCaptureMode::Move,
+                    CaptureMode::ByRef(RefKind::Shared) => ClosureCaptureMode::Shared,
+                    CaptureMode::ByRef(RefKind::Unique) => ClosureCaptureMode::Unique,
+                    CaptureMode::ByRef(RefKind::Alias) => ClosureCaptureMode::Alias,
+                };
+                ClosureCapture {
+                    name: source,
+                    ty,
+                    mode,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Which traits the *captured variable's type* must have so that the closure has `tr`.
+pub fn required_for_capture(mode: ClosureCaptureMode, tr: AutoTrait) -> &'static [AutoTrait] {
+    match (mode, tr) {
+        (ClosureCaptureMode::Alias, _) => &[AutoTrait::Send, AutoTrait::Sync],
+        (ClosureCaptureMode::Move, AutoTrait::Send)
+        | (ClosureCaptureMode::Unique, AutoTrait::Send) => &[AutoTrait::Send],
+        // Move/Sync, Shared/*, Unique/Sync
+        _ => &[AutoTrait::Sync],
+    }
+}
+
+pub fn capture_mode_text(mode: ClosureCaptureMode) -> &'static str {
+    match mode {
+        ClosureCaptureMode::Move => "by move",
+        ClosureCaptureMode::Shared => "by shared borrow",
+        ClosureCaptureMode::Unique => "by `&mut` borrow",
+        ClosureCaptureMode::Alias => "by `&alias` borrow",
     }
 }

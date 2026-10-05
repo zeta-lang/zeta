@@ -1,5 +1,5 @@
 use ir::{
-    ast::FuncSafety,
+    ast::{FuncSafety, MutabilityState},
     borrow_checker::{BorrowKind, LoanId, ReadTemplate, RefTemplate},
     errors::type_error::{TypeCheckResult, TypeErrorKind},
     hir::{HirExpr, HirFunc, HirParam, HirType, RefKind, StrId, ThisPassingKind},
@@ -386,8 +386,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     None => self.check_expr(arg),
                 };
                 self.check_and_record_value_use(arg, &arg_type);
-                if let Some(pt) = param.get_type() {
-                    self.recover(self.types_compatible(pt, &arg_type), ());
+                if let Some(param_type) = param.get_type() {
+                    let result = self.types_compatible(param_type, &arg_type);
+                    self.recover(result, ());
                 }
             }
         }
@@ -463,7 +464,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     };
                 }
 
-                let func = match self.context.get_function(&lookup_name) {
+                let func = self.context.get_function(&lookup_name).or_else(|| {
+                    self.functions_by_module
+                        .iter()
+                        .find(|(_, s)| s.contains(func_name))
+                        .and_then(|(&m, _)| self.context.get_module_function(m, &lookup_name))
+                });
+                let func = match func {
                     Some(f) => f,
                     None => {
                         self.record(TypeErrorKind::UndefinedFunction(lookup_name));
@@ -507,6 +514,38 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
             } => {
                 self.set_span(*span);
+                if let HirExpr::Ident(tname, _) = &**object {
+                    let t = str_id_to_string(*tname);
+                    if self.context.get_variable(&t).is_none() {
+                        let midx = self.context.current_module_idx;
+                        let mangled = self
+                            .context
+                            .dep_graph
+                            .borrow()
+                            .mangle_type_name(midx, *tname, &self.context.string_pool)
+                            .to_string();
+                        for key in [mangled, t.clone()] {
+                            if let Some(func) =
+                                self.context.get_method(&key, field.as_str()).copied()
+                            {
+                                let id = StrId(self.context.string_pool.intern(&key));
+                                self.check_unsafe_call(&func, &format!("{}.{}", t, field));
+                                let ret = self.check_resolved_function_call(
+                                    expr,
+                                    func,
+                                    &format!("{}.{}", t, field),
+                                    *span,
+                                    args,
+                                    type_args,
+                                    expected,
+                                );
+                                self.record_method_occurrence(*span, *field, ret, id);
+                                return ret;
+                            }
+                        }
+                    }
+                }
+
                 let obj_type = self.check_expr(object);
                 let stripped = Self::strip_ref(&obj_type);
 
@@ -603,6 +642,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         }
                         _ => None,
                     }),
+                    HirType::Generic(g) => self.generic_bound_with_method(*g, field.as_str()),
                     _ => None,
                 };
 
@@ -636,6 +676,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             expected_args,
                             found_args: args.len(),
                         });
+                    }
+
+                    let mut subs: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
+                    if let (Some(ta), Some(gs)) = (type_args, method.generics) {
+                        for (g, a) in gs.iter().zip(ta.iter()) {
+                            subs.insert(g.name, *a);
+                        }
                     }
 
                     if let Some(params) = method.params {
@@ -682,16 +729,31 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             }
                         }
                         for (arg, param) in args.iter().zip(params.iter().skip(1)) {
-                            let arg_type = self.check_expr(arg);
+                            let pt: Option<HirType<'a, 'bump>> = param.get_type().map(|t| {
+                                if subs.is_empty() {
+                                    *t
+                                } else {
+                                    self.substitute_type_local(t, &subs)
+                                }
+                            });
+                            let arg_type = match &pt {
+                                Some(pt) => self.check_expr_expected(arg, pt),
+                                None => self.check_expr(arg),
+                            };
                             self.check_and_record_value_use(arg, &arg_type);
-                            if let Some(param_type) = param.get_type() {
-                                let result = self.types_compatible(param_type, &arg_type);
+                            if let Some(pt) = &pt {
+                                let result = self.types_compatible(pt, &arg_type);
                                 self.recover(result, ());
                             }
                         }
                     }
 
-                    return method.return_type.unwrap_or(HirType::Void);
+                    let ret = method.return_type.unwrap_or(HirType::Void);
+                    return if subs.is_empty() {
+                        ret
+                    } else {
+                        self.substitute_type_local(&ret, &subs)
+                    };
                 }
 
                 let (struct_name_id, type_name, func) =
@@ -754,6 +816,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 if let Some(params) = func.params {
                     let mut receiver_multi_place_loans: Vec<LoanId> = Vec::new();
+
+                    let this_kind = match params.first() {
+                        Some(HirParam::This { kind, .. }) => Some(kind),
+                        _ => None,
+                    };
 
                     if let Some(HirParam::This {
                         kind,
@@ -833,6 +900,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
 
                     let arg_loans = self.check_all_func_args(args, normal_params, None, Some(func));
+                    self.apply_callee_concurrency(&func, args);
+
+                    if let Some(kind) = this_kind {
+                        self.on_method_call(object, field.as_str(), kind);
+                    }
 
                     let loan =
                         self.finalize_call_loans(Some(object), args, arg_loans, &ret_ty, template);
@@ -1013,6 +1085,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
 
                     let arg_loans = self.check_all_func_args(args, params, None, Some(func));
+                    self.apply_callee_concurrency(&func, args);
 
                     let ret_ty = func.return_type.unwrap_or(HirType::Void);
                     if !self.return_type_may_alias(&ret_ty) {
@@ -1188,6 +1261,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let arg_loans = self.check_all_func_args(args, params, None, Some(func));
+        self.apply_callee_concurrency(&func, args);
 
         substitutions.extend(std::mem::take(&mut self.closure_generic_subs));
         if type_args.is_none() {
@@ -1473,6 +1547,28 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         };
 
         if !self.context.is_mutable(&root_name) {
+            let through_ref = self
+                .context
+                .get_variable(&root_name)
+                .is_some_and(|(_, ty)| {
+                    matches!(
+                        ty,
+                        HirType::Ref {
+                            ref_kind: RefKind::Unique | RefKind::Alias,
+                            ..
+                        } | HirType::SafePointer {
+                            mutability_state: MutabilityState::Mut,
+                            ..
+                        } | HirType::UnsafePointer {
+                            mutability_state: MutabilityState::Mut,
+                            ..
+                        }
+                    )
+                });
+
+            if through_ref {
+                return Ok(());
+            }
             return Err(TypeErrorKind::Generic(format!(
                 "cannot call `{}` on `{}`: `{}` is not declared `mut`",
                 method_name, root_name, root_name
@@ -1507,5 +1603,48 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 display_name, display_name
             )));
         }
+    }
+
+    fn resolve_interface_key(&self, name: &str) -> Option<String> {
+        if self.context.get_interface(name).is_some() {
+            return Some(name.to_string());
+        }
+        let id = StrId(self.context.string_pool.intern(name));
+        let cur = self.context.current_module_idx;
+        let mut mods = vec![cur];
+        if let Some(imp) = self.imports_by_module.get(&cur) {
+            mods.extend(imp.named.get(&id).copied());
+            mods.extend(imp.modules.iter().copied());
+            mods.extend(imp.wildcard.iter().copied());
+        }
+        for m in mods {
+            let key = self
+                .context
+                .dep_graph
+                .borrow()
+                .mangle_type_name(m, id, &self.context.string_pool)
+                .to_string();
+            if self.context.get_interface(&key).is_some() {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn generic_bound_with_method(&self, g: StrId, method: &str) -> Option<String> {
+        for name in self.generic_bounds.get(&g)? {
+            let Some(key) = self.resolve_interface_key(name) else {
+                continue;
+            };
+            let declares = self
+                .context
+                .get_interface(&key)
+                .and_then(|i| i.methods)
+                .is_some_and(|ms| ms.iter().any(|m| m.unmangled_name.as_str() == method));
+            if declares {
+                return Some(key);
+            }
+        }
+        None
     }
 }
