@@ -1,0 +1,128 @@
+package zeta::time::duration;
+
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+struct Duration {
+    seconds: i64,
+    nanosecond: i32,
+}
+
+impl Duration {
+    func normalize(seconds: i64, nanosecond: i64): Duration {
+        let mut sec: i64 = seconds + nanosecond / 1000000000;
+        let mut nano: i64 = nanosecond % 1000000000;
+
+        if (nano < 0) {
+            nano += NANOS_PER_SECOND;
+            sec -= 1;
+        }
+
+        return Duration {
+            seconds: sec,
+            nanosecond: nano as i32,
+        };
+    }
+
+
+    func zero(): Duration {
+        return Duration {
+            seconds: 0,
+            nanosecond: 0,
+        };
+    }
+
+
+    func from_seconds(seconds: i64): Duration {
+        return Duration {
+            seconds,
+            nanosecond: 0,
+        };
+    }
+
+
+    func from_milliseconds(milliseconds: i64): Duration {
+        return Duration.normalize(
+            milliseconds / 1000,
+            (milliseconds % 1000) * 1_000_000
+        );
+    }
+
+
+    func from_microseconds(microseconds: i64): Duration {
+        return Duration.normalize(
+            microseconds / 1_000_000,
+            (microseconds % 1_000_000) * 1000
+        );
+    }
+
+
+    func from_nanoseconds(nanoseconds: i64): Duration {
+        return Duration.normalize(
+            nanoseconds / NANOS_PER_SECOND,
+            nanoseconds % NANOS_PER_SECOND
+        );
+    }
+
+
+    func total_seconds(&this): i64 {
+        return this.seconds;
+    }
+
+
+    func total_milliseconds(&this): i64 {
+        return this.seconds * 1000 +
+               (this.nanosecond as i64) / 1_000_000;
+    }
+
+
+    func total_microseconds(&this): i64 {
+        return this.seconds * 1_000_000 +
+               (this.nanosecond as i64) / 1000;
+    }
+
+
+    func total_nanoseconds(&this): i64 {
+        return this.seconds * NANOS_PER_SECOND +
+               (this.nanosecond as i64);
+    }
+
+
+    func add(&this, other: Duration): Duration {
+        return Duration.normalize(
+            this.seconds + other.seconds,
+            (this.nanosecond as i64) +
+            (other.nanosecond as i64)
+        );
+    }
+
+
+    func subtract(&this, other: Duration): Duration {
+        return Duration.normalize(
+            this.seconds - other.seconds,
+            (this.nanosecond as i64) -
+            (other.nanosecond as i64)
+        );
+    }
+
+
+    func negate(&this): Duration {
+        return Duration.normalize(
+            -this.seconds,
+            -(this.nanosecond as i64)
+        );
+    }
+
+
+    func is_zero(&this): bool {
+        return this.seconds == 0 && this.nanosecond == 0;
+    }
+
+
+    func is_negative(&this): bool {
+        return this.seconds < 0;
+    }
+
+    func from_minutes(minutes: i64): Duration { return Duration.normalize(minutes * 60, 0); }
+    func from_hours(hours: i64): Duration     { return Duration.normalize(hours * 3600, 0); }
+    func from_days(days: i64): Duration       { return Duration.normalize(days * 86400, 0); }
+}

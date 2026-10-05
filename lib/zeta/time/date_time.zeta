@@ -1,0 +1,602 @@
+package zeta::time::date_time;
+
+import zeta::parse.Parse;
+import zeta::parse.ParseError;
+import zeta::parse.ParseErrorKind;
+import zeta::time::duration.Duration;
+import zeta::time::libc_time;
+import zeta::debug;
+import zeta::time::libc_time.Timespec;
+import zeta::to_string.padded_u64;
+import zeta::to_string.ToString;
+import zeta::string.String;
+import zeta::utils::mallocator.Mallocator;
+
+struct DateTime {
+    year: i32,
+    month: u8,
+    day: u8,
+
+    hour: u8,
+    minute: u8,
+    second: u8,
+
+    nanosecond: u32,
+
+    offset_minutes: i32,
+}
+
+
+func is_leap_year(year: i32): bool {
+    return (year % 4 == 0 && year % 100 != 0) ||
+           (year % 400 == 0);
+}
+
+func days_in_month(year: i32, month: u8): u8 {
+    match (month) {
+        case 1 -> return 31;
+        case 2 -> {
+            if (is_leap_year(year)) {
+                return 29;
+            }
+            return 28;
+        }
+        case 3 -> return 31;
+        case 4 -> return 30;
+        case 5 -> return 31;
+        case 6 -> return 30;
+        case 7 -> return 31;
+        case 8 -> return 31;
+        case 9 -> return 30;
+        case 10 -> return 31;
+        case 11 -> return 30;
+        case 12 -> return 31;
+        case _ -> return 0;
+    }
+}
+
+func fixed_digits(bytes: &[]u8, start: usize, count: usize):
+    Result<u32, ParseError> {
+
+    if (start + count > bytes.len) {
+        return Result.Err {
+            error: ParseError {
+                kind: ParseErrorKind.UnexpectedEnd,
+                position: start,
+            },
+        };
+    }
+
+    let mut value: u32 = 0;
+
+    for (let mut i: usize = 0; i < count; i += 1) {
+        let b: u8 = bytes[start + i];
+
+        if (b < ('0' as u8) || b > ('9' as u8)) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.InvalidDigit,
+                    position: start + i,
+                },
+            };
+        }
+
+        value = value * 10 + (b - ('0' as u8)) as u32;
+    }
+
+    return Result.Ok { value };
+}
+
+impl DateTime by Parse {
+    func parse(s: str): Result<DateTime, ParseError> {
+        let input: str = s.trim();
+        let bytes: &[]u8 = input.as_bytes();
+
+        // YYYY-MM-DDTHH:MM:SS
+        if (bytes.len < 19) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.UnexpectedEnd,
+                    position: bytes.len,
+                },
+            };
+        }
+
+        let year: i32 = match (fixed_digits(bytes, 0, 4)) {
+            case Result.Ok { value } -> value as i32,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        if (bytes[4] != ('-' as u8) ||
+            bytes[7] != ('-' as u8) ||
+            (bytes[10] != ('T' as u8) && bytes[10] != ('t' as u8)) ||
+            bytes[13] != (':' as u8) ||
+            bytes[16] != (':' as u8)) {
+
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.InvalidFormat,
+                    position: 0,
+                },
+            };
+        }
+
+        let month: u8 = match (fixed_digits(bytes, 5, 2)) {
+            case Result.Ok { value } -> value as u8,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        let day: u8 = match (fixed_digits(bytes, 8, 2)) {
+            case Result.Ok { value } -> value as u8,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        let hour: u8 = match (fixed_digits(bytes, 11, 2)) {
+            case Result.Ok { value } -> value as u8,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        let minute: u8 = match (fixed_digits(bytes, 14, 2)) {
+            case Result.Ok { value } -> value as u8,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        let second: u8 = match (fixed_digits(bytes, 17, 2)) {
+            case Result.Ok { value } -> value as u8,
+            case Result.Err { error } -> return Result.Err { error },
+        };
+
+        if (month < 1 || month > 12) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.InvalidFormat,
+                    position: 5,
+                },
+            };
+        }
+
+        let max_day: u8 = days_in_month(year, month);
+
+        if (day < 1 || day > max_day) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.InvalidFormat,
+                    position: 8,
+                },
+            };
+        }
+
+        if (hour > 23 || minute > 59 || second > 59) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.InvalidFormat,
+                    position: 11,
+                },
+            };
+        }
+
+        let mut index: usize = 19;
+        let mut nanosecond: u32 = 0;
+
+        // Optional fractional seconds.
+        if (index < bytes.len && bytes[index] == ('.' as u8)) {
+            index += 1;
+
+            let mut digits: usize = 0;
+
+            while (index < bytes.len &&
+                   bytes[index] >= ('0' as u8) &&
+                   bytes[index] <= ('9' as u8)) {
+
+                if (digits < 9) {
+                    nanosecond =
+                        nanosecond * 10 +
+                        (bytes[index] - ('0' as u8)) as u32;
+                }
+
+                digits += 1;
+                index += 1;
+            }
+
+            if (digits == 0) {
+                return Result.Err {
+                    error: ParseError {
+                        kind: ParseErrorKind.InvalidFormat,
+                        position: index,
+                    },
+                };
+            }
+
+            if (digits > 9) {
+                return Result.Err {
+                    error: ParseError {
+                        kind: ParseErrorKind.Overflow,
+                        position: index,
+                    },
+                };
+            }
+
+            for (let mut i: usize = digits; i < 9; i += 1) {
+                nanosecond *= 10;
+            }
+        }
+
+        if (index >= bytes.len) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.UnexpectedEnd,
+                    position: index,
+                },
+            };
+        }
+
+        let mut offset_minutes: i32 = 0;
+
+        // UTC.
+        if (bytes[index] == ('Z' as u8) ||
+            bytes[index] == ('z' as u8)) {
+
+            index += 1;
+        }
+        else {
+            // ±HH:MM
+            let sign: i32 =
+                if (bytes[index] == ('+' as u8)) {
+                    index += 1;
+                    1
+                }
+                else if (bytes[index] == ('-' as u8)) {
+                    index += 1;
+                    -1
+                }
+                else {
+                    return Result.Err {
+                        error: ParseError {
+                            kind: ParseErrorKind.InvalidFormat,
+                            position: index,
+                        },
+                    };
+                };
+
+            if (index + 5 > bytes.len ||
+                bytes[index + 2] != (':' as u8)) {
+                return Result.Err {
+                    error: ParseError {
+                        kind: ParseErrorKind.InvalidFormat,
+                        position: index,
+                    },
+                };
+            }
+
+            let offset_hour: u8 =
+                match (fixed_digits(bytes, index, 2)) {
+                    case Result.Ok { value } -> value as u8,
+                    case Result.Err { error } -> return Result.Err { error },
+                };
+
+            let offset_minute: u8 =
+                match (fixed_digits(bytes, index + 3, 2)) {
+                    case Result.Ok { value } -> value as u8,
+                    case Result.Err { error } -> return Result.Err { error },
+                };
+
+            if (offset_hour > 23 || offset_minute > 59) {
+                return Result.Err {
+                    error: ParseError {
+                        kind: ParseErrorKind.InvalidFormat,
+                        position: index,
+                    },
+                };
+            }
+
+            offset_minutes =
+                sign * ((offset_hour as i32) * 60 +
+                        (offset_minute as i32));
+
+            index += 5;
+        }
+
+        if (index != bytes.len) {
+            return Result.Err {
+                error: ParseError {
+                    kind: ParseErrorKind.TrailingCharacters,
+                    position: index,
+                },
+            };
+        }
+
+        return Result.Ok {
+            value: DateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                nanosecond,
+                offset_minutes,
+            },
+        };
+    }
+
+    func now(): DateTime {
+        let mut ts: Timespec = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+
+        let result: i32 = unsafe {
+            libc_time.clock_gettime(
+                CLOCK_REALTIME,
+                &mut ts
+            )
+        };
+
+        if (result != 0) {
+            debug.debug_panic("clock_gettime(CLOCK_REALTIME) failed");
+        }
+
+        return DateTime.from_seconds(
+            ts.tv_sec,
+            ts.tv_nsec as u32,
+            0
+        );
+    }
+
+    func from_minutes(minutes: i64): DateTime {
+        return DateTime.normalize(minutes * 60, 0);
+    }
+
+    func from_hours(hours: i64): DateTime {
+        return DateTime.normalize(hours * 3600, 0);
+    }
+
+    func from_days(days: i64): DateTime {
+        return DateTime.normalize(days * 86400, 0);
+    }
+
+    func normalize(seconds: i64, nanosecond: i64): DateTime {
+        let mut sec: i64 = seconds + nanosecond / 1000000000;
+        let mut nano: i64 = nanosecond % 1000000000;
+
+        if (nano < 0) {
+            nano += NANOS_PER_SECOND;
+            sec -= 1;
+        }
+
+        return DateTime.from_seconds(
+            sec,
+            nano as u32,
+            0
+        );
+    }
+
+    func from_seconds(seconds: i64, nanosecond: u32, offset_minutes: i32): DateTime {
+        let local_seconds: i64 = seconds + (offset_minutes as i64) * 60;
+
+        let mut days: i64 = local_seconds / 86400;
+        let mut seconds_of_day: i64 = local_seconds % 86400;
+
+        // Floor division: truncation is wrong for negative timestamps.
+        if (seconds_of_day < 0) {
+            seconds_of_day += 86400;
+            days -= 1;
+        }
+
+        let mut result: DateTime = civil_from_days(days);
+        result.hour = (seconds_of_day / 3600) as u8;
+        result.minute = ((seconds_of_day % 3600) / 60) as u8;
+        result.second = (seconds_of_day % 60) as u8;
+        result.nanosecond = nanosecond;
+        result.offset_minutes = offset_minutes;
+        return result;
+    }
+
+    /// Unix timestamp (UTC seconds).
+    func to_seconds(&this): i64 {
+        let days: i64 = days_from_civil(this.year, this.month, this.day);
+        let seconds_of_day: i64 =
+            (this.hour as i64) * 3600 +
+            (this.minute as i64) * 60 +
+            (this.second as i64);
+        return days * 86400 + seconds_of_day - (this.offset_minutes as i64) * 60;
+    }
+
+    func now(): DateTime {
+        let mut ts: Timespec = Timespec { tv_sec: 0, tv_nsec: 0 };
+        let result: i32 = unsafe { libc_time.clock_gettime(CLOCK_REALTIME, &mut ts) };
+        if (result != 0) {
+            debug.debug_panic("clock_gettime(CLOCK_REALTIME) failed");
+        }
+        return DateTime.from_seconds(ts.tv_sec, ts.tv_nsec as u32, 0);
+    }
+
+    func add(&this, delta: Duration): DateTime {
+        let mut secs: i64 = this.to_seconds() + delta.seconds;
+        let mut nanos: i64 = (this.nanosecond as i64) + delta.nanosecond;
+
+        if (nanos >= 1000000000) {
+            nanos -= 1000000000;
+            secs += 1;
+        }
+        if (nanos < 0) {
+            nanos += 1000000000;
+            secs -= 1;
+        }
+        return DateTime.from_seconds(secs, nanos as u32, this.offset_minutes);
+    }
+
+    func subtract(&this, delta: Duration): DateTime {
+        return this.add(Duration.normalize(-delta.seconds, -(delta.nanosecond as i64)));
+    }
+
+    /// `this - other`
+    func difference(&this, other: DateTime): Duration {
+        return Duration.normalize(
+            this.to_seconds() - other.to_seconds(),
+            (this.nanosecond as i64) - (other.nanosecond as i64)
+        );
+    }
+}
+
+func days_from_civil(
+    year: i32,
+    month: u8,
+    day: u8
+): i64 {
+
+    let mut y: i64 = year as i64;
+    let m: i64 = month as i64;
+    let d: i64 = day as i64;
+
+    if (m <= 2) {
+        y -= 1;
+    }
+
+    let era: i64 =
+        if (y >= 0) {
+            y / 400
+        }
+        else {
+            (y - 399) / 400
+        };
+
+    let yoe: i64 = y - era * 400;
+
+    let mp: i64 =
+        if (m > 2) {
+            m - 3
+        }
+        else {
+            m + 9
+        };
+
+    let doy: i64 =
+        (153 * mp + 2) / 5 + d - 1;
+
+    let doe: i64 =
+        yoe * 365 +
+        yoe / 4 -
+        yoe / 100 +
+        doy;
+
+    return era * 146097 + doe - 719468;
+}
+
+func civil_from_days(days: i64):
+    DateTime {
+
+    let z: i64 = days + 719468;
+
+    let era: i64 =
+        if (z >= 0) {
+            z / 146097
+        }
+        else {
+            (z - 146096) / 146097
+        };
+
+    let doe: i64 =
+        z - era * 146097;
+
+    let yoe: i64 =
+        (doe -
+         doe / 1460 +
+         doe / 36524 -
+         doe / 146096) / 365;
+
+    let mut year: i64 =
+        yoe + era * 400;
+
+    let doy: i64 =
+        doe -
+        (365 * yoe +
+         yoe / 4 -
+         yoe / 100);
+
+    let mp: i64 =
+        (5 * doy + 2) / 153;
+
+    let day: i64 =
+        doy - (153 * mp + 2) / 5 + 1;
+
+    let month: i64 =
+        if (mp < 10) {
+            mp + 3
+        }
+        else {
+            mp - 9
+        };
+
+    if (month <= 2) {
+        year += 1;
+    }
+
+    return DateTime {
+        year: year as i32,
+        month: month as u8,
+        day: day as u8,
+
+        hour: 0,
+        minute: 0,
+        second: 0,
+
+        nanosecond: 0,
+        offset_minutes: 0,
+    };
+}
+
+impl DateTime by ToString {
+    func to_string(&this): String<Mallocator> {
+        let mut s: String<Mallocator> = String.new();
+
+        let y: String<Mallocator> = padded_u64(this.year as u64, 4); // line 535
+        s.push_str(y.as_str());
+        s.push_byte('-' as u8);
+        let mo: String<Mallocator> = padded_u64(this.month as u64, 2);
+        s.push_str(mo.as_str());
+        s.push_byte('-' as u8);
+        let d: String<Mallocator> = padded_u64(this.day as u64, 2);
+        s.push_str(d.as_str());
+        s.push_byte('T' as u8);
+        let h: String<Mallocator> = padded_u64(this.hour as u64, 2);
+        s.push_str(h.as_str());
+        s.push_byte(':' as u8);
+        let mi: String<Mallocator> = padded_u64(this.minute as u64, 2);
+        s.push_str(mi.as_str());
+        s.push_byte(':' as u8);
+        let se: String<Mallocator> = padded_u64(this.second as u64, 2);
+        s.push_str(se.as_str());
+
+        // Fractional seconds, trailing zeros trimmed.
+        if (this.nanosecond != 0) {
+            let mut n: u32 = this.nanosecond;
+            let mut width: usize = 9;
+            while (n % 10 == 0) {
+                n /= 10;
+                width -= 1;
+            }
+            s.push_byte('.' as u8);
+            let f: String<Mallocator> = padded_u64(n as u64, width);
+            s.push_str(f.as_str());
+        }
+
+        if (this.offset_minutes == 0) {
+            s.push_byte('Z' as u8);
+        } else {
+            let mut off: i32 = this.offset_minutes;
+            if (off < 0) {
+                s.push_byte('-' as u8);
+                off = -off;
+            } else {
+                s.push_byte('+' as u8);
+            }
+            let oh: String<Mallocator> = padded_u64((off / 60) as u64, 2);
+            s.push_str(oh.as_str());
+            s.push_byte(':' as u8);
+            let om: String<Mallocator> = padded_u64((off % 60) as u64, 2);
+            s.push_str(om.as_str());
+        }
+        return s;
+    }
+}

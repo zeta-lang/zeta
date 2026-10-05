@@ -1,0 +1,34 @@
+package zeta::time::process;
+
+import zeta::time::duration.Duration;
+import zeta::time::libc_time.Timespec;
+import zeta::time::libc_time;
+import zeta::debug;
+
+func sleep(duration: Duration): void {
+    if (duration.is_negative() || duration.is_zero()) {
+        return;
+    }
+
+    let request: Timespec = Timespec {
+        tv_sec: duration.seconds,
+        tv_nsec: duration.nanosecond as i64,
+    };
+
+    let mut remaining: Timespec = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    // Relative CLOCK_MONOTONIC sleep.
+    let result: i32 = libc_time.clock_nanosleep(
+        libc_time.CLOCK_MONOTONIC,
+        libc_time.TIMER_RELATIVE,
+        &request,
+        &mut remaining
+    );
+
+    if (result != 0) {
+        debug.debug_panic("clock_nanosleep failed");
+    }
+}

@@ -1,0 +1,83 @@
+package zeta::time::instant;
+
+import zeta::time::duration.Duration;
+import zeta::time::libc_time.Timespec;
+import zeta::time::libc_time.CLOCK_MONOTONIC;
+import zeta::time::libc_time;
+import zeta::debug;
+
+
+struct Instant {
+    seconds: i64,
+    nanosecond: i32,
+}
+
+impl Instant {
+    func now(): Instant {
+        let mut ts: Timespec = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+
+        let result: i32 = unsafe {
+            libc_time.clock_gettime(
+                libc_time.CLOCK_MONOTONIC,
+                &mut ts
+            )
+        };
+
+        if (result != 0) {
+            // This should eventually become a proper TimeError.
+            debug.debug_panic("clock_gettime(CLOCK_MONOTONIC) failed");
+        }
+
+        return Instant {
+            seconds: ts.tv_sec,
+            nanosecond: ts.tv_nsec as i32,
+        };
+    }
+
+
+    func add(&this, duration: Duration): Instant {
+        let mut seconds: i64 =
+            this.seconds + duration.seconds;
+
+        let mut nanosecond: i64 =
+            (this.nanosecond as i64) +
+            (duration.nanosecond as i64);
+
+        if (nanosecond >= 1_000_000_000) {
+            seconds += 1;
+            nanosecond -= 1_000_000_000;
+        }
+
+        if (nanosecond < 0) {
+            seconds -= 1;
+            nanosecond += 1_000_000_000;
+        }
+
+        return Instant {
+            seconds,
+            nanosecond: nanosecond as i32,
+        };
+    }
+
+
+    func subtract(&this, duration: Duration): Instant {
+        return this.add(duration.negate());
+    }
+
+
+    func elapsed(&this): Duration {
+        return Instant.now().difference(*this);
+    }
+
+
+    func difference(&this, earlier: Instant): Duration {
+        return Duration.normalize(
+            this.seconds - earlier.seconds,
+            (this.nanosecond as i64) -
+            (earlier.nanosecond as i64)
+        );
+    }
+}
