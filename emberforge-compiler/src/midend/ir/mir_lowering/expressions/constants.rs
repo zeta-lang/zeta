@@ -87,7 +87,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             return v;
         }
 
-        // Lower each element and collect its SSA type.
         let mut elem_vals: Vec<(Value, SsaType)> = Vec::with_capacity(elements.len());
         for elem in elements {
             let val = self.lower_expr(elem);
@@ -103,7 +102,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let field_types: Vec<SsaType> = elem_vals.iter().map(|(_, ty)| ty.clone()).collect();
         let tuple_ty = SsaType::Tuple(field_types.clone());
 
-        // Stack-allocate the tuple.
         let obj = self.new_value();
         self.emit(Instruction::StackAlloc {
             dest: obj,
