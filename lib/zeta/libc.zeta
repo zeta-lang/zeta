@@ -6,6 +6,29 @@ struct PthreadAttr {
     opaque: [128]u8,
 }
 
+// 8-byte aligned and 64 bytes, big enough for pthread_mutex_t on glibc (40)
+// and Darwin (64). Using u64 words gives the alignment that [N]u8 would not.
+struct PthreadMutex {
+    opaque: [8]u64,
+}
+
+struct PthreadMutexAttr {
+    opaque: [8]u64,
+}
+
+extern "C" func pthread_mutex_init(
+    mutex: [*]mut PthreadMutex,
+    attr: [*]const PthreadMutexAttr,
+): i32;
+
+extern "C" func pthread_mutex_destroy(mutex: [*]mut PthreadMutex): i32;
+
+extern "C" func pthread_mutex_lock(mutex: [*]mut PthreadMutex): i32;
+
+extern "C" func pthread_mutex_trylock(mutex: [*]mut PthreadMutex): i32;
+
+extern "C" func pthread_mutex_unlock(mutex: [*]mut PthreadMutex): i32;
+
 extern "C" func pthread_create(
     thread: [*]mut Pthread,
     attr: [*]const PthreadAttr,
