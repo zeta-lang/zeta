@@ -158,6 +158,7 @@ where
         &mut self,
         _visibility: Visibility,
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+        let is_unsafe = self.cursor.consume(TokenKind::Unsafe);
         let token = self.cursor.expect(TokenKind::Impl)?;
 
         // Check for generic impl: impl<T> ...
@@ -177,6 +178,21 @@ where
         } else {
             None
         };
+
+        if is_unsafe && interface.is_none() {
+            self.diag.record(
+                DiagnosticError::new(
+                    ParseErrorKind::UnexpectedToken {
+                        expected: TokenKind::By,
+                        found: self.cursor.peek(),
+                    },
+                    token.span,
+                )
+                .with_note(
+                    "`unsafe impl` must name an unsafe interface: `unsafe impl Type by Send {}`.",
+                ),
+            );
+        }
 
         self.cursor.expect(TokenKind::LBrace)?;
 
@@ -236,6 +252,7 @@ where
                 Some(self.bump.alloc_slice(&constants))
             },
             span: token.span,
+            is_unsafe,
         };
 
         Ok(ir::ast::Stmt::ImplDecl(
