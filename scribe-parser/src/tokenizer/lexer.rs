@@ -44,6 +44,7 @@ enum ByteClass {
     Comma,      // ,
     Question,   // ?
     Dollar,     // $
+    Hashtag,    // #
     SingleQuote,
     Unknown,
 }
@@ -101,6 +102,8 @@ const JUMP: [ByteClass; 128] = {
     t[b'?' as usize] = ByteClass::Question;
     t[b'$' as usize] = ByteClass::Dollar;
     t[b'\'' as usize] = ByteClass::SingleQuote;
+    t[b'#' as usize] = ByteClass::Hashtag;
+
     t
 };
 
@@ -212,6 +215,12 @@ impl Lexer {
                     pos += 1;
                     line += 1;
                     column = 1;
+                }
+
+                ByteClass::Hashtag => {
+                    pos += 1;
+                    column += 1;
+                    push!(TokenKind::Hashtag, start_line, start_col);
                 }
 
                 ByteClass::SingleQuote => {
@@ -590,7 +599,7 @@ impl Lexer {
                                 push!(TokenKind::Ellipsis, start_line, start_col);
                             }
                             _ => {
-                                push!(TokenKind::DotDot, start_line, start_col);
+                                push!(TokenKind::DotDotEq, start_line, start_col);
                             }
                         }
                     } else {
@@ -907,7 +916,13 @@ fn finish_number(
     kind: TokenKind,
     ctx: &Arc<StringPool>,
 ) -> (TokenKind, StrId) {
-    let id = ctx.intern_bytes(src[start..end].as_bytes());
+    let raw = &src[start..end];
+    let id = if raw.as_bytes().contains(&b'_') {
+        let cleaned: SmallVec<u8, 32> = raw.bytes().filter(|b| *b != b'_').collect();
+        ctx.intern_bytes(&cleaned)
+    } else {
+        ctx.intern_bytes(raw.as_bytes())
+    };
     (kind, StrId(id))
 }
 
@@ -921,7 +936,7 @@ fn lex_string(
 ) -> StrId {
     let mut text: SmallVec<u8, 32> = SmallVec::new();
     while *pos < bytes.len() {
-        let b = bytes[*pos];
+        let b = bytes.get(*pos).copied().unwrap_or(b'\\');
         *pos += 1;
         match b {
             b'"' => {
@@ -935,7 +950,7 @@ fn lex_string(
             }
             b'\\' => {
                 *column += 1;
-                let esc = bytes[*pos];
+                let esc = bytes.get(*pos).copied().unwrap_or(b'\\');
                 *pos += 1;
                 *column += 1;
                 text.push(match esc {

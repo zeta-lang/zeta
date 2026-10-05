@@ -401,6 +401,12 @@ where
                 Ok(Pattern::Boolean(false))
             }
 
+            TokenKind::Mut => {
+                self.cursor.advance(); // consume 'mut'
+                let (name, _) = self.cursor.expect_ident()?;
+                Ok(Pattern::Ident(name, true))
+            }
+
             TokenKind::Ident => {
                 let tok = self.cursor.bump();
                 let mut name = tok.text.unwrap_or_default();
@@ -442,7 +448,7 @@ where
                         let pattern = if self.cursor.consume(TokenKind::Colon) {
                             self.parse_pattern()?
                         } else {
-                            Pattern::Ident(field_name) // shorthand: `{ value }` == `{ value: value }`
+                            Pattern::Ident(field_name, false) // shorthand: `{ value }` == `{ value: value }`
                         };
                         fields.push((field_name, pattern));
                         if !self.cursor.consume(TokenKind::Comma) {
@@ -460,7 +466,7 @@ where
                         bindings: &[],
                     })
                 } else {
-                    Ok(Pattern::Ident(name))
+                    Ok(Pattern::Ident(name, false))
                 }
             }
 

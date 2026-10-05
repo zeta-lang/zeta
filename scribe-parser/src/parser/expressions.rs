@@ -42,6 +42,10 @@ where
                                 if !self.cursor.consume(TokenKind::Comma) {
                                     break;
                                 }
+
+                                if self.cursor.peek() == TokenKind::RParen {
+                                    break;
+                                }
                             }
                         }
 
@@ -155,6 +159,10 @@ where
                                     let arg = self.parse_expr_inner(0, true)?;
                                     args.push(arg);
                                     if !self.cursor.consume(TokenKind::Comma) {
+                                        break;
+                                    }
+
+                                    if self.cursor.peek() == TokenKind::RParen {
                                         break;
                                     }
                                 }
@@ -272,7 +280,7 @@ where
                 TokenKind::OrAssign => Op::BitOrAssign,
                 TokenKind::XorAssign => Op::BitXorAssign,
 
-                TokenKind::DotDot => Op::Range,
+                TokenKind::DotDotEq => Op::Range,
                 TokenKind::DotDotLt => Op::RangeExcl,
 
                 _ => break,
@@ -493,6 +501,10 @@ where
                             if !self.cursor.consume(TokenKind::Comma) {
                                 break;
                             }
+
+                            if self.cursor.peek() == TokenKind::RParen {
+                                break;
+                            }
                         }
                     }
                     self.cursor.expect(TokenKind::Gt)?;
@@ -505,6 +517,10 @@ where
                         let arg = self.parse_expr_inner(0, true)?;
                         args.push(arg);
                         if !self.cursor.consume(TokenKind::Comma) {
+                            break;
+                        }
+
+                        if self.cursor.peek() == TokenKind::RParen {
                             break;
                         }
                     }
@@ -522,7 +538,11 @@ where
             TokenKind::Number => {
                 self.cursor.advance();
                 let text = tok.text.unwrap_or_default();
-                let value = text.as_str().parse::<i64>().unwrap_or(0);
+                let digits = Self::strip_num_suffix(text.as_str());
+                let value = digits
+                    .parse::<i64>()
+                    .or_else(|_| digits.parse::<u64>().map(|v| v as i64))
+                    .unwrap_or(0);
                 Ok(Expr::Number {
                     value,
                     span: tok.span,
@@ -563,7 +583,9 @@ where
             TokenKind::Decimal => {
                 self.cursor.advance();
                 let text = tok.text.unwrap_or_default();
-                let value = text.as_str().parse::<f64>().unwrap_or(0.0);
+                let value = Self::strip_num_suffix(text.as_str())
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
                 Ok(Expr::Decimal {
                     value,
                     span: tok.span,
@@ -693,9 +715,30 @@ where
 
             TokenKind::LParen => {
                 self.cursor.advance();
-                let expr = self.parse_expr_inner(0, true)?;
+                let mut exprs = Vec::new();
+                let mut trailing_comma = false;
+                if self.cursor.peek() != TokenKind::RParen {
+                    loop {
+                        exprs.push(self.parse_expr_inner(0, true)?);
+                        if self.cursor.peek() == TokenKind::Comma {
+                            self.cursor.advance();
+                            trailing_comma = true;
+                        } else {
+                            trailing_comma = false;
+                            break;
+                        }
+                    }
+                }
+                let end_span = self.cursor.peek_token().span;
                 self.cursor.expect(TokenKind::RParen)?;
-                Ok(expr)
+                if exprs.len() == 1 && !trailing_comma {
+                    Ok(exprs.pop().unwrap())
+                } else {
+                    Ok(Expr::Tuple {
+                        values: self.bump.alloc_slice(&exprs),
+                        span: tok.span.merge(end_span),
+                    })
+                }
             }
 
             TokenKind::Sub => {
@@ -775,7 +818,9 @@ where
             .take_while(|c| c.is_digit(radix) || *c == '_')
             .filter(|c| *c != '_')
             .collect();
-        i64::from_str_radix(&digits, radix).unwrap_or(0)
+        u64::from_str_radix(&digits, radix)
+            .map(|v| v as i64)
+            .unwrap_or(0)
     }
 
     fn parse_lambda(&mut self) -> Result<Expr<'a, 'bump>, DiagnosticError<'a>> {
@@ -849,6 +894,21 @@ where
             body,
             span,
         })
+    }
+
+    fn strip_num_suffix(text: &str) -> &str {
+        const SUFFIXES: [&str; 14] = [
+            "i128", "u128", "isize", "usize", "i16", "i32", "i64", "u16", "u32", "u64", "i8", "u8",
+            "f32", "f64",
+        ];
+        for s in SUFFIXES {
+            if let Some(rest) = text.strip_suffix(s) {
+                if !rest.is_empty() {
+                    return rest;
+                }
+            }
+        }
+        text
     }
 
     pub fn parse_match_expr(&mut self) -> Result<Expr<'a, 'bump>, DiagnosticError<'a>> {

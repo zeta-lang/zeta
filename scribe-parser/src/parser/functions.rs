@@ -68,6 +68,7 @@ where
             return_type,
             body,
             span: fn_token.span,
+            attrs: self.pending_attrs,
         };
 
         Ok(func_decl)

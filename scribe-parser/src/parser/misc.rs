@@ -5,6 +5,7 @@ use ir::ast::{
     ThisParam, Type, TypeKind, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
+
 use ir::tokens::TokenKind::LBracket;
 use ir::tokens::{Cursor, TokenKind};
 use zetaruntime::bump::GrowableBump;
@@ -94,16 +95,12 @@ where
 
             let constraints = if self.cursor.consume(TokenKind::Colon) {
                 let mut types = Vec::new();
-
                 loop {
-                    let ty = self.parse_type()?;
-                    types.push(ty);
-
+                    types.push(self.parse_type()?);
                     if !self.cursor.consume(TokenKind::Add) {
                         break;
                     }
                 }
-
                 self.bump.alloc_slice(&types)
             } else {
                 &[]
@@ -550,7 +547,7 @@ where
 
         if token.kind == TokenKind::RBracket {
             cursor.advance();
-            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
+            let inner = Self::parse_type_impl(bump, cursor, pending)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::Slice { inner: inner_ref });
         } else if token.kind == TokenKind::Number {
@@ -606,7 +603,19 @@ where
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
     ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
-        // &self Player / &self.world Player
+        // &this Player / &this.world Player
+        if cursor.peek() == TokenKind::Ident {
+            let save = cursor.pos();
+            let (name, _) = cursor.expect_ident()?;
+            if name.as_str() != "This" && Self::starts_type_impl(cursor) {
+                return Ok(Some(ProvenanceAnnotation {
+                    root: ProvenanceRoot::Var(name),
+                    path: &[],
+                }));
+            }
+            cursor.reset(save);
+        }
+
         if cursor.peek() == TokenKind::This {
             let save = cursor.pos();
             cursor.advance();
@@ -692,9 +701,6 @@ where
             TokenKind::Void => return Ok(Type::void()),
             TokenKind::Never => return Ok(Type::never()),
 
-            // `this` as a type (for self-referential method return types)
-            TokenKind::This => return Ok(Type::this()),
-
             TokenKind::Underscore => return Ok(Type::infer()),
 
             TokenKind::LBracket => Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending)?,
@@ -756,6 +762,30 @@ where
                 }
             }
 
+            TokenKind::LParen => {
+                let mut types = Vec::new();
+                let mut trailing_comma = false;
+                if cursor.peek() != TokenKind::RParen {
+                    loop {
+                        types.push(Self::parse_type_impl(bump, cursor, pending)?);
+                        if cursor.peek() == TokenKind::Comma {
+                            cursor.advance();
+                            trailing_comma = true;
+                        } else {
+                            trailing_comma = false;
+                            break;
+                        }
+                    }
+                }
+                cursor.expect(TokenKind::RParen)?;
+                if types.len() == 1 && !trailing_comma {
+                    return Ok(types.pop().unwrap());
+                }
+                TypeKind::Tuple {
+                    values: bump.alloc_slice(&types),
+                }
+            }
+
             TokenKind::Ident => {
                 let mut name = tok
                     .text
@@ -785,6 +815,10 @@ where
 
                 let path = bump.alloc_slice(&path);
 
+                if path.is_empty() && name.as_str() == "This" {
+                    return Ok(Type::this());
+                }
+
                 match name.as_str() {
                     "void" => return Ok(Type::void()),
                     "bool" => return Ok(Type::boolean()),
@@ -802,8 +836,8 @@ where
                     "i128" => return Ok(Type::i128()),
                     "f32" => return Ok(Type::f32()),
                     "f64" => return Ok(Type::f64()),
-                    "this" => return Ok(Type::this()),
                     "never" => return Ok(Type::never()),
+                    "This" => return Ok(Type::this()),
                     _ => {}
                 }
 

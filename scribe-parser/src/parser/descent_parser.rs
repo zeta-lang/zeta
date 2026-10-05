@@ -1,6 +1,7 @@
-use ir::ast::{Stmt, Visibility};
+use ir::ast::{AttrArg, Attribute, AttributedStmt, Stmt, Visibility};
 use ir::diagnostics_context::{DiagnosticWarning, ParserDiagnosticsContext};
-use ir::errors::error::DiagnosticError;
+use ir::errors::error::{DiagnosticError, ParseErrorKind};
+use ir::span::SourceSpan;
 use std::sync::Arc;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
@@ -16,6 +17,7 @@ where
     pub(crate) bump: &'bump GrowableBump<'bump>,
     pub(crate) string_pool: Arc<StringPool>,
     pub(crate) diag: ParserDiagnosticsContext<'a, 'bump>,
+    pub(crate) pending_attrs: &'bump [Attribute<'a, 'bump>],
     pub(crate) pending_close_angle: u8, // To prevent mismatches when closing generics between `>`, `>>`, `>>>`, etc. So that they don't get confused with bitwise/comparison operators or fail entirely.
 }
 
@@ -34,6 +36,7 @@ where
             bump,
             diag: ParserDiagnosticsContext::new(true),
             pending_close_angle: 0,
+            pending_attrs: &[],
         };
 
         parser.parse_toplevel()
@@ -82,6 +85,22 @@ where
             TokenKind::Break => self.parse_break_stmt(),
             TokenKind::Continue => self.parse_continue_stmt(),
 
+            TokenKind::Hashtag => {
+                let attrs = self.parse_attributes()?;
+                // FuncDecl takes pending_attrs itself; everything else gets wrapped.
+                self.pending_attrs = attrs;
+                let inner = self.parse_stmt(visibility)?;
+                if self.pending_attrs.is_empty() {
+                    Ok(inner) // consumed by a FuncDecl
+                } else {
+                    let attrs = std::mem::take(&mut self.pending_attrs);
+                    Ok(Stmt::Attributed(
+                        self.bump
+                            .alloc_value_immutable(AttributedStmt { attrs, inner }),
+                    ))
+                }
+            }
+
             TokenKind::Public => {
                 self.cursor.advance();
                 self.parse_stmt(Visibility::Public)
@@ -115,6 +134,8 @@ where
                 // `unsafe func` / `unsafe extern` are function modifiers.
                 if self.cursor.peek_n(1) == TokenKind::LBrace {
                     self.parse_unsafe_block_stmt()
+                } else if self.cursor.peek_n(1) == TokenKind::Impl {
+                    self.parse_impl_decl(visibility)
                 } else {
                     self.parse_function_with_visibility(visibility)
                 }
@@ -163,6 +184,136 @@ where
             _ => self.parse_expr_stmt(),
         }
     }
+
+    fn at(&self, k: TokenKind) -> bool {
+        self.cursor.peek() == k
+    }
+
+    fn eat(&mut self, k: TokenKind) -> bool {
+        if self.at(k) {
+            self.cursor.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_tok(&mut self, k: TokenKind, what: &str) -> Result<(), DiagnosticError<'a>> {
+        if self.eat(k) {
+            Ok(())
+        } else {
+            let err = DiagnosticError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: k,
+                    found: self.cursor.peek(),
+                },
+                span: self.cur_span(),
+                context: Vec::new(),
+                notes: vec![what.to_string()],
+            };
+            self.diag.record(err.clone());
+            Err(err)
+        }
+    }
+
+    fn cur_span(&self) -> SourceSpan<'a> {
+        self.cursor.peek_token().span
+    }
+
+    /// Zero or more `#[a, b(1, "x"), c = ident]` groups. Returns an empty
+    /// slice if there is no `#`, so it is safe to call before any item.
+    pub(crate) fn parse_attributes(
+        &mut self,
+    ) -> Result<&'bump [Attribute<'a, 'bump>], DiagnosticError<'a>> {
+        let mut out = Vec::new();
+        while self.at(TokenKind::Hashtag) {
+            self.cursor.advance();
+            self.expect_tok(TokenKind::LBracket, "`[` after `#`")?;
+            loop {
+                let span = self.cur_span();
+                let name = self.cursor.expect_ident()?.0;
+                let args: &'bump [AttrArg<'bump>] = if self.eat(TokenKind::LParen) {
+                    let a = self.parse_attr_args()?;
+                    self.expect_tok(TokenKind::RParen, "`)` to close attribute arguments")?;
+                    a
+                } else {
+                    &[]
+                };
+                out.push(Attribute { name, args, span });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                if self.at(TokenKind::RBracket) {
+                    break;
+                } // trailing comma
+            }
+            self.expect_tok(TokenKind::RBracket, "`]` to close attribute")?;
+        }
+        Ok(self.bump.alloc_slice(&out))
+    }
+
+    /// `arg (',' arg)* [',']`, stops before `)`.
+    pub(crate) fn parse_attr_args(
+        &mut self,
+    ) -> Result<&'bump [AttrArg<'bump>], DiagnosticError<'a>> {
+        let mut out = Vec::new();
+        while !self.at(TokenKind::RParen) {
+            out.push(self.parse_attr_arg()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(self.bump.alloc_slice(&out))
+    }
+
+    /// ident | "str" | number | true | false | key = arg | name(args)
+    fn parse_attr_arg(&mut self) -> Result<AttrArg<'bump>, DiagnosticError<'a>> {
+        match self.cursor.peek() {
+            TokenKind::String => Ok(AttrArg::Str(self.cursor.expect_string()?.0)),
+            TokenKind::Number => {
+                let tok = self.cursor.peek_token();
+                let text = tok.text.unwrap_or_default();
+                let value = text.as_str().parse::<i64>().unwrap_or(0);
+                Ok(AttrArg::Number(value))
+            }
+            TokenKind::Ident => {
+                let name = self.cursor.expect_ident()?.0;
+                if self.eat(TokenKind::Assign) {
+                    let value = self.parse_attr_arg()?;
+                    Ok(AttrArg::KeyValue {
+                        key: name,
+                        value: self.bump.alloc_value_immutable(value),
+                    })
+                } else if self.eat(TokenKind::LParen) {
+                    let args = self.parse_attr_args()?;
+                    self.expect_tok(TokenKind::RParen, "`)`")?;
+                    Ok(AttrArg::Call { name, args })
+                } else if name == "true" {
+                    Ok(AttrArg::Bool(true))
+                } else if name == "false" {
+                    Ok(AttrArg::Bool(false))
+                } else {
+                    Ok(AttrArg::Ident(name))
+                }
+            }
+
+            _ => {
+                let tok = self.cursor.peek_token();
+                let text = tok.text.unwrap_or_default();
+                let err = DiagnosticError {
+                    kind: ParseErrorKind::UnexpectedTokenOneOf {
+                        expected: vec![TokenKind::Ident, TokenKind::Number, TokenKind::String],
+                        found: self.cursor.peek(),
+                    },
+                    span: self.cur_span(),
+                    context: Vec::new(),
+                    notes: vec![format!("expected an attribute argument, found `{text}`")],
+                };
+                self.diag.record(err.clone());
+                Err(err)
+            }
+        }
+    }
 }
 
 pub fn token_to_visibility(token_kind: TokenKind) -> Visibility {
@@ -197,6 +348,7 @@ pub fn parse_program<'a, 'bump>(
         bump: bump,
         diag: ParserDiagnosticsContext::new(false),
         pending_close_angle: 0,
+        pending_attrs: &[],
     };
 
     let stmts: Vec<Stmt<'_, '_>> = match parser.parse_toplevel() {
