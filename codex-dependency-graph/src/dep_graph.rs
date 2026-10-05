@@ -236,7 +236,7 @@ impl DepGraph {
             Some(pkg) => pool
                 .resolve_string(&pkg)
                 .split("::")
-                .map(|seg| StrId(pool.thread_local().intern(seg)))
+                .map(|seg| StrId(pool.intern(seg)))
                 .collect(),
             None => Vec::new(),
         }
@@ -291,7 +291,7 @@ impl DepGraph {
             joined.push('_');
         }
         joined.push_str(pool.resolve_string(&name));
-        StrId(pool.thread_local().intern(&joined))
+        StrId(pool.intern(&joined))
     }
 
     fn builtin_type_strid(&self, kind: &TypeKind, pool: &StringPool) -> Option<StrId> {
@@ -315,7 +315,7 @@ impl DepGraph {
             TypeKind::Char => "char",
             _ => return None,
         };
-        Some(StrId(pool.thread_local().intern(s)))
+        Some(StrId(pool.intern(s)))
     }
 
     fn type_name_of<'a, 'bump>(&self, ty: &Type<'a, 'bump>, pool: &StringPool) -> Option<StrId> {
@@ -325,11 +325,7 @@ impl DepGraph {
         }
     }
 
-    fn expr_type_name<'a, 'bump>(
-        &self,
-        expr: &Expr<'a, 'bump>,
-        pool: &StringPool,
-    ) -> Option<StrId> {
+    fn expr_type_name<'a, 'bump>(&self, expr: &Expr<'a, 'bump>) -> Option<StrId> {
         match expr {
             Expr::This { .. } => self.current_self_type,
             Expr::Ident { name, .. } => self.current_locals.get(name).copied(),
@@ -351,9 +347,8 @@ impl DepGraph {
         object: &Expr<'a, 'bump>,
         field: StrId,
         from_node: NodeIdx,
-        pool: &StringPool,
     ) {
-        let Some(type_name) = self.expr_type_name(object, pool) else {
+        let Some(type_name) = self.expr_type_name(object) else {
             return;
         };
         let Some(&(m, i, method_idx)) = self.method_symbol_table.get(&(type_name, field)) else {
@@ -1384,7 +1379,7 @@ impl DepGraph {
                 if let Expr::FieldAccess { object, field, .. } | Expr::Get { object, field, .. } =
                     callee
                 {
-                    self.record_method_call_dep(object, *field, from_node, pool);
+                    self.record_method_call_dep(object, *field, from_node);
                 }
                 self.walk_expr(callee, from_node, module_idx, pool);
                 for ty in *generic_args {
@@ -1529,6 +1524,9 @@ impl DepGraph {
                 for value in *values {
                     self.walk_expr(&value, from_node, module_idx, pool);
                 }
+            }
+            Expr::Attributed { expr, .. } => {
+                self.walk_expr(expr, from_node, module_idx, pool);
             }
         }
     }
@@ -2233,5 +2231,5 @@ fn path_to_strid<'a, 'bump>(path: &Path<'a, 'bump>, pool: &StringPool) -> StrId 
         .map(|s| pool.resolve_string(s))
         .collect::<Vec<_>>()
         .join("::");
-    StrId(pool.thread_local().intern(&joined))
+    StrId(pool.intern(&joined))
 }

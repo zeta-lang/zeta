@@ -18,7 +18,7 @@ mod tests {
     }
 
     fn sid(s: &str, p: &StringPool) -> StrId {
-        StrId(p.thread_local().intern(s))
+        StrId(p.intern(s))
     }
 
     fn dummy_span<'a>() -> SourceSpan<'a> {
@@ -645,6 +645,7 @@ mod tests {
             return_type: None,
             body: None,
             span: dummy_span(),
+            attrs: &[],
         }));
         let struct_decl = Box::leak(Box::new(StructDecl {
             visibility: Visibility::Public,
@@ -759,6 +760,7 @@ mod tests {
             methods: None,
             constants: None,
             span: dummy_span(),
+            is_unsafe: false,
         }));
 
         let stmts: &[Stmt] = &[Stmt::Const(const_stmt), Stmt::ImplDecl(impl_decl)];
