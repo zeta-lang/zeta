@@ -58,7 +58,8 @@ fn lower_type_hir_inner(
             // pointer (the only legal way to recurse). Pointer layout never looks
             // at the pointee's fields, so stop here.
             if in_progress.contains(name) {
-                return SsaType::User(*name, Vec::new());
+                let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
+                return SsaType::User(*name, unmangled, Vec::new());
             }
 
             match structs.get(name).filter(|s| s.generics.is_none()) {
@@ -76,7 +77,7 @@ fn lower_type_hir_inner(
                         ));
                     }
                     in_progress.pop();
-                    SsaType::User(*name, fields)
+                    SsaType::User(*name, def.unmangled_name, fields)
                 }
                 // Not registered yet: fall back to what the type carries.
                 None => {
@@ -84,18 +85,23 @@ fn lower_type_hir_inner(
                     for t in field_types.iter() {
                         fields.push(lower_type_hir_inner(t, enums, structs, in_progress));
                     }
-                    SsaType::User(*name, fields)
+                    SsaType::User(*name, *name, fields)
                 }
             }
         }
 
-        HirType::DynInterface(name, _args) => SsaType::Interface(*name),
+        HirType::DynInterface(name, _args) => {
+            let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
+            SsaType::Interface(*name, unmangled)
+        }
 
         HirType::Enum { name, .. } => {
+            let unmangled = enums.get(name).map(|e| e.unmangled_name).unwrap_or(*name);
             if in_progress.contains(name) {
                 // Behind a pointer; the layout never looks at the payload.
                 return SsaType::Enum {
                     name: *name,
+                    unmangled_name: unmangled,
                     variants: Vec::new(),
                 };
             }
@@ -122,19 +128,41 @@ fn lower_type_hir_inner(
             in_progress.pop();
             SsaType::Enum {
                 name: *name,
+                unmangled_name: hir_enum.unmangled_name,
                 variants,
             }
         }
 
         HirType::Void => SsaType::Void,
-        HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. } => {
+        HirType::SafePointer {
+            inner,
+            mutability_state,
+        }
+        | HirType::UnsafePointer {
+            inner,
+            mutability_state,
+        } => {
             // `*dyn T` / `[*]dyn T`: don't drill into the interface's own
             // field layout, that's only meaningful for the implementor.
             // A pointer-to-dyn is vtable-dispatched, same shape regardless
             // of which concrete type is behind it.
+            let ptr_kind = if *mutability_state == crate::ast::MutabilityState::Const {
+                if ty.is_safe_pointer() {
+                    crate::ssa_ir::SsaPointerKind::SafeConst
+                } else {
+                    crate::ssa_ir::SsaPointerKind::UnsafeConst
+                }
+            } else {
+                if ty.is_safe_pointer() {
+                    crate::ssa_ir::SsaPointerKind::SafeMut
+                } else {
+                    crate::ssa_ir::SsaPointerKind::UnsafeMut
+                }
+            };
             match inner {
                 HirType::DynInterface(name, _) => {
-                    SsaType::Pointer(Box::new(SsaType::Interface(*name)))
+                    let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
+                    SsaType::Pointer(ptr_kind, Box::new(SsaType::Interface(*name, unmangled)))
                 }
                 HirType::Dyn { bounds } => {
                     let iface = bounds.iter().find_map(|b| match b {
@@ -142,11 +170,21 @@ fn lower_type_hir_inner(
                         _ => None,
                     });
                     match iface {
-                        Some(name) => SsaType::Pointer(Box::new(SsaType::Interface(name))),
-                        None => SsaType::Pointer(Box::new(SsaType::Dyn)),
+                        Some(name) => {
+                            let unmangled =
+                                structs.get(&name).map(|s| s.unmangled_name).unwrap_or(name);
+                            SsaType::Pointer(
+                                ptr_kind,
+                                Box::new(SsaType::Interface(name, unmangled)),
+                            )
+                        }
+                        None => SsaType::Pointer(ptr_kind, Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_pointee(inner, enums, structs, in_progress))),
+                _ => SsaType::Pointer(
+                    ptr_kind,
+                    Box::new(lower_pointee(inner, enums, structs, in_progress)),
+                ),
             }
         }
         HirType::OwnedPointer { inner, .. } => SsaType::Owned(Box::new(lower_type_hir_inner(
@@ -180,15 +218,21 @@ fn lower_type_hir_inner(
         HirType::Char => SsaType::Char,
         HirType::Ref {
             inner,
-            ref_kind: _,
+            ref_kind,
             provenance: _,
         } => {
+            let ptr_kind = match ref_kind {
+                crate::hir::RefKind::Shared => crate::ssa_ir::SsaPointerKind::RefShared,
+                crate::hir::RefKind::Unique => crate::ssa_ir::SsaPointerKind::RefMut,
+                crate::hir::RefKind::Alias => crate::ssa_ir::SsaPointerKind::RefAlias,
+            };
             // Same rationale as SafePointer/UnsafePointer above: `&dyn T`
             // is a vtable-dispatched reference, not a pointer to a struct
             // shaped like the interface's own fields.
             match inner {
                 HirType::DynInterface(name, _) => {
-                    SsaType::Pointer(Box::new(SsaType::Interface(*name)))
+                    let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
+                    SsaType::Pointer(ptr_kind, Box::new(SsaType::Interface(*name, unmangled)))
                 }
                 HirType::Dyn { bounds } => {
                     let iface = bounds.iter().find_map(|b| match b {
@@ -196,16 +240,21 @@ fn lower_type_hir_inner(
                         _ => None,
                     });
                     match iface {
-                        Some(name) => SsaType::Pointer(Box::new(SsaType::Interface(name))),
-                        None => SsaType::Pointer(Box::new(SsaType::Dyn)),
+                        Some(name) => {
+                            let unmangled =
+                                structs.get(&name).map(|s| s.unmangled_name).unwrap_or(name);
+                            SsaType::Pointer(
+                                ptr_kind,
+                                Box::new(SsaType::Interface(name, unmangled)),
+                            )
+                        }
+                        None => SsaType::Pointer(ptr_kind, Box::new(SsaType::Dyn)),
                     }
                 }
-                _ => SsaType::Pointer(Box::new(lower_type_hir_inner(
-                    inner,
-                    enums,
-                    structs,
-                    in_progress,
-                ))),
+                _ => SsaType::Pointer(
+                    ptr_kind,
+                    Box::new(lower_type_hir_inner(inner, enums, structs, in_progress)),
+                ),
             }
         }
         HirType::Nullable(hir_type) => SsaType::Nullable(Box::new(lower_type_hir_inner(
@@ -220,7 +269,10 @@ fn lower_type_hir_inner(
                 _ => None,
             });
             match iface {
-                Some(name) => SsaType::Interface(name),
+                Some(name) => {
+                    let unmangled = structs.get(&name).map(|s| s.unmangled_name).unwrap_or(name);
+                    SsaType::Interface(name, unmangled)
+                }
                 None => SsaType::Dyn,
             }
         }
@@ -281,11 +333,18 @@ fn lower_pointee(
     ip: &mut Vec<StrId>,
 ) -> SsaType {
     match ty {
-        HirType::Struct { name, .. } => SsaType::User(*name, Vec::new()),
-        HirType::Enum { name, .. } => SsaType::Enum {
-            name: *name,
-            variants: Vec::new(),
-        },
+        HirType::Struct { name, .. } => {
+            let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
+            SsaType::User(*name, unmangled, Vec::new())
+        }
+        HirType::Enum { name, .. } => {
+            let unmangled = enums.get(name).map(|e| e.unmangled_name).unwrap_or(*name);
+            SsaType::Enum {
+                name: *name,
+                unmangled_name: unmangled,
+                variants: Vec::new(),
+            }
+        }
         other => lower_type_hir_inner(other, enums, structs, ip),
     }
 }
