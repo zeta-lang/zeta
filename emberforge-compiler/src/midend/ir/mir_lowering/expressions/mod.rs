@@ -8,7 +8,8 @@ pub mod names;
 use ir::{
     hir::{AssignmentOperator, HirExpr, HirType, StrId},
     ir_conversion::{assign_op_to_bin_op, lower_type_hir},
-    layout::{TargetInfo, alignof_ssa, round_up_to_align},
+    layout::TargetInfo,
+    span::SourceSpan,
     ssa_ir::{BinOp, Instruction, Operand, SsaType, Value, cast_kind},
 };
 
@@ -20,7 +21,7 @@ use crate::midend::{
     },
 };
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn lower_range_expr(
         &mut self,
         start: &HirExpr<'a, 'bump>,
@@ -70,7 +71,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         base: Operand::Value(src),
                         offset: 0,
                     });
-                    let ptr_ty = SsaType::Pointer(Box::new((**inner).clone()));
+                    let ptr_ty = SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new((**inner).clone()),
+                    );
                     self.current_block_data
                         .value_types
                         .insert(ptr, ptr_ty.clone());
@@ -78,7 +82,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     src_ty = ptr_ty;
                 }
 
-                SsaType::Pointer(inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
+                SsaType::Pointer(_, inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
                     let SsaType::Slice(elem) = inner.as_ref() else {
                         unreachable!()
                     };
@@ -88,7 +92,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         base: Operand::Value(src),
                         offset: 0,
                     });
-                    let ptr_ty = SsaType::Pointer(Box::new((**elem).clone()));
+                    let ptr_ty = SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new((**elem).clone()),
+                    );
                     self.current_block_data
                         .value_types
                         .insert(ptr, ptr_ty.clone());
@@ -104,7 +111,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             base: Operand::Value(src),
                             offset: 0,
                         });
-                        let ptr_ty = SsaType::Pointer(Box::new((**elem).clone()));
+                        let ptr_ty = SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new((**elem).clone()),
+                        );
                         self.current_block_data
                             .value_types
                             .insert(ptr, ptr_ty.clone());
@@ -113,7 +123,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     }
                 }
 
-                SsaType::Pointer(inner) if matches!(inner.as_ref(), SsaType::Owned(o) if matches!(o.as_ref(), SsaType::Slice(_))) =>
+                SsaType::Pointer(_, inner) if matches!(inner.as_ref(), SsaType::Owned(o) if matches!(o.as_ref(), SsaType::Slice(_))) =>
                 {
                     let SsaType::Owned(owned_inner) = inner.as_ref() else {
                         unreachable!()
@@ -127,7 +137,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         base: Operand::Value(src),
                         offset: 0,
                     });
-                    let ptr_ty = SsaType::Pointer(Box::new((**elem).clone()));
+                    let ptr_ty = SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new((**elem).clone()),
+                    );
                     self.current_block_data
                         .value_types
                         .insert(ptr, ptr_ty.clone());
@@ -136,7 +149,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 }
 
                 SsaType::Array(inner, _) => {
-                    src_ty = SsaType::Pointer(Box::new((**inner).clone()));
+                    src_ty = SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new((**inner).clone()),
+                    );
                 }
 
                 _ => {}
@@ -158,7 +174,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         dest
     }
 
-    pub(crate) fn lower_deref_expr(&mut self, expr: &HirExpr<'a, 'bump>) -> Value {
+    pub(crate) fn lower_deref_expr(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> Value {
         let ptr = match self.narrowed_field_value(expr) {
             Some(v) => v,
             None => self.lower_expr(expr),
@@ -172,8 +192,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         });
 
         let pointee_ty = match self.current_block_data.value_types[&ptr].clone() {
-            SsaType::Pointer(inner) | SsaType::Owned(inner) => *inner,
-            other => panic!("cannot dereference {:?}", other),
+            SsaType::Pointer(_, inner) | SsaType::Owned(inner) => *inner,
+            other => panic!("cannot dereference {:?} at {span}", other),
         };
 
         self.current_block_data.value_types.insert(dest, pointee_ty);
@@ -283,9 +303,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     left: Operand::Value(base_ptr),
                     right: Operand::Value(offset_v),
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(addr_v, SsaType::Pointer(Box::new(elem_ty.clone())));
+                self.current_block_data.value_types.insert(
+                    addr_v,
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(elem_ty.clone()),
+                    ),
+                );
 
                 let rhs_v = match op {
                     AssignmentOperator::Assign => {
@@ -388,6 +412,27 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
     }
 
+    fn load_through_pointer_field(&mut self, addr: Value, field_ty: &SsaType) -> Value {
+        let is_ptr_word = match field_ty {
+            SsaType::Pointer(_, _) => true,
+            // `^T` is a single pointer word; owned slices are 3-word aggregates.
+            SsaType::Owned(inner) => !matches!(inner.as_ref(), SsaType::Slice(_)),
+            _ => false,
+        };
+        if !is_ptr_word {
+            return addr; // inline aggregate: the slot address is the receiver
+        }
+        let dest = self.new_value();
+        self.emit(Instruction::Load {
+            dest,
+            ptr: Operand::Value(addr),
+        });
+        self.current_block_data
+            .value_types
+            .insert(dest, field_ty.clone());
+        dest
+    }
+
     pub(crate) fn lower_expr_as_receiver_raw(&mut self, object: &HirExpr<'a, 'bump>) -> Value {
         if let HirExpr::Deref { expr, .. } = object {
             let p = self.lower_expr(expr);
@@ -398,7 +443,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             if let Some(&v) = self.var_map.get(name) {
                 if matches!(
                     self.current_block_data.value_types.get(&v),
-                    Some(SsaType::Pointer(_))
+                    Some(SsaType::Pointer(_, _))
                 ) {
                     return v;
                 }
@@ -409,7 +454,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             if let Some(&v) = self.var_map.get(&this_name) {
                 if matches!(
                     self.current_block_data.value_types.get(&v),
-                    Some(SsaType::Pointer(_))
+                    Some(SsaType::Pointer(_, _))
                 ) {
                     return v;
                 }
@@ -426,8 +471,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             span,
         } = object
         {
-            let (addr, _) = self.lower_field_addr(base_obj, *field, span);
-            return self.auto_unwrap_receiver(addr);
+            let (addr, field_ty) = self.lower_field_addr(base_obj, *field, span);
+            let recv = self.load_through_pointer_field(addr, &field_ty);
+            return self.auto_unwrap_receiver(recv);
         }
         let v = self.lower_expr(object);
         self.auto_unwrap_receiver(v)
@@ -441,7 +487,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     pub(crate) fn canonicalize_receiver(&mut self, v: Value) -> Value {
         match self.value_type(v).cloned() {
             Some(SsaType::Owned(inner)) if !matches!(*inner, SsaType::Slice(_)) => {
-                let ptr_ty = SsaType::Pointer(inner);
+                let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, inner);
                 let dest = self.new_value();
                 self.emit(Instruction::Cast {
                     dest,
@@ -472,7 +518,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     ptr: Operand::Value(ptr),
                 });
 
-                if let Some(SsaType::Pointer(inner)) =
+                if let Some(SsaType::Pointer(_, inner)) =
                     self.current_block_data.value_types.get(&ptr).cloned()
                 {
                     self.current_block_data.value_types.insert(current, *inner);
@@ -514,7 +560,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let mut ty = self.value_type(obj)?;
         loop {
             match ty {
-                SsaType::User(name, _) => {
+                SsaType::User(name, _, _) => {
                     return self
                         .structs
                         .get(name)?
@@ -523,7 +569,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                         .find(|f| f.name == field)
                         .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs));
                 }
-                SsaType::Pointer(i) | SsaType::Owned(i) => ty = i.as_ref(),
+                SsaType::Pointer(_, i) | SsaType::Owned(i) => ty = i.as_ref(),
                 _ => return None,
             }
         }
@@ -555,6 +601,32 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
     }
 
+    fn as_address_word(&mut self, v: Value) -> Value {
+        match self.value_type(v).cloned() {
+            Some(ty) if Self::is_aggregate_ssa_type(&ty) => {
+                let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty));
+                let dest = self.new_value();
+                self.emit(Instruction::Cast {
+                    dest,
+                    value: Operand::Value(v),
+                    kind: cast_kind(&ptr_ty, &ptr_ty),
+                });
+                self.current_block_data.value_types.insert(dest, ptr_ty);
+                dest
+            }
+            _ => v,
+        }
+    }
+
+    pub(crate) fn store_ref_field_value(&mut self, base: Value, offset: usize, addr: Value) {
+        let addr = self.as_address_word(addr);
+        self.emit(Instruction::StoreField {
+            base: Operand::Value(base),
+            offset,
+            value: Operand::Value(addr),
+        });
+    }
+
     pub(crate) fn store_field_value(
         &mut self,
         base: Value,
@@ -562,6 +634,20 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         field_ty: &SsaType,
         val: Value,
     ) {
+        if matches!(field_ty, SsaType::Pointer(_, _))
+            && matches!(
+                self.current_block_data.value_types.get(&val),
+                Some(
+                    SsaType::User(..)
+                        | SsaType::Enum { .. }
+                        | SsaType::Tuple(_)
+                        | SsaType::Array(..)
+                )
+            )
+        {
+            self.store_ref_field_value(base, offset, val);
+            return;
+        }
         if let SsaType::Nullable(inner) = field_ty {
             if field_ty.is_tagged_nullable() {
                 let target = TargetInfo { ptr_bytes: 8 };
@@ -593,6 +679,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 }
             } else {
                 // pointer-optimized: the bits are the pointer (or 0)
+                let val = self.as_address_word(val);
                 let val = self.retype_nullable_ptr_bits(val, field_ty);
                 self.emit(Instruction::StoreField {
                     base: Operand::Value(base),
@@ -604,7 +691,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
 
         let words = match field_ty {
-            SsaType::Slice(_) => 2,
+            SsaType::Slice(_) | SsaType::String => 2,
             SsaType::Owned(i) if matches!(i.as_ref(), SsaType::Slice(_)) => 3,
             _ => 0,
         };
@@ -617,7 +704,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     offset: w * 8,
                 });
                 let wty = if w == 0 {
-                    SsaType::Pointer(Box::new(SsaType::I8))
+                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::I8))
                 } else {
                     SsaType::Usize
                 };
@@ -668,7 +755,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             SsaType::Owned(inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
                 Some(IndexedContainer::OwnedSlice)
             }
-            SsaType::Pointer(inner) => Self::classify_indexed_container(inner),
+            SsaType::Pointer(_, inner) => Self::classify_indexed_container(inner),
             _ => None,
         }
     }
