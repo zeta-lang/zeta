@@ -13,6 +13,14 @@ import zeta::file.FileReader;
 import zeta::result.Result;
 import zeta::io_error.IOError;
 
+import zeta::time::date_time.DateTime;
+import zeta::time::duration.Duration;
+import zeta::time::instant.Instant;
+import zeta::time::process;
+
+import zeta::sync::mutex.Mutex;
+import zeta::sync::mutex.MutexGuard;
+
 
 struct DroppableItem {
     tag: str,
@@ -393,23 +401,6 @@ func test_array_list_clear(): i64 {
     }
 
     io.stdout().writeln("[PASS] clear() length/capacity semantics");
-
-    // IMPORTANT:
-    //
-    // For DroppableItem, clear() MUST eventually drop the three
-    // initialized elements.
-    //
-    // The current implementation:
-    //
-    //     func clear(&mut this) {
-    //         this.data.len = 0;
-    //     }
-    //
-    // does NOT do that by itself.
-    //
-    // Therefore this test should currently expose a DROP LEAK
-    // unless the compiler/runtime has special semantics for changing
-    // slice length.
 
     return 0;
 }
@@ -1320,6 +1311,38 @@ func linked_list_tests(): i64 {
     return 0;
 }
 
+func test_defer_lifo(): i64 {
+    io.stdout().writeln("=== Running: test_defer_lifo ===");
+
+    defer io.stdout().writeln("  -> First defer");
+    defer io.stdout().writeln("  -> Second defer");
+    defer io.stdout().writeln("  -> Third defer");
+
+    io.stdout().writeln("  -> Inside function body");
+
+    io.stdout().writeln("[PASS] test_defer_lifo (check stdout for LIFO order)");
+    return 0;
+}
+
+func test_tuples(): i64 {
+    io.stdout().writeln("=== Running: test_tuples ===");
+
+    let t: (i64, bool, str) = (42, true, "hello tuple");
+
+    match (t) {
+        case (42, true, s) -> {
+            io.stdout().writeln(s);
+            io.stdout().writeln("[PASS] Tuple pattern matched successfully");
+        },
+        case _ -> {
+            io.stdout().writeln("[FAIL] Tuple pattern failed to match");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 func main(): i64 {
     io.stdout().writeln("========================================");
     io.stdout().writeln("         Zeta Test Suite");
@@ -1328,7 +1351,19 @@ func main(): i64 {
     io.stdout().writeln("");
     io.stdout().writeln("=== ArrayList tests ===");
 
-   let mut status: i64 = test_array_list_default_generic();
+   let mut status: i64 = test_defer_lifo();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_defer_lifo");
+        return status;
+    }
+
+    status = test_tuples();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_tuples");
+        return status;
+    }
+
+    status = test_array_list_default_generic();
     if (status != 0) {
         io.stdout().writeln("[FAIL] test_array_list_default_generic");
         return status;
@@ -1460,6 +1495,22 @@ func main(): i64 {
     status = thread_tests();
     if (status != 0) {
         io.stdout().writeln("[FAIL] thread_tests");
+        return status;
+    }
+
+    io.stdout().writeln("");
+    io.stdout().writeln("=== Time tests ===");
+
+    status = time_tests();
+
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] time_tests");
+        return status;
+    }
+
+    status = test_observer_pattern();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] test_observer_pattern");
         return status;
     }
 
@@ -1810,7 +1861,7 @@ func test_generic_closure_capture_owned(): i64 {
         }
     );
 
-    if (result != "clear_one") {
+    if (result.ne("clear_one")) {
         io.stdout().writeln("[FAIL] captured DroppableItem had wrong value");
         return 1;
     }
@@ -1863,7 +1914,7 @@ func test_closure_fnonce_moves_capture(): i64 {
         }
     );
 
-    if (taken.tag != "fnonce_moved") {
+    if (taken.tag.ne("fnonce_moved")) {
         io.stdout().writeln("[FAIL] FnOnce closure returned the wrong item");
         return 1;
     }
@@ -2040,7 +2091,7 @@ func test_thread_string_return(): i64 {
 
     let result: str = handle.join().unwrap();
 
-    if (result != "hello from thread") {
+    if (result.ne("hello from thread")) {
         io.stdout().writeln("[FAIL] thread returned wrong string");
         return 1;
     }
@@ -2204,7 +2255,7 @@ func test_thread_owned_capture(): i64 {
 
     let result: str = handle.join().unwrap();
 
-    if (result != "thread_owned_capture") {
+    if (result.ne("thread_owned_capture")) {
         io.stdout().writeln("[FAIL] thread capture returned wrong value");
         return 1;
     }
@@ -2235,7 +2286,7 @@ func test_thread_fnonce_capture(): i64 {
 
     let result: ThreadDropItem = handle.join().unwrap();
 
-    if (result.tag != "thread_fnonce") {
+    if (result.tag.ne("thread_fnonce")) {
         io.stdout().writeln("[FAIL] FnOnce thread returned wrong item");
         return 1;
     }
@@ -2362,6 +2413,17 @@ func thread_tests(): i64 {
     if (status9 != 0) {
         return status9;
     }
+
+    let status11: i64 = mutex_ok();
+    if (status11 != 0) {
+        return status11;
+    }
+
+    let status12: i64 = mutex_contention();
+    if (status12 != 0) {
+        return status12;
+    }
+
     io.stdout().writeln("");
     io.stdout().writeln("=== All thread tests passed ===");
 
@@ -2383,5 +2445,763 @@ func test_env_sizeof(): i64 {
     } else {
         io.stdout().writeln("[PASS] env sizeof == 8");
     }
+    return 0;
+}
+
+func test_duration_construction(): i64 {
+    io.stdout().writeln("=== Running: test_duration_construction ===");
+
+    let zero: Duration = Duration.zero();
+
+    if (!zero.is_zero()) {
+        io.stdout().writeln("[FAIL] zero() is not zero");
+        return 1;
+    }
+
+    let seconds: Duration =
+        Duration.from_seconds(42);
+
+    if (seconds.total_nanoseconds() != 42_000_000_000) {
+        io.stdout().writeln("[FAIL] from_seconds() produced wrong value");
+        return 2;
+    }
+
+    let milliseconds: Duration =
+        Duration.from_milliseconds(2500);
+
+    if (milliseconds.total_nanoseconds() != 2_500_000_000) {
+        io.stdout().writeln("[FAIL] from_milliseconds() produced wrong value");
+        return 3;
+    }
+
+    let microseconds: Duration =
+        Duration.from_microseconds(1234567);
+
+    if (microseconds.total_nanoseconds() != 1_234_567_000) {
+        io.stdout().writeln("[FAIL] from_microseconds() produced wrong value");
+        return 4;
+    }
+
+    let nanoseconds: Duration =
+        Duration.from_nanoseconds(987654321);
+
+    if (nanoseconds.total_nanoseconds() != 987654321) {
+        io.stdout().writeln("[FAIL] from_nanoseconds() produced wrong value");
+        return 5;
+    }
+
+    io.stdout().writeln("[PASS] Duration construction");
+
+    return 0;
+}
+
+
+func test_duration_normalization(): i64 {
+    io.stdout().writeln("=== Running: test_duration_normalization ===");
+
+    let negative_half_second: Duration =
+        Duration.from_nanoseconds(-500_000_000);
+
+    if (!negative_half_second.is_negative()) {
+        io.stdout().writeln("[FAIL] negative subsecond duration not negative");
+        return 1;
+    }
+
+    if (negative_half_second.total_nanoseconds() != -500_000_000) {
+        io.stdout().writeln("[FAIL] negative subsecond normalization failed");
+        return 2;
+    }
+
+    let negative_one_ns: Duration =
+        Duration.from_nanoseconds(-1);
+
+    if (!negative_one_ns.is_negative()) {
+        io.stdout().writeln("[FAIL] -1ns not recognized as negative");
+        return 3;
+    }
+
+    if (negative_one_ns.total_nanoseconds() != -1) {
+        io.stdout().writeln("[FAIL] -1ns normalization failed");
+        return 4;
+    }
+
+    io.stdout().writeln("[PASS] Duration normalization");
+
+    return 0;
+}
+
+
+func test_duration_arithmetic(): i64 {
+    io.stdout().writeln("=== Running: test_duration_arithmetic ===");
+
+    let a: Duration =
+        Duration.from_milliseconds(1500);
+
+    let b: Duration =
+        Duration.from_milliseconds(750);
+
+    let sum: Duration =
+        a.add(b);
+
+    if (sum.total_nanoseconds() != 2_250_000_000) {
+        io.stdout().writeln("[FAIL] Duration.add() produced wrong value");
+        return 1;
+    }
+
+    let difference: Duration =
+        a.subtract(b);
+
+    if (difference.total_nanoseconds() != 750_000_000) {
+        io.stdout().writeln("[FAIL] Duration.subtract() produced wrong value");
+        return 2;
+    }
+
+    let negative: Duration =
+        a.negate();
+
+    if (!negative.is_negative()) {
+        io.stdout().writeln("[FAIL] Duration.negate() did not produce negative duration");
+        return 3;
+    }
+
+    if (negative.total_nanoseconds() != -1_500_000_000) {
+        io.stdout().writeln("[FAIL] Duration.negate() produced wrong value");
+        return 4;
+    }
+
+    let restored: Duration =
+        negative.negate();
+
+    if (restored.total_nanoseconds() != 1_500_000_000) {
+        io.stdout().writeln("[FAIL] double negation failed");
+        return 5;
+    }
+
+    io.stdout().writeln("[PASS] Duration arithmetic");
+
+    return 0;
+}
+
+
+func test_datetime_parse_valid(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_parse_valid ===");
+
+    let result:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2024-02-29T23:59:59.123456789Z"
+        );
+
+    match (result) {
+        case Result.Err { error } -> {
+            io.stdout().writeln("[FAIL] valid leap-day DateTime was rejected");
+            return 1;
+        },
+
+        case Result.Ok { value } -> {
+            // 2024-02-29 23:59:59 UTC.
+            if (value.to_seconds() != 1709251199) {
+                io.stdout().writeln("[FAIL] parsed DateTime has wrong Unix timestamp");
+                return 2;
+            }
+        },
+    }
+
+    io.stdout().writeln("[PASS] valid DateTime parsing");
+
+    return 0;
+}
+
+
+func test_datetime_parse_invalid(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_parse_invalid ===");
+
+    let invalid_leap:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2023-02-29T12:00:00Z"
+        );
+
+    match (invalid_leap) {
+        case Result.Ok { value } -> {
+            io.stdout().writeln("[FAIL] invalid leap day was accepted");
+            return 1;
+        },
+
+        case Result.Err { error } -> {
+            io.stdout().writeln("[PASS] invalid leap day rejected");
+        },
+    }
+
+    let invalid_fraction:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2024-01-01T00:00:00.1234567890Z"
+        );
+
+    match (invalid_fraction) {
+        case Result.Ok { value } -> {
+            io.stdout().writeln("[FAIL] >9 fractional digits were accepted");
+            return 2;
+        },
+
+        case Result.Err { error } -> {
+            io.stdout().writeln("[PASS] excessive fractional precision rejected");
+        },
+    }
+
+    let missing_zone:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2024-01-01T00:00:00"
+        );
+
+    match (missing_zone) {
+        case Result.Ok { value } -> {
+            io.stdout().writeln("[FAIL] DateTime without timezone was accepted");
+            return 3;
+        },
+
+        case Result.Err { error } -> {
+            io.stdout().writeln("[PASS] missing timezone rejected");
+        },
+    }
+
+    return 0;
+}
+
+
+func test_datetime_offset_equivalence(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_offset_equivalence ===");
+
+    let local:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2024-01-01T00:00:00+02:00"
+        );
+
+    let utc:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2023-12-31T22:00:00Z"
+        );
+
+    let local_value: DateTime =
+        match (local) {
+            case Result.Ok { value } -> value,
+
+            case Result.Err { error } -> {
+                io.stdout().writeln("[FAIL] +02:00 DateTime failed to parse");
+                return 1;
+            },
+        };
+
+    let utc_value: DateTime =
+        match (utc) {
+            case Result.Ok { value } -> value,
+
+            case Result.Err { error } -> {
+                io.stdout().writeln("[FAIL] UTC DateTime failed to parse");
+                return 2;
+            },
+        };
+
+    let difference: Duration =
+        local_value.difference(utc_value);
+
+    if (difference.total_nanoseconds() != 0) {
+        io.stdout().writeln(
+            "[FAIL] equivalent offset DateTimes differ"
+        );
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] DateTime offset equivalence");
+
+    return 0;
+}
+
+
+func test_datetime_epoch_conversion(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_epoch_conversion ===");
+
+    let epoch: DateTime =
+        DateTime.from_seconds(0, 0, 0);
+
+    if (epoch.to_seconds() != 0) {
+        io.stdout().writeln("[FAIL] Unix epoch roundtrip failed");
+        return 1;
+    }
+
+    let negative:
+        DateTime =
+        DateTime.from_seconds(
+            -1,
+            500_000_000,
+            0
+        );
+
+    if (negative.to_seconds() != -1) {
+        io.stdout().writeln("[FAIL] negative Unix time roundtrip failed");
+        return 2;
+    }
+
+    let offset_epoch:
+        DateTime =
+        DateTime.from_seconds(
+            0,
+            0,
+            120
+        );
+
+    if (offset_epoch.to_seconds() != 0) {
+        io.stdout().writeln("[FAIL] offset Unix time roundtrip failed");
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] DateTime Unix conversion");
+
+    return 0;
+}
+
+
+func test_datetime_arithmetic(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_arithmetic ===");
+
+    let base:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2024-02-28T23:59:59.500000000Z"
+        );
+
+    let base_value:
+        DateTime =
+        match (base) {
+            case Result.Ok { value } -> value,
+
+            case Result.Err { error } -> {
+                io.stdout().writeln("[FAIL] base DateTime failed to parse");
+                return 1;
+            },
+        };
+
+    let delta:
+        Duration =
+        Duration.from_milliseconds(1500);
+
+    let advanced:
+        DateTime =
+        base_value.add(delta);
+
+    let elapsed:
+        Duration =
+        advanced.difference(base_value);
+
+    if (elapsed.total_nanoseconds() != 1_500_000_000) {
+        io.stdout().writeln("[FAIL] DateTime + Duration produced wrong difference");
+        return 2;
+    }
+
+    // Crossing both the second and day boundary.
+    if (advanced.to_seconds() != 1709164801) {
+        io.stdout().writeln("[FAIL] DateTime arithmetic crossed boundary incorrectly");
+        return 3;
+    }
+
+    let restored:
+        DateTime =
+        advanced.subtract(delta);
+
+    let restored_difference:
+        Duration =
+        restored.difference(base_value);
+
+    if (restored_difference.total_nanoseconds() != 0) {
+        io.stdout().writeln("[FAIL] DateTime subtract() did not restore original time");
+        return 4;
+    }
+
+    io.stdout().writeln("[PASS] DateTime arithmetic");
+
+    return 0;
+}
+
+
+func test_datetime_difference(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_difference ===");
+
+    let first:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2025-06-01T12:00:00.250000000Z"
+        );
+
+    let second:
+        Result<DateTime, ParseError> =
+        DateTime.parse(
+            "2025-06-01T12:00:01.750000000Z"
+        );
+
+    let a: DateTime =
+        match (first) {
+            case Result.Ok { value } -> value,
+
+            case Result.Err { error } -> {
+                io.stdout().writeln("[FAIL] first DateTime failed to parse");
+                return 1;
+            },
+        };
+
+    let b: DateTime =
+        match (second) {
+            case Result.Ok { value } -> value,
+
+            case Result.Err { error } -> {
+                io.stdout().writeln("[FAIL] second DateTime failed to parse");
+                return 2;
+            },
+        };
+
+    let difference:
+        Duration =
+        b.difference(a);
+
+    if (difference.total_nanoseconds() != 1_500_000_000) {
+        io.stdout().writeln("[FAIL] DateTime.difference() produced wrong duration");
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] DateTime difference");
+
+    return 0;
+}
+
+
+func test_instant_arithmetic(): i64 {
+    io.stdout().writeln("=== Running: test_instant_arithmetic ===");
+
+    let start:
+        Instant =
+        Instant.now();
+
+    let delta:
+        Duration =
+        Duration.from_milliseconds(2500);
+
+    let later:
+        Instant =
+        start.add(delta);
+
+    let difference:
+        Duration =
+        later.difference(start);
+
+    if (difference.total_nanoseconds() != 2_500_000_000) {
+        io.stdout().writeln("[FAIL] Instant.add() produced wrong difference");
+        return 1;
+    }
+
+    let restored:
+        Instant =
+        later.subtract(delta);
+
+    let restored_difference:
+        Duration =
+        restored.difference(start);
+
+    if (restored_difference.total_nanoseconds() != 0) {
+        io.stdout().writeln("[FAIL] Instant.subtract() did not restore original instant");
+        return 2;
+    }
+
+    io.stdout().writeln("[PASS] Instant arithmetic");
+
+    return 0;
+}
+
+
+func test_instant_monotonic_clock(): i64 {
+    io.stdout().writeln("=== Running: test_instant_monotonic_clock ===");
+
+    let start:
+        Instant =
+        Instant.now();
+
+    process.sleep(
+        Duration.from_milliseconds(2)
+    );
+
+    let end:
+        Instant =
+        Instant.now();
+
+    let elapsed:
+        Duration =
+        end.difference(start);
+
+    if (elapsed.is_negative()) {
+        io.stdout().writeln("[FAIL] monotonic clock went backwards");
+        return 1;
+    }
+
+    if (elapsed.total_nanoseconds() < 1_000_000) {
+        io.stdout().writeln("[FAIL] elapsed time was unexpectedly short");
+        return 2;
+    }
+
+    io.stdout().writeln("[PASS] CLOCK_MONOTONIC + sleep");
+
+    return 0;
+}
+
+
+func test_datetime_realtime_clock(): i64 {
+    io.stdout().writeln("=== Running: test_datetime_realtime_clock ===");
+
+    let now:
+        DateTime =
+        DateTime.now();
+
+    let unix_seconds:
+        i64 =
+        now.to_seconds();
+
+    io.stdout().writeln(
+        "[PASS] CLOCK_REALTIME returned Unix seconds:"
+    );
+    io.stdout().writeln(unix_seconds.to_string().as_str());
+
+    return 0;
+}
+
+
+func time_tests(): i64 {
+    let status1: i64 =
+        test_duration_construction();
+
+    if (status1 != 0) {
+        return status1;
+    }
+
+    let status2: i64 =
+        test_duration_normalization();
+
+    if (status2 != 0) {
+        return status2;
+    }
+
+    let status3: i64 =
+        test_duration_arithmetic();
+
+    if (status3 != 0) {
+        return status3;
+    }
+
+    let status4: i64 =
+        test_datetime_parse_valid();
+
+    if (status4 != 0) {
+        return status4;
+    }
+
+    let status5: i64 =
+        test_datetime_parse_invalid();
+
+    if (status5 != 0) {
+        return status5;
+    }
+
+    let status6: i64 =
+        test_datetime_offset_equivalence();
+
+    if (status6 != 0) {
+        return status6;
+    }
+
+    let status7: i64 =
+        test_datetime_epoch_conversion();
+
+    if (status7 != 0) {
+        return status7;
+    }
+
+    let status8: i64 =
+        test_datetime_arithmetic();
+
+    if (status8 != 0) {
+        return status8;
+    }
+
+    let status9: i64 =
+        test_datetime_difference();
+
+    if (status9 != 0) {
+        return status9;
+    }
+
+    let status10: i64 =
+        test_instant_arithmetic();
+
+    if (status10 != 0) {
+        return status10;
+    }
+
+    let status11: i64 =
+        test_instant_monotonic_clock();
+
+    if (status11 != 0) {
+        return status11;
+    }
+
+    let status12: i64 =
+        test_datetime_realtime_clock();
+
+    if (status12 != 0) {
+        return status12;
+    }
+
+    io.stdout().writeln("");
+    io.stdout().writeln("=== All time tests passed ===");
+
+    return 0;
+}
+
+// func leaks_handle(): i64 {
+//     let base: i64 = 1;
+//     let mut handle: JoinHandle<i64, Mallocator> =
+//         threads.spawn(func() { return base; });
+//     return 0;   // error: `handle` goes out of scope at this `return`
+//                 // with an outstanding `borrow_until` obligation
+// }
+//
+// struct RawHolder {
+//     ptr: [*]mut i64,
+// }
+//
+// func not_send(): i64 {
+//     let mut n: i64 = 0;
+//     let holder: RawHolder = RawHolder { ptr: &mut n };
+//
+//     let mut handle: JoinHandle<i64, Mallocator> =
+//         threads.spawn(move func() {
+//             return unsafe { *holder.ptr };   // closure captures a non-Send type
+//         });
+//
+//     return handle.join().unwrap();
+// }
+
+func mutex_ok(): i64 {
+    io.stdout().writeln("=== Running: mutex_ok ===");
+
+    let x: Mutex<i64> = Mutex.new(0);
+
+    let mut handle: JoinHandle<i64, Mallocator> =
+        threads.spawn(func() {
+            let mut lock: MutexGuard<i64> = x.lock(); // line 3054
+            *lock.get_mut() += 1;
+            return *lock.get();
+        });
+
+    let r: i64 = handle.join().unwrap();
+    io.stdout().writeln("Got:");
+    io.stdout().writeln(r.to_string().as_str());
+    return 0;
+}
+
+func mutex_contention(): i64 {
+    io.stdout().writeln("=== Running: mutex_contention ===");
+
+    let x: Mutex<i64> = Mutex.new(0);
+
+    let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(32);
+
+    let mut i: i64 = 0;
+
+    while (i < 32) {
+        let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
+            let mut j: i64 = 0;
+            while (j < 1000) {
+                let mut lock: MutexGuard<i64> = x.lock();
+                *lock.get_mut() += 1;
+                j += 1;
+            } // `lock` is dropped at the end of each iteration
+            return 0;
+        });
+        handles.push(h);
+
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < 32) {
+        handles.get(i as usize).join().unwrap();
+        i += 1;
+    }
+
+    let mut lock: MutexGuard<i64> = x.lock();
+    let total: i64 = *lock.get();
+
+    io.stdout().writeln("Total:");
+    io.stdout().writeln(total.to_string().as_str());
+
+    if (total != 32000) {
+        io.stdout().writeln("[FAIL] mutex lost updates");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] mutex contention, 32 threads x 1000 increments");
+    return 0;
+}
+
+struct Subject {
+    value: i64,
+    observer: ?&alias Observer,
+}
+
+struct Observer {
+    last_value: i64,
+}
+
+func notify(subject: &alias Subject) {
+    match (subject.observer) {
+        case null -> {},
+
+        case observer -> {
+            observer.last_value = subject.value;
+        },
+    }
+}
+
+func test_observer_pattern(): i64 {
+    io.stdout().writeln("=== Running: test_observer_pattern ===");
+
+    let mut observer: Observer = Observer {
+        last_value: 0,
+    };
+
+    let mut subject: Subject = Subject {
+        value: 0,
+        observer: &alias observer,
+    };
+
+    subject.value = 10;
+    notify(&alias subject);
+
+    if (observer.last_value != 10) {
+        io.stdout().writeln("[FAIL] observer did not receive 10");
+        return 1;
+    }
+
+    subject.value = 42;
+    notify(&alias subject);
+
+    if (observer.last_value != 42) {
+        io.stdout().writeln("[FAIL] observer did not receive 42");
+        return 2;
+    }
+
+    io.stdout().writeln("[PASS] observer pattern");
+
     return 0;
 }
