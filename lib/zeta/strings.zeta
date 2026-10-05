@@ -1,10 +1,40 @@
 package zeta::strings;
 
+import zeta::string.String;
+import zeta::utils::mallocator.Mallocator;
+import zeta::lang::traits.PartialEq;
+import zeta::lang::traits.Eq;
+
 import zeta::result.Result;
 
 public struct Utf8Decode {
     value: u32,
     width: usize,
+}
+
+struct Chars {
+    remaining: str,
+}
+
+impl Chars {
+    func next(&mut this): ?u32 {
+        if (this.remaining.is_empty()) {
+            return null;
+        }
+        match (decode_utf8_first(this.remaining)) {
+            case Result.Ok { value } -> {
+                this.remaining =
+                    this.remaining.get_slice(value.width, this.remaining.len());
+                return value.value;
+            },
+            case Result.Err { error } -> {
+                // Invalid sequence: skip one byte, yield U+FFFD.
+                this.remaining =
+                    this.remaining.get_slice(1, this.remaining.len());
+                return 0xFFFD;
+            },
+        }
+    }
 }
 
 struct Split {
@@ -21,7 +51,7 @@ impl Split {
 
         let bytes: &[]u8 = this.remaining.as_bytes();
 
-        for (let i: usize = 0; i < bytes.len; i += 1) {
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
             if (bytes[i] == this.delimiter) {
                 let part: str = this.remaining.get_slice(0, i);
 
@@ -170,10 +200,21 @@ func ascii_lower(byte: u8): u8 {
     return byte;
 }
 
-impl str {
-    unsafe func from_utf8(bytes: &[]u8): Result<str, Utf8ConversionError> {
-        return Result.Ok { value: "" };
+func ascii_upper(byte: u8): u8 {
+    if (byte >= ('a' as u8) && byte <= ('z' as u8)) {
+        return byte - 32;
     }
+    return byte;
+}
+
+impl str {
+    func as_bytes(&this): &[]u8 {
+        unsafe {
+            let data_ptr: [*]const u8 = *($reinterpret<[*]const [*]const u8>(this));
+            return data_ptr[0..<this.len()];
+        }
+    }
+
     func from_utf8(bytes: &[]u8): Result<str, Utf8ConversionError> {
         let mut offset: usize = 0;
 
@@ -202,14 +243,13 @@ impl str {
     }
 
     unsafe func from_utf8_unchecked(bytes: &[]u8): str {
-        return "";
+        return $reinterpret<str>(bytes);   // identical {ptr,len} layout
     }
 
     func as_bytes(&this): &[]u8 {
-        let len: usize = unsafe { *($reinterpret<[*]const usize>(this)) };
         unsafe {
-            let data_ptr: [*]const u8 = $reinterpret<[*]const u8>($reinterpret<usize>(this) + 8);
-            return data_ptr[0..<len];
+            let data_ptr: [*]const u8 = *($reinterpret<[*]const [*]const u8>(this));
+            return data_ptr[0..<this.len()];
         }
     }
 
@@ -223,8 +263,7 @@ impl str {
     }
 
     func get_slice(&this, start: usize, end: usize): str {
-        let bytes: &[]u8 = this.as_bytes();
-        return unsafe { str.from_utf8_unchecked(bytes[start..<end]) };
+        return this[start..<end];
     }
 
     func is_empty(&this): bool {
@@ -232,7 +271,10 @@ impl str {
     }
 
     func len(&this): usize {
-        return unsafe { *($reinterpret<[*]const usize>(this)) };
+        unsafe {
+            let words: [*]const usize = $reinterpret<[*]const usize>(this);
+            return words[1];
+        }
     }
 
     func trim_start(&this): str {
@@ -289,7 +331,7 @@ impl str {
             return false;
         }
 
-        for (let i: usize = 0; i < b.len; i += 1) {
+        for (let mut i: usize = 0; i < b.len; i += 1) {
             if (a[i] != b[i]) {
                 return false;
             }
@@ -308,7 +350,7 @@ impl str {
 
         let start: usize = a.len - b.len;
 
-        for (let i: usize = 0; i < b.len; i += 1) {
+        for (let mut i: usize = 0; i < b.len; i += 1) {
             if (a[start + i] != b[i]) {
                 return false;
             }
@@ -335,10 +377,10 @@ impl str {
 
         let last: usize = a.len - b.len;
 
-        for (let i: usize = 0; i <= last; i += 1) {
+        for (let mut i: usize = 0; i <= last; i += 1) {
             let mut matched: bool = true;
 
-            for (let j: usize = 0; j < b.len; j += 1) {
+            for (let mut j: usize = 0; j < b.len; j += 1) {
                 if (a[i + j] != b[j]) {
                     matched = false;
                     break;
@@ -361,7 +403,7 @@ impl str {
             return false;
         }
 
-        for (let i: usize = 0; i < a.len; i += 1) {
+        for (let mut i: usize = 0; i < a.len; i += 1) {
             if (ascii_lower(a[i]) != ascii_lower(b[i])) {
                 return false;
             }
@@ -377,6 +419,103 @@ impl str {
             finished: false,
         };
     }
+
+    func is_ascii(&this): bool {
+        let bytes: &[]u8 = this.as_bytes();
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
+            if (bytes[i] >= 0x80) { return false; }
+        }
+        return true;
+    }
+
+    func rfind(&this, needle: str): ?usize {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = needle.as_bytes();
+
+        if (b.len == 0) { return a.len; }
+        if (b.len > a.len) { return null; }
+
+        let mut i: usize = a.len - b.len + 1;
+        while (i > 0) {
+            i -= 1;
+            let mut matched: bool = true;
+            for (let mut j: usize = 0; j < b.len; j += 1) {
+                if (a[i + j] != b[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) { return i; }
+        }
+        return null;
+    }
+
+    func strip_prefix(&this, prefix: str): ?str {
+        if (!this.starts_with(prefix)) { return null; }
+        return this.get_slice(prefix.len(), this.len());
+    }
+
+    func strip_suffix(&this, suffix: str): ?str {
+        if (!this.ends_with(suffix)) { return null; }
+        return this.get_slice(0, this.len() - suffix.len());
+    }
+
+    func chars(&this): Chars {
+        return Chars { remaining: *this };
+    }
+
+    func char_count(&this): usize {
+        let mut it: Chars = this.chars();
+        let mut count: usize = 0;
+        while (it.next() != null) {
+            count += 1;
+        }
+        return count;
+    }
+
+    func to_ascii_lowercase(&this): String<Mallocator> {
+        let bytes: &[]u8 = this.as_bytes();
+        let mut out: String<Mallocator> = String.with_capacity(bytes.len);
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
+            out.push_byte(ascii_lower(bytes[i]));
+        }
+        return out;
+    }
+
+    func to_ascii_uppercase(&this): String<Mallocator> {
+        let bytes: &[]u8 = this.as_bytes();
+        let mut out: String<Mallocator> = String.with_capacity(bytes.len);
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
+            out.push_byte(ascii_upper(bytes[i]));
+        }
+        return out;
+    }
 }
 
 struct Utf8ConversionError {}
+
+impl str by PartialEq {
+    func eq(&this, other: &str): bool {
+        let a: &[]u8 = this.as_bytes();
+        let b: &[]u8 = other.as_bytes();
+
+        if (a.len != b.len) {
+            return false;
+        }
+
+        for (let mut i: usize = 0; i < a.len; i += 1) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    func ne(&this, other: &str): bool {
+        return !this.eq(other);
+    }
+}
+
+impl str by Eq {
+}
