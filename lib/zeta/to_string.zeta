@@ -1,0 +1,104 @@
+package zeta::to_string;
+
+import zeta::string.String;
+import zeta::utils::mallocator.Mallocator;
+
+public interface ToString {
+    func to_string(&this): String<Mallocator>;
+}
+
+public func u64_to_string(value: u64): String<Mallocator> {
+    let mut s: String<Mallocator> = String.new();
+
+    if (value == 0) {
+        s.push_byte('0' as u8);
+        return s;
+    }
+
+    // Largest power of ten <= value (10^19 fits in u64).
+    let mut divisor: u64 = 1;
+    while (value / divisor >= 10) {
+        divisor *= 10;
+    }
+
+    let mut rem: u64 = value;
+    while (divisor > 0) {
+        let digit: u64 = rem / divisor;
+        s.push_byte(('0' as u8) + (digit as u8));
+        rem = rem % divisor;
+        divisor /= 10;
+    }
+    return s;
+}
+
+public func i64_to_string(value: i64): String<Mallocator> {
+    if (value >= 0) {
+        return u64_to_string(value as u64);
+    }
+    // (-(v+1)) + 1 avoids overflow on i64::MIN.
+    let magnitude: u64 = ((-(value + 1)) as u64) + 1;
+    let mut s: String<Mallocator> = String.new();
+    s.push_byte('-' as u8);
+    let digits: String<Mallocator> = u64_to_string(magnitude);
+    s.push_str(digits.as_str());
+    return s;
+}
+
+/// Zero-padded decimal, at least `width` digits.
+public func padded_u64(value: u64, width: usize): String<Mallocator> {
+    let digits: String<Mallocator> = u64_to_string(value);
+    let mut s: String<Mallocator> = String.new();
+    let mut i: usize = digits.len();
+    while (i < width) {
+        s.push_byte('0' as u8);
+        i += 1;
+    }
+    s.push_str(digits.as_str());
+    return s;
+}
+
+impl u8 by ToString    { func to_string(&this): String<Mallocator> { return u64_to_string(*this as u64); } }
+impl u16 by ToString   { func to_string(&this): String<Mallocator> { return u64_to_string(*this as u64); } }
+impl u32 by ToString   { func to_string(&this): String<Mallocator> { return u64_to_string(*this as u64); } }
+impl u64 by ToString   { func to_string(&this): String<Mallocator> { return u64_to_string(*this); } }
+impl usize by ToString { func to_string(&this): String<Mallocator> { return u64_to_string(*this as u64); } }
+impl i8 by ToString    { func to_string(&this): String<Mallocator> { return i64_to_string(*this as i64); } }
+impl i16 by ToString   { func to_string(&this): String<Mallocator> { return i64_to_string(*this as i64); } }
+impl i32 by ToString   { func to_string(&this): String<Mallocator> { return i64_to_string(*this as i64); } }
+impl i64 by ToString   { func to_string(&this): String<Mallocator> { return i64_to_string(*this); } }
+impl isize by ToString { func to_string(&this): String<Mallocator> { return i64_to_string(*this as i64); } }
+
+impl bool by ToString {
+    func to_string(&this): String<Mallocator> {
+        if (*this) { return String.from("true"); } // line 73
+        return String.from("false");
+    }
+}
+
+public func f64_to_string(value: f64): String<Mallocator> {
+    if (value != value) { return String.from("NaN"); }
+    if (value > 1.7976931348623157e308) { return String.from("inf"); }
+    if (value < -1.7976931348623157e308) { return String.from("-inf"); }
+
+    let mut s: String<Mallocator> = String.new();
+    let mut v: f64 = value;
+    if (v < 0.0) {
+        s.push_byte('-' as u8);
+        v = (-v as f64);
+    }
+
+    // 6 fractional digits, rounded. Integer part must fit in u64.
+    let scaled: u64 = (v * 1000000.0 + 0.5) as u64;
+    let int_part: u64 = scaled / 1000000;
+    let frac_part: u64 = scaled % 1000000;
+
+    let int_s: String<Mallocator> = u64_to_string(int_part);
+    s.push_str(int_s.as_str());
+    s.push_byte('.' as u8);
+    let frac_s: String<Mallocator> = padded_u64(frac_part, 6);
+    s.push_str(frac_s.as_str());
+    return s;
+}
+
+impl f64 by ToString { func to_string(&this): String<Mallocator> { return f64_to_string(*this); } }
+impl f32 by ToString { func to_string(&this): String<Mallocator> { return f64_to_string(*this as f64); } }
