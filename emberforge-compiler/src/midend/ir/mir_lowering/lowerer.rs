@@ -1,13 +1,16 @@
 use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::{DropMoveState, DropScope};
 use crate::midend::ir::block_data::CurrentBlockData;
-use crate::midend::ir::mir_lowering::LoopCtx;
+use crate::midend::ir::mir_lowering::control_flow::LoopCtx;
 use codex_dependency_graph::DepGraph;
+use ir::attributes::{AttrTarget, KnownKind};
 use ir::hir::{HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, StrId};
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
+use ir::registry::global_registry::GlobalRegistry;
 use ir::ssa_ir::{
-    AllocatorKind, BasicBlock, BlockId, Function, Instruction, Operand, SsaType, Value,
+    AllocatorKind, AtomicOrdering, BasicBlock, BlockId, Function, Instruction, Operand, SsaType,
+    Value,
 };
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -24,6 +27,12 @@ pub(crate) enum IndexedContainer {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum OrdSel {
+    Static(AtomicOrdering),
+    Dynamic(Value), // pointer/aggregate holding the enum; tag at offset 0
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum SlicePrimitive {
     WriteUninit,
     WriteUninitAll,
@@ -37,75 +46,81 @@ pub(crate) enum FieldInitVal {
     Val(Value),
 }
 
-pub struct FunctionLowerer<'f, 'a, 'bump> {
+pub struct FunctionLowerer<'f, 's, 'a, 'bump, 'r>
+where
+    'bump: 'a,
+    'a: 's,
+{
     pub(super) current_block_data: CurrentBlockData<'f>,
     pub(super) var_map: HashMap<StrId, Value>,
     pub(super) phantom_data: PhantomData<&'bump ()>,
     pub(super) loop_stack: Vec<LoopCtx<'a, 'bump>>,
-    pub(super) funcs: &'a HashMap<StrId, Function>,
-    pub(super) struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
-    pub(super) struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-    pub(super) struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
-    pub(super) struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
-    pub(super) interface_id_map: &'a HashMap<StrId, usize>,
-    pub(super) interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-    pub(super) structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
-    pub(super) enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
-    pub(super) enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
+    pub(super) funcs: &'s HashMap<StrId, Function>,
+    pub(super) struct_field_offsets: &'s HashMap<StrId, HashMap<StrId, usize>>,
+    pub(super) struct_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+    pub(super) struct_mangled_map: &'s HashMap<StrId, HashMap<StrId, StrId>>,
+    pub(super) struct_vtable_slots: &'s HashMap<StrId, Vec<StrId>>,
+    pub(super) interface_id_map: &'s HashMap<StrId, usize>,
+    pub(super) interface_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+    pub(super) structs: &'s HashMap<StrId, HirStruct<'a, 'bump>>,
+    pub(super) enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
+    pub(super) enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
     pub(super) context: Arc<StringPool>,
-    pub(super) extern_c_names: &'a HashSet<StrId>,
-    pub(super) dep_graph: &'a RefCell<DepGraph>,
+    pub(super) extern_c_names: &'s HashSet<StrId>,
+    pub(super) dep_graph: &'s RefCell<DepGraph>,
     pub(super) module_idx: usize,
     pub(super) return_type: Option<HirType<'a, 'bump>>,
-    pub(super) global_funcs: &'a HashMap<StrId, Function>,
+    pub(super) global_funcs: &'s HashMap<StrId, Function>,
     pub(super) scope_stack: Vec<DropScope<'a, 'bump>>,
     pub(super) drop_state: DropMoveState<'a, 'bump>,
-    pub(super) glue_registry: &'a DropGlueRegistry,
-    pub(super) allocator_kind: &'a HashMap<StrId, AllocatorKind>,
-    pub(super) interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-    pub(super) bump: &'bump GrowableBump<'bump>,
-    pub(super) module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
-    pub(super) module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
-    pub(super) constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+    pub(super) glue_registry: &'s DropGlueRegistry,
+    pub(super) allocator_kind: &'s HashMap<StrId, AllocatorKind>,
+    pub(super) interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+    pub(super) bump: &'s GrowableBump<'bump>,
+    pub(super) module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
+    pub(super) module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
+    pub(super) constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
     pub(super) promoted_to_stack: HashSet<StrId>,
     pub(super) narrowed_fields: HashMap<(StrId, Vec<StrId>), Value>,
     pub(super) nullable_owned_locals: HashMap<StrId, HirType<'a, 'bump>>,
     pub(super) array_flags: HashMap<StrId, (Value, usize)>,
     pub(super) instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     pub(super) instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+    pub(super) registry: GlobalRegistry<'r, 'bump>,
 }
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump>
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r>
 where
     'bump: 'a,
 {
     pub fn new(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function>,
-        global_funcs: &'a HashMap<StrId, Function>,
-        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
-        interface_id_map: &'a HashMap<StrId, usize>,
-        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        funcs: &'s HashMap<StrId, Function>,
+        global_funcs: &'s HashMap<StrId, Function>,
+        struct_field_offsets: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'s HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'s HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'s HashMap<StrId, usize>,
+        interface_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'s HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
-        extern_c_names: &'a HashSet<StrId>,
-        dep_graph: &'a RefCell<DepGraph>,
+        extern_c_names: &'s HashSet<StrId>,
+        dep_graph: &'s RefCell<DepGraph>,
         module_idx: usize,
-        glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
-        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
-        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        glue_registry: &'s DropGlueRegistry,
+        allocator_kind: &'s HashMap<StrId, AllocatorKind>,
+        interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+        bump: &'s GrowableBump<'bump>,
+        enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        registry: GlobalRegistry<'r, 'bump>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -134,36 +149,38 @@ where
             constants,
             instantiated_functions,
             instantiated_struct_methods,
+            registry,
         )
     }
 
     pub fn new_with_struct(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function>,
-        global_funcs: &'a HashMap<StrId, Function>,
-        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
-        interface_id_map: &'a HashMap<StrId, usize>,
-        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        funcs: &'s HashMap<StrId, Function>,
+        global_funcs: &'s HashMap<StrId, Function>,
+        struct_field_offsets: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'s HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'s HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'s HashMap<StrId, usize>,
+        interface_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'s HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
-        extern_c_names: &'a HashSet<StrId>,
-        dep_graph: &'a RefCell<DepGraph>,
+        extern_c_names: &'s HashSet<StrId>,
+        dep_graph: &'s RefCell<DepGraph>,
         module_idx: usize,
-        glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
-        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
-        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        glue_registry: &'s DropGlueRegistry,
+        allocator_kind: &'s HashMap<StrId, AllocatorKind>,
+        interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+        bump: &'s GrowableBump<'bump>,
+        enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        registry: GlobalRegistry<'r, 'bump>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -192,36 +209,38 @@ where
             constants,
             instantiated_functions,
             instantiated_struct_methods,
+            registry,
         )
     }
 
     pub(super) fn new_internal(
         function: &'f mut Function,
         hir_fn: &HirFunc<'a, 'bump>,
-        funcs: &'a HashMap<StrId, Function>,
-        global_funcs: &'a HashMap<StrId, Function>,
-        struct_field_offsets: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        struct_mangled_map: &'a HashMap<StrId, HashMap<StrId, StrId>>,
-        struct_vtable_slots: &'a HashMap<StrId, Vec<StrId>>,
-        interface_id_map: &'a HashMap<StrId, usize>,
-        interface_method_slots: &'a HashMap<StrId, HashMap<StrId, usize>>,
-        structs: &'a HashMap<StrId, HirStruct<'a, 'bump>>,
-        enum_variant_tags: &'a HashMap<StrId, HashMap<StrId, usize>>,
+        funcs: &'s HashMap<StrId, Function>,
+        global_funcs: &'s HashMap<StrId, Function>,
+        struct_field_offsets: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        struct_mangled_map: &'s HashMap<StrId, HashMap<StrId, StrId>>,
+        struct_vtable_slots: &'s HashMap<StrId, Vec<StrId>>,
+        interface_id_map: &'s HashMap<StrId, usize>,
+        interface_method_slots: &'s HashMap<StrId, HashMap<StrId, usize>>,
+        structs: &'s HashMap<StrId, HirStruct<'a, 'bump>>,
+        enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
-        extern_c_names: &'a HashSet<StrId>,
-        dep_graph: &'a RefCell<DepGraph>,
+        extern_c_names: &'s HashSet<StrId>,
+        dep_graph: &'s RefCell<DepGraph>,
         module_idx: usize,
-        glue_registry: &'a DropGlueRegistry,
-        allocator_kind: &'a HashMap<StrId, AllocatorKind>,
-        interface_methods: &'a HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'bump GrowableBump<'bump>,
-        enums: &'a HashMap<StrId, HirEnum<'a, 'bump>>,
-        module_import_aliases: &'a HashMap<usize, HashMap<StrId, usize>>,
-        module_named_imports: &'a HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'a HashMap<StrId, HirExpr<'a, 'bump>>,
+        glue_registry: &'s DropGlueRegistry,
+        allocator_kind: &'s HashMap<StrId, AllocatorKind>,
+        interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
+        bump: &'s GrowableBump<'bump>,
+        enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
+        module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
+        module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
+        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        registry: GlobalRegistry<'r, 'bump>,
     ) -> Result<Self, std::alloc::AllocError> {
         let mut var_map = HashMap::default();
         let mut value_types = HashMap::default();
@@ -285,7 +304,7 @@ where
             module_idx,
             return_type: hir_fn.return_type,
             global_funcs,
-            scope_stack: vec![DropScope { locals: Vec::new() }],
+            scope_stack: vec![DropScope::default()],
             drop_state: DropMoveState::default(),
             glue_registry,
             allocator_kind,
@@ -301,14 +320,89 @@ where
             nullable_owned_locals: HashMap::default(),
             instantiated_functions,
             instantiated_struct_methods,
+            registry,
         })
+    }
+
+    /// If `expr` is (or names, via `constants`) a payload-free enum variant,
+    /// return `(enum_name, variant_name)`.
+    pub(super) fn resolve_constant_enum_variant(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+    ) -> Option<(StrId, StrId)> {
+        self.resolve_constant_enum_variant_depth(expr, 0)
+    }
+
+    fn resolve_constant_enum_variant_depth(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+        depth: u32,
+    ) -> Option<(StrId, StrId)> {
+        if depth > 16 {
+            return None; // guards against constant cycles
+        }
+        match expr {
+            HirExpr::EnumInit {
+                enum_name,
+                variant,
+                args,
+                ..
+            } if args.is_empty() => {
+                let known = self.enum_variant_tags.get(enum_name)?.contains_key(variant);
+                known.then_some((*enum_name, *variant))
+            }
+            HirExpr::Ident(name, _) => {
+                let c = self.constants.get(name)?;
+                self.resolve_constant_enum_variant_depth(c, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn known_type_target(&self, name: StrId) -> Option<AttrTarget> {
+        self.registry
+            .known
+            .borrow()
+            .get(&(KnownKind::Type, name))
+            .copied()
+    }
+
+    pub fn is_known_type(&self, ty: &HirType<'a, 'bump>, known_name: StrId) -> bool {
+        let Some(AttrTarget::Enum(known_enum)) = self.known_type_target(known_name) else {
+            return false;
+        };
+
+        let Some(actual_enum) = self.resolve_hir_enum_name(ty) else {
+            return false;
+        };
+
+        actual_enum == known_enum
+    }
+
+    pub fn peel_indirections(mut ty: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
+        loop {
+            match ty {
+                HirType::Ref { inner, .. }
+                | HirType::SafePointer { inner, .. }
+                | HirType::OwnedPointer { inner, .. } => ty = *inner,
+                _ => return ty,
+            }
+        }
+    }
+
+    pub(super) fn resolve_hir_enum_name(&self, ty: &HirType<'a, 'bump>) -> Option<StrId> {
+        match Self::peel_indirections(*ty) {
+            HirType::Enum { name, .. } => Some(name),
+            HirType::Nullable(inner) => self.resolve_hir_enum_name(inner),
+            _ => None,
+        }
     }
 
     pub(crate) fn lower_body(&mut self, body: Option<HirStmt<'a, 'bump>>) {
         if let Some(b) = body {
             match b {
                 HirStmt::Block { body, span } => {
-                    self.scope_stack.push(DropScope { locals: Vec::new() });
+                    self.scope_stack.push(DropScope::default());
                     self.lower_stmt_seq(body);
 
                     let scope = self.scope_stack.pop().unwrap();
@@ -411,8 +505,14 @@ where
                 };
                 let _ = self.lower_expr(&match_expr);
             }
-            HirStmt::Defer(_) => {
-                // TODO: handle defers
+            HirStmt::Defer(deferred) => {
+                // Push the deferred statement onto the current scope so it runs
+                // (in LIFO order) when the scope exits, before any drop glue.
+                if let Some(scope) = self.scope_stack.last_mut() {
+                    scope.actions.push(
+                        crate::midend::copy_analysis::drop_tracking::ScopeAction::Defer(deferred),
+                    );
+                }
             }
             _ => unimplemented!("Statement {:?} not yet lowered", stmt),
         }
@@ -467,7 +567,9 @@ where
         expected: &SsaType,
     ) -> Value {
         match expr {
-            HirExpr::Number(n, _) if expected.is_integer() => {
+            HirExpr::Number(n, _)
+                if expected.is_integer() || matches!(expected, SsaType::F32 | SsaType::F64) =>
+            {
                 self.lower_expr_number_inner(*n, expected.clone())
             }
 
@@ -587,7 +689,7 @@ where
             HirExpr::This { .. } => self.lower_this_expr(),
             HirExpr::Ref { expr, span, .. } => self.lower_place_addr(expr, span).0,
 
-            HirExpr::Deref { expr, .. } => self.lower_deref_expr(expr),
+            HirExpr::Deref { expr, span, .. } => self.lower_deref_expr(expr, *span),
             HirExpr::ModuleAccess(hir_module_access) => {
                 self.lower_module_access_expr(hir_module_access)
             }
@@ -657,7 +759,8 @@ where
             | SsaType::Tuple(_)
             | SsaType::Array(..)
             | SsaType::Slice(_)
-            | SsaType::Owned(_) => true,
+            | SsaType::Owned(_)
+            | SsaType::String => true,
             t @ SsaType::Nullable(_) => t.is_tagged_nullable(),
             _ => false,
         }
@@ -679,7 +782,7 @@ where
 
     pub(crate) fn finish(self) {
         // let n = self.current_block_data.func.name.as_str();
-        // if n.contains("threads") {
+        // if n.contains("_eq") {
         //     println!("{}'s MIR:", n);
         //     for b in &self.current_block_data.func.blocks {
         //         println!("bb{}:", b.id.0);
@@ -693,9 +796,9 @@ where
 }
 
 pub fn fun_name(inner: &Box<SsaType>) -> StrId {
-    if let SsaType::User(name, _) = inner.as_ref() {
+    if let SsaType::User(name, _, _) = inner.as_ref() {
         *name
-    } else if let SsaType::Pointer(ptr_inner) = inner.as_ref() {
+    } else if let SsaType::Pointer(_, ptr_inner) = inner.as_ref() {
         fun_name(ptr_inner)
     } else if let SsaType::Owned(ptr_inner) = inner.as_ref() {
         fun_name(ptr_inner)
