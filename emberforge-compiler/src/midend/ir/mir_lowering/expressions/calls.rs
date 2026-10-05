@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn lower_call_args(
         &mut self,
         args: &[HirExpr<'a, 'bump>],
@@ -110,7 +110,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     let is_closure = ptr_ty
                         .as_ref()
                         .and_then(|ty| match ty {
-                            SsaType::User(name, _) => Some(*name),
+                            SsaType::User(name, _, _) => Some(*name),
                             other => self.resolve_receiver_target_key(other),
                         })
                         .and_then(|key| self.struct_mangled_map.get(&key))
@@ -348,14 +348,15 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         if let Some(_) = cls_name_id {
             let receiver_is_moved = param_types
                 .first()
-                .map(|ty| matches!(ty, SsaType::User(_, _)))
+                .map(|ty| matches!(ty, SsaType::User(_, _, _)))
                 .unwrap_or(false);
             if receiver_is_moved {
                 self.record_arg_move(object);
             }
         }
 
-        operands.push(Operand::Value(obj_val));
+        let recv_arg = self.coerce_receiver_to_param(obj_val, param_types.first());
+        operands.push(Operand::Value(recv_arg));
         for (i, a) in args.iter().enumerate() {
             if Self::is_move_by_value(param_types.get(i + 1).unwrap_or(&SsaType::I64)) {
                 self.record_arg_move(a);
@@ -543,7 +544,14 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     .get(&cls_name)
                     .and_then(|methods| methods.iter().find(|(name, _, _)| name == &field))
                     .map(|(_, _, ret)| ret.clone())
-                    .unwrap_or(SsaType::I64);
+                    .or_else(|| {
+                        self.struct_vtable_slots
+                            .get(&cls_name)
+                            .filter(|slots| *slot_idx < slots.len())
+                            .and_then(|slots| self.funcs.get(&slots[*slot_idx]))
+                            .map(|f| f.ret_type.clone())
+                    })
+                    .unwrap_or(SsaType::Void);
                 self.current_block_data.value_types.insert(dest, ret_ty);
                 return Some(dest);
             }
@@ -565,11 +573,17 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     args: operands.clone(),
                 });
                 let ret_ty = self
-                    .struct_vtable_slots
+                    .interface_methods
                     .get(&cls_name)
-                    .filter(|slots| *slot_idx < slots.len())
-                    .and_then(|slots| self.funcs.get(&slots[*slot_idx]))
-                    .map(|f| f.ret_type.clone())
+                    .and_then(|methods| methods.iter().find(|(name, _, _)| name == &field))
+                    .map(|(_, _, ret)| ret.clone())
+                    .or_else(|| {
+                        self.struct_vtable_slots
+                            .get(&cls_name)
+                            .filter(|slots| *slot_idx < slots.len())
+                            .and_then(|slots| self.funcs.get(&slots[*slot_idx]))
+                            .map(|f| f.ret_type.clone())
+                    })
                     .unwrap_or(SsaType::Void);
                 self.current_block_data.value_types.insert(dest, ret_ty);
                 return Some(dest);
@@ -641,7 +655,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         });
 
         let interface_val = match self.current_block_data.value_types.get(&obj_val).cloned() {
-            Some(SsaType::User(ref _name, _args)) => {
+            Some(SsaType::User(ref _name, _, _args)) => {
                 let upcast_dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::UpcastToInterface {
                     dest: upcast_dest,
@@ -651,7 +665,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                 self.current_block_data
                     .value_types
-                    .insert(upcast_dest, SsaType::Interface(interface));
+                    .insert(upcast_dest, SsaType::Interface(interface, interface));
                 upcast_dest
             }
             _ => obj_val,
@@ -677,5 +691,40 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             "f32", "f64", "bool", "char", "str",
         ];
         PRIMS.contains(&name.as_str()).then_some(name)
+    }
+
+    /// The callee takes `this` by pointer (`&this`, `*mut this`, ...) but the
+    /// receiver lowered to a plain scalar SSA value (an rvalue such as a call
+    /// result or literal, or a by-value local). Spill it to a stack slot and
+    /// pass the slot's address instead of the value itself.
+    fn coerce_receiver_to_param(&mut self, obj_val: Value, param0: Option<&SsaType>) -> Value {
+        let Some(SsaType::Pointer(_, _)) = param0 else {
+            return obj_val;
+        };
+        let Some(have) = self.current_block_data.value_types.get(&obj_val).cloned() else {
+            return obj_val;
+        };
+
+        // Aggregates and existing pointers are already passed by address.
+        let is_scalar = have.is_integer() || have.is_float() || have == SsaType::Bool;
+        if !is_scalar {
+            return obj_val;
+        }
+
+        let slot = self.current_block_data.fresh_value();
+        self.emit(Instruction::StackAlloc {
+            dest: slot,
+            ty: have.clone(),
+            count: 1,
+        });
+        self.current_block_data.value_types.insert(
+            slot,
+            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(have)),
+        );
+        self.emit(Instruction::Store {
+            ptr: Operand::Value(slot),
+            value: Operand::Value(obj_val),
+        });
+        slot
     }
 }
