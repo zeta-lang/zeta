@@ -5,7 +5,13 @@ use ir::{
     span::SourceSpan,
 };
 
-use crate::{naming::type_to_string, str_id_to_string, TypeChecker};
+use crate::{
+    TypeChecker,
+    borrow_lifetime::{Holder, ObligationBranch},
+    initialization::{InitNode, InitStatus},
+    naming::type_to_string,
+    str_id_to_string,
+};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn check_package_stmt(
@@ -127,11 +133,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .loan_owners
                 .iter()
                 .filter(|(_, owner)| local_names.contains(owner))
-                .filter(|(_, &owner)| match after_point {
-                    Some(p) => !self.local_used_after(p, owner),
+                .filter(|(_, owner)| match after_point {
+                    Some(p) => !self.local_used_after(p, **owner),
                     None => !body[(i + 1)..]
                         .iter()
-                        .any(|s| self.stmt_references_local(s, owner)),
+                        .any(|s| self.stmt_references_local(s, **owner)),
                 })
                 .map(|(&loan_id, _)| loan_id)
                 .collect();
@@ -176,12 +182,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         self.context.enter_loop();
 
+        let speculative = self.begin_obligation_branch();
         let entry_state = self.move_state.clone();
         let init_entry = self.init_state.clone();
         let (converged_entry, converged_init) =
             self.converge_loop_states(body, entry_state, init_entry);
+        self.abort_obligation_branch(speculative);
         self.move_state = converged_entry;
         self.init_state = converged_init;
+
+        let br = self.begin_obligation_branch();
         self.check_stmt(body);
 
         self.context.exit_loop();
@@ -189,6 +199,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(inc) = increment {
             self.check_expr(inc);
         }
+
+        let body_arm = self.end_obligation_arm(&br);
+        self.join_obligation_loop(br, body_arm);
 
         None
     }
@@ -208,13 +221,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         self.context.enter_loop();
 
+        let speculative = self.begin_obligation_branch();
         let entry_state = self.move_state.clone();
         let init_entry = self.init_state.clone();
         let (converged_entry, converged_init) =
             self.converge_loop_states(body, entry_state, init_entry);
+        self.abort_obligation_branch(speculative);
         self.move_state = converged_entry;
         self.init_state = converged_init;
+
+        let br = self.begin_obligation_branch();
         self.check_stmt(body);
+        let body_arm = self.end_obligation_arm(&br);
+        self.join_obligation_loop(br, body_arm);
 
         self.context.exit_loop();
         None
@@ -255,6 +274,33 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Some(HirType::Never)
     }
 
+    pub fn init_struct_with_uninit_fields(
+        &mut self,
+        root: StrId,
+        ty: &HirType<'a, 'bump>,
+        uninit: &[StrId],
+    ) {
+        let HirType::Struct { name, .. } = ty else {
+            return;
+        };
+        let Some(def) = self.context.get_struct(&str_id_to_string(*name)) else {
+            return;
+        };
+        let map = def
+            .fields
+            .iter()
+            .map(|f| {
+                let s = if uninit.contains(&f.name) {
+                    InitStatus::Uninitialized
+                } else {
+                    InitStatus::Initialized
+                };
+                (f.name, InitNode::Whole(s))
+            })
+            .collect();
+        self.init_state.insert(root, InitNode::Struct(map));
+    }
+
     pub fn check_let_stmt(
         &mut self,
         name: &StrId,
@@ -266,6 +312,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> Option<HirType<'a, 'bump>> {
         let var_name = str_id_to_string(*name);
         let is_wildcard = var_name == "_";
+
+        if let Some((r, p)) = self.static_field_path(value) {
+            if self.is_non_null(r, &p) {
+                self.mark_non_null(*name, &[]);
+            }
+        }
 
         if !is_wildcard && self.context.variables.contains_key(&var_name) {
             self.record(TypeErrorKind::VariableAlreadyExists {
@@ -287,10 +339,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let result = self.types_compatible(ty, &inner);
                     self.recover(result, ());
 
+                    let br = self.begin_obligation_branch();
+                    self.discharge_unbound_obligations();
+
                     let else_context = self.context.create_child_scope();
                     let old_context = std::mem::replace(&mut self.context, else_context);
-                    self.check_stmt(else_block);
+                    let else_ty = self.check_stmt(else_block);
                     self.context = old_context;
+
+                    let else_diverges = matches!(else_ty, Some(HirType::Never));
+                    let else_arm = self.end_obligation_arm(&br);
+                    self.restore_obligations(&br);
+                    let cont_arm = self.end_obligation_arm(&br);
+                    self.join_obligation_arms(
+                        br,
+                        vec![(else_arm, else_diverges), (cont_arm, false)],
+                    );
                 }
                 _ => {
                     self.record(TypeErrorKind::Generic(format!(
@@ -327,10 +391,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         } else {
             self.mark_whole_init(*name);
             if let HirExpr::StructInit { args, .. } = value {
-                for fi in args.iter() {
-                    if matches!(fi.value, HirExpr::Uninit { .. }) {
-                        self.mark_field_uninit(*name, &[fi.name]);
-                    }
+                let uninit: Vec<StrId> = args
+                    .iter()
+                    .filter(|fi| matches!(fi.value, HirExpr::Uninit { .. }))
+                    .map(|fi| fi.name)
+                    .collect();
+                if !uninit.is_empty() {
+                    self.init_struct_with_uninit_fields(*name, ty, &uninit);
                 }
             }
         }
@@ -375,6 +442,33 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
+        self.bind_obligations_to(*name);
+
         None
+    }
+
+    pub fn abort_obligation_branch(&mut self, br: ObligationBranch) {
+        let prev = self.suppress_errors;
+        self.suppress_errors = true;
+        let _ = self.end_obligation_arm(&br);
+
+        self.suppress_errors = prev;
+        self.restore_obligations(&br);
+        self.obligation_branches.pop();
+    }
+
+    pub fn discharge_unbound_obligations(&mut self) {
+        let idxs: Vec<usize> = self
+            .borrow_obligations
+            .iter()
+            .enumerate()
+            .filter(|(_, ob)| {
+                !ob.discharged && matches!(ob.holder, Holder::Pending | Holder::InFlight(_))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in idxs {
+            self.discharge(i);
+        }
     }
 }
