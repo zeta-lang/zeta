@@ -1,6 +1,6 @@
 use crate::{
     ast::{self, MutabilityState},
-    hir::{self, HirType, Operator, RefKind, StrId},
+    hir::{self, HirFunc, HirParam, HirType, Operator, RefKind, StrId},
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -232,4 +232,33 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&elem_suf))
         }
     })
+}
+
+pub fn hir_contains_this(ty: &HirType) -> bool {
+    match ty {
+        HirType::This => true,
+        HirType::Nullable(i) | HirType::Slice(i) | HirType::Array(i, _) => hir_contains_this(i),
+        HirType::Ref { inner, .. }
+        | HirType::SafePointer { inner, .. }
+        | HirType::UnsafePointer { inner, .. }
+        | HirType::OwnedPointer { inner, .. } => hir_contains_this(inner),
+        HirType::Tuple(ts) => ts.iter().any(hir_contains_this),
+        HirType::Struct { type_args, .. }
+        | HirType::Enum { type_args, .. }
+        | HirType::DynInterface(_, type_args) => type_args.iter().any(hir_contains_this),
+        HirType::Dyn { bounds } => bounds.iter().any(hir_contains_this),
+        HirType::Lambda {
+            params,
+            return_type,
+        } => params.iter().any(hir_contains_this) || hir_contains_this(return_type),
+        _ => false,
+    }
+}
+
+pub fn sig_contains_this(f: &HirFunc) -> bool {
+    f.return_type.as_ref().is_some_and(hir_contains_this)
+        || f.params.unwrap_or_default().iter().any(|p| match p {
+            HirParam::Normal { param_type, .. } => hir_contains_this(param_type),
+            _ => false,
+        })
 }
