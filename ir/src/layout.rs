@@ -88,15 +88,12 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
         SsaType::I32 | SsaType::U32 | SsaType::F32 => Ok(Layout { size: 4, align: 4 }),
         SsaType::I64 | SsaType::U64 | SsaType::F64 => Ok(Layout { size: 8, align: 8 }),
 
-        SsaType::Slice(_) => Ok(Layout {
-            size: 24, // data ptr (8) + len (8) + capacity (8)
-            align: 8,
-        }),
+        SsaType::Slice(_) => Ok(Layout { size: 16, align: 8 }),
 
         SsaType::Dyn => Ok(Layout { size: 8, align: 8 }),
 
         // Tuples/structs: sequential fields with padding between and at end to struct align.
-        SsaType::Tuple(fields) | SsaType::User(_, fields) => {
+        SsaType::Tuple(fields) | SsaType::User(_, _,  fields) => {
             let mut off = 0usize;
             let mut max_align = 1usize;
             for fty in fields {
@@ -129,13 +126,13 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
             size: 16,
             align: 16,
         }),
-        SsaType::Pointer(_) => Ok(Layout {
+        SsaType::Pointer(_, _) => Ok(Layout {
             size: target.ptr_bytes as usize,
             align: target.ptr_bytes as usize,
         }),
         SsaType::Null => Ok(Layout { size: 0, align: 1 }),
         SsaType::Char => Ok(Layout { size: 4, align: 4 }),
-        SsaType::Interface(_str_id) => todo!(),
+        SsaType::Interface(_str_id, _) => todo!(),
         SsaType::Nullable(inner) => {
             if inner.is_pointer() {
                 layout_of_ssa(inner, target)
@@ -154,8 +151,9 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
             size: sizeof_ssa(ssa_type, TargetInfo { ptr_bytes: 8 })? * length,
             align: 8,
         }),
+
         SsaType::Owned(inner) => match inner.as_ref() {
-            SsaType::Slice(_) => layout_of_ssa(inner, target),
+            SsaType::Slice(_) => Ok(Layout { size: 24, align: 8 }),
             _ => Ok(Layout {
                 size: target.ptr_bytes as usize,
                 align: target.ptr_bytes as usize,
