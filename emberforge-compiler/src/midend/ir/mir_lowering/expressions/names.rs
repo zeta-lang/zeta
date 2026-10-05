@@ -6,13 +6,13 @@ use zetaruntime::intern_fmt;
 
 use crate::{midend::ir::mir_lowering::FunctionLowerer, optimized_string_buffering};
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn resolve_receiver_target_key(&self, ty: &SsaType) -> Option<StrId> {
         match ty {
-            SsaType::User(name, _) => Some(*name),
-            SsaType::Enum { name, .. } => Some(*name),
-            SsaType::Interface(name) => Some(*name),
-            SsaType::Pointer(inner) | SsaType::Owned(inner) => {
+            SsaType::User(name, _,  _) => Some(*name),
+            SsaType::Enum { name, unmangled_name: _, .. } => Some(*name),
+            SsaType::Interface(name, _) => Some(*name),
+            SsaType::Pointer(_, inner) | SsaType::Owned(inner) => {
                 self.resolve_receiver_target_key(inner)
             }
             other => self.builtin_target_key(other),
@@ -20,7 +20,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     }
 
     pub(super) fn builtin_target_key(&self, ty: &SsaType) -> Option<StrId> {
-        let prim = |s: &str| Some(StrId(self.context.thread_local().intern(s)));
+        let prim = |s: &str| Some(StrId(self.context.intern(s)));
 
         match ty {
             SsaType::I8 => prim("i8"),
@@ -42,7 +42,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             SsaType::Char => prim("char"),
             SsaType::Slice(elem) | SsaType::Array(elem, _) => {
                 let elem_key = match elem.as_ref() {
-                    SsaType::User(n, _) => Some(*n),
+                    SsaType::User(n, _,  _) => Some(*n),
                     other => self.builtin_target_key(other),
                 };
                 if let Some(ek) = elem_key {
@@ -130,7 +130,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 let pkg_str = pkg.to_string();
                 let segments: Vec<StrId> = pkg_str
                     .split("::")
-                    .map(|s| StrId(self.context.thread_local().intern(s)))
+                    .map(|s| StrId(self.context.intern(s)))
                     .collect();
                 optimized_string_buffering::build_module_scoped_name(
                     &segments,
@@ -206,7 +206,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             let pkg_str = pkg.to_string();
                             let segments: Vec<StrId> = pkg_str
                                 .split("::")
-                                .map(|s| StrId(self.context.thread_local().intern(s)))
+                                .map(|s| StrId(self.context.intern(s)))
                                 .collect();
                             optimized_string_buffering::build_module_scoped_name(
                                 &segments,
