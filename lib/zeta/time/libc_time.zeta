@@ -1,3 +1,5 @@
+package zeta::time::libc_time;
+
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
@@ -19,3 +21,14 @@ extern "C" func clock_nanosleep(
     request: [*]const Timespec,
     remain: [*]mut Timespec
 ): i32;
+
+
+// Linux/POSIX clock IDs.
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+
+// clock_nanosleep flags.
+
+const TIMER_ABSTIME: i32 = 1;
+const TIMER_RELATIVE: i32 = 0;
