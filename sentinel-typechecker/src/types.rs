@@ -42,6 +42,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if matches!(a, Generic(_)) || matches!(b, Generic(_)) {
             return true;
         }
+
         match (a, b) {
             (Nullable(inner), n_b) => self.types_structurally_equal(inner, n_b),
             (n_a, Nullable(inner)) => self.types_structurally_equal(n_a, inner),
@@ -82,6 +83,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 // type regardless of which place each one happens to alias.
                 ma == mb && self.types_structurally_equal(ia, ib)
             }
+            #[allow(unreachable_patterns)]
             (Nullable(ia), Nullable(ib)) => self.types_structurally_equal(ia, ib),
             (
                 SafePointer {
@@ -178,6 +180,55 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
+        if let HirType::Ref { inner, .. } = expected {
+            if matches!(**inner, HirType::String) && matches!(found, HirType::String) {
+                return Ok(());
+            }
+        }
+
+        if matches!(expected, HirType::String) {
+            if let HirType::Ref { inner, .. } = found {
+                if matches!(**inner, HirType::String) {
+                    return Ok(());
+                }
+            }
+        }
+
+        if let HirType::Ref {
+            inner: ei,
+            ref_kind: erk,
+            ..
+        } = expected
+        {
+            if let HirType::Slice(es) = &**ei {
+                match found {
+                    HirType::Slice(fs) if self.types_structurally_equal(es, fs) => return Ok(()),
+                    HirType::Ref {
+                        inner: fi,
+                        ref_kind: frk,
+                        ..
+                    } => {
+                        if let HirType::Array(fe, _) | HirType::Slice(fe) = &**fi {
+                            if self.types_structurally_equal(es, fe) && frk.coerces_to(*erk) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let HirType::Slice(es) = expected {
+            if let HirType::Ref { inner: fi, .. } = found {
+                if let HirType::Array(fe, _) | HirType::Slice(fe) = &**fi {
+                    if self.types_structurally_equal(es, fe) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         if let (HirType::OwnedPointer { inner: ei, .. }, HirType::OwnedPointer { inner: fi, .. }) =
             (expected, found)
         {
@@ -202,11 +253,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
         ) = (found, expected)
         {
-            let mutability_ok = match ref_kind {
-                RefKind::Unique | RefKind::Alias => true,
-                RefKind::Shared => *mutability_state == MutabilityState::Const,
+            let elem: &HirType<'a, 'bump> = match &**ri {
+                HirType::Array(e, _) | HirType::Slice(e) => e,
+                other => other,
             };
-            if mutability_ok && self.types_structurally_equal(ri, pi) {
+            // `&` may only become a const pointer; otherwise a shared borrow could be written through.
+            let mut_ok =
+                *ref_kind != RefKind::Shared || *mutability_state == MutabilityState::Const;
+            if mut_ok
+                && (self.types_structurally_equal(ri, pi)
+                    || self.types_structurally_equal(elem, pi))
+            {
                 return Ok(());
             }
         }
@@ -364,7 +421,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     .1
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
-                match self.peek_type(object) {
+                match Self::peel_indirections(self.peek_type(object)) {
                     HirType::Struct {
                         name: struct_name,
                         type_args,
