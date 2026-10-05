@@ -86,11 +86,7 @@ where
 
         let auto_imports = Rc::new(RefCell::new(AutoImportRegistry::new()));
 
-        let cpy_ctx = Rc::new(RefCell::new(CopyAnalysisCtx::new(
-            &[],
-            registry.clone(),
-            pool.clone(),
-        )));
+        let cpy_ctx = Rc::new(RefCell::new(CopyAnalysisCtx::new(&[], registry.clone())));
         let type_checker = Rc::new(RefCell::new(TypeChecker::new(
             dep_graph,
             lowerer_bump_ref,
@@ -501,6 +497,10 @@ where
             .collect();
 
         let mut lowered = lowerer.lower_all_modules(&module_stmts, order);
+
+        self.type_checker
+            .borrow_mut()
+            .check_attributes(&lowerer.ctx.attrs.borrow());
 
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {

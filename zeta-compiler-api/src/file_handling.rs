@@ -177,16 +177,17 @@ pub(crate) fn emit_all<'a, 'bump>(
 ) where
     'bump: 'a,
 {
-    let glue_registry = DropGlueRegistry::new(&registry, pool.clone());
+    let glue_registry = DropGlueRegistry::new(registry.clone(), pool.clone());
 
     let mir_module: Module = MirModuleLowerer::new(
         pool.clone(),
         extern_c_names.clone(),
         dep_graph,
         0, // sentinel, it's overwritten
-        &glue_registry,
+        glue_registry,
         registry.instantiated_functions.clone(),
         registry.struct_methods.clone(),
+        registry.clone(),
     )
     .lower_all_modules(hir_modules, compilation_order);
 
