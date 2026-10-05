@@ -12,7 +12,7 @@ public interface Copy {
 // Unlike `Copy`, cloning is never implicit and must be spelled out with a
 // call to `.clone()`.
 public interface Clone {
-    func clone(&this): this;
+    func clone(&this): This;
 }
 
 // Types that need to run cleanup logic before their storage is reclaimed,
@@ -29,13 +29,27 @@ public interface Drop {
 // For example:
 //     a.eq(b)
 //     a.ne(b)
-// public interface PartialEq {
-//     func eq(&this, other: &this): bool;
-//     func ne(&this, other: &this): bool;
-// }
+public interface PartialEq {
+    func eq(&this, other: &This): bool;
+    func ne(&this, other: &This): bool;
+}
 
 // Marker meaning equality is an equivalence relation for this type.
 //
 // A type implementing Eq should also implement PartialEq.
 public interface Eq {
+}
+
+// Auto marker: a value of this type can be moved to another thread.
+// Derived structurally by the compiler (see `auto_traits.rs`). Raw pointers
+// opt out, so wrappers over them need `unsafe impl X by Send`.
+public interface Send {
+}
+
+// Auto marker: `&T` can be shared between threads (so `&T: Send` if `T: Sync`).
+public interface Sync {
+}
+
+public interface Hash {
+    func hash(&this): usize;
 }
