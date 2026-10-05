@@ -63,9 +63,11 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         if (this.data.len == 0) {
             return null;
         }
-        this.data.len -= 1;
-        let ptr: [*]mut T = this.data as [*]mut T;
-        return unsafe { ptr[this.data.len] };
+        return unsafe {
+            this.data.len -= 1;
+            let ptr: [*]mut T = this.data as [*]mut T;
+            ptr[this.data.len]
+        };
     }
 
     func get(&this, index: usize): &T {
@@ -94,12 +96,12 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
 
     unsafe func get_unchecked(&this, index: usize): &T {
         let ptr: *const T = this.data as *const T;
-        unsafe { return &*ptr[index] };
+        unsafe { return &ptr[index] };
     }
 
     unsafe func get_unchecked_mut(&mut this, index: usize): &mut T {
         let ptr: *mut T = this.data as *mut T;
-        unsafe { return &mut *ptr[index] };
+        unsafe { return &mut ptr[index] };
     }
 
     func grow(&mut this) {
@@ -118,6 +120,13 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
     }
 
     func clear(&mut this) {
-        this.data.len = 0;
+        let ptr: [*]mut T = this.data as [*]mut T;
+
+        while (this.data.len > 0) {
+            unsafe {
+                this.data.len -= 1;
+                $drop_in_place(&mut ptr[this.data.len]);
+            }
+        }
     }
 }
