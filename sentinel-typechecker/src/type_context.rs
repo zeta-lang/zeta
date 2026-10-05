@@ -6,7 +6,7 @@ use ir::{
 use std::{cell::RefCell, sync::Arc};
 use zetaruntime::{bump::GrowableBump, string_pool::StringPool};
 
-use crate::type_checker::SymbolId;
+use crate::type_checker::{ImplCondition, SymbolId};
 
 #[derive(Debug, Clone, Default)]
 pub struct TypeMethodTable<'a, 'bump> {
@@ -55,6 +55,7 @@ pub struct TypeContext<'a, 'bump> {
             &'bump [(StrId, &'bump [HirType<'a, 'bump>])],
         )>,
     >,
+    pub conditional_impls: HashMap<(String, String), Vec<ImplCondition<'a, 'bump>>>,
 }
 
 impl<'a, 'bump> TypeContext<'a, 'bump> {
@@ -84,6 +85,7 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
             interface_owner_module: HashMap::default(),
             generic_struct_instantiations: RefCell::new(Vec::new()),
             generic_enum_instantiations: RefCell::new(Vec::new()),
+            conditional_impls: HashMap::default(),
         }
     }
 
@@ -288,6 +290,38 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
 
         StrId(self.string_pool.intern(&joined))
     }
+
+    pub fn add_conditional_impl(
+        &mut self,
+        target: &str,
+        interface: &str,
+        cond: ImplCondition<'a, 'bump>,
+    ) {
+        let key = (
+            target.to_string(),
+            interface
+                .rsplit("::")
+                .next()
+                .unwrap_or(interface)
+                .to_string(),
+        );
+        let v = self.conditional_impls.entry(key).or_default();
+        if !v.contains(&cond) {
+            v.push(cond);
+        }
+    }
+
+    pub fn conditional_impls_for(
+        &self,
+        target: &str,
+        interface: &str,
+    ) -> Vec<ImplCondition<'a, 'bump>> {
+        self.conditional_impls
+            .get(&(target.to_string(), interface.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn create_child_scope(&self) -> Self {
         Self {
             variables: self.variables.clone(),
@@ -310,6 +344,7 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
             interface_owner_module: self.interface_owner_module.clone(),
             generic_struct_instantiations: self.generic_struct_instantiations.clone(),
             generic_enum_instantiations: self.generic_enum_instantiations.clone(),
+            conditional_impls: self.conditional_impls.clone(),
         }
     }
 }
