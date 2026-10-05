@@ -7,7 +7,7 @@ use ir::{
 
 use crate::midend::ir::mir_lowering::{FunctionLowerer, lowerer::fun_name};
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn lower_field_access_expr(
         &mut self,
         object: &HirExpr<'a, 'bump>,
@@ -57,8 +57,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
 
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _)) => *name,
-            Some(SsaType::Pointer(inner)) => fun_name(inner),
+            Some(SsaType::User(name, _,  _)) => *name,
+            Some(SsaType::Pointer(_, inner)) => fun_name(inner),
             other => panic!(
                 "Could not determine object's struct for FieldAccess: {:?} at span {span}",
                 other
@@ -105,7 +105,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             let addr_ty = if field_type.is_tagged_nullable() {
                 field_type
             } else {
-                SsaType::Pointer(Box::new(field_type))
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(field_type))
             };
             self.current_block_data.value_types.insert(addr, addr_ty);
             return addr;
@@ -201,9 +201,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         if matches!(op, AssignmentOperator::Assign) {
             let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-                Some(SsaType::User(name, _)) => Some(*name),
-                Some(SsaType::Pointer(inner)) => {
-                    if let SsaType::User(name, _) = inner.as_ref() {
+                Some(SsaType::User(name, _,  _)) => Some(*name),
+                Some(SsaType::Pointer(_, inner)) => {
+                    if let SsaType::User(name, _,  _) = inner.as_ref() {
                         Some(*name)
                     } else {
                         None
@@ -241,7 +241,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                                 });
                                 self.current_block_data.value_types.insert(
                                     field_addr,
-                                    SsaType::Pointer(Box::new(lower_type_hir(
+                                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(lower_type_hir(
                                         &f.field_type,
                                         self.enums,
                                         self.structs,
@@ -318,7 +318,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
             self.current_block_data
                 .value_types
-                .insert(ptr_val, SsaType::Pointer(Box::new(SsaType::I8)));
+                .insert(ptr_val, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::I8)));
             self.current_block_data
                 .value_types
                 .insert(len_val, SsaType::Usize);
@@ -394,8 +394,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
     pub(crate) fn get_field_offset(&mut self, obj: &Value, field: StrId) -> usize {
         let cls_name = match self.current_block_data.value_types.get(obj) {
-            Some(SsaType::User(name, _)) => name,
-            Some(SsaType::Pointer(inner)) => &fun_name(inner),
+            Some(SsaType::User(name, _,  _)) => name,
+            Some(SsaType::Pointer(_, inner)) => &fun_name(inner),
             Some(SsaType::Owned(inner)) => &fun_name(inner),
             other => panic!(
                 "Could not determine object's struct for FieldAccess: {:?}",

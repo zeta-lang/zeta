@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirEnum, HirExpr, HirFieldInit, StrId},
+    hir::{HirEnum, HirExpr, HirFieldInit, HirType, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
     span::SourceSpan,
@@ -11,7 +11,7 @@ use crate::{
     optimized_string_buffering,
 };
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn try_lower_bare_enum_variant(
         &mut self,
         enum_name: &StrId,
@@ -99,6 +99,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             dest: obj,
             ty: SsaType::Enum {
                 name: resolved_enum_name,
+                unmangled_name: resolved_enum_name,
                 variants: lowered_variants.clone(),
             },
             count: 1,
@@ -107,6 +108,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             obj,
             SsaType::Enum {
                 name: resolved_enum_name,
+                unmangled_name: resolved_enum_name,
                 variants: lowered_variants,
             },
         );
@@ -162,7 +164,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
             .collect();
 
-        let mut inits: Vec<(StrId, SsaType, FieldInitVal)> = Vec::with_capacity(args.len());
+        // (field name, lowered type, is ref/pointer field, lowered init value)
+        let mut inits: Vec<(StrId, SsaType, bool, FieldInitVal)> = Vec::with_capacity(args.len());
         for arg in args {
             let idx = hir_struct
                 .fields
@@ -171,15 +174,23 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 .unwrap_or_else(|| {
                     panic!("Struct {} has no field {} at {span}", struct_name, arg.name)
                 });
+            let hir_field = &hir_struct.fields[idx];
             let field_ty = field_types[idx].clone();
+            let is_ref_field = matches!(
+                field_ty,
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, _)
+            ) || matches!(
+                hir_field.field_type,
+                HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            );
             if Self::is_move_by_value(&field_ty) {
                 self.record_arg_move(&arg.value);
             }
             let init = self.lower_init_operand(&arg.value, &field_ty);
-            inits.push((arg.name, field_ty, init));
+            inits.push((arg.name, field_ty, is_ref_field, init));
         }
 
-        let alloc_ty = SsaType::User(struct_name, field_types);
+        let alloc_ty = SsaType::User(struct_name, hir_struct.unmangled_name, field_types);
         let obj = self.new_value();
         self.emit(Instruction::StackAlloc {
             dest: obj,
@@ -192,11 +203,19 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let offsets = offsets_map
             .get(&struct_name)
             .unwrap_or_else(|| panic!("Unknown struct {} when initializing", struct_name));
-        for (fname, fty, init) in inits {
+        for (fname, fty, is_ref_field, init) in inits {
             let offset = *offsets
                 .get(&fname)
                 .unwrap_or_else(|| panic!("Unknown field {} on struct {}", fname, struct_name));
-            self.store_init(obj, offset, &fty, init);
+
+            match init {
+                FieldInitVal::Val(v) if is_ref_field => {
+                    // v is already an address (aggregates are represented by their address).
+                    // Store it as a pointer word
+                    self.store_ref_field_value(obj, offset, v)
+                }
+                other => self.store_init(obj, offset, &fty, other),
+            }
         }
 
         self.store_vtable_if_any(obj, struct_name);
