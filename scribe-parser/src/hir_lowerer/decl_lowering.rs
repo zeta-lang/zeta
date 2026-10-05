@@ -6,7 +6,7 @@ use ir::ast::{
     StructDecl,
 };
 use ir::hir::{
-    ConstStmt, EffectIndexKey, HirEffectAccess, HirEffectSegment, HirEnum, HirEnumVariant,
+    ConstStmt, EffectIndexKey, Hir, HirEffectAccess, HirEffectSegment, HirEnum, HirEnumVariant,
     HirField, HirFunc, HirGeneric, HirImpl, HirInterface, HirParam, HirStmt, HirStruct, HirType,
     StrId, ThisPassingKind,
 };
@@ -16,6 +16,80 @@ use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
+    fn with_params_in_scope<R>(
+        &self,
+        params: Option<&[HirParam<'a, 'bump>]>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let mut saved: Vec<(StrId, Option<HirType<'a, 'bump>>)> = Vec::new();
+        for p in params.unwrap_or(&[]) {
+            if let HirParam::Normal {
+                name, param_type, ..
+            } = p
+            {
+                let prev = self
+                    .ctx
+                    .variable_types
+                    .borrow_mut()
+                    .insert(*name, *param_type);
+                saved.push((*name, prev));
+            }
+        }
+        let r = f();
+        for (name, prev) in saved.into_iter().rev() {
+            let mut vt = self.ctx.variable_types.borrow_mut();
+            match prev {
+                Some(t) => {
+                    vt.insert(name, t);
+                }
+                None => {
+                    vt.remove(&name);
+                }
+            }
+        }
+        r
+    }
+
+    pub(super) fn lower_free_func_item(&mut self, f: &FuncDecl<'a, 'bump>) -> Hir<'a, 'bump> {
+        let generics = self.lower_generics_slice(f.generics.unwrap_or_default());
+        if let Some(gs) = generics {
+            for g in gs {
+                self.add_generic_param(g.name);
+            }
+        }
+
+        let is_extern = matches!(
+            f.function_metadata.extern_modifier,
+            ir::ast::ExternModifier::Abi(_)
+        );
+        let is_main = f.name.eq("main");
+        let lookup_name = if is_extern || is_main {
+            f.name
+        } else {
+            self.mangle_with_module_path(f.name)
+        };
+        let params = self
+            .ctx
+            .functions
+            .borrow()
+            .get(&lookup_name)
+            .and_then(|p| p.params);
+
+        let lowered_body =
+            self.with_params_in_scope(params, || f.body.map(|b| self.lower_block(b)));
+
+        if let Some(gs) = generics {
+            for g in gs {
+                self.remove_generic_param(g.name);
+            }
+        }
+
+        let mut fb = self.ctx.functions.borrow_mut();
+        let func = fb.get_mut(&lookup_name).unwrap();
+        func.body = lowered_body;
+        Hir::Func(self.ctx.bump.alloc_value(func.clone()))
+    }
+
     pub(super) fn lower_func_body_from_proto(
         &mut self,
         func: FuncDecl<'a, 'bump>,
@@ -48,13 +122,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        let body = func.body.map(|b| {
-            let stmts: Vec<HirStmt<'a, 'bump>> =
-                b.block.into_iter().map(|s| self.lower_stmt(*s)).collect();
-            HirStmt::Block {
-                body: self.ctx.bump.alloc_slice(&stmts),
-                span: b.span,
-            }
+        let body = self.with_params_in_scope(proto.params, || {
+            func.body.map(|b| {
+                let stmts: Vec<HirStmt<'a, 'bump>> =
+                    b.block.into_iter().map(|s| self.lower_stmt(*s)).collect();
+                HirStmt::Block {
+                    body: self.ctx.bump.alloc_slice(&stmts),
+                    span: b.span,
+                }
+            })
         });
 
         if let Some(gs) = generics {
@@ -161,6 +237,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
+        let mangled = self.ctx.mangle_type_name(c.name);
+        let own_args: Vec<HirType<'a, 'bump>> = generics
+            .map(|gs| gs.iter().map(|g| HirType::Generic(g.name)).collect())
+            .unwrap_or_default();
+        let prev_this = self.ctx.current_this_type.replace(Some(HirType::Struct {
+            name: mangled,
+            field_types: &[], // avoids a recursive type; the registry resolves by name
+            type_args: self.ctx.bump.alloc_slice(&own_args),
+        }));
+
         let fields_vec: Vec<HirField<'a, 'bump>> = c
             .params
             .unwrap_or_default()
@@ -168,6 +254,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             .map(|p| self.lower_field(p))
             .collect();
         let fields = self.ctx.bump.alloc_slice(&fields_vec);
+        self.ctx.current_this_type.replace(prev_this);
 
         if let Some(gs) = generics {
             for g in gs {
@@ -176,10 +263,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
 
         HirStruct {
-            name: self.ctx.mangle_type_name(c.name),
+            name: mangled,
             visibility: lower_visibility(&c.visibility),
             generics,
             fields,
+            unmangled_name: c.name,
         }
     }
 
@@ -198,7 +286,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub fn lower_interface_decl(&mut self, i: InterfaceDecl<'a, 'bump>) -> HirInterface<'a, 'bump> {
         let is_builtin = matches!(
             i.name.as_str(),
-            "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator"
+            "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator" | "Send" | "Sync"
         );
 
         let interface_name = if is_builtin && !self.ctx.interfaces.borrow().contains_key(&i.name) {
@@ -235,6 +323,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             } else {
                 Some(generics.unwrap())
             },
+            unmangled_name: i.name,
         }
     }
 
@@ -288,20 +377,20 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             None => (None, None),
         };
 
-        let self_type_args: Vec<HirType<'a, 'bump>> = generics
-            .map(|gs| gs.iter().map(|g| HirType::Generic(g.name)).collect())
+        let generic_names: Vec<StrId> = generics
+            .map(|gs| gs.iter().map(|g| g.name).collect())
             .unwrap_or_default();
-
-        let self_ty = self.impl_target_self_type(target_key, target_kind, &self_type_args);
+        let self_ty =
+            self.impl_self_type(&i.target, target_key, target_kind, &generic_names, i.span);
 
         let methods_vec: Vec<HirFunc<'a, 'bump>> = i
             .methods
             .unwrap_or_default()
             .into_iter()
             .map(|f| {
-                let prev_self = self.ctx.current_self_type.replace(Some(self_ty));
+                let prev_self = self.ctx.current_this_type.replace(Some(self_ty));
                 let mut func = self.lower_func_body_from_proto(*f, Some(target_key));
-                self.ctx.current_self_type.replace(prev_self);
+                self.ctx.current_this_type.replace(prev_self);
                 func.generics = Self::merge_generics(generics, func.generics, self.ctx.bump);
                 func
             })
@@ -329,10 +418,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             } else {
                 Some(methods)
             },
+            is_unsafe: i.is_unsafe,
         }
     }
 
-    fn impl_target_self_type(
+    pub fn impl_target_self_type(
         &self,
         target_key: StrId,
         target_kind: ImplTargetKind,
@@ -385,7 +475,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
     }
 
-    fn lower_impl_type_args(
+    pub fn lower_impl_type_args(
         &self,
         ty: &ir::ast::Type<'a, 'bump>,
         span: SourceSpan<'a>,
@@ -427,6 +517,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
+        let mangled = self.ctx.mangle_type_name(e.name);
+        let own_args: Vec<HirType<'a, 'bump>> = generics
+            .map(|gs| gs.iter().map(|g| HirType::Generic(g.name)).collect())
+            .unwrap_or_default();
+        let prev_this = self.ctx.current_this_type.replace(Some(HirType::Enum {
+            name: mangled,
+            type_args: self.ctx.bump.alloc_slice(&own_args),
+            variants: &[],
+        }));
+
         let variants_vec: Vec<HirEnumVariant<'a, 'bump>> = e
             .variants
             .into_iter()
@@ -452,6 +552,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             })
             .collect();
         let variants: &[HirEnumVariant<'a, 'bump>] = self.ctx.bump.alloc_slice(&variants_vec);
+        self.ctx.current_this_type.replace(prev_this);
 
         if let Some(gs) = generics {
             for g in gs {
@@ -460,10 +561,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
 
         HirEnum {
-            name: self.ctx.mangle_type_name(e.name),
+            name: mangled,
             visibility: lower_visibility(&e.visibility),
             generics,
             variants,
+            unmangled_name: e.name,
         }
     }
 
