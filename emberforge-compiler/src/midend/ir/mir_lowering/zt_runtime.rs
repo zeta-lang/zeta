@@ -6,7 +6,7 @@ use ir::{
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 use smallvec::smallvec;
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// Emits a call to the runtime's `__zeta_memset(ptr, value, size)`.
     pub(super) fn emit_memset(&mut self, ptr: Value, value: i64, size: usize) {
         let memset_fn = StrId::from_static("__zeta_memset");
