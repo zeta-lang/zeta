@@ -12,7 +12,7 @@ public interface Copy {
 // Unlike `Copy`, cloning is never implicit and must be spelled out with a
 // call to `.clone()`.
 public interface Clone {
-    func clone(&this): this;
+    func clone(&this): This;
 }
 
 // Types that need to run cleanup logic before their storage is reclaimed,
