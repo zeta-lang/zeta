@@ -15,6 +15,44 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         args: &&[HirExpr<'a, 'bump>],
     ) -> HirType<'a, 'bump> {
         match kind {
+            IntrinsicKind::AssumeInit => {
+                if !type_args.is_empty() {
+                    self.record(TypeErrorKind::Generic(
+                        "$assume_init takes no type arguments".into(),
+                    ));
+                }
+                if !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                    "$assume_init requires an unsafe block: marking a place initialized that is not \
+                     is undefined behavior if it is later read"
+                        .into(),
+                ));
+                }
+                if args.len() != 1 {
+                    self.record(TypeErrorKind::InvalidFunctionCall {
+                        expected_args: 1,
+                        found_args: args.len(),
+                    });
+                    return HirType::Void;
+                }
+                if !matches!(
+                    &args[0],
+                    HirExpr::Ident(..)
+                        | HirExpr::FieldAccess { .. }
+                        | HirExpr::Get { .. }
+                        | HirExpr::Index { .. }
+                        | HirExpr::Slice { .. }
+                ) {
+                    self.record(TypeErrorKind::Generic(
+                    "$assume_init's argument must be a place (variable, field, index, or slice)".into(),
+                ));
+                    return HirType::Void;
+                }
+                // Suppressed so naming the uninit place isn't itself an error. Not a move: no value-use.
+                let _ = self.check_expr_suppressed(&args[0]);
+                self.optimistically_mark_mut_target_init(&args[0]);
+                HirType::Void
+            }
             IntrinsicKind::FnPtr => {
                 let t = self.check_expr(&args[0]);
                 let HirType::Struct { name, .. } = t else {
@@ -309,18 +347,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             self.context.struct_implements(&struct_name, "RawAllocator")
                                 || self.context.struct_implements(&struct_name, "Allocator")
                         }
-                        HirType::Generic(param_name) => self
-                            .current_fn
-                            .and_then(|fname| self.context.get_function(&str_id_to_string(fname)))
-                            .and_then(|f| f.generics)
-                            .and_then(|gs| gs.iter().find(|g| g.name == *param_name))
-                            .is_some_and(|g| {
-                                g.constraints.iter().any(|c| matches!(
-                                    c,
-                                    HirType::DynInterface(iface, _)
-                                        if iface.as_str() == "RawAllocator" || iface.as_str() == "Allocator"
-                                ))
-                            }),
+                        HirType::Generic(p) => self
+                            .generic_bounds
+                            .get(p)
+                            .is_some_and(|names| names.iter().any(|n| n.ends_with("Allocator"))),
                         _ => false,
                     };
 
@@ -449,110 +479,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 HirType::Void
             }
-            IntrinsicKind::AtomicCasU32 => {
-                if !self.in_unsafe() {
-                    self.record(TypeErrorKind::Generic(
-                        "$atomic_cas_u32 requires an unsafe block".to_string(),
-                    ));
-                }
-                if args.len() != 3 {
-                    self.record(TypeErrorKind::InvalidFunctionCall {
-                        expected_args: 3,
-                        found_args: args.len(),
-                    });
-                    return HirType::U32;
-                }
-                let ptr_ty = self.check_expr(&args[0]);
-                self.check_and_record_value_use(&args[0], &ptr_ty);
-                let points_to_u32 = matches!(
-                    Self::strip_ref(&ptr_ty),
-                    HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. }
-                        if matches!(**inner, HirType::U32)
-                );
-                if !points_to_u32 {
-                    self.record(TypeErrorKind::Generic(format!(
-                        "$atomic_cas_u32 expects a pointer to `u32`, found `{}`",
-                        type_to_string(&ptr_ty)
-                    )));
-                }
-                for a in &args[1..] {
-                    let t = self.check_expr(a);
-                    self.check_and_record_value_use(a, &t);
-                    if !matches!(t, HirType::U32) {
-                        self.record(TypeErrorKind::TypeMismatch {
-                            expected: "u32".to_string(),
-                            found: type_to_string(&t),
-                        });
-                    }
-                }
-                HirType::U32
-            }
-
-            IntrinsicKind::AtomicLoadU32 => {
-                if !self.in_unsafe() {
-                    self.record(TypeErrorKind::Generic(
-                        "$atomic_load_u32 requires an unsafe block".to_string(),
-                    ));
-                }
-                if args.len() != 1 {
-                    self.record(TypeErrorKind::InvalidFunctionCall {
-                        expected_args: 1,
-                        found_args: args.len(),
-                    });
-                    return HirType::U32;
-                }
-                let ptr_ty = self.check_expr(&args[0]);
-                self.check_and_record_value_use(&args[0], &ptr_ty);
-                let points_to_u32 = matches!(
-                    Self::strip_ref(&ptr_ty),
-                    HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. }
-                        if matches!(**inner, HirType::U32)
-                );
-                if !points_to_u32 {
-                    self.record(TypeErrorKind::Generic(format!(
-                        "$atomic_load_u32 expects a pointer to `u32`, found `{}`",
-                        type_to_string(&ptr_ty)
-                    )));
-                }
-                HirType::U32
-            }
-
-            IntrinsicKind::AtomicStoreU32 => {
-                if !self.in_unsafe() {
-                    self.record(TypeErrorKind::Generic(
-                        "$atomic_store_u32 requires an unsafe block".to_string(),
-                    ));
-                }
-                if args.len() != 2 {
-                    self.record(TypeErrorKind::InvalidFunctionCall {
-                        expected_args: 2,
-                        found_args: args.len(),
-                    });
-                    return HirType::Void;
-                }
-                let ptr_ty = self.check_expr(&args[0]);
-                self.check_and_record_value_use(&args[0], &ptr_ty);
-                let points_to_u32 = matches!(
-                    Self::strip_ref(&ptr_ty),
-                    HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. }
-                        if matches!(**inner, HirType::U32)
-                );
-                if !points_to_u32 {
-                    self.record(TypeErrorKind::Generic(format!(
-                        "$atomic_store_u32 expects a pointer to `u32`, found `{}`",
-                        type_to_string(&ptr_ty)
-                    )));
-                }
-                let val_ty = self.check_expr(&args[1]);
-                self.check_and_record_value_use(&args[1], &val_ty);
-                if !matches!(val_ty, HirType::U32) {
-                    self.record(TypeErrorKind::TypeMismatch {
-                        expected: "u32".to_string(),
-                        found: type_to_string(&val_ty),
-                    });
-                }
-                HirType::Void
-            }
             IntrinsicKind::DropInPlace => {
                 if type_args.len() > 1 {
                     self.record(TypeErrorKind::Generic(
@@ -576,6 +502,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
 
                 let ptr_ty = self.check_expr(&args[0]);
+                if matches!(
+                    &args[0],
+                    HirExpr::Index { .. } | HirExpr::FieldAccess { .. } | HirExpr::Get { .. }
+                ) && !matches!(
+                    Self::strip_ref(&ptr_ty),
+                    HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                ) {
+                    self.record(TypeErrorKind::Generic(
+                        "$drop_in_place needs an address: write `&mut place`, not the place itself"
+                            .into(),
+                    ));
+                    return HirType::Void;
+                }
+
                 let pointee = match &ptr_ty {
                     HirType::UnsafePointer {
                         inner,
@@ -620,6 +560,144 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 HirType::Void
             }
+
+            IntrinsicKind::AtomicLoad => self
+                .check_atomic_intrinsic("$atomic_load", type_args, args, 0, 1, false)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicStore => {
+                self.check_atomic_intrinsic("$atomic_store", type_args, args, 1, 1, false);
+                HirType::Void
+            }
+            IntrinsicKind::AtomicSwap => self
+                .check_atomic_intrinsic("$atomic_swap", type_args, args, 1, 1, false)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicCas => self
+                .check_atomic_intrinsic("$atomic_cas", type_args, args, 2, 2, false)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFetchAdd => self
+                .check_atomic_intrinsic("$atomic_fetch_add", type_args, args, 1, 1, true)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFetchSub => self
+                .check_atomic_intrinsic("$atomic_fetch_sub", type_args, args, 1, 1, true)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFetchAnd => self
+                .check_atomic_intrinsic("$atomic_fetch_and", type_args, args, 1, 1, true)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFetchOr => self
+                .check_atomic_intrinsic("$atomic_fetch_or", type_args, args, 1, 1, true)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFetchXor => self
+                .check_atomic_intrinsic("$atomic_fetch_xor", type_args, args, 1, 1, true)
+                .unwrap_or(HirType::Unknown),
+            IntrinsicKind::AtomicFence => {
+                if !type_args.is_empty() || !args.is_empty() {
+                    self.record(TypeErrorKind::Generic(
+                        "$atomic_fence takes no arguments".to_string(),
+                    ));
+                }
+                HirType::Void
+            }
         }
+    }
+
+    fn check_atomic_intrinsic(
+        &mut self,
+        name: &str,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+        value_args: usize,
+        ordering_args: usize,
+        integer_only: bool,
+    ) -> Option<HirType<'a, 'bump>> {
+        if type_args.len() != 1 {
+            self.record(TypeErrorKind::Generic(format!(
+                "{name} expects exactly 1 type argument, found {}",
+                type_args.len()
+            )));
+            return None;
+        }
+        if args.len() != 1 + value_args + ordering_args {
+            self.record(TypeErrorKind::InvalidFunctionCall {
+                expected_args: 1 + value_args,
+                found_args: args.len(),
+            });
+            return None;
+        }
+
+        let t = type_args[0];
+        let ok = matches!(t, HirType::Generic(_))
+            || self.is_integer(&t)
+            || (!integer_only
+                && matches!(
+                    t,
+                    HirType::Boolean | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                ));
+        if !ok {
+            self.record(TypeErrorKind::Generic(format!(
+                "{name} requires {}, found `{}`",
+                if integer_only {
+                    "an integer type"
+                } else {
+                    "an integer, `bool` or pointer type"
+                },
+                type_to_string(&t)
+            )));
+            return None;
+        }
+
+        let mutates = value_args > 0;
+        let ptr_ty = self.check_expr(&args[0]);
+        self.check_and_record_value_use(&args[0], &ptr_ty);
+        let pointee = match &ptr_ty {
+            HirType::Ref {
+                inner, ref_kind, ..
+            } => {
+                if mutates && *ref_kind != RefKind::Alias {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name} mutates through its pointer: pass `&alias place` \
+                         (not `&mut`/`&`; atomics are shared mutation)"
+                    )));
+                    return Some(t); // keep the result type so callers don't cascade
+                }
+                **inner
+            }
+            HirType::SafePointer {
+                inner,
+                mutability_state,
+            }
+            | HirType::UnsafePointer {
+                inner,
+                mutability_state,
+            } => {
+                if mutates && *mutability_state != ir::ast::MutabilityState::Mut {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name} needs a `mut` pointer"
+                    )));
+                    return Some(t);
+                }
+                **inner
+            }
+            _ => {
+                self.record(TypeErrorKind::Generic(format!(
+                    "{name} expects `&alias`, `&`, or a raw pointer, found `{}`",
+                    type_to_string(&ptr_ty)
+                )));
+                return Some(t);
+            }
+        };
+        self.recover(self.types_compatible(&t, &pointee), ());
+
+        for a in &args[1 + value_args..] {
+            let ot = self.check_expr(a);
+            let ok = matches!(Self::strip_ref(&ot), HirType::Enum { name, .. } if name.as_str().ends_with("Ordering"))
+                || matches!(ot, HirType::Unknown);
+            if !ok {
+                self.record(TypeErrorKind::Generic(format!(
+                    "{name}: expected an `Ordering`, found `{}`",
+                    type_to_string(&ot)
+                )));
+            }
+        }
+        Some(t)
     }
 }
