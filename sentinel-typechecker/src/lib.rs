@@ -1,5 +1,8 @@
+pub mod auto_traits;
+pub mod borrow_lifetime;
 pub mod borrowck;
 pub mod closures;
+pub mod concurrency;
 pub mod control_flow;
 pub mod expressions;
 pub mod initialization;
