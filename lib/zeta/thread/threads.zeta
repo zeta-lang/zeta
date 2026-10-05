@@ -7,6 +7,8 @@ import zeta::libc;
 import zeta::debug;
 import zeta::io;
 
+import zeta::lang::traits.Send;
+
 struct ThreadCtxHeader {
     invoke: &func(arg: [*]mut void): void,
 }
@@ -60,7 +62,7 @@ func reclaim_ctx<F: func(): R, R>(raw: [*]mut void, alloc: Mallocator): void {
         unsafe { $own(raw as [*]mut ThreadCtx<F, R, Mallocator>, alloc) };
 }
 
-func spawn<F: func(): R, R>(f: F): JoinHandle<R, Mallocator> {
+func spawn<F: Send + func(): R, R>(f: F): JoinHandle<R, Mallocator> {
     let alloc: Mallocator = Mallocator {};
 
     let slot: ^ResultSlot<R, Mallocator> =
