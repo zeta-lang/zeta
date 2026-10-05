@@ -1,0 +1,317 @@
+package zeta::utils::hash_map;
+
+import zeta::alloc::allocator.Allocator;
+import zeta::utils::mallocator.Mallocator;
+import zeta::lang::traits.Hash;
+import zeta::lang::traits.PartialEq;
+
+struct Entry<K, V> {
+    key: K,
+    value: V,
+    next: ?^Entry<K, V>,
+}
+
+struct HashMap<K: Hash + PartialEq, V, A: Allocator = Mallocator> {
+    buckets: ^this.alloc []?^Entry<K, V>,
+    alloc: A,
+}
+
+impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
+    func new(): HashMap<K, V, Mallocator> {
+        let alloc: Mallocator = Mallocator {};
+
+        return HashMap<K, V, Mallocator> {
+            buckets: alloc.calloc<?^Entry<K, V>>(16),
+            alloc,
+        };
+    }
+
+    func with_capacity(capacity: usize): HashMap<K, V, Mallocator> {
+        let alloc: Mallocator = Mallocator {};
+
+        let bucket_count: usize =
+            if (capacity < 1) {
+                1
+            } else {
+                capacity
+            };
+
+        return HashMap<K, V, Mallocator> {
+            buckets: alloc.calloc<?^Entry<K, V>>(bucket_count),
+            alloc,
+        };
+    }
+
+    func new_in(alloc: A): HashMap<K, V, A> {
+        return HashMap<K, V, A> {
+            buckets: alloc.calloc<?^Entry<K, V>>(16),
+            alloc,
+        };
+    }
+
+    func with_capacity_in(capacity: usize, alloc: A): HashMap<K, V, A> {
+        let bucket_count: usize =
+            if (capacity < 1) {
+                1
+            } else {
+                capacity
+            };
+
+        return HashMap<K, V, A> {
+            buckets: alloc.calloc<?^Entry<K, V>>(bucket_count),
+            alloc,
+        };
+    }
+
+    func len(&this): usize {
+        return this.buckets.len;
+    }
+
+    func cap(&this): usize {
+        return this.buckets.cap;
+    }
+
+    func is_empty(&this): bool {
+        return this.buckets.len == 0;
+    }
+
+    func insert(&mut this, key: K, value: V): ?V {
+        let bucket_count: usize = this.buckets.cap;
+        let index: usize = key.hash() % bucket_count;
+
+        // Replace an existing value.
+        let current: ?^Entry<K, V> = this.buckets[index];
+
+        match (current) {
+            case null -> {},
+            case mut node -> {
+                while (true) {
+                    if (node.key.eq(&key)) {
+                        let old_value: V = $replace(node.value, value);
+                        return old_value;
+                    }
+
+                    match (node.next) {
+                        case null -> {
+                            break;
+                        },
+                        case next_node -> {
+                            node = next_node;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keep the load factor at roughly <= 0.75.
+        if ((this.buckets.len + 1) * 4 > bucket_count * 3) {
+            this.grow();
+
+            let new_bucket_count: usize = this.buckets.cap;
+            let new_index: usize = key.hash() % new_bucket_count;
+
+            let node: ^Entry<K, V> = this.alloc.new<Entry<K, V>>(Entry<K, V> {
+                key: key,
+                value: value,
+                next: $replace(this.buckets[new_index], null),
+            });
+
+            this.buckets[new_index] = node;
+        } else {
+            let node: ^Entry<K, V> = this.alloc.new<Entry<K, V>>(Entry<K, V> {
+                key: key,
+                value: value,
+                next: $replace(this.buckets[index], null),
+            });
+
+            this.buckets[index] = node;
+        }
+
+        unsafe {
+            this.buckets.len += 1;
+        }
+        return null;
+    }
+
+    func get(&this, key: &K): ?&V {
+        let index: usize = key.hash() % this.buckets.cap;
+        let current: ?^Entry<K, V> = this.buckets[index];
+
+        match (current) {
+            case null -> {
+                return null;
+            },
+            case mut node -> {
+                while (true) {
+                    if (node.key.eq(key)) {
+                        return &node.value;
+                    }
+
+                    match (node.next) {
+                        case null -> {
+                            return null;
+                        },
+                        case next_node -> {
+                            node = next_node;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func get_mut(&mut this, key: &K): ?&mut V {
+        let index: usize = key.hash() % this.buckets.cap;
+        let current: ?^Entry<K, V> = this.buckets[index];
+
+        match (current) {
+            case null -> {
+                return null;
+            },
+            case mut node -> {
+                while (true) {
+                    if (node.key.eq(key)) {
+                        return &mut node.value;
+                    }
+
+                    match (node.next) {
+                        case null -> {
+                            return null;
+                        },
+                        case next_node -> {
+                            node = next_node;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func contains_key(&this, key: &K): bool {
+        return this.get(key) != null;
+    }
+
+    func remove(&mut this, key: &K): ?V {
+        let index: usize = key.hash() % this.buckets.cap;
+
+        let current: ?^Entry<K, V> = this.buckets[index];
+        let mut previous: ?^Entry<K, V> = null;
+
+        match (current) {
+            case null -> {
+                return null;
+            },
+            case mut node -> {
+                while (true) {
+                    if (node.key.eq(key)) {
+                        let next: ?^Entry<K, V> = $replace(node.next, null);
+
+                        match (previous) {
+                            case null -> {
+                                $replace(this.buckets[index], next);
+                            },
+                            case prev_node -> {
+                                prev_node.next = next;
+                            }
+                        }
+
+                        let entry: Entry<K, V> = *node;
+
+                        unsafe {
+                            this.buckets.len -= 1;
+                        }
+                        return entry.value;
+                    }
+
+                    match (node.next) {
+                        case null -> {
+                            return null;
+                        },
+                        case next_node -> {
+                            previous = node;
+                            node = next_node;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func clear(&mut this) {
+        let bucket_count: usize = this.buckets.cap;
+
+        for (let mut i: usize = 0; i < bucket_count; i += 1) {
+            let current: ?^Entry<K, V> =
+                $replace(this.buckets[i], null);
+
+            match (current) {
+                case null -> {},
+                case mut node -> {
+                    while (true) {
+                        let next: ?^Entry<K, V> = $replace(node.next, null);
+
+                        match (next) {
+                            case null -> {
+                                break;
+                            },
+                            case next_node -> {
+                                node = next_node;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            this.buckets.len = 0;
+        }
+    }
+
+    func grow(&mut this) {
+        let old_bucket_count: usize = this.buckets.cap;
+
+        let new_bucket_count: usize =
+            if (old_bucket_count == 0) {
+                16
+            } else {
+                old_bucket_count * 2
+            };
+
+        let new_buckets: ^this.alloc []?^Entry<K, V> =
+            this.alloc.calloc<?^Entry<K, V>>(new_bucket_count);
+
+        for (let mut i: usize = 0; i < old_bucket_count; i += 1) {
+            let current: ?^Entry<K, V> =
+                $replace(this.buckets[i], null);
+
+            match (current) {
+                case null -> {},
+                case mut node -> {
+                    while (true) {
+                        let next: ?^Entry<K, V> =
+                            $replace(node.next, null);
+
+                        let index: usize =
+                            node.key.hash() % new_bucket_count;
+
+                        node.next = $replace(new_buckets[index], null);
+                        new_buckets[index] = node;
+
+                        match (next) {
+                            case null -> {
+                                break;
+                            },
+                            case next_node -> {
+                                node = next_node;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let old_buckets: ^this.alloc []?^Entry<K, V> =
+            $replace(this.buckets, new_buckets);
+    }
+}
