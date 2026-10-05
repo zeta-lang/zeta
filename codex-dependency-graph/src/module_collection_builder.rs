@@ -37,7 +37,7 @@ impl<'bump> ModuleBuilder<'bump> {
 }
 
 fn extract_symbol_info(stmt: &Stmt<'_, '_>, pool: &StringPool) -> (StrId, StrId) {
-    let kind = |s: &str| StrId(pool.thread_local().intern(s));
+    let kind = |s: &str| StrId(pool.intern(s));
     match stmt {
         Stmt::FuncDecl(f) => (f.name, kind("function")),
         Stmt::StructDecl(s) => (s.name, kind("struct")),
