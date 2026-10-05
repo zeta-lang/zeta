@@ -280,12 +280,13 @@ impl<'a> ErrorReporter<'a> {
             }
         };
 
-        eprintln!("{}: {}", prefix, diagnostic.message);
-
         if let Some(span) = &diagnostic.span {
+            eprintln!("{}: {} at {}", prefix, diagnostic.message, span);
             if let Some(source) = self.source_files.get(span.file_name) {
                 self.print_source_snippet_raw(span, source);
             }
+        } else {
+            eprintln!("{}: {}", prefix, diagnostic.message);
         }
         for note in &diagnostic.notes {
             eprintln!("  note: {}", note);
