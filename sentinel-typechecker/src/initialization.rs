@@ -4,7 +4,7 @@ use ir::{
     ir_hasher::{FxHashMap, HashSet},
 };
 
-use crate::{move_state::MoveState, str_id_to_string, TypeChecker};
+use crate::{TypeChecker, move_state::MoveState, str_id_to_string};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingMode {
@@ -168,10 +168,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             self.mark_array_range(root, &path, *i, *i + 1, len);
                         }
                         _ => {
-                            let node = self
-                                .init_state
-                                .entry(root)
-                                .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+                            let Some(node) = self.init_state.get_mut(&root) else {
+                                return;
+                            };
                             *Self::node_at_path_mut(node, &path) =
                                 InitNode::Whole(InitStatus::Initialized);
                         }
@@ -309,10 +308,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         end: i64,
         len: Option<usize>,
     ) {
-        let node = self
-            .init_state
-            .entry(root)
-            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+        let Some(node) = self.init_state.get_mut(&root) else {
+            return;
+        };
         Self::mark_array_range_node(node, path, start, end, len);
     }
 
@@ -323,6 +321,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         end: i64,
         len: Option<usize>,
     ) {
+        if path.is_empty()
+            && let InitNode::Whole(InitStatus::Initialized) = node
+        {
+            return;
+        }
+
         if let Some((head, rest)) = path.split_first() {
             let map = match node {
                 InitNode::Struct(m) => m,
@@ -341,6 +345,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
         match node {
             InitNode::Array { ranges, .. } => ranges.insert(start, end),
+
             InitNode::Whole(InitStatus::Initialized) => {}
             _ => {
                 let mut ranges = IntervalSet::default();
@@ -467,18 +472,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut converged_move = move_entry;
         let mut converged_init = init_entry;
 
-        self.with_suppressed_errors(|this| loop {
-            this.move_state = converged_move.clone();
-            this.init_state = converged_init.clone();
-            this.check_stmt(body);
-            let next_move = MoveState::join(&converged_move, &this.move_state);
-            let next_init = Self::join_init_states(&converged_init, &this.init_state);
+        self.with_suppressed_errors(|this| {
+            loop {
+                this.move_state = converged_move.clone();
+                this.init_state = converged_init.clone();
+                this.check_stmt(body);
+                let next_move = MoveState::join(&converged_move, &this.move_state);
+                let next_init = Self::join_init_states(&converged_init, &this.init_state);
 
-            let stable = converged_move.is_superset_of(&next_move) && converged_init == next_init;
-            converged_move = next_move;
-            converged_init = next_init;
-            if stable {
-                break;
+                let stable =
+                    converged_move.is_superset_of(&next_move) && converged_init == next_init;
+                converged_move = next_move;
+                converged_init = next_init;
+                if stable {
+                    break;
+                }
             }
         });
 
