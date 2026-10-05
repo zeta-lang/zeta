@@ -3,12 +3,12 @@ use ir::{
     ir_conversion::lower_operator_bin,
     layout::TargetInfo,
     span::SourceSpan,
-    ssa_ir::{Instruction, Operand, SsaType, Value, cast_kind},
+    ssa_ir::{Instruction, Operand, SsaType, Value},
 };
 
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn store_const_u8(&mut self, base: Value, offset: usize, v: i64) {
         let c = self.current_block_data.fresh_value();
         self.emit(Instruction::Const {
@@ -31,9 +31,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             base: Operand::Value(base),
             offset,
         });
-        self.current_block_data
-            .value_types
-            .insert(a, SsaType::Pointer(Box::new(ty.clone())));
+        self.current_block_data.value_types.insert(
+            a,
+            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())),
+        );
         a
     }
 
@@ -77,11 +78,82 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
     pub(crate) fn lower_tuple_expr(&mut self, elements: &[HirExpr<'a, 'bump>]) -> Value {
         if elements.is_empty() {
             let v = self.current_block_data.fresh_value();
+            self.emit(Instruction::Const {
+                dest: v,
+                ty: SsaType::I64,
+                value: Operand::ConstInt(0),
+            });
             self.current_block_data.value_types.insert(v, SsaType::I64);
-            v
-        } else {
-            self.lower_expr(&elements[0])
+            return v;
         }
+
+        // Lower each element and collect its SSA type.
+        let mut elem_vals: Vec<(Value, SsaType)> = Vec::with_capacity(elements.len());
+        for elem in elements {
+            let val = self.lower_expr(elem);
+            let ty = self
+                .current_block_data
+                .value_types
+                .get(&val)
+                .cloned()
+                .unwrap_or(SsaType::I64);
+            elem_vals.push((val, ty));
+        }
+
+        let field_types: Vec<SsaType> = elem_vals.iter().map(|(_, ty)| ty.clone()).collect();
+        let tuple_ty = SsaType::Tuple(field_types.clone());
+
+        // Stack-allocate the tuple.
+        let obj = self.new_value();
+        self.emit(Instruction::StackAlloc {
+            dest: obj,
+            ty: tuple_ty.clone(),
+            count: 0,
+        });
+        self.current_block_data
+            .value_types
+            .insert(obj, tuple_ty.clone());
+
+        // Compute field offsets using the same alignment rules as layout_of_ssa.
+        let target = ir::layout::TargetInfo { ptr_bytes: 8 };
+        let mut cursor = 0usize;
+        for (i, (val, fty)) in elem_vals.iter().enumerate() {
+            let falign = ir::layout::alignof_ssa(fty, target).unwrap_or(8);
+            // Round up cursor to field alignment.
+            cursor = (cursor + falign - 1) & !(falign - 1);
+
+            if Self::is_aggregate_ssa_type(fty) {
+                // Aggregate: copy via memcpy (store_init handles this).
+                let addr = self.current_block_data.fresh_value();
+                self.emit(Instruction::FieldAddr {
+                    dest: addr,
+                    base: Operand::Value(obj),
+                    offset: cursor,
+                });
+                self.current_block_data.value_types.insert(
+                    addr,
+                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(fty.clone())),
+                );
+                self.store_init(
+                    obj,
+                    cursor,
+                    fty,
+                    crate::midend::ir::mir_lowering::lowerer::FieldInitVal::Val(*val),
+                );
+            } else {
+                self.emit(Instruction::StoreField {
+                    base: Operand::Value(obj),
+                    offset: cursor,
+                    value: Operand::Value(*val),
+                });
+            }
+
+            let fsize = ir::layout::sizeof_ssa(fty, target).unwrap_or(8);
+            cursor += fsize;
+            let _ = i; // suppress unused warning
+        }
+
+        obj
     }
 
     pub(crate) fn lower_decimal_expr(&mut self, d: &f64) -> Value {
@@ -123,7 +195,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         if let Some(&v) = self.var_map.get(name) {
             if self.promoted_to_stack.contains(name) {
                 let pointee_ty = match self.current_block_data.value_types.get(&v) {
-                    Some(SsaType::Pointer(inner)) => (**inner).clone(),
+                    Some(SsaType::Pointer(_, inner)) => (**inner).clone(),
                     other => panic!(
                         "Ident `{}` marked stack-promoted but its value type isn't a pointer: {:?}",
                         name, other
@@ -186,9 +258,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     ty: ty.clone(),
                     count: 1,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Pointer(Box::new(ty.clone())));
+                self.current_block_data.value_types.insert(
+                    dest,
+                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())),
+                );
                 dest
             }
 
@@ -238,9 +311,13 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 base: Operand::Value(arr_v),
                 offset: (i as i64 * elem_size) as usize,
             });
-            self.current_block_data
-                .value_types
-                .insert(addr_v, SsaType::Pointer(Box::new(elem_ty.clone())));
+            self.current_block_data.value_types.insert(
+                addr_v,
+                SsaType::Pointer(
+                    ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                    Box::new(elem_ty.clone()),
+                ),
+            );
 
             self.emit(Instruction::Store {
                 ptr: Operand::Value(addr_v),
@@ -269,16 +346,20 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 dest
             }
 
-            SsaType::User(_, _) | SsaType::Tuple(_) => {
+            SsaType::User(_, _, _) | SsaType::Tuple(_) => {
                 let dest = self.current_block_data.fresh_value();
                 self.emit(Instruction::StackAlloc {
                     dest,
                     ty: ssa_ty.clone(),
                     count: 1,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Pointer(Box::new(ssa_ty.clone())));
+                self.current_block_data.value_types.insert(
+                    dest,
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(ssa_ty.clone()),
+                    ),
+                );
 
                 let size = ir::layout::sizeof_ssa(ssa_ty, TargetInfo { ptr_bytes: 8 })
                     .expect("lower_zeroed_value: aggregate type has no known size");
@@ -319,48 +400,18 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
     pub(crate) fn lower_expr_number_inner(&mut self, n: i64, ty: SsaType) -> Value {
         let v = self.current_block_data.fresh_value();
+        let value = if matches!(ty, SsaType::F32 | SsaType::F64) {
+            Operand::ConstFloat(n as f64)
+        } else {
+            Operand::ConstInt(n)
+        };
         self.emit(Instruction::Const {
             dest: v,
             ty: ty.clone(),
-            value: Operand::ConstInt(n),
+            value,
         });
         self.current_block_data.value_types.insert(v, ty);
         v
-    }
-
-    pub(crate) fn lower_expr_as_u32(&mut self, expr: &HirExpr<'a, 'bump>) -> Value {
-        if let HirExpr::Number(n, _) = expr {
-            let v = self.current_block_data.fresh_value();
-            self.emit(Instruction::Const {
-                dest: v,
-                ty: SsaType::U32,
-                value: Operand::ConstInt(*n),
-            });
-            self.current_block_data.value_types.insert(v, SsaType::U32);
-            return v;
-        }
-
-        let v = self.lower_expr(expr);
-        let src_ty = self
-            .current_block_data
-            .value_types
-            .get(&v)
-            .cloned()
-            .unwrap_or(SsaType::I64);
-        if src_ty == SsaType::U32 {
-            return v;
-        }
-
-        let dest = self.current_block_data.fresh_value();
-        self.emit(Instruction::Cast {
-            dest,
-            value: Operand::Value(v),
-            kind: cast_kind(&src_ty, &SsaType::U32),
-        });
-        self.current_block_data
-            .value_types
-            .insert(dest, SsaType::U32);
-        dest
     }
 
     pub(crate) fn lower_expr_binary(
@@ -383,17 +434,33 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             Operator::LogicalAnd => self.lower_short_circuit_and(left, right),
             Operator::LogicalOr => self.lower_short_circuit_or(left, right),
             _ => {
-                let l = match expected {
-                    Some(exp) => self.lower_expr_expected(left, exp),
-                    None => self.lower_expr(left),
+                let left_is_lit = matches!(left, HirExpr::Number(..) | HirExpr::Decimal(..));
+                let right_is_lit = matches!(right, HirExpr::Number(..) | HirExpr::Decimal(..));
+
+                let (l, r, l_ty) = if expected.is_none() && left_is_lit && !right_is_lit {
+                    let r = self.lower_expr(right);
+                    let r_ty = self
+                        .current_block_data
+                        .value_types
+                        .get(&r)
+                        .cloned()
+                        .unwrap_or(SsaType::I64);
+                    let l = self.lower_expr_expected(left, &r_ty);
+                    (l, r, r_ty)
+                } else {
+                    let l = match expected {
+                        Some(exp) => self.lower_expr_expected(left, exp),
+                        None => self.lower_expr(left),
+                    };
+                    let l_ty = self
+                        .current_block_data
+                        .value_types
+                        .get(&l)
+                        .cloned()
+                        .unwrap_or(SsaType::I64);
+                    let r = self.lower_expr_expected(right, &l_ty);
+                    (l, r, l_ty)
                 };
-                let l_ty = self
-                    .current_block_data
-                    .value_types
-                    .get(&l)
-                    .cloned()
-                    .unwrap_or(SsaType::I64);
-                let r = self.lower_expr_expected(right, &l_ty);
 
                 let v = self.current_block_data.fresh_value();
                 self.emit(Instruction::Binary {
