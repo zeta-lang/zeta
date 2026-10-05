@@ -132,9 +132,6 @@ pub enum IntrinsicKind {
     AssertAlign,
     TypeName,
     Own,
-    AtomicCasU32,
-    AtomicLoadU32,
-    AtomicStoreU32,
     CpuRelax,
     Unreachable,
     Reinterpret,
@@ -143,6 +140,18 @@ pub enum IntrinsicKind {
     FnPtr,
     DropInPlace,
     MemForget,
+    AssumeInit,
+
+    AtomicLoad,
+    AtomicStore,
+    AtomicSwap,
+    AtomicCas,
+    AtomicFetchAdd,
+    AtomicFetchSub,
+    AtomicFetchAnd,
+    AtomicFetchOr,
+    AtomicFetchXor,
+    AtomicFence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -240,6 +249,7 @@ where
     pub visibility: Visibility,
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub fields: &'bump [HirField<'a, 'bump>],
+    pub unmangled_name: StrId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -253,6 +263,7 @@ where
     pub target: StrId,
     pub target_generics: Option<&'bump [HirType<'a, 'bump>]>,
     pub methods: Option<&'bump [HirFunc<'a, 'bump>]>,
+    pub is_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -264,6 +275,7 @@ where
     pub visibility: Visibility,
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub methods: Option<&'bump [HirFunc<'a, 'bump>]>,
+    pub unmangled_name: StrId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -272,6 +284,7 @@ pub struct HirEnum<'a, 'bump> {
     pub visibility: Visibility,
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub variants: &'bump [HirEnumVariant<'a, 'bump>],
+    pub unmangled_name: StrId,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -558,7 +571,7 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HirPattern<'bump> {
-    Ident(StrId),
+    Ident(StrId, bool),
     Number(i64),
     String(StrId),
     Boolean(bool),
@@ -1329,7 +1342,7 @@ pub fn effect_index_key_eq(a: &EffectIndexKey<'_>, b: &EffectIndexKey<'_>) -> bo
 /// Names a pattern binds (syntactic; shared by the checker and the hoister).
 pub fn pattern_bound_names(pat: &HirPattern<'_>, out: &mut Vec<StrId>) {
     match pat {
-        HirPattern::Ident(n) => out.push(*n),
+        HirPattern::Ident(n, _) => out.push(*n),
         HirPattern::EnumVariant { bindings, .. } => out.extend(bindings.iter().copied()),
         HirPattern::Tuple(ps) | HirPattern::Array(ps) => {
             for p in ps.iter() {
@@ -1351,5 +1364,46 @@ pub fn pattern_bound_names(pat: &HirPattern<'_>, out: &mut Vec<StrId>) {
         | HirPattern::String(_)
         | HirPattern::Boolean(_)
         | HirPattern::Null => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HirAttrArg<'bump> {
+    Ident(StrId),
+    Str(StrId),
+    Number(i64),
+    Bool(bool),
+    KeyValue {
+        key: StrId,
+        value: &'bump HirAttrArg<'bump>,
+    },
+    Call {
+        name: StrId,
+        args: &'bump [HirAttrArg<'bump>],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HirAttribute<'a, 'bump> {
+    pub name: StrId,
+    pub args: &'bump [HirAttrArg<'bump>],
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Default)]
+pub struct AttrTable<'a, 'bump> {
+    pub map:
+        crate::ir_hasher::FxHashMap<crate::attributes::AttrTarget, Vec<HirAttribute<'a, 'bump>>>,
+}
+impl<'a, 'bump> AttrTable<'a, 'bump> {
+    pub fn get(&self, t: crate::attributes::AttrTarget) -> &[HirAttribute<'a, 'bump>] {
+        self.map.get(&t).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    pub fn find(
+        &self,
+        t: crate::attributes::AttrTarget,
+        name: &str,
+    ) -> Option<&HirAttribute<'a, 'bump>> {
+        self.get(t).iter().find(|a| a.name == name)
     }
 }
