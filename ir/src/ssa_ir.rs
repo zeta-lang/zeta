@@ -20,11 +20,11 @@ impl SsaType {
     }
 
     pub fn ptr_to(inner: SsaType) -> Self {
-        SsaType::Pointer(Box::new(inner))
+        SsaType::Pointer(SsaPointerKind::UnsafeMut, Box::new(inner))
     }
 
     pub fn is_pointer(&self) -> bool {
-        matches!(self, SsaType::Pointer(_) | SsaType::Owned(_))
+        matches!(self, SsaType::Pointer(..) | SsaType::Owned(_))
     }
 
     /// Anything that lives in a pointer-sized register.
@@ -34,7 +34,7 @@ impl SsaType {
 
     pub fn as_pointer(&self) -> Option<&SsaType> {
         match self {
-            SsaType::Pointer(inner) | SsaType::Owned(inner) => Some(inner),
+            SsaType::Pointer(_, inner) | SsaType::Owned(inner) => Some(inner),
             _ => None,
         }
     }
@@ -123,15 +123,52 @@ pub enum Operand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicOrdering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
     SizeOf,
     AlignOf,
     AssertAlign,
     TypeName,
-    AtomicCasU32,
-    AtomicLoadU32,
-    AtomicStoreU32,
     CpuRelax,
+    AtomicLoad {
+        ordering: AtomicOrdering,
+    },
+    AtomicStore {
+        ordering: AtomicOrdering,
+    },
+    AtomicSwap {
+        ordering: AtomicOrdering,
+    },
+    AtomicCas {
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+    },
+    AtomicFetchAdd {
+        ordering: AtomicOrdering,
+    },
+    AtomicFetchSub {
+        ordering: AtomicOrdering,
+    },
+    AtomicFetchAnd {
+        ordering: AtomicOrdering,
+    },
+    AtomicFetchOr {
+        ordering: AtomicOrdering,
+    },
+    AtomicFetchXor {
+        ordering: AtomicOrdering,
+    },
+    AtomicFence {
+        ordering: AtomicOrdering,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,16 +195,17 @@ pub enum SsaType {
     Void,   // Unit type, zero size
 
     // Composite types
-    User(StrId, Vec<SsaType>), // User-defined type with fields
-    Interface(StrId),
+    User(StrId, StrId, Vec<SsaType>), // mangled_name, unmangled_name, fields
+    Interface(StrId, StrId),          // mangled_name, unmangled_name
     Enum {
         name: StrId,
+        unmangled_name: StrId,
         variants: Vec<Vec<SsaType>>,
     }, // Tagged union of types
-    Tuple(Vec<SsaType>), // Fixed-size collection of heterogeneous types
+    Tuple(Vec<SsaType>),              // Fixed-size collection of heterogeneous types
 
     // Pointer types
-    Pointer(Box<SsaType>), // Pointer to another type
+    Pointer(SsaPointerKind, Box<SsaType>), // Pointer to another type
     Owned(Box<SsaType>),
 
     // Dynamically sized types
@@ -183,44 +221,89 @@ pub enum SsaType {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsaPointerKind {
+    SafeConst,
+    SafeMut,
+    UnsafeConst,
+    UnsafeMut,
+    RefShared,
+    RefMut,
+    RefAlias,
+}
+
+impl SsaPointerKind {
+    pub fn is_mut(&self) -> bool {
+        matches!(
+            self,
+            SsaPointerKind::SafeMut | SsaPointerKind::UnsafeMut | SsaPointerKind::RefMut
+        )
+    }
+}
+
 impl fmt::Display for SsaType {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
-        // f.write_str(match self {
-        //     SsaType::I8 => todo!(),
-        //     SsaType::U8 => todo!(),
-        //     SsaType::I16 => todo!(),
-        //     SsaType::U16 => todo!(),
-        //     SsaType::I32 => todo!(),
-        //     SsaType::U32 => todo!(),
-        //     SsaType::I64 => todo!(),
-        //     SsaType::U64 => todo!(),
-        //     SsaType::I128 => todo!(),
-        //     SsaType::U128 => todo!(),
-        //     SsaType::F32 => todo!(),
-        //     SsaType::F64 => todo!(),
-        //     SsaType::Isize => todo!(),
-        //     SsaType::Usize => todo!(),
-        //     SsaType::Null => todo!(),
-        //     SsaType::Bool => todo!(),
-        //     SsaType::String => todo!(),
-        //     SsaType::Void => todo!(),
-        //     SsaType::User(str_id, ssa_types) => todo!(),
-        //     SsaType::Interface(str_id) => todo!(),
-        //     SsaType::Enum { name, variants } => todo!(),
-        //     SsaType::Tuple(ssa_types) => todo!(),
-        //     SsaType::Pointer(ssa_type) => todo!(),
-        //     SsaType::Owned(ssa_type) => todo!(),
-        //     SsaType::Dyn => todo!(),
-        //     SsaType::Slice(ssa_type) => todo!(),
-        //     SsaType::Array(ssa_type, _) => todo!(),
-        //     SsaType::Char => todo!(),
-        //     SsaType::Nullable(ssa_type) => todo!(),
-        //     SsaType::FuncPointer {
-        //         params,
-        //         return_type,
-        //     } => todo!(),
-        // });
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SsaType::I8 => write!(f, "i8"),
+            SsaType::U8 => write!(f, "u8"),
+            SsaType::I16 => write!(f, "i16"),
+            SsaType::U16 => write!(f, "u16"),
+            SsaType::I32 => write!(f, "i32"),
+            SsaType::U32 => write!(f, "u32"),
+            SsaType::I64 => write!(f, "i64"),
+            SsaType::U64 => write!(f, "u64"),
+            SsaType::I128 => write!(f, "i128"),
+            SsaType::U128 => write!(f, "u128"),
+            SsaType::F32 => write!(f, "f32"),
+            SsaType::F64 => write!(f, "f64"),
+            SsaType::Isize => write!(f, "isize"),
+            SsaType::Usize => write!(f, "usize"),
+            SsaType::Null => write!(f, "null"),
+            SsaType::Bool => write!(f, "bool"),
+            SsaType::String => write!(f, "str"),
+            SsaType::Void => write!(f, "void"),
+            SsaType::Char => write!(f, "char"),
+            SsaType::Dyn => write!(f, "dyn"),
+            SsaType::User(_, unmangled, _) => write!(f, "{}", unmangled),
+            SsaType::Interface(_, unmangled) => write!(f, "{}", unmangled),
+            SsaType::Enum { unmangled_name, .. } => write!(f, "{}", unmangled_name),
+            SsaType::Tuple(types) => {
+                write!(f, "(")?;
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, ")")
+            }
+            SsaType::Pointer(kind, inner) => match kind {
+                SsaPointerKind::SafeConst => write!(f, "*const {}", inner),
+                SsaPointerKind::SafeMut => write!(f, "*mut {}", inner),
+                SsaPointerKind::UnsafeConst => write!(f, "[*]const {}", inner),
+                SsaPointerKind::UnsafeMut => write!(f, "[*]mut {}", inner),
+                SsaPointerKind::RefShared => write!(f, "&{}", inner),
+                SsaPointerKind::RefMut => write!(f, "&mut {}", inner),
+                SsaPointerKind::RefAlias => write!(f, "&alias {}", inner),
+            },
+            SsaType::Owned(inner) => write!(f, "^{}", inner),
+            SsaType::Slice(inner) => write!(f, "[]{}", inner),
+            SsaType::Array(inner, len) => write!(f, "[{}]{}", len, inner),
+            SsaType::Nullable(inner) => write!(f, "{}?", inner),
+            SsaType::FuncPointer {
+                params,
+                return_type,
+            } => {
+                write!(f, "func(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", p)?;
+                }
+                write!(f, "): {}", return_type)
+            }
+        }
     }
 }
 
@@ -261,7 +344,7 @@ pub enum Instruction {
         /// The type being queried, for SizeOf/AlignOf/TypeName. None for AssertAlign.
         query_ty: Option<SsaType>,
         /// Runtime args: [ptr, align] for AssertAlign, empty otherwise.
-        args: SmallVec<Operand, 2>,
+        args: SmallVec<Operand, 4>,
     },
 
     /// Binary operation: dest = left OP right
@@ -433,7 +516,10 @@ impl Function {
                         };
                         match kind {
                             ThisPassingKind::Move | ThisPassingKind::MoveMut => inner,
-                            _ => SsaType::Pointer(Box::new(inner)),
+                            _ => SsaType::Pointer(
+                                crate::ssa_ir::SsaPointerKind::UnsafeMut,
+                                Box::new(inner),
+                            ),
                         }
                     }
                     HirParam::Normal { param_type, .. } => {
@@ -511,7 +597,7 @@ impl Function {
                     .iter()
                     .map(|f| lower_type_hir(&f.field_type, enums, structs))
                     .collect();
-                return SsaType::Slice(Box::new(SsaType::User(elem_id, field_types)));
+                return SsaType::Slice(Box::new(SsaType::User(elem_id, elem_id, field_types)));
             }
 
             return SsaType::Slice(Box::new(SsaType::Void));
@@ -522,10 +608,10 @@ impl Function {
         }
 
         if interfaces.contains_key(&target) {
-            return SsaType::Interface(target);
+            return SsaType::Interface(target, target);
         }
 
-        SsaType::User(target, vec![])
+        SsaType::User(target, target, vec![])
     }
 }
 
@@ -678,6 +764,14 @@ pub fn cast_kind(src: &SsaType, dst: &SsaType) -> CastKind {
     }
     if src.is_integer() && dst.is_pointer_like() {
         return IntToPtr;
+    }
+
+    if (matches!(src, SsaType::Slice(inner) if **inner == SsaType::U8)
+        && matches!(dst, SsaType::String))
+        || (matches!(src, SsaType::String)
+            && matches!(dst, SsaType::Slice(inner) if **inner == SsaType::U8))
+    {
+        return Bitcast;
     }
 
     panic!("unsupported cast {:?} -> {:?}", src, dst);
