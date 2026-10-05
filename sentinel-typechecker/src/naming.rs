@@ -105,11 +105,11 @@ pub fn type_to_string(ty: &HirType) -> String {
                 String::new()
             };
             if let RefKind::Unique = *ref_kind {
-                format!("&{}mut {}", displayed_provenance, inner)
+                format!("&{} mut {}", displayed_provenance, inner)
             } else if let RefKind::Alias = *ref_kind {
-                format!("&{}alias {}", displayed_provenance, inner)
+                format!("&{} alias {}", displayed_provenance, inner)
             } else {
-                format!("&{}{}", displayed_provenance, inner)
+                format!("&{} {}", displayed_provenance, inner)
             }
         }
         HirType::Nullable(hir_type) => format!("?{}", hir_type),
