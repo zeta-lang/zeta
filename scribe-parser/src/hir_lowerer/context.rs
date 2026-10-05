@@ -1,4 +1,5 @@
 use codex_dependency_graph::dep_graph::DepGraph;
+use ir::attributes::{AttrTable, AttrTarget, KnownKind};
 use ir::auto_imports::AutoImportRegistry;
 use ir::errors::reporter::ErrorReporter;
 use ir::hir::{HirEnum, HirExpr, HirFuncProto, RefKind};
@@ -39,12 +40,15 @@ pub struct LoweringCtx<'a, 'bump> {
     pub instantiated_struct_origins:
         Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
 
-    pub current_self_type: RefCell<Option<HirType<'a, 'bump>>>,
+    pub current_this_type: RefCell<Option<HirType<'a, 'bump>>>,
     pub named_imports: RefCell<FxHashMap<StrId, usize>>,
     pub auto_imports: Rc<RefCell<AutoImportRegistry>>,
     pub lowering_errors: RefCell<Vec<(String, SourceSpan<'a>)>>,
     pub type_aliases: Rc<RefCell<FxHashMap<StrId, TypeAliasEntry<'a, 'bump>>>>,
     pub(super) alias_resolution_stack: RefCell<Vec<StrId>>,
+    pub module_consts: RefCell<FxHashMap<(usize, StrId), HirExpr<'a, 'bump>>>,
+    pub attrs: RefCell<AttrTable<'a, 'bump>>,
+    pub registry: GlobalRegistry<'a, 'bump>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +66,10 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
     ) -> StrId {
         if path.is_empty() {
             let s = name.as_str();
-            if matches!(s, "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator") {
+            if matches!(
+                s,
+                "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator" | "Send" | "Sync"
+            ) {
                 return name;
             }
             if let Some(&target_module_idx) = self.named_imports.borrow().get(&name) {
@@ -186,6 +193,29 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
             .borrow_mut()
             .push((message.into(), span));
     }
+
+    /// `#[known]` function -> mangled name. Methods default to "Type.method".
+    pub fn known_func(&self, name: &str) -> Option<StrId> {
+        let key = StrId(self.context.intern(name));
+        match self.registry.known.borrow().get(&(KnownKind::Func, key))? {
+            AttrTarget::Func(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// `#[known]` struct/enum/interface -> mangled name.
+    pub fn known_type(&self, name: &str) -> Option<StrId> {
+        let key = StrId(self.context.intern(name));
+        match self.registry.known.borrow().get(&(KnownKind::Type, key))? {
+            AttrTarget::Struct(m) | AttrTarget::Enum(m) | AttrTarget::Interface(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// Hand this to later phases (type checker, MIR lowerer) once lowering is done.
+    pub fn known_snapshot(&self) -> FxHashMap<(KnownKind, StrId), AttrTarget> {
+        self.registry.known.borrow().clone()
+    }
 }
 
 pub struct HirLowerer<'a, 'bump> {
@@ -204,17 +234,17 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     ) -> Self {
         Self {
             ctx: LoweringCtx {
-                structs: registry.structs,
-                consts: registry.consts,
-                enums: registry.enums,
+                structs: registry.structs.clone(),
+                consts: registry.consts.clone(),
+                enums: registry.enums.clone(),
                 functions: registry.functions.clone(),
                 func_protos: RefCell::new(FxHashMap::default()),
-                interfaces: registry.interfaces,
+                interfaces: registry.interfaces.clone(),
                 type_bindings: RefCell::new(FxHashMap::default()),
                 variable_types: RefCell::new(FxHashMap::default()),
                 generic_params: RefCell::new(HashSet::default()),
-                enum_owner_module: registry.enum_owner_module,
-                struct_owner_module: registry.struct_owner_module,
+                enum_owner_module: registry.enum_owner_module.clone(),
+                struct_owner_module: registry.struct_owner_module.clone(),
                 context: context.clone(),
                 bump,
                 imported_modules: RefCell::new(FxHashMap::default()),
@@ -222,14 +252,17 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 type_aliases: Rc::new(RefCell::new(FxHashMap::default())),
                 dep_graph,
                 module_idx: usize::MAX,
-                struct_interfaces: registry.struct_interfaces,
-                struct_methods: registry.struct_methods,
-                current_self_type: RefCell::new(None),
+                struct_interfaces: registry.struct_interfaces.clone(),
+                struct_methods: registry.struct_methods.clone(),
+                current_this_type: RefCell::new(None),
                 instantiated_structs: registry.instantiated_structs.clone(),
                 instantiated_struct_origins: registry.instantiated_struct_origins.clone(),
                 named_imports: RefCell::new(FxHashMap::default()),
+                module_consts: RefCell::new(FxHashMap::default()),
                 lowering_errors: RefCell::new(Vec::default()),
                 auto_imports,
+                attrs: RefCell::new(AttrTable::default()),
+                registry: registry.clone(),
             },
 
             error_reporter: ErrorReporter::new(),
