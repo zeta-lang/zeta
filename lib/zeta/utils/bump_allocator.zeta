@@ -4,6 +4,7 @@ import zeta::debug;
 import zeta::libc;
 
 import zeta::alloc::allocator.Allocator;
+import zeta::utils::mallocator.Mallocator;
 
 struct BumpAllocator<A: Allocator> {
     memory: ^this []u8,
@@ -11,12 +12,12 @@ struct BumpAllocator<A: Allocator> {
     backing: A,
 }
 
-impl<A: Allocator> BumpAllocator<A> {
-    func new(size: usize, alloc: A): BumpAllocator<A> {
+impl<A: Allocator = Mallocator> BumpAllocator<A> {
+    func create(size: usize, alloc: A): BumpAllocator<A> {
         return BumpAllocator<A> {
             memory: alloc.calloc<u8>(size),
             offset: 0,
-            alloc,
+            backing: alloc,
         };
     }
 
@@ -33,9 +34,14 @@ impl<A: Allocator> BumpAllocator<A> {
     }
 
     func reset(&mut this) {
-        this.memory.len = 0;
+        unsafe {
+            this.memory.len = 0;
+        }
     }
 
+}
+
+impl<A: Allocator = Mallocator> BumpAllocator<A> by Allocator {
     func alloc<T>(&mut this): ^this T {
         let start: usize = align_up(this.memory.len, $alignof<T>());
         let end: usize = start + $sizeof<T>();
@@ -46,7 +52,9 @@ impl<A: Allocator> BumpAllocator<A> {
 
         let ptr: [*]mut u8 = (this.memory as [*]mut u8) + start;
 
-        this.memory.len = end;
+        unsafe {
+            this.memory.len = end;
+        }
 
         return $own(ptr as [*]mut T, this);
     }
@@ -55,7 +63,7 @@ impl<A: Allocator> BumpAllocator<A> {
         let align: usize = $alignof<T>();
         let size: usize = count * $sizeof<T>();
 
-        let start: usize = this.align_up(this.memory.len, align);
+        let start: usize = align_up(this.memory.len, align);
         let end: usize = start + size;
 
         if (end > this.memory.cap) {
@@ -65,9 +73,10 @@ impl<A: Allocator> BumpAllocator<A> {
         let ptr: [*]mut u8 =
             (this.memory as [*]mut u8) + start;
 
-        libc.memset(ptr as [*]mut void, 0, size);
-
-        this.memory.len = end;
+        unsafe {
+            libc.memset(ptr as [*]mut void, 0, size);
+            this.memory.len = end;
+        }
 
         return $own(
             ptr as [*]mut T,
@@ -90,12 +99,11 @@ impl<A: Allocator> BumpAllocator<A> {
     func free_slice<T>(&this, value: ^this []T) {
         // no-op
     }
+}
 
-    func align_up(
-        &this,
-        value: usize,
-        align: usize
-    ): usize {
-        return (value + align - 1) & ~(align - 1);
-    }
+func align_up(
+    value: usize,
+    align: usize
+): usize {
+    return (value + align - 1) & ~(align - 1);
 }
