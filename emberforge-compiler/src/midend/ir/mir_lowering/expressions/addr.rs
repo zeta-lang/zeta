@@ -8,7 +8,7 @@ use ir::{
 
 use crate::midend::ir::mir_lowering::{FunctionLowerer, lowerer::fun_name};
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn lower_place_addr(
         &mut self,
         expr: &HirExpr<'a, 'bump>,
@@ -60,7 +60,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     None => self.lower_expr(inner),
                 };
                 let pointee_ty = match self.current_block_data.value_types.get(&ptr).cloned() {
-                    Some(SsaType::Pointer(inner_ty)) | Some(SsaType::Owned(inner_ty)) => *inner_ty,
+                    Some(SsaType::Pointer(_, inner_ty)) | Some(SsaType::Owned(inner_ty)) => *inner_ty,
                     other => panic!(
                         "lower_place_addr: Deref of non-pointer {:?} at span {deref_span}",
                         other
@@ -77,8 +77,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                             {
                                 let already_addressable = matches!(
                                     ty,
-                                    SsaType::Pointer(_)
-                                        | SsaType::User(_, _)
+                                    SsaType::Pointer(_, _)
+                                        | SsaType::User(_, _,  _)
                                         | SsaType::Enum { .. }
                                         | SsaType::Slice(_)
                                         | SsaType::Owned(_)
@@ -94,7 +94,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                                     });
                                     self.current_block_data
                                         .value_types
-                                        .insert(slot, SsaType::Pointer(Box::new(ty.clone())));
+                                        .insert(slot, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())));
                                     self.emit(Instruction::Store {
                                         ptr: Operand::Value(slot),
                                         value: Operand::Value(cur),
@@ -110,10 +110,10 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
                 let val = self.lower_expr(other);
                 match self.current_block_data.value_types.get(&val).cloned() {
-                    Some(SsaType::Pointer(inner_ty)) => (val, *inner_ty),
+                    Some(SsaType::Pointer(_, inner_ty)) => (val, *inner_ty),
 
                     Some(
-                        ty @ (SsaType::User(_, _)
+                        ty @ (SsaType::User(_, _,  _)
                         | SsaType::Enum { .. }
                         | SsaType::Slice(_)
                         | SsaType::Owned(_)
@@ -172,7 +172,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         });
         self.current_block_data
             .value_types
-            .insert(addr_v, SsaType::Pointer(Box::new(elem_ty.clone())));
+            .insert(addr_v, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ty.clone())));
         addr_v
     }
 
@@ -193,7 +193,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     SsaType::Slice(elem) => Some((elem, true)),
                     _ => None,
                 },
-                SsaType::Pointer(p) => match p.as_ref() {
+                SsaType::Pointer(_, p) => match p.as_ref() {
                     SsaType::Slice(inner) => Some((inner, false)),
                     SsaType::Owned(inner) => match inner.as_ref() {
                         SsaType::Slice(elem) => Some((elem, true)),
@@ -209,7 +209,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                     "len" => (8, SsaType::I64),
                     "cap" if is_owned => (16, SsaType::I64),
                     "cap" => panic!("field `cap` does not exist on borrowed slice at {span}"),
-                    "ptr" => (0, SsaType::Pointer(elem_ty.clone())),
+                    "ptr" => (0, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, elem_ty.clone())),
                     other => panic!("unknown builtin field `{}` on slice type at {span}", other),
                 };
 
@@ -221,15 +221,15 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 });
                 self.current_block_data
                     .value_types
-                    .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
+                    .insert(addr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(field_ty.clone())));
 
                 return (addr, field_ty);
             }
         }
 
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _)) => *name,
-            Some(SsaType::Pointer(inner)) | Some(SsaType::Owned(inner)) => fun_name(inner),
+            Some(SsaType::User(name, _,  _)) => *name,
+            Some(SsaType::Pointer(_, inner)) | Some(SsaType::Owned(inner)) => fun_name(inner),
             other => panic!(
                 "lower_field_addr: could not determine object's struct: {:?}",
                 other
@@ -260,7 +260,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         });
         self.current_block_data
             .value_types
-            .insert(addr, SsaType::Pointer(Box::new(field_ty.clone())));
+            .insert(addr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(field_ty.clone())));
 
         (addr, field_ty)
     }

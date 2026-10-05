@@ -35,7 +35,7 @@ pub struct LoopCtx<'a, 'bump> {
     pub(super) break_states: Vec<DropMoveState<'a, 'bump>>,
 }
 
-impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
+impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn lower_if_expr(
         &mut self,
         condition: &HirExpr<'a, 'bump>,
@@ -55,13 +55,15 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         expected: Option<&SsaType>,
     ) -> Value {
         let drop_before = self.drop_state.clone();
+        let vars_before = self.var_map.clone();
+        let mut live_vars: Vec<(BlockId, HashMap<StrId, Value>)> = Vec::new();
         let mut live_drop: Vec<DropMoveState<'a, 'bump>> = Vec::new();
         let cond = self.lower_expr(condition);
         let narrowed_before = self.narrowed_fields.clone();
 
         let then_bb = self.current_block_data.new_block();
         let else_bb = self.current_block_data.new_block();
-        let merge_bb = self.current_block_data.new_block();
+        let merge_bb = self.current_block_data.fresh_block();
 
         self.emit(Instruction::Branch {
             cond: Operand::Value(cond),
@@ -72,7 +74,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         // then
         self.current_block_data.switch_to(then_bb);
         self.narrowed_fields = narrowed_before.clone();
-        self.scope_stack.push(DropScope { locals: Vec::new() });
+        self.scope_stack.push(DropScope::default());
         let then_narrowed = self.narrow_nonnull(condition, true);
         let then_narrowed_path = self.narrow_nonnull_path(condition, true);
         let then_val = self.lower_block_value_inner(then_block, expected);
@@ -92,18 +94,20 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
         let then_end = self.current_block_data.current_block;
         if !then_terminated {
+            live_vars.push((then_end, self.var_map.clone()));
             self.emit(Instruction::Jump { target: merge_bb });
         }
 
         // else
         self.drop_state = drop_before.clone();
+        self.var_map = vars_before.clone();
         self.current_block_data.switch_to(else_bb);
         self.narrowed_fields = narrowed_before.clone();
         let else_narrowed = self.narrow_nonnull(condition, false);
         let else_narrowed_path = self.narrow_nonnull_path(condition, false);
         let else_val = match else_block {
             Some(HirStmt::Block { body, span: _ }) => {
-                self.scope_stack.push(DropScope { locals: Vec::new() });
+                self.scope_stack.push(DropScope::default());
                 let v = self.lower_block_value_inner(body, expected);
                 let else_scope = self.scope_stack.pop().unwrap();
                 if !self.block_terminated() {
@@ -115,8 +119,8 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
                 cond: ec,
                 then_block: etb,
                 else_block: eeb,
-                span,
-            }) => self.lower_if_expr(ec, etb, *eeb, *span),
+                span: espan,
+            }) => self.lower_if_expr_inner(ec, etb, *eeb, *espan, expected),
             Some(other) => panic!(
                 "if-expression else-arm must be a block or else-if, found {:?}: \
              every path through an if used as an expression needs a value",
@@ -141,6 +145,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
         let else_end = self.current_block_data.current_block;
         if !else_terminated {
+            live_vars.push((else_end, self.var_map.clone()));
             self.emit(Instruction::Jump { target: merge_bb });
         }
 
@@ -149,7 +154,9 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         }
 
         self.narrowed_fields = narrowed_before;
+        self.current_block_data.push_block(merge_bb);
         self.current_block_data.switch_to(merge_bb);
+        self.merge_var_maps(live_vars);
         if let Some(j) = DropMoveState::join_all(live_drop) {
             self.drop_state = j;
         }
@@ -215,6 +222,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         self.drop_state = header_drop.clone();
 
         let cond_val = self.lower_expr(cond);
+        let cond_end = self.current_block_data.current_block;
         self.emit(Instruction::Branch {
             cond: Operand::Value(cond_val),
             then_bb: body_bb,
@@ -224,7 +232,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         self.current_block_data.switch_to(after_bb);
         let exit_phis = self.open_join();
-        self.contribute_join_edge(after_bb, cond_bb, &header_vars, &exit_phis);
+        self.contribute_join_edge(after_bb, cond_end, &header_vars, &exit_phis);
 
         self.loop_stack.push(LoopCtx {
             continue_target: cond_bb,
@@ -295,9 +303,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         let header_drop = self.loop_header_state();
         self.drop_state = header_drop.clone();
 
+        let mut cond_end = cond_bb;
         match condition {
             Some(cond_expr) => {
                 let cond_val = self.lower_expr(cond_expr);
+                cond_end = self.current_block_data.current_block;
                 self.emit(Instruction::Branch {
                     cond: Operand::Value(cond_val),
                     then_bb: body_bb,
@@ -312,7 +322,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
 
         self.current_block_data.switch_to(after_bb);
         let exit_phis = self.open_join();
-        self.contribute_join_edge(after_bb, cond_bb, &header_vars, &exit_phis);
+        self.contribute_join_edge(after_bb, cond_end, &header_vars, &exit_phis);
 
         self.current_block_data.switch_to(incr_bb);
         let incr_phis = self.open_join();
@@ -431,7 +441,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             let phi_ty = self.current_block_data.value_type(*dest).cloned();
             let val_ty = self.current_block_data.value_type(val).cloned();
 
-            if let (Some(pt), Some(SsaType::Pointer(inner))) = (&phi_ty, &val_ty) {
+            if let (Some(pt), Some(SsaType::Pointer(_, inner))) = (&phi_ty, &val_ty) {
                 if &**inner == pt && from_bb == self.current_block_data.current_block {
                     let loaded = self.current_block_data.fresh_value();
                     self.emit(Instruction::LoadField {
@@ -539,11 +549,11 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         span: SourceSpan<'a>,
     ) {
         let drop_before = self.drop_state.clone();
-        let mut live_drop: Vec<DropMoveState<'a, 'bump>> = Vec::new();
-        let pre_if_bb = self.current_block_data.current_block;
-        let vars_before = self.var_map.clone();
+        let mut live_drop = Vec::new();
         let narrowed_before = self.narrowed_fields.clone();
         let cond_val = self.lower_expr(cond);
+        let pre_if_bb = self.current_block_data.current_block;
+        let vars_before = self.var_map.clone();
 
         let then_bb = self.current_block_data.new_block();
         let merge_bb = self.current_block_data.fresh_block();
@@ -563,7 +573,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
         self.var_map = vars_before.clone();
         self.narrowed_fields = narrowed_before.clone();
         self.current_block_data.switch_to(then_bb);
-        self.scope_stack.push(DropScope { locals: Vec::new() });
+        self.scope_stack.push(DropScope::default());
         self.narrow_nonnull(cond, true);
         let then_narrowed = self.narrow_nonnull(cond, true);
         self.narrow_nonnull_path(cond, true);
@@ -591,7 +601,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             self.narrow_nonnull_path(cond, false);
 
             if let Some(else_stmt) = else_block {
-                self.scope_stack.push(DropScope { locals: Vec::new() });
+                self.scope_stack.push(DropScope::default());
                 self.lower_stmt(else_stmt);
             }
 
@@ -819,7 +829,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             unreachable!()
         };
         let saved = self.drop_state.clone();
-        self.scope_stack.push(DropScope { locals: Vec::new() });
+        self.scope_stack.push(DropScope::default());
         self.lower_stmt_seq(body);
         self.scope_stack.pop();
         if !body.last().map_or(false, Self::stmt_diverges) {
@@ -991,7 +1001,7 @@ impl<'f, 'a, 'bump> FunctionLowerer<'f, 'a, 'bump> {
             let instr = if Self::is_aggregate_ssa_type(ty) {
                 Instruction::Const {
                     dest: dummy,
-                    ty: SsaType::Pointer(Box::new(ty.clone())),
+                    ty: SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())),
                     value: Operand::ConstInt(0),
                 }
             } else {
