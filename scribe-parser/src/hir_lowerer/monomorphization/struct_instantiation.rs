@@ -5,6 +5,7 @@ use crate::hir_lowerer::monomorphization::assertions::contains_unresolved_generi
 use crate::hir_lowerer::monomorphization::naming::instantiate_enum_name;
 use crate::hir_lowerer::monomorphization::suffix_for_subs;
 use ir::hir::{HirEnum, HirEnumVariant, HirField, HirStruct, HirType, StrId};
+use ir::hir_utils::hir_contains_this;
 use ir::ir_hasher::FxHashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,6 +19,13 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
     concrete_args: &[HirType<'a, 'bump>],
     bump: &'bump GrowableBump<'bump>,
 ) -> Option<&'bump HirEnum<'a, 'bump>> {
+    if concrete_args
+        .iter()
+        .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+    {
+        return None;
+    }
+
     if concrete_args.is_empty() {
         return ctx
             .enums
@@ -132,6 +140,13 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
     concrete_args: &[HirType<'a, 'bump>],
     bump: &'bump GrowableBump<'bump>,
 ) -> Option<&'bump HirStruct<'a, 'bump>> {
+    if concrete_args
+        .iter()
+        .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+    {
+        return None;
+    }
+
     if concrete_args.is_empty() {
         return ctx
             .structs
@@ -298,7 +313,10 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
         HirType::Struct {
             name, type_args, ..
         } => {
-            if !type_args.is_empty() && !type_args.iter().any(|t| matches!(t, HirType::Generic(_)))
+            if !type_args.is_empty()
+                && !type_args
+                    .iter()
+                    .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
             {
                 let rec_args: Vec<_> = type_args
                     .iter()
@@ -352,7 +370,10 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
             type_args,
             variants: _,
         } => {
-            if !type_args.is_empty() && !type_args.iter().any(|t| matches!(t, HirType::Generic(_)))
+            if !type_args.is_empty()
+                && !type_args
+                    .iter()
+                    .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
             {
                 let rec_args: Vec<_> = type_args
                     .iter()

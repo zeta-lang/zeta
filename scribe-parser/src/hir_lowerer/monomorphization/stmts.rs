@@ -207,12 +207,31 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let HirExpr::ModuleAccess(acc) = &**callee else {
             return None;
         };
+        // `foo(...)` via a named import lowers to ModuleAccess { path: [foo], member: "" }.
+        // That's a free function, not `Type.method(...)`.
+        if acc.member.is_empty() {
+            return None;
+        }
         let HirType::Struct {
-            type_args: expected_targs,
+            name: expected_name,
+            type_args: declared_targs,
             ..
         } = expected_ty
         else {
             return None;
+        };
+
+        let recovered: Vec<HirType<'a, 'bump>>;
+        let expected_targs: &[HirType<'a, 'bump>] = if declared_targs.is_empty() {
+            match self.instantiated_struct_origins.borrow().get(expected_name) {
+                Some((_, targs)) => {
+                    recovered = targs.clone();
+                    &recovered
+                }
+                None => return None,
+            }
+        } else {
+            declared_targs
         };
         if expected_targs.is_empty() {
             return None;
@@ -236,6 +255,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 .ctx
                 .resolve_type_path_name(module_path, struct_name, *span);
             if !self.ctx.structs.borrow().contains_key(&resolved) {
+                if self.functions.borrow().contains_key(&resolved) {
+                    return None;
+                }
                 panic!(
                     "[try_monomorphize_assoc_call] resolve_type_path_name resolved bare name `{}` \
                  to `{}` (using ctx.module_idx = {}) at {span}, but no struct is registered \

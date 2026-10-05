@@ -245,6 +245,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     span: module_decl.span,
                 }
             }
+            Stmt::Attributed(attributed_stmt) => self.lower_stmt(attributed_stmt.inner),
         }
     }
 

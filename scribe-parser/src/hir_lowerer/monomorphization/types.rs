@@ -1,5 +1,6 @@
 use ir::{
     hir::{HirExpr, HirFunc, HirParam, HirType, StrId},
+    hir_utils::hir_contains_this,
     ir_hasher::FxHashMap,
     span::SourceSpan,
 };
@@ -8,6 +9,7 @@ use crate::hir_lowerer::monomorphization::{
     Monomorphizer,
     assertions::{contains_unresolved_generic, peel_to_struct},
     instantiate_struct_for_types,
+    monomorphizer::replace_this,
     struct_instantiation::instantiate_enum_for_types,
     substitute_type,
 };
@@ -18,12 +20,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         ty: &HirType<'a, 'bump>,
         subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
-        if let HirType::This = ty {
-            if let Some(self_ty) = *self.current_this.borrow() {
-                return self_ty;
+        let substituted = substitute_type(ty, subs, &self.bump);
+        match *self.current_this.borrow() {
+            Some(self_ty) if hir_contains_this(&substituted) => {
+                replace_this(&substituted, &self_ty, self.bump)
             }
+            _ => substituted,
         }
-        substitute_type(ty, subs, &self.bump)
     }
 
     pub(crate) fn instantiate_type_recursively(
@@ -31,6 +34,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         ty: HirType<'a, 'bump>,
         span: SourceSpan<'a>,
     ) -> HirType<'a, 'bump> {
+        if hir_contains_this(&ty) {
+            return ty;
+        }
         let ty = self.instantiate_struct_ty_if_needed(ty, span);
         let ty = self.instantiate_enum_ty_if_needed(ty);
         match ty {
@@ -456,7 +462,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     .borrow()
                     .get(name)
                     .and_then(|f| f.return_type)
-                    .filter(|t| !contains_unresolved_generic(t)),
+                    .filter(|t| !contains_unresolved_generic(t) && !hir_contains_this(t)),
                 _ => None,
             },
             HirExpr::This { .. } => *self.current_this.borrow(),
@@ -500,6 +506,18 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     }
                     None
                 }),
+            HirExpr::Deref { expr, .. } => {
+                let inner = self.concrete_type_of(expr)?;
+                match inner {
+                    HirType::Ref { inner, .. }
+                    | HirType::SafePointer { inner, .. }
+                    | HirType::UnsafePointer { inner, .. }
+                    | HirType::OwnedPointer { inner, .. } => Some(*inner),
+                    other => Some(other),
+                }
+            }
+            HirExpr::Ref { expr, .. } => self.concrete_type_of(expr),
+            HirExpr::Cast { target_type, .. } => Some(*target_type),
             HirExpr::ModuleAccess(acc) => {
                 let (&struct_name, module_path) = acc.path.split_last()?;
                 let target_key = if self.ctx.structs.borrow().contains_key(&struct_name) {

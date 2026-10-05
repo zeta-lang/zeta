@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use crate::hir_lowerer::context::TypeAliasEntry;
 
 use super::context::HirLowerer;
-use ir::ast::Stmt;
+use ir::ast::{AttrArg, Stmt};
 use ir::ast::{FuncDecl, Path};
-use ir::hir::HirFuncProto;
-use ir::hir::{Hir, HirModule, HirStmt, StrId};
+use ir::attributes::{AttrTarget, KnownKind};
+use ir::hir::{Hir, HirAttrArg, HirModule, HirStmt, StrId};
+use ir::hir::{HirAttribute, HirFuncProto};
 use ir::hir::{HirEnum, HirEnumVariant, HirField, HirFunc, HirInterface, HirStruct};
 use ir::hir::{HirParam, HirType};
 use ir::ir_hasher::FxHashMap;
@@ -15,7 +16,7 @@ use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ImplTargetKind {
+pub enum ImplTargetKind {
     UserType,
     Primitive,
     /// element is `None` for the bare `impl []` form and for a generic
@@ -77,7 +78,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         self.ctx.named_imports.borrow_mut().clear();
         self.ctx.imported_modules.borrow_mut().clear();
 
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             if let Stmt::Import(import_stmt) = stmt {
                 let segments = import_stmt.path.path;
                 match self.ctx.dep_graph.borrow().resolve_module_path(segments) {
@@ -142,10 +145,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     pub fn collect_const_declarations(&mut self, stmts: &[Stmt<'a, 'bump>]) {
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             if let Stmt::Const(const_stmt) = stmt {
                 let value = self.lower_expr(&const_stmt.value);
                 self.ctx.consts.borrow_mut().insert(const_stmt.ident, value);
+                self.ctx
+                    .module_consts
+                    .borrow_mut()
+                    .insert((self.ctx.module_idx, const_stmt.ident), value);
             }
             if let Stmt::Module(module_decl) = stmt {
                 self.collect_const_declarations(module_decl.body);
@@ -271,9 +280,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub fn collect_type_declarations(&mut self, stmts: &[Stmt<'a, 'bump>]) {
         self.pre_register_type_names(stmts);
 
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             if let Stmt::InterfaceDecl(interface_decl) = stmt {
                 let hir_interface = self.lower_interface_decl(**interface_decl);
+                self.record_attrs(
+                    AttrTarget::Interface(hir_interface.name),
+                    hir_interface.unmangled_name,
+                    &attrs,
+                );
                 self.ctx
                     .interfaces
                     .borrow_mut()
@@ -291,6 +307,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
             if let Stmt::StructDecl(struct_decl) = stmt {
                 let ty_struct = self.lower_struct_decl(**struct_decl);
+                self.record_attrs(
+                    AttrTarget::Struct(ty_struct.name),
+                    ty_struct.unmangled_name,
+                    &attrs,
+                );
                 self.ctx
                     .struct_owner_module
                     .borrow_mut()
@@ -302,6 +323,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
             if let Stmt::EnumDecl(enum_decl) = stmt {
                 let ty_enum = self.lower_enum_decl(**enum_decl);
+                self.record_attrs(
+                    AttrTarget::Enum(ty_enum.name),
+                    ty_enum.unmangled_name,
+                    &attrs,
+                );
                 self.ctx
                     .enum_owner_module
                     .borrow_mut()
@@ -315,7 +341,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     fn pre_register_type_names(&mut self, stmts: &[Stmt<'a, 'bump>]) {
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             match stmt {
                 Stmt::TypeAliasDecl(alias) => {
                     let mangled = self.ctx.mangle_type_name(alias.name);
@@ -339,6 +367,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             visibility: ir::hir_utils::lower_visibility(&s.visibility),
                             generics: None,
                             fields: self.ctx.bump.alloc_slice::<HirField>(&[]),
+                            unmangled_name: s.name,
                         });
                     self.ctx
                         .struct_owner_module
@@ -356,6 +385,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             visibility: ir::hir_utils::lower_visibility(&e.visibility),
                             generics: None,
                             variants: self.ctx.bump.alloc_slice::<HirEnumVariant>(&[]),
+                            unmangled_name: e.name,
                         });
                     self.ctx
                         .enum_owner_module
@@ -365,7 +395,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 Stmt::InterfaceDecl(i) => {
                     let is_builtin = matches!(
                         i.name.as_str(),
-                        "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator"
+                        "Drop" | "Copy" | "Clone" | "Allocator" | "RawAllocator" | "Send" | "Sync"
                     );
                     let mangled =
                         if is_builtin && !self.ctx.interfaces.borrow().contains_key(&i.name) {
@@ -382,6 +412,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             visibility: ir::hir_utils::lower_visibility(&i.visibility),
                             methods: None,
                             generics: None,
+                            unmangled_name: i.name,
                         });
                 }
                 Stmt::Module(module_decl) => self.pre_register_type_names(module_decl.body),
@@ -391,7 +422,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     pub fn collect_function_prototypes(&mut self, stmts: &[Stmt<'a, 'bump>]) {
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             if let Stmt::InterfaceDecl(interface_decl) = stmt {
                 let Some(methods) = interface_decl.methods else {
                     continue;
@@ -412,12 +445,14 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             if let Stmt::FuncDecl(f) = stmt {
                 self.lower_func_as_proto(f, None);
             }
             if let Stmt::ImplDecl(impl_decl) = stmt {
-                let Some((target_key, _target_kind)) =
+                let Some((target_key, target_kind)) =
                     self.resolve_impl_target(&impl_decl.target, impl_decl.span)
                 else {
                     self.ctx.record_error(
@@ -462,6 +497,16 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     self.add_generic_param(g.type_name);
                 }
 
+                let generic_names: Vec<StrId> = impl_generics.iter().map(|g| g.type_name).collect();
+                let self_ty = self.impl_self_type(
+                    &impl_decl.target,
+                    target_key,
+                    target_kind,
+                    &generic_names,
+                    impl_decl.span,
+                );
+                let prev_self = self.ctx.current_this_type.replace(Some(self_ty));
+
                 for x in methods {
                     let hir_func = self.lower_func_as_proto(x, Some(target_key));
                     self.ctx
@@ -471,6 +516,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .or_insert_with(FxHashMap::default)
                         .insert(hir_func.unmangled_name, hir_func.name);
                 }
+
+                self.ctx.current_this_type.replace(prev_self);
 
                 for g in impl_generics {
                     self.remove_generic_param(g.type_name);
@@ -516,6 +563,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         };
 
         self.ctx.functions.borrow_mut().insert(proto.name, hir_func);
+        let key = self.known_default_key(struct_name, f.name);
+        self.record_attrs(AttrTarget::Func(hir_func.name), key, f.attrs);
         hir_func
     }
 
@@ -553,7 +602,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         let mut items: Vec<Hir<'a, 'bump>> = Vec::with_capacity(64);
         let mut pkg_name: Option<StrId> = None;
 
-        for stmt in stmts {
+        for wrapped in stmts {
+            let (_attrs, stmt) = wrapped.peel();
+            let stmt = &stmt;
             match stmt {
                 Stmt::Import(import_stmt) => {
                     imports.push(*import_stmt.path);
@@ -566,7 +617,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     )));
                 }
                 Stmt::Module(module_decl) => {
-                    for &body_stmt in module_decl.body {
+                    for &wrapped_body in module_decl.body {
+                        let (_, body_stmt) = wrapped_body.peel();
                         match body_stmt {
                             Stmt::FuncDecl(f) => {
                                 let generics =
@@ -595,10 +647,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                                 } else {
                                     self.mangle_with_module_path(f.name)
                                 };
-                                let mut func_binding = self.ctx.functions.borrow_mut();
-                                let func = func_binding.get_mut(&lookup_name).unwrap();
-                                func.body = lowered_body;
-                                items.push(Hir::Func(self.ctx.bump.alloc_value(func.clone())));
+                                {
+                                    let mut func_binding = self.ctx.functions.borrow_mut();
+                                    let func = func_binding.get_mut(&lookup_name).unwrap();
+                                    func.body = lowered_body;
+                                }
+                                items.push(self.lower_free_func_item(f));
                             }
                             other => items.push(self.lower_toplevel(other)),
                         }
@@ -630,10 +684,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     } else {
                         self.mangle_with_module_path(f.name)
                     };
-                    let mut func_binding = self.ctx.functions.borrow_mut();
-                    let func = func_binding.get_mut(&lookup_name).unwrap();
-                    func.body = lowered_body;
-                    items.push(Hir::Func(self.ctx.bump.alloc_value(func.clone())));
+                    {
+                        let mut func_binding = self.ctx.functions.borrow_mut();
+                        let func = func_binding.get_mut(&lookup_name).unwrap();
+                        func.body = lowered_body;
+                    }
+                    items.push(self.lower_free_func_item(f));
                 }
                 other => items.push(self.lower_toplevel(*other)),
             }
@@ -804,6 +860,125 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 Some(self.ctx.resolve_type_path_name(path, name, span))
             }
             ref other => primitive_canonical_name(other).map(|s| StrId(self.ctx.context.intern(s))),
+        }
+    }
+
+    /// Default #[known] key. Free fn: its name. Method: "Type.method" using the
+    /// type's *unmangled* name (primitives/slices fall back to their key).
+    fn known_default_key(&self, owner: Option<StrId>, name: StrId) -> StrId {
+        let Some(owner) = owner else { return name };
+        let unmangled_owner = self
+            .ctx
+            .structs
+            .borrow()
+            .get(&owner)
+            .map(|s| s.unmangled_name)
+            .or_else(|| {
+                self.ctx
+                    .enums
+                    .borrow()
+                    .get(&owner)
+                    .map(|e| e.unmangled_name)
+            })
+            .or_else(|| {
+                self.ctx
+                    .interfaces
+                    .borrow()
+                    .get(&owner)
+                    .map(|i| i.unmangled_name)
+            })
+            .unwrap_or(owner);
+        StrId(intern_fmt!(
+            self.ctx.context,
+            "{}.{}",
+            unmangled_owner,
+            name
+        ))
+    }
+
+    /// `#[known("explicit")]` wins, otherwise the default key.
+    fn known_key(attr: &HirAttribute<'a, 'bump>, default_key: StrId) -> StrId {
+        match attr.args.first() {
+            Some(HirAttrArg::Str(s)) => *s,
+            _ => default_key, // wrong arg shape is the type checker's error to report
+        }
+    }
+
+    pub(super) fn lower_attr_args(&self, args: &[AttrArg<'bump>]) -> &'bump [HirAttrArg<'bump>] {
+        let lowered: Vec<HirAttrArg<'bump>> = args.iter().map(|a| self.lower_attr_arg(a)).collect();
+        self.ctx.bump.alloc_slice(&lowered)
+    }
+
+    fn lower_attr_arg(&self, arg: &AttrArg<'bump>) -> HirAttrArg<'bump> {
+        match *arg {
+            AttrArg::Ident(s) => HirAttrArg::Ident(s),
+            AttrArg::Str(s) => HirAttrArg::Str(s),
+            AttrArg::Number(n) => HirAttrArg::Number(n),
+            AttrArg::Bool(b) => HirAttrArg::Bool(b),
+            AttrArg::KeyValue { key, value } => HirAttrArg::KeyValue {
+                key,
+                value: self
+                    .ctx
+                    .bump
+                    .alloc_value_immutable(self.lower_attr_arg(value)),
+            },
+            AttrArg::Call { name, args } => HirAttrArg::Call {
+                name,
+                args: self.lower_attr_args(args),
+            },
+        }
+    }
+
+    fn record_attrs(
+        &self,
+        target: AttrTarget,
+        default_key: StrId,
+        attrs: &[ir::ast::Attribute<'a, 'bump>],
+    ) {
+        if attrs.is_empty() {
+            return;
+        }
+        let lowered: Vec<HirAttribute<'a, 'bump>> = attrs
+            .iter()
+            .map(|a| HirAttribute {
+                name: a.name,
+                args: self.lower_attr_args(a.args),
+                span: a.span,
+            })
+            .collect();
+
+        if let Some(k) = lowered.iter().find(|a| a.name == "known") {
+            let kind = match target {
+                AttrTarget::Func(_) => Some(KnownKind::Func),
+                AttrTarget::Struct(_) | AttrTarget::Enum(_) | AttrTarget::Interface(_) => {
+                    Some(KnownKind::Type)
+                }
+                AttrTarget::Node(_) => None, // still stored below; the checker reports the misuse
+            };
+            if let Some(kind) = kind {
+                let key = Self::known_key(k, default_key);
+                let prev = self
+                    .ctx
+                    .registry
+                    .known
+                    .borrow_mut()
+                    .insert((kind, key), target);
+                if let Some(prev) = prev {
+                    if prev != target {
+                        // re-lowering the same item is fine
+                        self.ctx.record_error(
+                            format!("duplicate #[known] name `{key}` (already on {prev:?})"),
+                            k.span,
+                        );
+                    }
+                }
+            }
+        }
+
+        // insert, not extend: lowering the same item twice must not duplicate attributes
+        let mut t = self.ctx.attrs.borrow_mut();
+        if t.map.insert(target, lowered).is_none() {
+            t.order.push(target);
         }
     }
 }

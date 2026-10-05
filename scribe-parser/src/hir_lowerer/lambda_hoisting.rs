@@ -790,6 +790,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             visibility: Visibility::Private,
             generics: None,
             fields: self.bump.alloc_slice(&env_fields),
+            unmangled_name: closure.env_name,
         };
         self.hoisted
             .push(Hir::Struct(self.bump.alloc_value(env_struct)));

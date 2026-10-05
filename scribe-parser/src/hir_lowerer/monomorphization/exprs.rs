@@ -907,6 +907,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 .or_else(|| {
                     self.try_monomorphize_struct_init_with_expected_type(expr, expected_ty, subs)
                 })
+                .or_else(|| self.try_monomorphize_assoc_call(expr, expected_ty, subs))
                 .unwrap_or_else(|| self.monomorphize_expr(expr, subs)),
         }
     }
@@ -1449,18 +1450,21 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let concrete_recv_ty = self.concrete_type_of(new_object)?;
         let struct_ty = peel_to_struct(&concrete_recv_ty);
         let HirType::Struct {
-            name: recv_name, ..
+            name: recv_name,
+            type_args: recv_targs,
+            ..
         } = struct_ty
         else {
             return None;
         };
 
-        let base_method_name = *self
-            .ctx
-            .struct_methods
-            .borrow()
-            .get(&recv_name)?
-            .get(&field)?;
+        let (origin, recv_targs): (StrId, Vec<HirType>) =
+            match self.instantiated_struct_origins.borrow().get(&recv_name) {
+                Some((o, t)) => (*o, t.clone()),
+                None => (*recv_name, recv_targs.to_vec()),
+            };
+
+        let base_method_name = *self.ctx.struct_methods.borrow().get(&origin)?.get(&field)?;
         let base_func = self.functions.borrow().get(&base_method_name)?.clone();
         let type_params = base_func.generics?;
 
@@ -1469,6 +1473,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .map_or(false, |p| matches!(p.first(), Some(HirParam::This { .. })));
 
         let mut inner_subs: FxHashMap<StrId, HirType> = FxHashMap::default();
+
+        for (p, a) in type_params.iter().zip(recv_targs.iter()) {
+            inner_subs.insert(p.name, substitute_type(a, outer_subs, &self.bump));
+        }
 
         if let Some(targs) = call_type_args {
             if type_params.len() != targs.len() {
@@ -1512,7 +1520,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         new_args.extend(args.iter().map(|a| self.monomorphize_expr(a, outer_subs)));
         let args_slice = self.bump.alloc_slice(&new_args);
 
-        let prev_self = self.current_this.replace(Some(concrete_recv_ty));
+        let this_ty = self.instantiate_type_recursively(*struct_ty, Default::default());
+
+        let prev_self = self.current_this.replace(Some(this_ty));
         let new_name = self.monomorphize_function(&base_func, &inner_subs);
         self.current_this.replace(prev_self);
         let new_name = new_name?;
@@ -1720,10 +1730,6 @@ fn owned_link_parts<'a, 'bump>(ty: &HirType<'a, 'bump>) -> Option<(HirType<'a, '
         return None;
     };
     Some((pointee, name))
-}
-
-fn owned_link_target<'a, 'bump>(ty: &HirType<'a, 'bump>) -> Option<StrId> {
-    owned_link_parts(ty).map(|(_, name)| name)
 }
 
 fn field_allocator_annotation<'a, 'bump>(

@@ -1,3 +1,4 @@
+use crate::hir_lowerer::module_lowering::ImplTargetKind;
 use crate::optimized_string_buffering::build_module_scoped_name;
 
 use super::context::HirLowerer;
@@ -22,9 +23,6 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("assert_align", IntrinsicKind::AssertAlign),
     ("type_name", IntrinsicKind::TypeName),
     ("own", IntrinsicKind::Own),
-    ("atomic_cas_u32", IntrinsicKind::AtomicCasU32),
-    ("atomic_load_u32", IntrinsicKind::AtomicLoadU32),
-    ("atomic_store_u32", IntrinsicKind::AtomicStoreU32),
     ("cpu_relax", IntrinsicKind::CpuRelax),
     ("unreachable", IntrinsicKind::Unreachable),
     ("reinterpret", IntrinsicKind::Reinterpret),
@@ -33,6 +31,17 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("fn_ptr", IntrinsicKind::FnPtr),
     ("drop_in_place", IntrinsicKind::DropInPlace),
     ("mem_forget", IntrinsicKind::MemForget),
+    ("assume_init", IntrinsicKind::AssumeInit),
+    ("atomic_load", IntrinsicKind::AtomicLoad),
+    ("atomic_store", IntrinsicKind::AtomicStore),
+    ("atomic_swap", IntrinsicKind::AtomicSwap),
+    ("atomic_cas", IntrinsicKind::AtomicCas),
+    ("atomic_fetch_add", IntrinsicKind::AtomicFetchAdd),
+    ("atomic_fetch_sub", IntrinsicKind::AtomicFetchSub),
+    ("atomic_fetch_and", IntrinsicKind::AtomicFetchAnd),
+    ("atomic_fetch_or", IntrinsicKind::AtomicFetchOr),
+    ("atomic_fetch_xor", IntrinsicKind::AtomicFetchXor),
+    ("atomic_fence", IntrinsicKind::AtomicFence),
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -183,6 +192,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
 
                         if acc.member.is_empty() {
+                            if let Some(c) = self.try_module_const(acc.path, *field) {
+                                return c;
+                            }
+
                             HirExpr::ModuleAccess(
                                 self.canonical_module_access(acc.path, *field, *span),
                             )
@@ -657,7 +670,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 segments,
                 member,
                 span,
-            } => HirExpr::ModuleAccess(self.canonical_module_access(*segments, *member, *span)),
+            } => {
+                if let Some(c) = self.try_module_const(*segments, *member) {
+                    return c;
+                }
+                HirExpr::ModuleAccess(self.canonical_module_access(*segments, *member, *span))
+            }
             Expr::ArrayLiteral { elements, span } => HirExpr::ArrayLiteral {
                 elements: self.ctx.bump.alloc_slice(
                     elements
@@ -706,6 +724,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ),
                 *span,
             ),
+            Expr::Attributed { expr, .. } => self.lower_expr(expr),
         }
     }
 
@@ -755,6 +774,21 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         if let HirExpr::ModuleAccess(acc) = &lowered_callee {
             if let Some(name) = self.resolve_module_function(acc) {
                 lowered_callee = HirExpr::Ident(name, acc.span);
+            }
+        }
+
+        if let HirExpr::ModuleAccess(acc) = &lowered_callee {
+            if acc.member.is_empty() && acc.path.len() == 1 {
+                let name = acc.path[0];
+                let named_idx = self.ctx.named_imports.borrow().get(&name).copied();
+                if let Some(midx) = named_idx {
+                    let dg = self.ctx.dep_graph.borrow();
+                    let real_idx = dg.canonical_member_module(midx, name);
+                    let mangled = dg.mangle_free_function(real_idx, name, false, &self.ctx.context);
+                    if let Some(f) = self.ctx.functions.borrow().get(&mangled) {
+                        lowered_callee = HirExpr::Ident(f.name, acc.span);
+                    }
+                }
             }
         }
 
@@ -1014,7 +1048,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         match expr {
             HirExpr::This { .. } => self
                 .ctx
-                .current_self_type
+                .current_this_type
                 .borrow()
                 .unwrap_or(HirType::Unknown),
             HirExpr::Number(_, _) => HirType::I32,
@@ -1409,7 +1443,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub(super) fn lower_pattern(&self, pattern: &Pattern) -> HirPattern<'bump> {
         match pattern {
-            Pattern::Ident(name) => HirPattern::Ident(*name),
+            Pattern::Ident(name, is_mut) => HirPattern::Ident(*name, *is_mut),
             Pattern::Null => HirPattern::Null,
             Pattern::Number(n) => HirPattern::Number(*n),
             Pattern::String(s) => HirPattern::String(*s),
@@ -1445,7 +1479,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 let binding_ids: Vec<ir::hir::StrId> = bindings
                     .iter()
                     .filter_map(|p| {
-                        if let Pattern::Ident(id) = p {
+                        if let Pattern::Ident(id, _) = p {
                             Some(*id)
                         } else {
                             None
@@ -1500,7 +1534,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             TypeKind::Boolean => HirType::Boolean,
             TypeKind::Void => HirType::Void,
 
-            TypeKind::This => HirType::This,
+            TypeKind::This => match *self.ctx.current_this_type.borrow() {
+                Some(self_ty) => self_ty,
+                None => HirType::This, // interface signatures / default bodies
+            },
 
             TypeKind::Struct {
                 name,
@@ -1509,6 +1546,10 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             } => {
                 if path.is_empty() && self.is_generic_param(*name) {
                     return HirType::Generic(*name);
+                }
+
+                if path.is_empty() && name.as_str() == "This" && !self.is_generic_param(*name) {
+                    return self.lower_type_inner(&Type::this(), span);
                 }
 
                 let resolved_name = self.ctx.resolve_type_path_name(path, *name, span);
@@ -1927,6 +1968,39 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             .map(|f| f.field_type)
     }
 
+    pub(super) fn impl_self_type(
+        &self,
+        target: &ir::ast::Type<'a, 'bump>,
+        target_key: StrId,
+        target_kind: ImplTargetKind,
+        impl_generic_names: &[StrId],
+        span: SourceSpan<'a>,
+    ) -> HirType<'a, 'bump> {
+        let mut args: Vec<HirType<'a, 'bump>> = match self.lower_impl_type_args(target, span) {
+            Some(explicit) => explicit.to_vec(),
+            None => impl_generic_names
+                .iter()
+                .map(|n| HirType::Generic(*n))
+                .collect(),
+        };
+
+        if matches!(target_kind, ImplTargetKind::UserType) {
+            if let Some(declared) = self
+                .ctx
+                .structs
+                .borrow()
+                .get(&target_key)
+                .and_then(|s| s.generics)
+            {
+                if args.len() < declared.len() {
+                    Self::fill_default_type_args(declared, &mut args, self.ctx.bump);
+                }
+            }
+        }
+
+        self.impl_target_self_type(target_key, target_kind, &args)
+    }
+
     pub(crate) fn fill_default_type_args(
         declared: &[ir::hir::HirGeneric<'a, 'bump>],
         type_args: &mut Vec<HirType<'a, 'bump>>,
@@ -1951,6 +2025,25 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
         true
+    }
+
+    fn try_module_const(&self, path: &'bump [StrId], member: StrId) -> Option<HirExpr<'a, 'bump>> {
+        if member.is_empty() {
+            return None;
+        }
+        let dg = self.ctx.dep_graph.borrow();
+        let module_idx = self
+            .ctx
+            .imported_modules
+            .borrow()
+            .get(path.last()?)
+            .copied()
+            .or_else(|| dg.resolve_module_path(path))?;
+        self.ctx
+            .module_consts
+            .borrow()
+            .get(&(module_idx, member))
+            .copied()
     }
 }
 
