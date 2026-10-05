@@ -44,7 +44,7 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
 
     func flush(&mut this): Result<bool, IOError> {
         this.lock.lock();
-        let result: Result<void, IOError> = this.flush_locked();
+        let result: Result<usize, IOError> = this.flush_locked();
         this.lock.unlock();
         return match (result) {
             case Result.Ok { value } -> Result.Ok { value: true },
@@ -52,11 +52,11 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
         };
     }
 
-    func flush_locked(&mut this): Result<void, IOError> {
+    func flush_locked(&mut this): Result<usize, IOError> {
         if (this.buffer.len() == 0) {
-            return Result.Ok { value: void };
+            return Result.Ok { value: 0 };
         }
-        let result: Result<void, IOError> = unsafe {
+        let result: Result<usize, IOError> = unsafe {
             this.inner.write_all(this.buffer.as_slice())
         };
         this.buffer.clear();
@@ -82,7 +82,7 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
         return Result.Ok { value: written };
     }
 
-    func writeln(&mut this, s: str): Result<bool, IOError> {
+    func writeln(&mut this, s: str): Result<usize, IOError> {
         return match (this.write_all(s.as_bytes())) {
             case Result.Err { error } -> Result.Err { error },
             case Result.Ok { value } -> this.write_all("\n".as_bytes()),
@@ -93,7 +93,7 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
 impl<W: WriteChannel, A: Allocator> BufWriter<W, A> by WriteChannel {
     unsafe func write_raw(&mut this, bytes: &[]u8): Result<usize, IOError> {
         this.lock.lock();
-        for (let i: usize = 0; i < bytes.len; i += 1) {
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
             this.buffer.push(bytes[i]);
         }
         let mut result: Result<usize, IOError> = Result.Ok { value: bytes.len };
@@ -146,7 +146,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
             case Result.Ok { value } -> value,
             case Result.Err { error } -> return Result.Err { error },
         };
-        for (let i: usize = 0; i < n; i += 1) {
+        for (let mut i: usize = 0; i < n; i += 1) {
             this.buffer.push(chunk[i]);
         }
         return Result.Ok { value: n };
@@ -182,16 +182,16 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: count - remaining };
     }
 
-    func read_to_end<A: Allocator>(&mut this, out: &ArrayList<u8, A>): Result<usize, IOError> {
+    func read_to_end<A: Allocator>(&mut this, out: &mut ArrayList<u8, A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut chunk: [4096]u8 = uninit;
         while (true) {
-            let n: usize = match (unsafe { this.read_raw(&chunk) }) {
+            let n: usize = match (unsafe { this.read_raw(&mut chunk) }) {
                 case Result.Ok { value } -> value,
                 case Result.Err { error } -> return Result.Err { error },
             };
             if (n == 0) { break; }
-            for (let i: usize = 0; i < n; i += 1) {
+            for (let mut i: usize = 0; i < n; i += 1) {
                 out.push(chunk[i]);
             }
             total += n;
@@ -199,7 +199,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: total };
     }
 
-    func read_line<A: Allocator>(&mut this, out: &String<A>): Result<usize, IOError> {
+    func read_line<A: Allocator>(&mut this, out: &mut String<A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut byte: [1]u8 = uninit;
         while (true) {
