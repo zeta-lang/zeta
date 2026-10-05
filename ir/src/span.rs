@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceSpan<'a> {
     pub file_name: &'a str,
 
