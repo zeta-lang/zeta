@@ -9,6 +9,7 @@ use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::ir::MemFlags;
 use cranelift_codegen::ir::Signature;
 use cranelift_codegen::ir::Type;
+use cranelift_codegen::ir::Value as ClifValue;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::isa;
@@ -22,8 +23,8 @@ use ir::ir_hasher::FxHashBuilder;
 use ir::layout::TargetInfo;
 use ir::layout::sizeof_ssa;
 use ir::ssa_ir::{
-    BasicBlock, BinOp, BlockId, CastKind, Function, Instruction, Module, Operand, SsaType, UnOp,
-    Value, inst_is_terminator,
+    AtomicOrdering, BasicBlock, BinOp, BlockId, CastKind, Function, Instruction, Module, Operand,
+    SsaType, UnOp, Value, inst_is_terminator,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -116,6 +117,174 @@ impl CraneliftBackend {
             current_sret_var: None,
             cpu_relax_func,
             global_data: HashMap::with_hasher(FxHashBuilder),
+        }
+    }
+
+    fn atomic_ordering_value(
+        &self,
+        builder: &mut FunctionBuilder,
+        ordering: AtomicOrdering,
+    ) -> cranelift::prelude::Value {
+        let value = match ordering {
+            AtomicOrdering::Relaxed => 0,
+            AtomicOrdering::Acquire => 1,
+            AtomicOrdering::Release => 2,
+            AtomicOrdering::AcqRel => 3,
+            AtomicOrdering::SeqCst => 4,
+        };
+
+        builder.ins().iconst(types::I32, value)
+    }
+
+    fn declare_c_import(
+        &mut self,
+        name: &'static str,
+        params: &[types::Type],
+        ret: Option<types::Type>,
+    ) -> FuncId {
+        let key = StrId::from_static(name);
+
+        if let Some(f) = self.func_ids.get(&key) {
+            return *f;
+        }
+
+        let mut sig = Signature::new(self.module.isa().default_call_conv());
+
+        for ty in params {
+            sig.params.push(AbiParam::new(*ty));
+        }
+
+        if let Some(ty) = ret {
+            sig.returns.push(AbiParam::new(ty));
+        }
+
+        let fid = self
+            .module
+            .declare_function(name, Linkage::Import, &sig)
+            .unwrap_or_else(|e| panic!("failed to declare {name}: {:?}", e));
+
+        self.func_ids.insert(key, fid);
+        fid
+    }
+
+    fn panic_func(&mut self) -> FuncId {
+        let name = StrId::from_static("zeta_debug_debug_panic");
+        if let Some(f) = self.func_ids.get(&name) {
+            return *f;
+        }
+        // debug_panic(msg: str) -> void ; str is a pointer-sized value
+        let mut sig = Signature::new(self.module.isa().default_call_conv());
+        sig.params.push(AbiParam::new(types::I64));
+        let fid = self
+            .module
+            .declare_function("zeta_debug_debug_panic", Linkage::Import, &sig)
+            .unwrap_or_else(|e| panic!("failed to declare zeta_debug_debug_panic: {:?}", e));
+        self.func_ids.insert(name, fid);
+        fid
+    }
+
+    /// Return a zero/default value of the function's return type (used after a
+    /// panic call, and for blocks that fall off the end).
+    fn emit_zero_return(&mut self, builder: &mut FunctionBuilder, func: &Function) {
+        if func.ret_type != SsaType::Void && Self::is_aggregate_ty(&func.ret_type) {
+            let p = builder.use_var(self.current_sret_var.expect("sret var missing"));
+            builder.ins().return_(&[p]);
+            return;
+        }
+        match &func.ret_type {
+            SsaType::Void => {
+                builder.ins().return_(&[]);
+            }
+            SsaType::F32 => {
+                let z = builder.ins().f32const(0.0);
+                builder.ins().return_(&[z]);
+            }
+            SsaType::F64 => {
+                let z = builder.ins().f64const(0.0);
+                builder.ins().return_(&[z]);
+            }
+            other => {
+                let z = builder.ins().iconst(clif_type(other), 0);
+                builder.ins().return_(&[z]);
+            }
+        }
+    }
+
+    /// If `cond` is true at runtime: call debug_panic(msg) and return.
+    /// Otherwise fall through in a fresh block. Never emits a trap.
+    fn guard_or_panic(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        cond: ClifValue,
+        msg: &str,
+        func: &Function,
+    ) {
+        let fail = builder.create_block();
+        let cont = builder.create_block();
+        builder.set_cold_block(fail);
+        builder.ins().brif(cond, fail, &[], cont, &[]);
+
+        builder.switch_to_block(fail);
+        let did = self.get_or_create_string(&StrId(self.context.intern(msg)));
+        let gv = self.module.declare_data_in_func(did, &mut builder.func);
+        let msg_ptr = builder.ins().global_value(types::I64, gv);
+        let pf = self.panic_func();
+        let fref = self.module.declare_func_in_func(pf, &mut builder.func);
+        builder.ins().call(fref, &[msg_ptr]);
+        self.emit_zero_return(builder, func);
+
+        builder.switch_to_block(cont);
+    }
+
+    fn emit_checked_int_div(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        op: &BinOp,
+        l: ClifValue,
+        r: ClifValue,
+        unsigned: bool,
+        func: &Function,
+    ) -> ClifValue {
+        let ty = builder.func.dfg.value_type(r);
+        let zero = builder.ins().iconst(ty, 0);
+        let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
+        let what = if matches!(op, BinOp::Div) {
+            "division"
+        } else {
+            "remainder"
+        };
+        self.guard_or_panic(
+            builder,
+            is_zero,
+            &format!("{what} by zero in `{}`", func.name),
+            func,
+        );
+
+        if !unsigned && matches!(op, BinOp::Div) {
+            let min_val = if ty.bits() >= 64 {
+                i64::MIN
+            } else {
+                -(1i64 << (ty.bits() - 1))
+            };
+            let min = builder.ins().iconst(ty, min_val);
+            let neg1 = builder.ins().iconst(ty, -1);
+            let is_min = builder.ins().icmp(IntCC::Equal, l, min);
+            let is_m1 = builder.ins().icmp(IntCC::Equal, r, neg1);
+            let overflow = builder.ins().band(is_min, is_m1);
+            self.guard_or_panic(
+                builder,
+                overflow,
+                &format!("signed division overflow in `{}`", func.name),
+                func,
+            );
+        }
+
+        match (op, unsigned) {
+            (BinOp::Div, true) => builder.ins().udiv(l, r),
+            (BinOp::Div, false) => builder.ins().sdiv(l, r),
+            (BinOp::Mod, true) => builder.ins().urem(l, r),
+            (_, false) => builder.ins().srem(l, r),
+            _ => unreachable!(),
         }
     }
 
@@ -221,11 +390,12 @@ impl CraneliftBackend {
 
     fn is_aggregate_ty(ty: &SsaType) -> bool {
         match ty {
-            SsaType::User(_, _)
+            SsaType::User(_, _, _)
             | SsaType::Array(_, _)
             | SsaType::Tuple(_)
             | SsaType::Enum { .. }
-            | SsaType::Slice(_) => true,
+            | SsaType::Slice(_)
+            | SsaType::String => true,
             SsaType::Owned(inner) => matches!(inner.as_ref(), SsaType::Slice(_)),
             SsaType::Nullable(_) => ty.is_tagged_nullable(),
             _ => false,
@@ -327,113 +497,168 @@ impl CraneliftBackend {
                 left,
                 right,
             } => {
-                let l = match left {
-                    Operand::Value(v) => {
-                        builder.use_var(*var_map.get(v).expect("binary left undefined"))
-                    }
-                    Operand::ConstInt(i) => builder.ins().iconst(types::I64, *i),
-                    _ => unimplemented!(),
-                };
-                let r = match right {
-                    Operand::Value(v) => {
-                        builder.use_var(*var_map.get(v).expect("binary right undefined"))
-                    }
-                    Operand::ConstInt(i) => builder.ins().iconst(types::I64, *i),
-                    _ => unimplemented!(),
-                };
-
-                let lt = builder.func.dfg.value_type(l);
-                let rt = builder.func.dfg.value_type(r);
-                let (l, r) = if lt != rt {
-                    if lt.bits() < rt.bits() {
-                        (l, builder.ins().ireduce(lt, r))
-                    } else {
-                        (builder.ins().ireduce(rt, l), r)
-                    }
-                } else {
-                    (l, r)
-                };
-
-                let operand_ty = |operand: &Operand| -> Option<&SsaType> {
+                let ssa_of = |operand: &Operand| -> Option<&SsaType> {
                     match operand {
                         Operand::Value(v) => func.value_types.get(v),
                         _ => None,
                     }
                 };
-                let unsigned = operand_ty(left)
-                    .or_else(|| operand_ty(right))
+
+                // Evaluate real values first so we can see their actual clif types.
+                let mut l_val = match left {
+                    Operand::Value(v) => {
+                        Some(builder.use_var(*var_map.get(v).expect("binary left undefined")))
+                    }
+                    _ => None,
+                };
+                let mut r_val = match right {
+                    Operand::Value(v) => {
+                        Some(builder.use_var(*var_map.get(v).expect("binary right undefined")))
+                    }
+                    _ => None,
+                };
+
+                // Float type from the actual values, not from func.value_types.
+                let float_ty = [l_val, r_val]
+                    .iter()
+                    .flatten()
+                    .map(|v| builder.func.dfg.value_type(*v))
+                    .find(|t| t.is_float());
+
+                // Materialise constants, matching the float type when there is one.
+                let make_const = |operand: &Operand, builder: &mut FunctionBuilder| match operand {
+                    Operand::ConstInt(i) => match float_ty {
+                        Some(types::F32) => builder.ins().f32const(*i as f32),
+                        Some(_) => builder.ins().f64const(*i as f64),
+                        None => builder.ins().iconst(types::I64, *i),
+                    },
+                    Operand::ConstFloat(f) => match float_ty {
+                        Some(types::F32) => builder.ins().f32const(*f as f32),
+                        _ => builder.ins().f64const(*f),
+                    },
+                    _ => unimplemented!("binary operand {:?}", operand),
+                };
+                let l = match l_val.take() {
+                    Some(v) => v,
+                    None => make_const(left, builder),
+                };
+                let r = match r_val.take() {
+                    Some(v) => v,
+                    None => make_const(right, builder),
+                };
+
+                let lt = builder.func.dfg.value_type(l);
+                let rt = builder.func.dfg.value_type(r);
+
+                let signed_of = |o: &Operand| ssa_of(o).map_or(true, |t| t.is_signed_integer());
+
+                let (l, r) = if lt.is_float() && rt.is_int() {
+                    (l, builder.ins().fcvt_from_sint(lt, r))
+                } else if lt.is_int() && rt.is_float() {
+                    (builder.ins().fcvt_from_sint(rt, l), r)
+                } else if lt.is_int() && rt.is_int() && lt != rt {
+                    if lt.bits() < rt.bits() {
+                        let l2 = if signed_of(left) {
+                            builder.ins().sextend(rt, l)
+                        } else {
+                            builder.ins().uextend(rt, l)
+                        };
+                        (l2, r)
+                    } else {
+                        let r2 = if signed_of(right) {
+                            builder.ins().sextend(lt, r)
+                        } else {
+                            builder.ins().uextend(lt, r)
+                        };
+                        (l, r2)
+                    }
+                } else {
+                    (l, r)
+                };
+
+                let is_float = builder.func.dfg.value_type(l).is_float();
+                let unsigned = ssa_of(left)
+                    .or_else(|| ssa_of(right))
                     .map(is_unsigned_ssa_type)
                     .unwrap_or(false);
 
-                let res = match op {
-                    BinOp::Add => builder.ins().iadd(l, r),
-                    BinOp::Sub => builder.ins().isub(l, r),
-                    BinOp::Mul => builder.ins().imul(l, r),
-                    BinOp::Div => {
-                        if unsigned {
-                            builder.ins().udiv(l, r)
-                        } else {
-                            builder.ins().sdiv(l, r)
+                let res = if is_float {
+                    use cranelift_codegen::ir::condcodes::FloatCC;
+                    match op {
+                        BinOp::Add => builder.ins().fadd(l, r),
+                        BinOp::Sub => builder.ins().fsub(l, r),
+                        BinOp::Mul => builder.ins().fmul(l, r),
+                        BinOp::Div => builder.ins().fdiv(l, r),
+                        BinOp::Eq => builder.ins().fcmp(FloatCC::Equal, l, r),
+                        BinOp::Ne => builder.ins().fcmp(FloatCC::NotEqual, l, r),
+                        BinOp::Lt => builder.ins().fcmp(FloatCC::LessThan, l, r),
+                        BinOp::Le => builder.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
+                        BinOp::Gt => builder.ins().fcmp(FloatCC::GreaterThan, l, r),
+                        BinOp::Ge => builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
+                        other => {
+                            panic!("operator {other:?} is not valid on floating-point operands")
                         }
                     }
-                    BinOp::Mod => {
-                        if unsigned {
-                            builder.ins().urem(l, r)
-                        } else {
-                            builder.ins().srem(l, r)
+                } else {
+                    match op {
+                        BinOp::Add => builder.ins().iadd(l, r),
+                        BinOp::Sub => builder.ins().isub(l, r),
+                        BinOp::Mul => builder.ins().imul(l, r),
+                        BinOp::Div | BinOp::Mod => {
+                            self.emit_checked_int_div(builder, op, l, r, unsigned, func)
                         }
-                    }
-                    BinOp::Eq => builder.ins().icmp(IntCC::Equal, l, r),
-                    BinOp::Ne => builder.ins().icmp(IntCC::NotEqual, l, r),
-                    BinOp::Lt => builder.ins().icmp(
-                        if unsigned {
-                            IntCC::UnsignedLessThan
-                        } else {
-                            IntCC::SignedLessThan
-                        },
-                        l,
-                        r,
-                    ),
-                    BinOp::Le => builder.ins().icmp(
-                        if unsigned {
-                            IntCC::UnsignedLessThanOrEqual
-                        } else {
-                            IntCC::SignedLessThanOrEqual
-                        },
-                        l,
-                        r,
-                    ),
-                    BinOp::Gt => builder.ins().icmp(
-                        if unsigned {
-                            IntCC::UnsignedGreaterThan
-                        } else {
-                            IntCC::SignedGreaterThan
-                        },
-                        l,
-                        r,
-                    ),
-                    BinOp::Ge => builder.ins().icmp(
-                        if unsigned {
-                            IntCC::UnsignedGreaterThanOrEqual
-                        } else {
-                            IntCC::SignedGreaterThanOrEqual
-                        },
-                        l,
-                        r,
-                    ),
-                    BinOp::BitAnd => builder.ins().band(l, r),
-                    BinOp::BitOr => builder.ins().bor(l, r),
-                    BinOp::BitXor => builder.ins().bxor(l, r),
-                    BinOp::ShiftLeft => builder.ins().ishl(l, r),
-                    BinOp::ShiftRight => {
-                        if unsigned {
-                            builder.ins().ushr(l, r)
-                        } else {
-                            builder.ins().sshr(l, r)
+                        BinOp::Eq => builder.ins().icmp(IntCC::Equal, l, r),
+                        BinOp::Ne => builder.ins().icmp(IntCC::NotEqual, l, r),
+                        BinOp::Lt => builder.ins().icmp(
+                            if unsigned {
+                                IntCC::UnsignedLessThan
+                            } else {
+                                IntCC::SignedLessThan
+                            },
+                            l,
+                            r,
+                        ),
+                        BinOp::Le => builder.ins().icmp(
+                            if unsigned {
+                                IntCC::UnsignedLessThanOrEqual
+                            } else {
+                                IntCC::SignedLessThanOrEqual
+                            },
+                            l,
+                            r,
+                        ),
+                        BinOp::Gt => builder.ins().icmp(
+                            if unsigned {
+                                IntCC::UnsignedGreaterThan
+                            } else {
+                                IntCC::SignedGreaterThan
+                            },
+                            l,
+                            r,
+                        ),
+                        BinOp::Ge => builder.ins().icmp(
+                            if unsigned {
+                                IntCC::UnsignedGreaterThanOrEqual
+                            } else {
+                                IntCC::SignedGreaterThanOrEqual
+                            },
+                            l,
+                            r,
+                        ),
+                        BinOp::BitAnd => builder.ins().band(l, r),
+                        BinOp::BitOr => builder.ins().bor(l, r),
+                        BinOp::BitXor => builder.ins().bxor(l, r),
+                        BinOp::ShiftLeft => builder.ins().ishl(l, r),
+                        BinOp::ShiftRight => {
+                            if unsigned {
+                                builder.ins().ushr(l, r)
+                            } else {
+                                builder.ins().sshr(l, r)
+                            }
                         }
+                        BinOp::LogicalAnd => unreachable!(),
+                        BinOp::LogicalOr => unreachable!(),
                     }
-                    BinOp::LogicalAnd => unreachable!(),
-                    BinOp::LogicalOr => unreachable!(),
                 };
                 let ty = func.value_types.get(dest).unwrap_or_else(|| {
                     panic!("Could not find a value type for {dest:?}, op: {op:?}, {left:?}, {right:?} cranelift backend info: \ncurrent_sret_var: {:?} \nfunc_param_types: {:#?} \nfunc_ret_types: {:#?}", self.current_sret_var, self.func_param_types, self.func_ret_types)
@@ -442,7 +667,7 @@ impl CraneliftBackend {
 
                 let res_ty = builder.func.dfg.value_type(res);
 
-                let res = if res_ty == clif_ty {
+                let res = if res_ty == clif_ty || res_ty.is_float() || clif_ty.is_float() {
                     res
                 } else {
                     match (res_ty, clif_ty) {
@@ -540,23 +765,10 @@ impl CraneliftBackend {
                             }
                         }
                         if !found {
-                            let phi_ty = func
-                                .value_types
-                                .get(dest)
-                                .expect("phi dest missing a value type");
-                            let clif_ty = if *phi_ty == SsaType::Void {
-                                types::I8
-                            } else {
-                                clif_type(phi_ty)
-                            };
-                            let z = if clif_ty == types::F32 {
-                                builder.ins().f32const(0.0)
-                            } else if clif_ty == types::F64 {
-                                builder.ins().f64const(0.0)
-                            } else {
-                                builder.ins().iconst(clif_ty, 0)
-                            };
-                            args.push(BlockArg::Value(z));
+                            panic!(
+                                "phi {:?} in {:?} has no incoming for pred {:?} (jumping from {:?})",
+                                dest, target, curr_bb, curr_bb
+                            );
                         }
                     } else {
                         break;
@@ -628,23 +840,10 @@ impl CraneliftBackend {
                             }
                         }
                         if !found {
-                            let phi_ty = func
-                                .value_types
-                                .get(dest)
-                                .expect("phi dest missing a value type");
-                            let clif_ty = if *phi_ty == SsaType::Void {
-                                types::I8
-                            } else {
-                                clif_type(phi_ty)
-                            };
-                            let z = if clif_ty == types::F32 {
-                                builder.ins().f32const(0.0)
-                            } else if clif_ty == types::F64 {
-                                builder.ins().f64const(0.0)
-                            } else {
-                                builder.ins().iconst(clif_ty, 0)
-                            };
-                            then_args.push(BlockArg::Value(z));
+                            panic!(
+                                "phi {:?} in {:?} has no incoming for pred {:?} (jumping from {:?})",
+                                dest, then_bb, curr_bb, curr_bb
+                            );
                         }
                     } else {
                         break;
@@ -692,23 +891,10 @@ impl CraneliftBackend {
                             }
                         }
                         if !found {
-                            let phi_ty = func
-                                .value_types
-                                .get(dest)
-                                .expect("phi dest missing a value type");
-                            let clif_ty = if *phi_ty == SsaType::Void {
-                                types::I8
-                            } else {
-                                clif_type(phi_ty)
-                            };
-                            let z = if clif_ty == types::F32 {
-                                builder.ins().f32const(0.0)
-                            } else if clif_ty == types::F64 {
-                                builder.ins().f64const(0.0)
-                            } else {
-                                builder.ins().iconst(clif_ty, 0)
-                            };
-                            else_args.push(BlockArg::Value(z));
+                            panic!(
+                                "phi {:?} in {:?} has no incoming for pred {:?} (jumping from {:?})",
+                                dest, else_bb, curr_bb, curr_bb
+                            );
                         }
                     } else {
                         break;
@@ -845,13 +1031,7 @@ impl CraneliftBackend {
                 let off_val = builder.ins().iconst(types::I64, offset_bytes);
                 let addr = builder.ins().iadd(base_val, off_val);
 
-                if matches!(
-                    field_ty,
-                    SsaType::User(_, _)
-                        | SsaType::Array(_, _)
-                        | SsaType::Tuple(_)
-                        | SsaType::Enum { .. }
-                ) {
+                if Self::is_aggregate_ty(field_ty) {
                     let var = self.declare_and_def_addr_var(builder, addr, "LoadField(aggregate)");
                     var_map.insert(*dest, var);
                 } else {
@@ -893,14 +1073,7 @@ impl CraneliftBackend {
                     Operand::Value(v) => func.value_types.get(v),
                     _ => None,
                 };
-                let is_aggregate = matches!(
-                    value_ssa_ty,
-                    Some(SsaType::User(_, _))
-                        | Some(SsaType::Array(_, _))
-                        | Some(SsaType::Tuple(_))
-                        | Some(SsaType::Enum { .. })
-                        | Some(SsaType::Slice(_))
-                );
+                let is_aggregate = value_ssa_ty.map_or(false, Self::is_aggregate_ty);
 
                 if is_aggregate {
                     let src_addr = match value {
@@ -1082,11 +1255,22 @@ impl CraneliftBackend {
                         .and_then(|p| p.get(i))
                         .map(clif_type)
                         .unwrap_or(types::I64);
+                    let src_signed = match a {
+                        Operand::Value(v) => func
+                            .value_types
+                            .get(v)
+                            .map_or(true, |t| t.is_signed_integer()),
+                        _ => true,
+                    };
                     let raw_ty = builder.func.dfg.value_type(raw_val);
                     let coerced = if raw_ty == expected_ty {
                         raw_val
                     } else if raw_ty.bits() < expected_ty.bits() {
-                        builder.ins().uextend(expected_ty, raw_val)
+                        if src_signed {
+                            builder.ins().sextend(expected_ty, raw_val)
+                        } else {
+                            builder.ins().uextend(expected_ty, raw_val)
+                        }
                     } else if raw_ty.bits() > expected_ty.bits() {
                         builder.ins().ireduce(expected_ty, raw_val)
                     } else {
@@ -1162,9 +1346,8 @@ impl CraneliftBackend {
 
                     CastKind::UnsignedIntToFloat => builder.ins().fcvt_from_uint(dst_ty, src),
 
-                    CastKind::FloatToSignedInt => builder.ins().fcvt_to_sint(dst_ty, src),
-
-                    CastKind::FloatToUnsignedInt => builder.ins().fcvt_to_uint(dst_ty, src),
+                    CastKind::FloatToSignedInt => builder.ins().fcvt_to_sint_sat(dst_ty, src),
+                    CastKind::FloatToUnsignedInt => builder.ins().fcvt_to_uint_sat(dst_ty, src),
 
                     CastKind::FloatExtend => builder.ins().fpromote(dst_ty, src),
 
@@ -1195,7 +1378,13 @@ impl CraneliftBackend {
                 };
 
                 let res = match op {
-                    UnOp::Neg => builder.ins().ineg(val),
+                    UnOp::Neg => {
+                        if builder.func.dfg.value_type(val).is_float() {
+                            builder.ins().fneg(val)
+                        } else {
+                            builder.ins().ineg(val)
+                        }
+                    }
 
                     UnOp::BitNot => builder.ins().bnot(val),
 
@@ -1266,13 +1455,7 @@ impl CraneliftBackend {
                     .get(dest)
                     .expect("Load: destination type missing");
 
-                if matches!(
-                    ty,
-                    SsaType::User(_, _)
-                        | SsaType::Array(_, _)
-                        | SsaType::Tuple(_)
-                        | SsaType::Enum { .. }
-                ) {
+                if Self::is_aggregate_ty(ty) {
                     let var = self.declare_and_def_addr_var(builder, ptr_val, "Load(aggregate)");
                     var_map.insert(*dest, var);
                     return;
@@ -1307,14 +1490,7 @@ impl CraneliftBackend {
                     Operand::Value(v) => func.value_types.get(v),
                     _ => None,
                 };
-                let is_aggregate = matches!(
-                    value_ssa_ty,
-                    Some(SsaType::User(_, _))
-                        | Some(SsaType::Array(_, _))
-                        | Some(SsaType::Tuple(_))
-                        | Some(SsaType::Enum { .. })
-                        | Some(SsaType::Slice(_))
-                );
+                let is_aggregate = value_ssa_ty.map_or(false, Self::is_aggregate_ty);
 
                 if is_aggregate {
                     let src_addr = match value {
@@ -1505,58 +1681,444 @@ impl CraneliftBackend {
                     }
 
                     IntrinsicOp::AssertAlign => {} // Lowered differently
-                    IntrinsicOp::AtomicCasU32 => {
-                        let resolve = |a: &Operand,
-                                       builder: &mut FunctionBuilder|
-                         -> cranelift_codegen::ir::Value {
-                            match a {
-                                Operand::Value(v) => builder.use_var(
-                                    *var_map.get(v).expect("atomic_cas_u32 operand undefined"),
-                                ),
-                                Operand::ConstInt(i) => builder.ins().iconst(types::I32, *i),
-                                _ => unimplemented!(),
+                    IntrinsicOp::AtomicLoad { ordering } => {
+                        let dest = dest.expect("AtomicLoad requires a destination");
+
+                        if args.len() != 1 {
+                            panic!("AtomicLoad expects 1 argument, got {}", args.len());
+                        }
+
+                        let result_ssa_ty = func
+                            .value_types
+                            .get(&dest)
+                            .unwrap_or_else(|| panic!("AtomicLoad: destination type missing"));
+
+                        let atomic_ty = atomic_type_from_ssa(result_ssa_ty, "AtomicLoad");
+
+                        let ptr = match &args[0] {
+                            Operand::Value(v) => builder.use_var(
+                                *var_map
+                                    .get(v)
+                                    .expect("AtomicLoad: pointer operand undefined"),
+                            ),
+
+                            Operand::ConstInt(i) => builder.ins().iconst(self.addr_type(), *i),
+
+                            _ => panic!("AtomicLoad: invalid pointer operand {:?}", args[0]),
+                        };
+
+                        let symbol = match atomic_suffix(atomic_ty) {
+                            "u8" => "__zeta_atomic_load_u8",
+                            "u16" => "__zeta_atomic_load_u16",
+                            "u32" => "__zeta_atomic_load_u32",
+                            "u64" => "__zeta_atomic_load_u64",
+                            _ => unreachable!(),
+                        };
+
+                        let fid = self.declare_c_import(
+                            symbol,
+                            &[self.addr_type(), types::I32],
+                            Some(atomic_ty),
+                        );
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let order = self.atomic_ordering_value(builder, *ordering);
+
+                        let call = builder.ins().call(fref, &[ptr, order]);
+
+                        let val = builder.inst_results(call)[0];
+
+                        let var = self.def_fresh_var(builder, val, Some(atomic_ty), "AtomicLoad");
+
+                        var_map.insert(dest, var);
+                    }
+
+                    IntrinsicOp::AtomicStore { ordering } => {
+                        if args.len() != 2 {
+                            panic!("AtomicStore expects 2 arguments, got {}", args.len());
+                        }
+
+                        let atomic_ty = if let Some(ty) = query_ty.as_ref() {
+                            atomic_type_from_ssa(ty, "AtomicStore")
+                        } else {
+                            match &args[1] {
+                                Operand::Value(v) => {
+                                    let ty = func.value_types.get(v).unwrap_or_else(|| {
+                                        panic!("AtomicStore: value type missing")
+                                    });
+
+                                    atomic_type_from_ssa(ty, "AtomicStore")
+                                }
+
+                                Operand::ConstInt(_) => {
+                                    panic!(
+                                        "AtomicStore: query_ty is required \
+                                         when storing a constant"
+                                    )
+                                }
+
+                                _ => panic!("AtomicStore: invalid value operand {:?}", args[1]),
                             }
                         };
-                        let ptr = resolve(&args[0], builder);
-                        let expected = resolve(&args[1], builder);
-                        let new = resolve(&args[2], builder);
-                        let old = builder
+
+                        let ptr = match &args[0] {
+                            Operand::Value(v) => builder.use_var(
+                                *var_map
+                                    .get(v)
+                                    .expect("AtomicStore: pointer operand undefined"),
+                            ),
+
+                            Operand::ConstInt(i) => builder.ins().iconst(self.addr_type(), *i),
+
+                            _ => panic!("AtomicStore: invalid pointer operand {:?}", args[0]),
+                        };
+
+                        let value = self.resolve_atomic_operand(
+                            builder,
+                            var_map,
+                            &args[1],
+                            atomic_ty,
+                            "AtomicStore",
+                        );
+
+                        let symbol = match atomic_suffix(atomic_ty) {
+                            "u8" => "__zeta_atomic_store_u8",
+                            "u16" => "__zeta_atomic_store_u16",
+                            "u32" => "__zeta_atomic_store_u32",
+                            "u64" => "__zeta_atomic_store_u64",
+                            _ => unreachable!(),
+                        };
+
+                        let fid = self.declare_c_import(
+                            symbol,
+                            &[self.addr_type(), atomic_ty, types::I32],
+                            None,
+                        );
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let order = self.atomic_ordering_value(builder, *ordering);
+
+                        builder.ins().call(fref, &[ptr, value, order]);
+                    }
+
+                    IntrinsicOp::AtomicSwap { ordering } => {
+                        let dest = dest.expect("AtomicSwap requires a destination");
+
+                        if args.len() != 2 {
+                            panic!("AtomicSwap expects 2 arguments, got {}", args.len());
+                        }
+
+                        let atomic_ty = if let Some(ty) = query_ty.as_ref() {
+                            atomic_type_from_ssa(ty, "AtomicSwap")
+                        } else {
+                            match &args[1] {
+                                Operand::Value(v) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(v)
+                                        .expect("AtomicSwap: value type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicSwap")
+                                }
+
+                                Operand::ConstInt(_) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(&dest)
+                                        .expect("AtomicSwap: destination type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicSwap")
+                                }
+
+                                _ => panic!("AtomicSwap: invalid value operand"),
+                            }
+                        };
+
+                        let ptr = match &args[0] {
+                            Operand::Value(v) => builder.use_var(
+                                *var_map
+                                    .get(v)
+                                    .expect("AtomicSwap: pointer operand undefined"),
+                            ),
+
+                            Operand::ConstInt(i) => builder.ins().iconst(self.addr_type(), *i),
+
+                            _ => panic!("AtomicSwap: invalid pointer operand {:?}", args[0]),
+                        };
+
+                        let value = self.resolve_atomic_operand(
+                            builder,
+                            var_map,
+                            &args[1],
+                            atomic_ty,
+                            "AtomicSwap",
+                        );
+
+                        let symbol = match atomic_suffix(atomic_ty) {
+                            "u8" => "__zeta_atomic_swap_u8",
+                            "u16" => "__zeta_atomic_swap_u16",
+                            "u32" => "__zeta_atomic_swap_u32",
+                            "u64" => "__zeta_atomic_swap_u64",
+                            _ => unreachable!(),
+                        };
+
+                        let fid = self.declare_c_import(
+                            symbol,
+                            &[self.addr_type(), atomic_ty, types::I32],
+                            Some(atomic_ty),
+                        );
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let order = self.atomic_ordering_value(builder, *ordering);
+
+                        let call = builder.ins().call(fref, &[ptr, value, order]);
+
+                        let old = builder.inst_results(call)[0];
+
+                        let var = self.def_fresh_var(builder, old, Some(atomic_ty), "AtomicSwap");
+
+                        var_map.insert(dest, var);
+                    }
+
+                    IntrinsicOp::AtomicCas { success, failure } => {
+                        let dest = dest.expect("AtomicCas requires a destination");
+
+                        if args.len() != 3 {
+                            panic!("AtomicCas expects 3 arguments, got {}", args.len());
+                        }
+
+                        let atomic_ty = if let Some(ty) = query_ty.as_ref() {
+                            atomic_type_from_ssa(ty, "AtomicCas")
+                        } else {
+                            match &args[2] {
+                                Operand::Value(v) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(v)
+                                        .expect("AtomicCas: new value type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicCas")
+                                }
+
+                                Operand::ConstInt(_) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(&dest)
+                                        .expect("AtomicCas: destination type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicCas")
+                                }
+
+                                _ => panic!("AtomicCas: invalid new value operand"),
+                            }
+                        };
+
+                        let ptr = match &args[0] {
+                            Operand::Value(v) => builder.use_var(
+                                *var_map
+                                    .get(v)
+                                    .expect("AtomicCas: pointer operand undefined"),
+                            ),
+
+                            Operand::ConstInt(i) => builder.ins().iconst(self.addr_type(), *i),
+
+                            _ => panic!("AtomicCas: invalid pointer operand {:?}", args[0]),
+                        };
+
+                        let expected = self.resolve_atomic_operand(
+                            builder,
+                            var_map,
+                            &args[1],
+                            atomic_ty,
+                            "AtomicCas(expected)",
+                        );
+
+                        let new = self.resolve_atomic_operand(
+                            builder,
+                            var_map,
+                            &args[2],
+                            atomic_ty,
+                            "AtomicCas(new)",
+                        );
+
+                        let symbol = match atomic_suffix(atomic_ty) {
+                            "u8" => "__zeta_atomic_cas_u8",
+                            "u16" => "__zeta_atomic_cas_u16",
+                            "u32" => "__zeta_atomic_cas_u32",
+                            "u64" => "__zeta_atomic_cas_u64",
+                            _ => unreachable!(),
+                        };
+
+                        let fid = self.declare_c_import(
+                            symbol,
+                            &[
+                                self.addr_type(),
+                                atomic_ty,
+                                atomic_ty,
+                                types::I32,
+                                types::I32,
+                            ],
+                            Some(atomic_ty),
+                        );
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let success_order = self.atomic_ordering_value(builder, *success);
+
+                        let failure_order = self.atomic_ordering_value(builder, *failure);
+
+                        let call = builder
                             .ins()
-                            .atomic_cas(MemFlags::new(), ptr, expected, new);
-                        let var =
-                            self.def_fresh_var(builder, old, Some(types::I32), "AtomicCasU32");
-                        if let Some(d) = dest {
-                            var_map.insert(*d, var);
-                        }
+                            .call(fref, &[ptr, expected, new, success_order, failure_order]);
+
+                        let old = builder.inst_results(call)[0];
+
+                        let var = self.def_fresh_var(builder, old, Some(atomic_ty), "AtomicCas");
+
+                        var_map.insert(dest, var);
                     }
 
-                    IntrinsicOp::AtomicLoadU32 => {
-                        let ptr = match &args[0] {
-                            Operand::Value(v) => builder
-                                .use_var(*var_map.get(v).expect("atomic_load_u32 ptr undefined")),
-                            _ => unimplemented!(),
-                        };
-                        let val = builder.ins().atomic_load(types::I32, MemFlags::new(), ptr);
-                        let var = builder.declare_var(types::I32);
-                        builder.def_var(var, val);
-                        if let Some(d) = dest {
-                            var_map.insert(*d, var);
+                    IntrinsicOp::AtomicFetchAdd { ordering }
+                    | IntrinsicOp::AtomicFetchSub { ordering }
+                    | IntrinsicOp::AtomicFetchAnd { ordering }
+                    | IntrinsicOp::AtomicFetchOr { ordering }
+                    | IntrinsicOp::AtomicFetchXor { ordering } => {
+                        let dest = dest.expect("AtomicFetch* requires a destination");
+
+                        if args.len() != 2 {
+                            panic!("{op:?} expects 2 arguments, got {}", args.len());
                         }
+
+                        let atomic_ty = if let Some(ty) = query_ty.as_ref() {
+                            atomic_type_from_ssa(ty, "AtomicFetch")
+                        } else {
+                            match &args[1] {
+                                Operand::Value(v) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(v)
+                                        .expect("AtomicFetch*: value type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicFetch")
+                                }
+
+                                Operand::ConstInt(_) => {
+                                    let ty = func
+                                        .value_types
+                                        .get(&dest)
+                                        .expect("AtomicFetch*: destination type missing");
+
+                                    atomic_type_from_ssa(ty, "AtomicFetch")
+                                }
+
+                                _ => panic!("{op:?}: invalid value operand {:?}", args[1]),
+                            }
+                        };
+
+                        let ptr = match &args[0] {
+                            Operand::Value(v) => builder.use_var(
+                                *var_map
+                                    .get(v)
+                                    .expect("AtomicFetch*: pointer operand undefined"),
+                            ),
+
+                            Operand::ConstInt(i) => builder.ins().iconst(self.addr_type(), *i),
+
+                            _ => panic!("{op:?}: invalid pointer operand {:?}", args[0]),
+                        };
+
+                        let value = self.resolve_atomic_operand(
+                            builder,
+                            var_map,
+                            &args[1],
+                            atomic_ty,
+                            "AtomicFetch",
+                        );
+
+                        let suffix = atomic_suffix(atomic_ty);
+
+                        let symbol = match op {
+                            IntrinsicOp::AtomicFetchAdd { .. } => match suffix {
+                                "u8" => "__zeta_atomic_add_u8",
+                                "u16" => "__zeta_atomic_add_u16",
+                                "u32" => "__zeta_atomic_add_u32",
+                                "u64" => "__zeta_atomic_add_u64",
+                                _ => unreachable!(),
+                            },
+
+                            IntrinsicOp::AtomicFetchSub { .. } => match suffix {
+                                "u8" => "__zeta_atomic_sub_u8",
+                                "u16" => "__zeta_atomic_sub_u16",
+                                "u32" => "__zeta_atomic_sub_u32",
+                                "u64" => "__zeta_atomic_sub_u64",
+                                _ => unreachable!(),
+                            },
+
+                            IntrinsicOp::AtomicFetchAnd { .. } => match suffix {
+                                "u8" => "__zeta_atomic_and_u8",
+                                "u16" => "__zeta_atomic_and_u16",
+                                "u32" => "__zeta_atomic_and_u32",
+                                "u64" => "__zeta_atomic_and_u64",
+                                _ => unreachable!(),
+                            },
+
+                            IntrinsicOp::AtomicFetchOr { .. } => match suffix {
+                                "u8" => "__zeta_atomic_or_u8",
+                                "u16" => "__zeta_atomic_or_u16",
+                                "u32" => "__zeta_atomic_or_u32",
+                                "u64" => "__zeta_atomic_or_u64",
+                                _ => unreachable!(),
+                            },
+
+                            IntrinsicOp::AtomicFetchXor { .. } => match suffix {
+                                "u8" => "__zeta_atomic_xor_u8",
+                                "u16" => "__zeta_atomic_xor_u16",
+                                "u32" => "__zeta_atomic_xor_u32",
+                                "u64" => "__zeta_atomic_xor_u64",
+                                _ => unreachable!(),
+                            },
+
+                            _ => unreachable!(),
+                        };
+
+                        let fid = self.declare_c_import(
+                            symbol,
+                            &[self.addr_type(), atomic_ty, types::I32],
+                            Some(atomic_ty),
+                        );
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let order = self.atomic_ordering_value(builder, *ordering);
+
+                        let call = builder.ins().call(fref, &[ptr, value, order]);
+
+                        /*
+                         * The C helper uses __atomic_fetch_*,
+                         * so the returned value is the value from BEFORE the RMW.
+                         */
+                        let old = builder.inst_results(call)[0];
+
+                        let var = self.def_fresh_var(builder, old, Some(atomic_ty), "AtomicFetch");
+
+                        var_map.insert(dest, var);
                     }
 
-                    IntrinsicOp::AtomicStoreU32 => {
-                        let ptr = match &args[0] {
-                            Operand::Value(v) => builder
-                                .use_var(*var_map.get(v).expect("atomic_store_u32 ptr undefined")),
-                            _ => unimplemented!(),
-                        };
-                        let val = match &args[1] {
-                            Operand::Value(v) => builder
-                                .use_var(*var_map.get(v).expect("atomic_store_u32 val undefined")),
-                            Operand::ConstInt(i) => builder.ins().iconst(types::I32, *i),
-                            _ => unimplemented!(),
-                        };
-                        builder.ins().atomic_store(MemFlags::new(), val, ptr);
+                    IntrinsicOp::AtomicFence { ordering } => {
+                        if !args.is_empty() {
+                            panic!("AtomicFence expects no arguments, got {}", args.len());
+                        }
+
+                        let fid = self.declare_c_import("__zeta_atomic_fence", &[types::I32], None);
+
+                        let fref = self.module.declare_func_in_func(fid, &mut builder.func);
+
+                        let order = self.atomic_ordering_value(builder, *ordering);
+
+                        builder.ins().call(fref, &[order]);
                     }
 
                     IntrinsicOp::CpuRelax => {
@@ -1575,37 +2137,34 @@ impl CraneliftBackend {
         if let Some(id) = self.string_data.get(&vm_str) {
             return id.0;
         }
-
-        let id = self
-            .module
-            .declare_data(
-                &format!("t_str_{}", self.string_data.len()),
-                Linkage::Local,
-                false,
-                false,
-            )
-            .unwrap();
-
-        let mut data_ctx = DataDescription::new();
-
+        let n = self.string_data.len();
         let bytes = self.context.resolve_bytes(s);
 
-        let mut blob = Vec::new();
+        // raw bytes
+        let bytes_id = self
+            .module
+            .declare_data(&format!("t_strb_{n}"), Linkage::Local, false, false)
+            .unwrap();
+        let mut bd = DataDescription::new();
+        bd.define(bytes.to_vec().into_boxed_slice());
+        self.module.define_data(bytes_id, &bd).unwrap();
 
-        match self.target.ptr_bytes {
-            4 => blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes()),
-            8 => blob.extend_from_slice(&(bytes.len() as u64).to_le_bytes()),
-            n => panic!("unsupported pointer size: {n}"),
-        }
+        // descriptor { ptr, len }
+        let desc_id = self
+            .module
+            .declare_data(&format!("t_str_{n}"), Linkage::Local, false, false)
+            .unwrap();
+        let mut dd = DataDescription::new();
+        let mut blob = vec![0u8; 16];
+        blob[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        dd.define(blob.into_boxed_slice());
+        dd.set_align(8);
+        let gv = self.module.declare_data_in_data(bytes_id, &mut dd);
+        dd.write_data_addr(0, gv, 0);
+        self.module.define_data(desc_id, &dd).unwrap();
 
-        blob.extend_from_slice(bytes);
-
-        data_ctx.define(blob.into_boxed_slice());
-        data_ctx.set_align(self.target.ptr_bytes as u64);
-        self.module.define_data(id, &data_ctx).unwrap();
-
-        self.string_data.insert(vm_str, ZetaDataId(id));
-        id
+        self.string_data.insert(vm_str, ZetaDataId(desc_id));
+        desc_id
     }
 
     fn emit_main_wrapper(&mut self, zeta_main_fid: FuncId) {
@@ -1920,48 +2479,7 @@ impl Backend for CraneliftBackend {
                 .last()
                 .map_or(false, |i| inst_is_terminator(i));
             if !last_was_terminator {
-                if ret_is_aggregate {
-                    let sret_ptr = builder.use_var(self.current_sret_var.unwrap());
-                    builder.ins().return_(&[sret_ptr]);
-                } else {
-                    match func.ret_type {
-                        SsaType::Void => {
-                            builder.ins().return_(&[]);
-                        }
-                        SsaType::Nullable(_)
-                        | SsaType::Pointer(_)
-                        | SsaType::User(_, _)
-                        | SsaType::Enum { .. }
-                        | SsaType::Null => {
-                            let z = builder.ins().iconst(types::I64, 0);
-                            builder.ins().return_(&[z]);
-                        }
-                        SsaType::I32 | SsaType::U32 => {
-                            let z = builder.ins().iconst(types::I32, 0);
-                            builder.ins().return_(&[z]);
-                        }
-                        SsaType::I64 | SsaType::U64 => {
-                            let z = builder.ins().iconst(types::I64, 0);
-                            builder.ins().return_(&[z]);
-                        }
-                        SsaType::F32 => {
-                            let z = builder.ins().f32const(0.0);
-                            builder.ins().return_(&[z]);
-                        }
-                        SsaType::F64 => {
-                            let z = builder.ins().f64const(0.0);
-                            builder.ins().return_(&[z]);
-                        }
-                        SsaType::Bool => {
-                            let z = builder.ins().iconst(types::I8, 0);
-                            builder.ins().return_(&[z]);
-                        }
-                        _ => {
-                            let z = builder.ins().iconst(types::I64, 0);
-                            builder.ins().return_(&[z]);
-                        }
-                    }
-                }
+                self.emit_zero_return(&mut builder, func);
             }
         }
 
@@ -2061,39 +2579,57 @@ impl CraneliftBackend {
     fn is_zst(&self, ty: &SsaType) -> bool {
         sizeof_ssa(ty, self.target).map(|s| s == 0).unwrap_or(false)
     }
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn __zeta_streq(a: *const u8, b: *const u8) -> i64 {
-    unsafe {
-        let a_len = *(a as *const u64) as usize;
-        let b_len = *(b as *const u64) as usize;
-        if a_len != b_len {
-            return 0;
+    fn resolve_atomic_operand(
+        &self,
+        builder: &mut FunctionBuilder,
+        var_map: &HashMap<Value, Variable, FxHashBuilder>,
+        operand: &Operand,
+        expected_ty: Type,
+        name: &str,
+    ) -> ClifValue {
+        match operand {
+            Operand::Value(v) => {
+                let var = var_map
+                    .get(v)
+                    .unwrap_or_else(|| panic!("{name}: operand undefined"));
+
+                let value = builder.use_var(*var);
+                let actual_ty = value_type(builder, value);
+
+                if actual_ty != expected_ty {
+                    panic!(
+                        "{name}: operand has Cranelift type {:?}, expected {:?}",
+                        actual_ty, expected_ty
+                    );
+                }
+
+                value
+            }
+
+            Operand::ConstInt(i) => builder.ins().iconst(expected_ty, *i),
+
+            _ => unimplemented!("{name}: unsupported operand {:?}", operand),
         }
-        let a_bytes = std::slice::from_raw_parts(a.add(8), a_len);
-        let b_bytes = std::slice::from_raw_parts(b.add(8), b_len);
-        (a_bytes == b_bytes) as i64
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn __enum_new(tag: i64, size: i64) -> *mut u8 {
-    unsafe {
-        let total = 8 + size as usize;
-        let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-        let ptr = std::alloc::alloc(layout);
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        *(ptr as *mut i64) = tag;
-        ptr
-    }
+#[inline]
+fn value_type(builder: &FunctionBuilder, value: ClifValue) -> Type {
+    builder.func.dfg.value_type(value)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn __enum_tag(obj: *const u8) -> i64 {
-    unsafe { *(obj as *const i64) }
+fn atomic_type_from_ssa(ty: &SsaType, name: &str) -> Type {
+    let clif_ty = clif_type(ty);
+
+    if !clif_ty.is_int() {
+        panic!(
+            "{name}: atomic operations require an integer type, got {:?} -> {:?}",
+            ty, clif_ty
+        );
+    }
+
+    clif_ty
 }
 
 fn is_unsigned_ssa_type(ty: &SsaType) -> bool {
@@ -2101,4 +2637,14 @@ fn is_unsigned_ssa_type(ty: &SsaType) -> bool {
         ty,
         SsaType::U8 | SsaType::U16 | SsaType::U32 | SsaType::U64 | SsaType::U128 | SsaType::Usize
     )
+}
+
+fn atomic_suffix(ty: types::Type) -> &'static str {
+    match ty {
+        types::I8 => "u8",
+        types::I16 => "u16",
+        types::I32 => "u32",
+        types::I64 => "u64",
+        _ => panic!("unsupported atomic Cranelift type: {ty}"),
+    }
 }

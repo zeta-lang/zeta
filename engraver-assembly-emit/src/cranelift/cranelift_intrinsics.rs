@@ -20,7 +20,7 @@ pub fn stack_alloc(
     let slot = builder.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
         aligned_size as u32,
-        0,
+        3,
     ));
     builder.ins().stack_addr(ptr_ty, slot, 0)
 }

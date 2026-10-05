@@ -22,17 +22,20 @@ fn clif_type(ty: &SsaType) -> Type {
         SsaType::F32 => types::F32,
         SsaType::F64 => types::F64,
         SsaType::Bool => types::I8, // Using i8 for bool
-        SsaType::String => clif_type(&SsaType::Pointer(Box::new(SsaType::I8))),
+        SsaType::String => clif_type(&SsaType::Pointer(
+            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+            Box::new(SsaType::I8),
+        )),
         SsaType::Void => unimplemented!(),
-        SsaType::User(_, _) => types::I64, // User types passed by reference
-        SsaType::Enum { .. } => types::I64, // Tagged union, passed by reference
-        SsaType::Tuple(_) => types::I64,   // Tuples passed by reference
-        SsaType::Pointer(_) => types::I64, // Pointers are 64-bit
-        SsaType::Dyn => types::I64,        // Trait object (fat pointer)
-        SsaType::Slice(_) => types::I64,   // Slice (fat pointer)
+        SsaType::User(_, _, _) => types::I64, // User types passed by reference
+        SsaType::Enum { .. } => types::I64,   // Tagged union, passed by reference
+        SsaType::Tuple(_) => types::I64,      // Tuples passed by reference
+        SsaType::Pointer(_, _) => types::I64, // Pointers are 64-bit
+        SsaType::Dyn => types::I64,           // Trait object (fat pointer)
+        SsaType::Slice(_) => types::I64,      // Slice (fat pointer)
         SsaType::Null => types::I64,
         SsaType::Char => types::I32,
-        SsaType::Interface(_str_id) => todo!(),
+        SsaType::Interface(_str_id, _) => todo!(),
         SsaType::Nullable(_ssa_type) => types::I64, // pointer
         SsaType::Array(_, _) => types::I64,         // pointer
         SsaType::Owned(_) => types::I64,            // Pointers are 64-bit

@@ -1,4 +1,3 @@
-use crate::ast::MutabilityState;
 use crate::borrow_checker::{Bound, Interval};
 use crate::hir::{
     AssignmentOperator, Hir, HirEnum, HirExpr, HirModule, HirParam, HirType, Operator, RefKind,
@@ -6,8 +5,6 @@ use crate::hir::{
 };
 use crate::ir_hasher::FxHashMap;
 use crate::registry::global_registry::GlobalRegistry;
-use std::sync::Arc;
-use zetaruntime::string_pool::StringPool;
 
 use crate::hir::{HirFunc, HirStmt};
 use std::cell::RefCell;
@@ -538,7 +535,6 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
     pub fn new(
         hir_modules: &[(usize, HirModule<'a, 'bump>)],
         registry: GlobalRegistry<'a, 'bump>,
-        context: Arc<StringPool>,
     ) -> Self {
         let mut enums: FxHashMap<StrId, HirEnum<'a, 'bump>> = FxHashMap::default();
         let mut enums_by_module: FxHashMap<usize, Vec<StrId>> = FxHashMap::default();
