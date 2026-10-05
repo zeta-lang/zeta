@@ -40,7 +40,7 @@ impl<A: Allocator = Mallocator> String<A> {
     }
     func push_str(&mut this, s: str) {
         let bytes: &[]u8 = s.as_bytes();
-        for (let i: usize = 0; i < bytes.len; i += 1) {
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
             this.data.push(bytes[i]);
         }
     }
@@ -75,7 +75,7 @@ impl<A: Allocator = Mallocator> String<A> {
         return Result.Ok { value: written };
     }
 
-    func writeln(&mut this, s: str): Result<bool, IOError> {
+    func writeln(&mut this, s: str): Result<usize, IOError> {
         return match (this.write_all(s.as_bytes())) {
             case Result.Err { error } -> Result.Err { error },
             case Result.Ok { value } -> this.write_all("\n".as_bytes()),
@@ -89,7 +89,7 @@ impl<A: Allocator = Mallocator> String<A> {
 
 impl<A: Allocator> String<A> by WriteChannel {
     unsafe func write_raw(&mut this, bytes: &[]u8): Result<usize, IOError> {
-        for (let i: usize = 0; i < bytes.len; i += 1) {
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
             this.data.push(bytes[i]);
         }
         return Result.Ok { value: bytes.len };
