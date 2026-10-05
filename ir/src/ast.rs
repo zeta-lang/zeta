@@ -31,6 +31,26 @@ where
     Break(Option<&'bump Expr<'a, 'bump>>, SourceSpan<'a>),
     TypeAliasDecl(&'bump TypeAliasDecl<'a, 'bump>),
     Continue(SourceSpan<'a>),
+    Attributed(&'bump AttributedStmt<'a, 'bump>),
+}
+
+impl<'a, 'bump> Stmt<'a, 'bump> {
+    /// Strips Attributed wrappers (any depth) -> (attrs, real stmt).
+    pub fn peel(self) -> (Vec<Attribute<'a, 'bump>>, Stmt<'a, 'bump>) {
+        let mut attrs = Vec::new();
+        let mut cur = self;
+        while let Stmt::Attributed(a) = cur {
+            attrs.extend_from_slice(a.attrs);
+            cur = a.inner;
+        }
+        (attrs, cur)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttributedStmt<'a, 'bump> {
+    pub attrs: &'bump [Attribute<'a, 'bump>],
+    pub inner: Stmt<'a, 'bump>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,6 +132,7 @@ where
     pub methods: Option<&'bump [FuncDecl<'a, 'bump>]>,
     pub span: SourceSpan<'a>,
     pub constants: Option<&'bump [ConstStmt<'a, 'bump>]>,
+    pub is_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -246,7 +267,7 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pattern<'bump> {
-    Ident(StrId),
+    Ident(StrId, bool),
     Number(i64),
     String(StrId),
     Boolean(bool),
@@ -286,6 +307,7 @@ where
     pub return_type: Option<Type<'a, 'bump>>,
     pub body: Option<&'bump Block<'a, 'bump>>,
     pub span: SourceSpan<'a>,
+    pub attrs: &'bump [Attribute<'a, 'bump>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -383,6 +405,11 @@ pub enum Expr<'a, 'bump>
 where
     'bump: 'a,
 {
+    Attributed {
+        attrs: &'bump [Attribute<'a, 'bump>],
+        expr: &'bump Expr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    },
     Intrinsic {
         name: StrId,
         generic_args: &'bump [Type<'a, 'bump>],
@@ -1339,4 +1366,27 @@ impl RefKind {
                 | (Shared, Shared)
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attribute<'a, 'bump> {
+    pub name: StrId,
+    pub args: &'bump [AttrArg<'bump>],
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttrArg<'bump> {
+    Ident(StrId),
+    Str(StrId),
+    Number(i64),
+    Bool(bool),
+    KeyValue {
+        key: StrId,
+        value: &'bump AttrArg<'bump>,
+    },
+    Call {
+        name: StrId,
+        args: &'bump [AttrArg<'bump>],
+    },
 }
