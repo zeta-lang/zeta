@@ -28,10 +28,15 @@ impl CPathBuf {
             debug.debug_panic("path exceeds max length");
         }
         let mut cbuf: CPathBuf = CPathBuf { buf: uninit, len: bytes.len };
-        for (let i: usize = 0; i < bytes.len; i += 1) {
+        for (let mut i: usize = 0; i < bytes.len; i += 1) {
             cbuf.buf[i] = bytes[i];
         }
         cbuf.buf[bytes.len] = 0;
+        // SAFETY: Even if there are no bytes, the null terminator is still needed.
+        // By contract, when it reaches `open_with_flags` and goes through `libc.open`,
+        // the null terminator is used to determine the end of the path.
+        // Therefore, this is safe to call even if the rest of the buffer is uninitialized.
+        unsafe { $assume_init(cbuf.buf); }
         return cbuf;
     }
     unsafe func ptr(&this): [*]const u8 {
@@ -129,16 +134,16 @@ impl FileReader by ReadChannel {
         return Result.Ok { value: count - remaining };
     }
 
-    func read_to_end<A: Allocator>(&mut this, out: &ArrayList<u8, A>): Result<usize, IOError> {
+    func read_to_end<A: Allocator>(&mut this, out: &mut ArrayList<u8, A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut chunk: [4096]u8 = uninit;
         while (true) {
-            let n: usize = match (unsafe { this.read_raw(&chunk) }) {
+            let n: usize = match (unsafe { this.read_raw(&mut chunk) }) {
                 case Result.Ok { value } -> value,
                 case Result.Err { error } -> return Result.Err { error },
             };
             if (n == 0) { break; }
-            for (let i: usize = 0; i < n; i += 1) {
+            for (let mut i: usize = 0; i < n; i += 1) {
                 out.push(chunk[i]);
             }
             total += n;
@@ -146,7 +151,7 @@ impl FileReader by ReadChannel {
         return Result.Ok { value: total };
     }
 
-    func read_line<A: Allocator>(&mut this, out: &String<A>): Result<usize, IOError> {
+    func read_line<A: Allocator>(&mut this, out: &mut String<A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut byte: [1]u8 = uninit;
         while (true) {
