@@ -415,11 +415,12 @@ pub enum TokenKind {
     Arrow,      // ->
     FatArrow,   // =>
     Ellipsis,   // ...
-    DotDot,     // ..
+    DotDotEq,   // ..
     DotDotLt,   // ..<
     ColonColon, // ::
     Dollar,     // $
     Octal,      // "o" or "O" when used in a number.
+    Hashtag,    // #
 
     // ===== Operators =====
     Assign,            // =
@@ -588,8 +589,9 @@ impl fmt::Display for TokenKind {
             Arrow => "->",
             FatArrow => "=>",
             Ellipsis => "...",
-            DotDot => "..",
+            DotDotEq => "..=",
             DotDotLt => "..<",
+            Hashtag => "#",
 
             Assign => "=",
             ColonAssign => ":=",
