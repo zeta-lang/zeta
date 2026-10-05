@@ -1,0 +1,142 @@
+package zeta::sync::atomic;
+
+type AtomicBool = Atomic<bool>;
+type AtomicU8 = Atomic<u8>;
+type AtomicU16 = Atomic<u16>;
+type AtomicU32 = Atomic<u32>;
+type AtomicU64 = Atomic<u64>;
+type AtomicUsize = Atomic<usize>;
+
+type AtomicI8 = Atomic<i8>;
+type AtomicI16 = Atomic<i16>;
+type AtomicI32 = Atomic<i32>;
+type AtomicI64 = Atomic<i64>;
+type AtomicIsize = Atomic<isize>;
+
+#[known]
+enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+struct Atomic<T> {
+    value: T,
+}
+
+impl<T> Atomic<T> {
+    func new(value: T): Atomic<T> {
+        return Atomic<T> {
+            value: value,
+        };
+    }
+
+    func load(&this, ordering: Ordering): T {
+        return $atomic_load<T>(
+            &this.value, // line 38
+            ordering,
+        );
+    }
+
+    func store(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ) {
+        $atomic_store<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func swap(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_swap<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func compare_exchange(
+        &mut this,
+        expected: T,
+        desired: T,
+        success: Ordering,
+        failure: Ordering,
+    ): bool {
+        return $atomic_cas<T>(
+            &alias this.value,
+            expected,
+            desired,
+            success,
+            failure,
+        ) == expected;
+    }
+
+    func fetch_add(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_fetch_add<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func fetch_sub(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_fetch_sub<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func fetch_and(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_fetch_and<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func fetch_or(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_fetch_or<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+
+    func fetch_xor(
+        &mut this,
+        value: T,
+        ordering: Ordering,
+    ): T {
+        return $atomic_fetch_xor<T>(
+            &alias this.value,
+            value,
+            ordering,
+        );
+    }
+}
