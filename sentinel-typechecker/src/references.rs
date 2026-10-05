@@ -4,7 +4,7 @@ use ir::{
     span::SourceSpan,
 };
 
-use crate::{closures, str_id_to_string, TypeChecker};
+use crate::{TypeChecker, closures, str_id_to_string};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn is_reference_like(&self, ty: &HirType<'a, 'bump>) -> bool {
@@ -17,15 +17,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         )
     }
 
-    pub fn expr_is_dangling(&self, expr: &HirExpr<'a, 'bump>) -> bool {
+    pub fn expr_is_dangling(&mut self, expr: &HirExpr<'a, 'bump>) -> bool {
         match expr {
             HirExpr::Ref { expr: inner, .. } => match self.find_root_local_ident(inner) {
                 Some(root_name) => match self.context.get_variable(&root_name) {
-                    Some((_, root_type)) => !root_type.is_pointer_semantics(),
+                    Some((_, root_type)) => {
+                        !root_type.is_pointer_semantics() && !self.place_crosses_indirection(inner)
+                    }
                     None => false,
                 },
                 None => false,
             },
+
             HirExpr::Ident(name, _) => {
                 let var_name = str_id_to_string(*name);
                 self.context.is_dangling(&var_name)
@@ -34,11 +37,44 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    pub fn check_no_dangling_pointer(&self, expr: &HirExpr<'a, 'bump>) -> TypeCheckResult<'a, ()> {
+    fn is_indirection(ty: &HirType<'a, 'bump>) -> bool {
+        let ty = match ty {
+            HirType::Nullable(inner) => **inner,
+            t => *t,
+        };
+        matches!(
+            ty,
+            HirType::Ref { .. }
+                | HirType::SafePointer { .. }
+                | HirType::UnsafePointer { .. }
+                | HirType::OwnedPointer { .. }
+        )
+    }
+
+    /// True if reaching `expr` from its root local crosses a pointer, so the
+    /// storage it names is not inline in that local's stack slot.
+    fn place_crosses_indirection(&mut self, expr: &HirExpr<'a, 'bump>) -> bool {
+        match expr {
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                Self::is_indirection(&self.peek_type(object))
+                    || self.place_crosses_indirection(object)
+            }
+            HirExpr::Deref { expr: inner, .. } => {
+                Self::is_indirection(&self.peek_type(inner))
+                    || self.place_crosses_indirection(inner)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn check_no_dangling_pointer(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+    ) -> TypeCheckResult<'a, ()> {
         if let HirExpr::Ref { expr: inner, .. } = expr {
             if let Some(root_name) = self.find_root_local_ident(inner) {
                 if let Some((_, root_type)) = self.context.get_variable(&root_name) {
-                    if !root_type.is_pointer_semantics() {
+                    if !root_type.is_pointer_semantics() && !self.place_crosses_indirection(inner) {
                         return Err(TypeErrorKind::Generic(format!(
                             "cannot return a pointer to local variable `{}`: its storage does not outlive this function",
                             root_name
