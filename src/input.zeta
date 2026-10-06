@@ -2203,9 +2203,7 @@ func test_multiple_threads(): i64 {
 func test_many_threads(): i64 {
     io.stdout().writeln("=== Running: test_many_threads ===");
 
-    let mut handles: ArrayList<
-        JoinHandle<i64, Mallocator>
-    > = ArrayList.with_capacity(32);
+    let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(32);
 
     let mut i: i64 = 0;
 
@@ -2220,8 +2218,16 @@ func test_many_threads(): i64 {
 
     i = 0;
 
+    let mut values: ArrayList<i64, Mallocator> = ArrayList.with_capacity(32);
     while (i < 32) {
         let result: i64 = handles.get(i as usize).join().unwrap();
+        values.push(result);
+        i += 1;
+    }
+
+    i = 0;
+    while (i < 32) {
+        let result: i64 = *values.get(i as usize);
         let expected: i64 = i * i;
 
         if (result != expected) {
