@@ -55,7 +55,10 @@ impl<'r> AllocatorResolver for FnAllocatorResolver<'r> {
                 )
             }
             hir::ProvenanceRoot::ImplicitParam(_) => {
-                unreachable!("resolved by monomorphization before MIR")
+                unreachable!("resolved before MIR")
+            }
+            hir::ProvenanceRoot::Static => {
+                unreachable!("No allocator")
             }
         }
     }

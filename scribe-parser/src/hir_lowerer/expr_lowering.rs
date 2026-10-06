@@ -1894,7 +1894,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             ast::ProvenanceRoot::Global { module_idx, name } => {
                 hir::ProvenanceRoot::Global { module_idx, name }
             }
-            ast::ProvenanceRoot::ImplicitParam(_) => todo!(),
+            ast::ProvenanceRoot::ImplicitParam(i) => hir::ProvenanceRoot::ImplicitParam(i),
+            ast::ProvenanceRoot::Static => hir::ProvenanceRoot::Static,
         }
     }
 
@@ -1908,7 +1909,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         }
     }
 
-    fn lower_provenance(
+    pub fn lower_provenance(
         &self,
         option: &Option<ProvenanceAnnotation<'bump>>,
     ) -> Option<hir::ProvenanceAnnotation<'bump>> {

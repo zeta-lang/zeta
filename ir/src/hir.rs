@@ -17,6 +17,18 @@ use zetaruntime::string_pool::VmString;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct StrId(pub VmString);
 
+impl Ord for StrId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for StrId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl fmt::Debug for StrId {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -160,6 +172,7 @@ pub enum ProvenanceRoot {
     ThisRoot,
     Global { module_idx: usize, name: StrId },
     ImplicitParam(u32),
+    Static,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,7 +193,8 @@ impl fmt::Display for ProvenanceRoot {
             ProvenanceRoot::Var(name) => write!(f, "{name}"),
             ProvenanceRoot::ThisRoot => write!(f, "self"),
             ProvenanceRoot::Global { name, .. } => write!(f, "{name}"),
-            ProvenanceRoot::ImplicitParam(_) => todo!(),
+            ProvenanceRoot::ImplicitParam(i) => write!(f, "'{i}"),
+            ProvenanceRoot::Static => write!(f, "static"),
         }
     }
 }
@@ -191,6 +205,13 @@ impl fmt::Display for ProvenancePathSegment {
             ProvenancePathSegment::Field(field) => write!(f, ".{field}"),
             ProvenancePathSegment::Deref => write!(f, "*"),
         }
+    }
+}
+
+impl<'bump> ProvenanceAnnotation<'bump> {
+    #[inline]
+    pub fn is_static(&self) -> bool {
+        matches!(self.root, ProvenanceRoot::Static)
     }
 }
 
@@ -392,6 +413,7 @@ pub struct HirGeneric<'a, 'bump> {
     pub name: StrId,
     pub constraints: &'bump [HirType<'a, 'bump>],
     pub default_type: Option<HirType<'a, 'bump>>,
+    pub min_provenance: Option<ProvenanceAnnotation<'bump>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

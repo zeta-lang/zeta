@@ -186,6 +186,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     name: g.type_name,
                     constraints: self.ctx.bump.alloc_slice(&constraints_vec),
                     default_type,
+                    min_provenance: self.lower_provenance(&g.min_provenance),
                 }
             })
             .collect();

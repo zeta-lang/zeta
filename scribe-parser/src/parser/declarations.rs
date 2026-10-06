@@ -200,6 +200,8 @@ where
         let mut constants = Vec::new();
 
         while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
+            let attrs = self.parse_attributes()?; // empty slice if there's no `#`
+
             if self.cursor.peek() == TokenKind::Const {
                 let Stmt::Const(const_stmt) = self.parse_const_stmt()? else {
                     unreachable!()
@@ -219,6 +221,7 @@ where
                 Visibility::Public
             };
 
+            self.pending_attrs = attrs;
             match self.parse_function_with_visibility(method_vis) {
                 Ok(func) => {
                     if let ir::ast::Stmt::FuncDecl(func) = func {

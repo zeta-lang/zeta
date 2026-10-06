@@ -15,7 +15,7 @@ pub fn suffix_for_subs(pool: Arc<StringPool>, subs: &HashMap<StrId, HirType>) ->
         })
         .collect();
     // sort deterministically by key bytes so result is stable across hashmap order
-    pieces.sort_by_key(|(k, _)| pool.resolve_string(k).to_string());
+    pieces.sort_by_key(|(k, _)| k.clone());
     let mut buf: SmallVec<u8, 128> = SmallVec::new();
     for (i, (_, v)) in pieces.iter().enumerate() {
         if i > 0 {

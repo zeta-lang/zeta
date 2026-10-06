@@ -31,7 +31,10 @@ impl AllocatorResolver for GlueAllocatorResolver {
                 unimplemented!("global-rooted allocator provenance in drop glue")
             }
             hir::ProvenanceRoot::ImplicitParam(_) => {
-                unreachable!("resolved by monomorphization before MIR")
+                unreachable!("resolved before MIR")
+            }
+            hir::ProvenanceRoot::Static => {
+                unreachable!("No allocator.")
             }
         }
     }
@@ -222,7 +225,10 @@ impl DropGlueBuilder {
         });
         let offsets = struct_field_offsets.get(&struct_name);
 
-        let this_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::User(struct_name, struct_name, vec![])));
+        let this_ty = SsaType::Pointer(
+            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+            Box::new(SsaType::User(struct_name, struct_name, vec![])),
+        );
         let this_val = Value(0);
         let this_operand = Operand::Value(this_val);
 
@@ -355,10 +361,13 @@ impl DropGlueBuilder {
             match drop {
                 FieldDrop::Type { offset, glue } => {
                     let field_ptr = emitter.current_block_data.fresh_value();
-                    emitter
-                        .current_block_data
-                        .value_types
-                        .insert(field_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Void)));
+                    emitter.current_block_data.value_types.insert(
+                        field_ptr,
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(SsaType::Void),
+                        ),
+                    );
                     emitter.emit(Instruction::FieldAddr {
                         dest: field_ptr,
                         base: this_operand.clone(),
@@ -380,7 +389,10 @@ impl DropGlueBuilder {
                     let field_addr = emitter.current_block_data.fresh_value();
                     emitter.current_block_data.value_types.insert(
                         field_addr,
-                        SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Owned(Box::new(field_ssa_ty.clone())))),
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new(SsaType::Owned(Box::new(field_ssa_ty.clone()))),
+                        ),
                     );
                     emitter.emit(Instruction::FieldAddr {
                         dest: field_addr,

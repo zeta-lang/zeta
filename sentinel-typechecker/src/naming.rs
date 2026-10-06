@@ -164,7 +164,8 @@ pub fn provenance_to_string(p: &ProvenanceAnnotation) -> String {
             module_idx: _,
             name,
         } => str_id_to_string(name),
-        ProvenanceRoot::ImplicitParam(_) => todo!(),
+        ProvenanceRoot::ImplicitParam(i) => format!("{i}"),
+        ProvenanceRoot::Static => "static".to_string(),
     };
     p.path.iter().fold(root, |acc, seg| match seg {
         ProvenancePathSegment::Field(f) => format!("{}.{}", acc, str_id_to_string(*f)),

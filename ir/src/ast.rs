@@ -382,6 +382,7 @@ pub struct Generic<'a, 'bump> {
     pub is_static: bool,
     pub constraints: &'bump [Type<'a, 'bump>],
     pub default_type: Option<Type<'a, 'bump>>,
+    pub min_provenance: Option<ProvenanceAnnotation<'bump>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -646,6 +647,7 @@ pub enum ProvenanceRoot {
     ThisRoot,
     Global { module_idx: usize, name: StrId },
     ImplicitParam(u32),
+    Static,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,7 +668,8 @@ impl fmt::Display for ProvenanceRoot {
             ProvenanceRoot::Var(name) => write!(f, "{name}"),
             ProvenanceRoot::ThisRoot => write!(f, "self"),
             ProvenanceRoot::Global { name, .. } => write!(f, "{name}"),
-            ProvenanceRoot::ImplicitParam(_) => todo!(),
+            ProvenanceRoot::ImplicitParam(i) => write!(f, "{i}"),
+            ProvenanceRoot::Static => write!(f, "static"),
         }
     }
 }

@@ -93,10 +93,25 @@ where
 
             let (name, span) = self.cursor.expect_ident()?;
 
+            let mut min_provenance: Option<ProvenanceAnnotation<'bump>> = None;
             let constraints = if self.cursor.consume(TokenKind::Colon) {
                 let mut types = Vec::new();
                 loop {
-                    types.push(self.parse_type()?);
+                    // `T: Send + &static`: a bare provenance is a bound, not a type.
+                    let bound_span = self.cursor.peek_token().span;
+                    if let Some(bound) =
+                        Self::parse_min_provenance_bound_impl(self.bump, &mut self.cursor)?
+                    {
+                        if min_provenance.is_some() {
+                            return Err(DiagnosticError::new(
+                                ParseErrorKind::DuplicateProvenanceBound,
+                                bound_span,
+                            ));
+                        }
+                        min_provenance = Some(bound);
+                    } else {
+                        types.push(self.parse_type()?);
+                    }
                     if !self.cursor.consume(TokenKind::Add) {
                         break;
                     }
@@ -126,6 +141,7 @@ where
                 is_static,
                 constraints,
                 default_type,
+                min_provenance,
             });
 
             if !self.cursor.consume(TokenKind::Comma) {
@@ -599,10 +615,96 @@ where
         }
     }
 
+    /// `&static`, `&this`, `&this.field`, `&name` in a generic bound position, i.e. a `&`
+    /// followed by a provenance and then the end of the bound (`+`, `,`, `>`, `>>`, `=`).
+    /// Anything else (`&Trait`, `&[T]`) is left for `parse_type`; the cursor is restored.
+    fn parse_min_provenance_bound_impl(
+        bump: &'bump GrowableBump<'bump>,
+        cursor: &mut Cursor<'a, 'bump>,
+    ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
+        if cursor.peek() != TokenKind::BitAnd {
+            return Ok(None);
+        }
+        let save = cursor.pos();
+        cursor.advance();
+
+        let ends_bound = |c: &Cursor<'a, 'bump>| {
+            matches!(
+                c.peek(),
+                TokenKind::Add
+                    | TokenKind::Comma
+                    | TokenKind::Gt
+                    | TokenKind::Shr
+                    | TokenKind::UnsignedShr
+                    | TokenKind::Assign
+            )
+        };
+
+        let parsed = match cursor.peek() {
+            TokenKind::Static => {
+                cursor.advance();
+                Some(ProvenanceAnnotation {
+                    root: ProvenanceRoot::Static,
+                    path: &[],
+                })
+            }
+            TokenKind::This => {
+                cursor.advance();
+                if cursor.consume(TokenKind::Dot) {
+                    let (field, _) = cursor.expect_ident()?;
+                    Some(ProvenanceAnnotation {
+                        root: ProvenanceRoot::ThisRoot,
+                        path: bump.alloc_slice(&[ProvenancePathSegment::Field(field)]),
+                    })
+                } else {
+                    Some(ProvenanceAnnotation {
+                        root: ProvenanceRoot::ThisRoot,
+                        path: &[],
+                    })
+                }
+            }
+            TokenKind::Ident => {
+                let (name, _) = cursor.expect_ident()?;
+                Some(ProvenanceAnnotation {
+                    root: ProvenanceRoot::Var(name),
+                    path: &[],
+                })
+            }
+            _ => None,
+        };
+
+        match parsed {
+            Some(p) if ends_bound(cursor) => Ok(Some(p)),
+            _ => {
+                cursor.reset(save);
+                Ok(None)
+            }
+        }
+    }
+
     fn parse_optional_provenance_impl(
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
     ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
+        // &static Player: the referent lives forever.
+        if cursor.peek() == TokenKind::Static {
+            let save = cursor.pos();
+            cursor.advance();
+            if Self::starts_type_impl(cursor)
+                || matches!(
+                    cursor.peek(),
+                    TokenKind::Mut | TokenKind::Alias | TokenKind::Dyn
+                )
+            {
+                return Ok(Some(ProvenanceAnnotation {
+                    root: ProvenanceRoot::Static,
+                    path: &[],
+                }));
+            }
+            cursor.reset(save);
+            return Ok(None);
+        }
+
         // &this Player / &this.world Player
         if cursor.peek() == TokenKind::Ident {
             let save = cursor.pos();

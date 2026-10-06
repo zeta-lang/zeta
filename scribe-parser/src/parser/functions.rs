@@ -13,6 +13,7 @@ where
         &mut self,
         visibility: Visibility,
     ) -> Result<FuncDecl<'a, 'bump>, DiagnosticError<'a>> {
+        let attrs = std::mem::take(&mut self.pending_attrs);
         let function_metadata = Self::get_func_metadata(&mut self.cursor, visibility)?;
         let fn_token = self.cursor.expect(TokenKind::Func)?;
 
@@ -68,7 +69,7 @@ where
             return_type,
             body,
             span: fn_token.span,
-            attrs: self.pending_attrs,
+            attrs,
         };
 
         Ok(func_decl)
