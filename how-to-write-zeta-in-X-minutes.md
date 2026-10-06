@@ -16,7 +16,6 @@ func main() {
     buf_writer.write("Hello");
     buf_writer.writeln(", world!");
     // you may choose to `buf_writer.flush()` or wait until the scope ends and Drop semantics does what it does best.
-    // Doesn't exist for now though
   
   	// Call another function within this package.
   	beyond_hello();
