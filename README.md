@@ -1,3 +1,5 @@
+###### Come chat at [our discord server](https://discord.gg/VXGk2jjuzc)!
+
 # Introduction
 
 Research systems programming language focused on concurrency and memory safety.
