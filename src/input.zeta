@@ -2,6 +2,7 @@ package input;
 
 import zeta::io;
 import zeta::thread::threads; // threads.spawn
+import zeta::thread::scope.scope;
 import zeta::thread::threads.Thread;
 import zeta::thread::threads.JoinHandle;
 import zeta::file.FileWriter;
@@ -18,6 +19,7 @@ import zeta::time::duration.Duration;
 import zeta::time::instant.Instant;
 import zeta::time::process;
 
+import zeta::sync::arc.Arc;
 import zeta::sync::mutex.Mutex;
 import zeta::sync::mutex.MutexGuard;
 
@@ -1514,6 +1516,12 @@ func main(): i64 {
         return status;
     }
 
+    status = static_tests();
+    if (status != 0) {
+        io.stdout().writeln("[FAIL] static_tests");
+        return status;
+    }
+
     io.stdout().writeln("");
     io.stdout().writeln("========================================");
     io.stdout().writeln("       ALL TESTS PASSED");
@@ -2305,38 +2313,6 @@ func test_thread_fnonce_capture(): i64 {
     return 0;
 }
 
-
-func test_thread_nested_computation(): i64 {
-    io.stdout().writeln("=== Running: test_thread_nested_computation ===");
-
-    let base: i64 = 100;
-
-    let mut handle: JoinHandle<i64, Mallocator> =
-        threads.spawn(
-            func() {
-                let mut value: i64 = base;
-
-                value *= 2;
-                value += 50;
-                value -= 25;
-
-                return value;
-            }
-        );
-
-    let result: i64 = handle.join().unwrap();
-
-    if (result != 225) {
-        io.stdout().writeln("[FAIL] nested computation returned wrong value");
-        return 1;
-    }
-
-    io.stdout().writeln("[PASS] captured computation");
-
-    return 0;
-}
-
-
 func test_thread_repeated_spawn_join(): i64 {
     io.stdout().writeln("=== Running: test_thread_repeated_spawn_join ===");
 
@@ -2347,7 +2323,7 @@ func test_thread_repeated_spawn_join(): i64 {
 
         let mut handle: JoinHandle<i64, Mallocator> =
             threads.spawn(
-                func() {
+                move func() {
                     return value + 1;
                 }
             );
@@ -2429,6 +2405,12 @@ func thread_tests(): i64 {
     if (status12 != 0) {
         return status12;
     }
+
+    let status13: i64 = test_scope_borrows_locals();
+    if (status13 != 0) { return status13; }
+
+    let status14: i64 = test_scope_joins_unjoined();
+    if (status14 != 0) { return status14; }
 
     io.stdout().writeln("");
     io.stdout().writeln("=== All thread tests passed ===");
@@ -3096,41 +3078,81 @@ func time_tests(): i64 {
 //     return handle.join().unwrap();
 // }
 
+func test_thread_nested_computation(): i64 {
+    io.stdout().writeln("=== Running: test_thread_nested_computation ===");
+
+    let base: i64 = 100;
+
+    let mut handle: JoinHandle<i64, Mallocator> =
+        threads.spawn(
+            move func() {
+                let mut value: i64 = base;
+
+                value *= 2;
+                value += 50;
+                value -= 25;
+
+                return value;
+            }
+        );
+
+    let result: i64 = handle.join().unwrap();
+
+    if (result != 225) {
+        io.stdout().writeln("[FAIL] nested computation returned wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] captured computation");
+
+    return 0;
+}
+
+
 func mutex_ok(): i64 {
     io.stdout().writeln("=== Running: mutex_ok ===");
 
-    let x: Mutex<i64> = Mutex.new(0);
+    let x: Arc<Mutex<i64>> = Arc.new(Mutex.new(0));
+    let x_thread: Arc<Mutex<i64>> = x.clone();
 
     let mut handle: JoinHandle<i64, Mallocator> =
-        threads.spawn(func() {
-            let mut lock: MutexGuard<i64> = x.lock(); // line 3054
+        threads.spawn(move func() {
+            let mut lock: MutexGuard<i64> = x_thread.get().lock();
             *lock.get_mut() += 1;
             return *lock.get();
         });
 
     let r: i64 = handle.join().unwrap();
-    io.stdout().writeln("Got:");
-    io.stdout().writeln(r.to_string().as_str());
+
+    if (r != 1) {
+        io.stdout().writeln("[FAIL] mutex_ok wrong value");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] mutex_ok");
     return 0;
 }
+
 
 func mutex_contention(): i64 {
     io.stdout().writeln("=== Running: mutex_contention ===");
 
-    let x: Mutex<i64> = Mutex.new(0);
+    let x: Arc<Mutex<i64>> = Arc.new(Mutex.new(0));
 
     let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(32);
 
     let mut i: i64 = 0;
 
     while (i < 32) {
-        let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
+        let x_thread: Arc<Mutex<i64>> = x.clone();
+
+        let h: JoinHandle<i64, Mallocator> = threads.spawn(move func() {
             let mut j: i64 = 0;
             while (j < 1000) {
-                let mut lock: MutexGuard<i64> = x.lock();
+                let mut lock: MutexGuard<i64> = x_thread.get().lock();
                 *lock.get_mut() += 1;
                 j += 1;
-            } // `lock` is dropped at the end of each iteration
+            }
             return 0;
         });
         handles.push(h);
@@ -3145,20 +3167,95 @@ func mutex_contention(): i64 {
         i += 1;
     }
 
-    let mut lock: MutexGuard<i64> = x.lock();
+    let mut lock: MutexGuard<i64> = x.get().lock();
     let total: i64 = *lock.get();
-
-    io.stdout().writeln("Total:");
-    io.stdout().writeln(total.to_string().as_str());
 
     if (total != 32000) {
         io.stdout().writeln("[FAIL] mutex lost updates");
         return 1;
     }
 
+    if (x.strong_count() != 1) {
+        io.stdout().writeln("[FAIL] Arc clones were not released by the finished threads");
+        io.stdout().writeln(x.strong_count().to_string().as_str());
+        return 2;
+    }
+
     io.stdout().writeln("[PASS] mutex contention, 32 threads x 1000 increments");
     return 0;
 }
+
+func test_scope_borrows_locals(): i64 {
+    io.stdout().writeln("=== Running: test_scope_borrows_locals ===");
+
+    let base: i64 = 100;
+
+    let sum: i64 = scope(func(s: &alias Scope) {
+        let mut h1: ScopedJoinHandle<i64> = s.spawn(func() { return base + 1; });
+        let mut h2: ScopedJoinHandle<i64> = s.spawn(func() { return base + 2; });
+
+        return h1.join().unwrap() + h2.join().unwrap();
+    });
+
+    if (sum != 203) {
+        io.stdout().writeln("[FAIL] scoped threads returned wrong sum");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] scope borrows locals");
+    return 0;
+}
+
+func test_scope_joins_unjoined(): i64 {
+    io.stdout().writeln("=== Running: test_scope_joins_unjoined ===");
+
+    let x: Mutex<i64> = Mutex.new(0);
+
+    let done: i64 = scope(func(s: &alias Scope) {
+        let mut i: i64 = 0;
+        while (i < 8) {
+            s.spawn(func() {
+                let mut j: i64 = 0;
+                while (j < 1000) {
+                    let mut lock: MutexGuard<i64> = x.lock();
+                    *lock.get_mut() += 1;
+                    j += 1;
+                }
+                return 0;
+            });
+            i += 1;
+        }
+        return 0;
+    });
+
+    let mut lock: MutexGuard<i64> = x.lock();
+    if (*lock.get() != 8000) {
+        io.stdout().writeln("[FAIL] scope returned before its threads finished");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] scope joins unjoined threads");
+    return 0;
+}
+
+
+//   func test_fail_spawn_not_send() {
+//       let mut n: i64 = 0;
+//       let holder: RawHolder = RawHolder { ptr: &mut n };
+//       let h = threads.spawn(move func() { return unsafe { *holder.ptr }; }); // ERROR: not Send
+//   }
+
+// compile-fail: closure borrows a local, but `spawn` requires `F: &static`
+// fail_spawn_borrows_local
+// func spawn_borrows_local(): i64 {
+//     let x: Mutex<i64> = Mutex.new(0);
+//     let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
+//         let mut lock: MutexGuard<i64> = x.lock();
+//         *lock.get_mut() += 1;
+//         return 0;
+//     });
+//     return h.join();
+// }
 
 struct Subject {
     value: i64,
@@ -3209,5 +3306,540 @@ func test_observer_pattern(): i64 {
 
     io.stdout().writeln("[PASS] observer pattern");
 
+    return 0;
+}
+
+struct Tile {
+    kind: i64,
+}
+
+struct Level {
+    tiles: [64]Tile,
+}
+
+unsafe impl Tile by Send {}
+unsafe impl Level by Send {}
+
+func fill_tiles(tiles: &mut []Tile, kind: i64) {
+    let mut i: usize = 0;
+    while (i < tiles.len) {
+        tiles[i].kind = kind;
+        i += 1;
+    }
+}
+
+// Two disjoint &mut sub-slices of one array, each handed to its own scoped thread.
+func test_scope_disjoint_slices(): i64 {
+    io.stdout().writeln("=== Running: test_scope_disjoint_slices ===");
+
+    let mut level: Level = Level { tiles: undefined };
+
+    let done: i64 = scope(func(s: &alias Scope) {
+        let a: &mut []Tile = &mut level.tiles[0..<16];
+        let b: &mut []Tile = &mut level.tiles[16..<32];
+
+        s.spawn(func() { fill_tiles(a, 1); return 0; });
+        s.spawn(func() { fill_tiles(b, 2); return 0; });
+
+        return 0;
+    });
+
+    // The scope has joined both threads, so `level` is usable again.
+    if (level.tiles[0].kind != 1 || level.tiles[15].kind != 1) {
+        io.stdout().writeln("[FAIL] first half not filled by thread a");
+        return 1;
+    }
+    if (level.tiles[16].kind != 2 || level.tiles[31].kind != 2) {
+        io.stdout().writeln("[FAIL] second half not filled by thread b");
+        return 2;
+    }
+    if (level.tiles[32].kind != 0) {
+        io.stdout().writeln("[FAIL] untouched region was modified");
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] scope with disjoint &mut slices");
+    return 0;
+}
+
+func test_scope_four_disjoint_slices(): i64 {
+    io.stdout().writeln("=== Running: test_scope_disjoint_slices ===");
+
+    let mut level: Level = Level { tiles: undefined };
+    let N: i64 = 64;
+
+    let done: i64 = scope(func(s: &alias Scope) {
+        let a: &mut []Tile = &mut level.tiles[0..<(N / 4)];
+        let b: &mut []Tile = &mut level.tiles[(N / 4)..<(N / 2)];
+        let c: &mut []Tile = &mut level.tiles[(N / 2)..<(3 * N / 4)];
+        let d: &mut []Tile = &mut level.tiles[(3 * N / 4)..<N];
+
+        s.spawn(func() {
+            fill_tiles(a, 1);
+            return 0;
+        });
+
+        s.spawn(func() {
+            fill_tiles(b, 2);
+            return 0;
+        });
+
+        s.spawn(func() {
+            fill_tiles(c, 3);
+            return 0;
+        });
+
+        s.spawn(func() {
+            fill_tiles(d, 4);
+            return 0;
+        });
+
+        return 0;
+    });
+
+    // The scope has joined all four threads.
+    if (level.tiles[0].kind != 1 || level.tiles[15].kind != 1) {
+        io.stdout().writeln("[FAIL] first quarter not filled");
+        return 1;
+    }
+
+    if (level.tiles[16].kind != 2 || level.tiles[31].kind != 2) {
+        io.stdout().writeln("[FAIL] second quarter not filled");
+        return 2;
+    }
+
+    if (level.tiles[32].kind != 3 || level.tiles[47].kind != 3) {
+        io.stdout().writeln("[FAIL] third quarter not filled");
+        return 3;
+    }
+
+    if (level.tiles[48].kind != 4 || level.tiles[63].kind != 4) {
+        io.stdout().writeln("[FAIL] fourth quarter not filled");
+        return 4;
+    }
+
+    io.stdout().writeln("[PASS] scope with four disjoint &mut slices");
+    return 0;
+}
+
+// compile-fail: overlapping ranges must be rejected (two live &mut to tiles[16..<20])
+//
+// func test_fail_scope_overlapping_slices() {
+//     let mut level: Level = uninit;
+//     scope(func(s: &alias Scope) {
+//         let a: &mut []Tile = &mut level.tiles[0..<20];
+//         let b: &mut []Tile = &mut level.tiles[16..<32];   // ERROR: overlaps `a`
+//         s.spawn(move func() { fill_tiles(a, 1); return 0; });
+//         s.spawn(move func() { fill_tiles(b, 2); return 0; });
+//         return 0;
+//     });
+// }
+//
+// compile-fail: using `level` while the threads may still run
+//
+// func test_fail_scope_use_inside() {
+//     let mut level: Level = uninit;
+//     scope(func(s: &alias Scope) {
+//         let a: &mut []Tile = &mut level.tiles[0..<16];
+//         s.spawn(move func() { fill_tiles(a, 1); return 0; });
+//         level.tiles[0] = Tile { kind: 9 };                // ERROR: `a` still borrows tiles[0..<16]
+//
+
+static let mut G_COUNTER: i64 = 0;
+static let G_CONST: i64 = 1234;
+static let mut G_POINT: Point = Point { x: 1, y: 2 };
+static let mut G_ARR: [8]i64 = [0, 0, 0, 0, 0, 0, 0, 0];
+static let mut G_DROPPABLE: DroppableItem = DroppableItem { tag: "static_droppable" };
+static let mut G_LINE: Line = Line {
+    start: Point { x: 0, y: 0 },
+    end: Point { x: 0, y: 0 },
+};
+
+func static_bump(): i64 {
+    G_COUNTER += 1;
+    return G_COUNTER;
+}
+
+func static_fill_point(p: &alias Point, v: i64) {
+    p.x = v;
+    p.y = v;
+}
+
+// Read, write, compound-assign without any unsafe block.
+func test_static_read_write(): i64 {
+    io.stdout().writeln("=== Running: test_static_read_write ===");
+
+    if (G_CONST != 1234) {
+        io.stdout().writeln("[FAIL] static initializer wrong");
+        return 1;
+    }
+
+    G_COUNTER = 5;
+    if (G_COUNTER != 5) {
+        io.stdout().writeln("[FAIL] static assignment not visible");
+        return 2;
+    }
+
+    G_COUNTER += 10;
+    G_COUNTER *= 2;
+    if (G_COUNTER != 30) {
+        io.stdout().writeln("[FAIL] static compound assignment wrong");
+        return 3;
+    }
+
+    G_COUNTER = 0;
+    io.stdout().writeln("[PASS] static read/write, no unsafe");
+    return 0;
+}
+
+// State survives across calls and is shared between functions.
+func test_static_persists_across_calls(): i64 {
+    io.stdout().writeln("=== Running: test_static_persists_across_calls ===");
+
+    G_COUNTER = 0;
+    static_bump();
+    static_bump();
+    let third: i64 = static_bump();
+
+    if (third != 3 || G_COUNTER != 3) {
+        io.stdout().writeln("[FAIL] static did not persist across calls");
+        return 1;
+    }
+
+    G_COUNTER = 0;
+    io.stdout().writeln("[PASS] static persists across calls");
+    return 0;
+}
+
+// Fields and nested fields of an aggregate static.
+func test_static_struct_fields(): i64 {
+    io.stdout().writeln("=== Running: test_static_struct_fields ===");
+
+    G_POINT.x = 10;
+    io.stdout().writeln(G_POINT.x.to_string().as_str());
+    G_POINT.y = 20;
+    io.stdout().writeln(G_POINT.y.to_string().as_str());
+
+    if (G_POINT.x + G_POINT.y != 30) {
+        io.stdout().writeln("[FAIL] static struct field write");
+        return 1;
+    }
+
+    G_LINE.start.x = 1;
+    G_LINE.start.y = 2;
+    G_LINE.end.x = 11;
+    G_LINE.end.y = 22;
+
+    let dx: i64 = G_LINE.end.x - G_LINE.start.x;
+    let dy: i64 = G_LINE.end.y - G_LINE.start.y;
+    if (dx != 10 || dy != 20) {
+        io.stdout().writeln("[FAIL] static nested struct fields");
+        return 2;
+    }
+
+    G_POINT = Point { x: 7, y: 8 };
+    io.stdout().writeln(G_POINT.x.to_string().as_str());
+    io.stdout().writeln(G_POINT.y.to_string().as_str());
+    let px: i64 = G_POINT.x;
+    io.stdout().writeln(px.to_string().as_str());
+    if (G_POINT.x != 7 || G_POINT.y != 8) {
+        io.stdout().writeln("[FAIL] whole-struct static assignment");
+        return 3;
+    }
+
+    io.stdout().writeln("[PASS] static struct fields");
+    return 0;
+}
+
+// Static array element access and slicing.
+func test_static_array(): i64 {
+    io.stdout().writeln("=== Running: test_static_array ===");
+
+    let mut i: usize = 0;
+    while (i < 8) {
+        G_ARR[i] = (i as i64) * 3;
+        i += 1;
+    }
+
+    if (G_ARR[0] != 0 || G_ARR[3] != 9 || G_ARR[7] != 21) {
+        io.stdout().writeln("[FAIL] static array element mismatch");
+        return 1;
+    }
+
+    let s: &alias []i64 = &alias G_ARR[2..<6];
+    s[0] = 99;
+    if (G_ARR[2] != 99) {
+        io.stdout().writeln("[FAIL] write through slice of static array not visible");
+        return 2;
+    }
+
+    io.stdout().writeln("[PASS] static array");
+    return 0;
+}
+
+// Taking &mut of a static must be allowed with no unsafe, and stay valid.
+func test_static_borrow_no_unsafe(): i64 {
+    io.stdout().writeln("=== Running: test_static_borrow_no_unsafe ===");
+
+    G_POINT = Point { x: 0, y: 0 };
+    static_fill_point(&alias G_POINT, 5);
+    if (G_POINT.x != 5 || G_POINT.y != 5) {
+        io.stdout().writeln("[FAIL] &mut static not written by callee");
+        return 1;
+    }
+
+    let r: &alias i64 = &alias G_COUNTER;
+    *r = 77;
+    if (G_COUNTER != 77) {
+        io.stdout().writeln("[FAIL] &mut static scalar not visible");
+        return 2;
+    }
+
+    G_COUNTER = 0;
+    io.stdout().writeln("[PASS] &mut to static without unsafe");
+    return 0;
+}
+
+func test_static_aliasing_allowed(): i64 {
+    io.stdout().writeln("=== Running: test_static_aliasing_allowed ===");
+
+    G_COUNTER = 0;
+
+    let a: &alias i64 = &alias G_COUNTER;
+    let b: &alias i64 = &alias G_COUNTER;
+
+    *a = 1;
+    *b += 1;
+    G_COUNTER += 1; // direct access while a and b are live
+
+    if (*a != 3 || *b != 3 || G_COUNTER != 3) {
+        io.stdout().writeln("[FAIL] aliased static accesses disagree");
+        return 1;
+    }
+
+    G_COUNTER = 0;
+    io.stdout().writeln("[PASS] overlapping &mut to static accepted and coherent");
+    return 0;
+}
+
+// Non-capturing use of statics inside closures: nothing is captured, so nothing to Send.
+func test_static_in_closure(): i64 {
+    io.stdout().writeln("=== Running: test_static_in_closure ===");
+
+    G_COUNTER = 0;
+
+    io.stdout().writeln(G_COUNTER.to_string().as_str());
+
+    apply_mut(
+        func() {
+            G_COUNTER += 1;
+            io.stdout().writeln(G_COUNTER.to_string().as_str());
+        }
+    );
+
+    io.stdout().writeln(G_COUNTER.to_string().as_str());
+    if (G_COUNTER != 2) {
+        io.stdout().writeln("[FAIL] closure did not mutate static twice");
+        return 1;
+    }
+
+    let r: i64 = apply(
+        func(x: i64) {
+            return x + G_CONST;
+        },
+        6
+    );
+
+    if (r != 1240) {
+        io.stdout().writeln("[FAIL] closure read of static wrong");
+        return 2;
+    }
+
+    // $sizeof on a closure that only touches statics: env should be empty.
+    if (probe(func() { return G_CONST; }) != 0) {
+        io.stdout().writeln("[FAIL] closure env captured a static (should be size 0)");
+        return 3;
+    }
+
+    G_COUNTER = 0;
+    io.stdout().writeln("[PASS] statics used in closures without capture");
+    return 0;
+}
+
+// A non-Send, non-Sync type in a static, spawned threads touch it with no Mutex/Arc.
+struct RawHolderStatic {
+    ptr: [*]mut i64,
+}
+
+//static let mut G_RAW: RawHolderStatic = RawHolderStatic { ptr: &alias G_COUNTER };
+
+// func test_static_thread_no_send_sync(): i64 {
+//     io.stdout().writeln("=== Running: test_static_thread_no_send_sync ===");
+//
+//     G_COUNTER = 0;
+//
+//     // Sequential spawn/join so the result is deterministic; the point is that it
+//     // type-checks with no Send/Sync, no unsafe, and no capture.
+//     let mut i: i64 = 0;
+//     while (i < 16) {
+//         let mut h: JoinHandle<i64, Mallocator> =
+//             threads.spawn(func() {
+//                 G_COUNTER += 1;
+//                 return G_COUNTER;
+//             });
+//         h.join().unwrap();
+//         i += 1;
+//     }
+//
+//     if (G_COUNTER != 16) {
+//         io.stdout().writeln("[FAIL] thread writes to static lost");
+//         return 1;
+//     }
+//
+//     // Static holding a raw-pointer struct (not Send / not Sync) is used from a thread.
+//     let mut h2: JoinHandle<i64, Mallocator> =
+//         threads.spawn(func() {
+//             return *G_RAW.ptr;
+//         });
+//     let seen: i64 = h2.join().unwrap();
+//     if (seen != 16) {
+//         io.stdout().writeln("[FAIL] thread read of non-Send static wrong");
+//         return 2;
+//     }
+//
+//     G_COUNTER = 0;
+//     io.stdout().writeln("[PASS] static used across threads with no Send/Sync");
+//     return 0;
+// }
+
+// Scoped threads writing disjoint static slots. No unsafe, no Send impls, no borrows.
+func test_static_scope_threads(): i64 {
+    io.stdout().writeln("=== Running: test_static_scope_threads ===");
+
+    let done: i64 = scope(func(s: &alias Scope) {
+        s.spawn(func() { G_ARR[0] = 11; return 0; });
+        s.spawn(func() { G_ARR[1] = 22; return 0; });
+        s.spawn(func() { G_ARR[2] = 33; return 0; });
+        return 0;
+    });
+
+    if (G_ARR[0] != 11 || G_ARR[1] != 22 || G_ARR[2] != 33) {
+        io.stdout().writeln("[FAIL] scoped writes to static array missing");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] scoped threads write static array");
+    return 0;
+}
+
+// Intentional data race: 8 threads x 1000 unsynchronized increments. Language must allow it.
+// Only the program surviving and the count being in range is asserted.
+func test_static_data_race_allowed(): i64 {
+    io.stdout().writeln("=== Running: test_static_data_race_allowed ===");
+
+    G_COUNTER = 0;
+
+    let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(8);
+    let mut i: i64 = 0;
+    while (i < 8) {
+        let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
+            let mut j: i64 = 0;
+            while (j < 1000) {
+                G_COUNTER += 1;
+                j += 1;
+            }
+            return 0;
+        });
+        handles.push(h);
+        i += 1;
+    }
+
+    i = 0;
+    while (i < 8) {
+        handles.get(i as usize).join().unwrap();
+        i += 1;
+    }
+
+    // Racy: lost updates are expected and legal. Must be 1..=8000.
+    if (G_COUNTER < 1 || G_COUNTER > 8000) {
+        io.stdout().writeln("[FAIL] racy static counter out of possible range");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] unsynchronized static access compiles and runs");
+    io.stdout().writeln(G_COUNTER.to_string().as_str());
+    G_COUNTER = 0;
+    return 0;
+}
+
+// Statics are never dropped: no scope-exit drop, and reassignment still drops the old value.
+func test_static_drop_semantics(): i64 {
+    io.stdout().writeln("=== Running: test_static_drop_semantics ===");
+
+    io.stdout().writeln("Reassigning static (expect ONE drop of 'static_droppable' right after this line)...");
+    G_DROPPABLE = DroppableItem { tag: "static_replaced" };
+
+    if (G_DROPPABLE.tag.ne("static_replaced")) {
+        io.stdout().writeln("[FAIL] static droppable not replaced");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] static droppable reassign");
+    io.stdout().writeln("Expect NO drop of 'static_replaced' at function exit or program exit.");
+    return 0;
+}
+
+func test_static_moves_out(): i64 {
+    io.stdout().writeln("=== Running: test_static_moves_out ===");
+
+    // Moving out of a static must not be rejected (no move checking on statics).
+    let a: DroppableItem = G_DROPPABLE;
+    let b: DroppableItem = G_DROPPABLE;
+
+    if (a.tag.ne("static_replaced") || b.tag.ne("static_replaced")) {
+        io.stdout().writeln("[FAIL] moved-from static was not readable");
+        return 1;
+    }
+
+    io.stdout().writeln("[PASS] move out of static accepted, twice");
+    io.stdout().writeln("(a and b both drop at scope end: double drop is the programmer's problem here)");
+    return 0;
+}
+
+func static_tests(): i64 {
+    let s1: i64 = test_static_read_write();
+    if (s1 != 0) { return s1; }
+
+    let s2: i64 = test_static_persists_across_calls();
+    if (s2 != 0) { return s2; }
+
+    let s4: i64 = test_static_struct_fields();
+    if (s4 != 0) { return s4; }
+
+    let s5: i64 = test_static_array();
+    if (s5 != 0) { return s5; }
+
+    let s6: i64 = test_static_borrow_no_unsafe();
+    if (s6 != 0) { return s6; }
+
+    let s7: i64 = test_static_aliasing_allowed();
+    if (s7 != 0) { return s7; }
+
+    let s8: i64 = test_static_in_closure();
+    if (s8 != 0) { return s8; }
+
+    // let s9: i64 = test_static_thread_no_send_sync();
+    // if (s9 != 0) { return s9; }
+
+    let s10: i64 = test_static_scope_threads();
+    if (s10 != 0) { return s10; }
+
+    let s11: i64 = test_static_data_race_allowed();
+    if (s11 != 0) { return s11; }
+
+    let s12: i64 = test_static_drop_semantics();
+    if (s12 != 0) { return s12; }
+
+    io.stdout().writeln("=== All static tests passed ===");
     return 0;
 }
