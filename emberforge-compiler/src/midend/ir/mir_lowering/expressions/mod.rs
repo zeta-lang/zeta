@@ -232,6 +232,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         op: AssignmentOperator,
         value: &HirExpr<'a, 'bump>,
     ) -> Value {
+        if let HirExpr::Ident(name, span) = target {
+            if self.is_static_name(name) {
+                return self.lower_static_assign(target, *name, op, value, *span);
+            }
+        }
+
         if matches!(op, AssignmentOperator::Assign) {
             self.record_move_if_any(value);
         }
@@ -762,6 +768,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
     pub(crate) fn narrowed_field_value(&self, expr: &HirExpr<'a, 'bump>) -> Option<Value> {
         let (root, path) = self.static_field_path_mir(expr)?;
+        if self.is_static_name(&root) {
+            return None; // statics can change behind our back: always re-read memory
+        }
         self.narrowed_fields.get(&(root, path)).copied()
     }
 
@@ -771,5 +780,45 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .or_else(|| self.global_funcs.get(name))
             .map(|f| f.params.iter().map(|(_, t)| t.clone()).collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn is_static_name(&self, name: &StrId) -> bool {
+        !self.var_map.contains_key(name) && self.registry.statics.borrow().contains_key(name)
+    }
+
+    pub(crate) fn lower_static_assign(
+        &mut self,
+        target: &HirExpr<'a, 'bump>,
+        name: StrId,
+        op: AssignmentOperator,
+        value: &HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> Value {
+        let (addr, ty) = self.lower_static_addr(name).expect("static vanished");
+        if !matches!(op, AssignmentOperator::Assign) {
+            let rhs = self.lower_expr(value);
+            return self.handle_deref_assign(addr, rhs, op); // load, binop, store
+        }
+        self.record_move_if_any(value);
+        self.narrowed_fields.retain(|(root, _), _| *root != name);
+        // Evaluate the new value BEFORE dropping the old one.
+        let init = self.lower_init_operand(value, &ty);
+
+        let flag_name = ir::registry::global_registry::static_flag_name(&self.context, name);
+        if let Some((flag, _)) = self.lower_static_addr(flag_name) {
+            let kind = self.drop_kind_for_ssa_type(&ty, target);
+            if kind.is_droppable() {
+                self.emit_if_flag(flag, 0, |s| s.emit_indexed_element_drop(&kind, addr, span));
+            }
+            let now_init = !matches!(init, FieldInitVal::Uninit);
+            self.store_const_u8(flag, 0, if now_init { 1 } else { 0 });
+        }
+
+        let result = match &init {
+            FieldInitVal::Val(v) => *v,
+            _ => addr,
+        };
+        self.store_init(addr, 0, &ty, init); // Uninit => no store
+        result
     }
 }

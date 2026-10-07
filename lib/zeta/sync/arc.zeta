@@ -1,0 +1,83 @@
+package zeta::sync::arc;
+
+import zeta::utils::mallocator.Mallocator;
+import zeta::alloc::allocator.Allocator;
+import zeta::lang::traits.Clone;
+import zeta::sync::atomic.Atomic;
+import zeta::sync::atomic.Ordering;
+import zeta::libc;
+import zeta::io;
+
+struct ArcInner<T> {
+    strong: Atomic<usize>,
+    value: T,
+}
+
+struct Arc<T, A: Allocator = Mallocator> {
+    manual inner: [*]mut ArcInner<T>,
+    alloc: A
+}
+
+// Sharing an Arc across threads shares the T, so T must be both.
+unsafe impl<T: Send + Sync, A: Allocator + Clone + Send> Arc<T, A> by Send {}
+unsafe impl<T: Send + Sync, A: Allocator + Clone + Sync> Arc<T, A> by Sync {}
+
+impl<T, A: Allocator + Clone = Mallocator> Arc<T, A> {
+    func new(value: T): Arc<T> {
+        let alloc: Mallocator = Mallocator {};
+        return Arc.new_in(value, alloc);
+    }
+
+    func new_in(value: T, alloc: A): Arc<T, A> {
+        let inner: ^ArcInner<T> = alloc.new(ArcInner<T> {
+            strong: Atomic.new(1),
+            value: value,
+        });
+
+        let raw: [*]mut ArcInner<T> = unsafe { $leak(inner) } as [*]mut ArcInner<T>;
+
+        return Arc<T, A> { inner: raw, alloc };
+    }
+
+    func clone(&this): Arc<T, A> {
+        let prev: usize = unsafe { (*this.inner).strong.fetch_add(1, Ordering.Relaxed) };
+
+        if (prev > 2147483647) {
+            libc.abort();
+        }
+
+        return Arc<T, A> { inner: this.inner, alloc: this.alloc.clone() };
+    }
+
+    func get_shared(&this): &T {
+        let r: &T = unsafe { &(*this.inner).value };
+        return r;
+    }
+
+    func get(&alias this): &alias T {
+        let r: &alias T = unsafe { &alias (*this.inner).value };
+        return r;
+    }
+
+    func as_ptr(&this): [*]mut T {
+        return unsafe { &mut (*this.inner).value as [*]mut T };
+    }
+
+    func strong_count(&this): usize {
+        return unsafe { (*this.inner).strong.load(Ordering.SeqCst) };
+    }
+}
+
+impl<T, A: Allocator + Clone> Arc<T, A> by Drop {
+    func drop(mut this) {
+        let raw: [*]mut ArcInner<T> = this.inner;
+
+        let prev: usize = unsafe { (*raw).strong.fetch_sub(1, Ordering.Release) };
+
+        if (prev == 1) {
+            let _seen: usize = unsafe { (*raw).strong.load(Ordering.Acquire) };
+
+            let owned: ^ArcInner<T> = unsafe { $own(raw, this.alloc) };
+        }
+    }
+}

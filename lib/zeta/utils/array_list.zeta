@@ -1,12 +1,18 @@
 package zeta::utils::array_list;
 
 import zeta::libc;
+import zeta::debug;
 import zeta::alloc::allocator.Allocator;
 import zeta::utils::mallocator.Mallocator;
 
-struct ArrayList<T, A: Allocator = Mallocator> {
+public struct ArrayList<T, A: Allocator = Mallocator> {
     data: ^this.alloc []T,
     alloc: A,
+}
+
+struct ArrayListDrain<T, A: Allocator = Mallocator> {
+    data: ArrayList<T, A>,
+    index: usize,
 }
 
 impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
@@ -48,6 +54,10 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         return this.data.cap;
     }
 
+    func is_empty(&this): bool {
+        return this.data.len == 0;
+    }
+
     func push(&mut this, value: T) {
         if (this.data.len == this.data.cap) {
             this.grow();
@@ -63,6 +73,7 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         if (this.data.len == 0) {
             return null;
         }
+
         return unsafe {
             this.data.len -= 1;
             let ptr: [*]mut T = this.data as [*]mut T;
@@ -115,6 +126,125 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         this.data = this.alloc.realloc(this.data, new_cap);
     }
 
+    func reserve(&mut this, additional: usize) {
+        let required: usize = this.data.len + additional;
+
+        if (required <= this.data.cap) {
+            return;
+        }
+
+        let mut new_cap: usize =
+            if (this.data.cap == 0) {
+                16
+            } else {
+                this.data.cap
+            };
+
+        while (new_cap < required) {
+            new_cap *= 2;
+        }
+
+        this.data = this.alloc.realloc(this.data, new_cap);
+    }
+
+    func insert(&mut this, index: usize, value: T) {
+        if (index > this.data.len) {
+            debug.debug_panic("ArrayList::insert index out of bounds");
+        }
+
+        this.reserve(1);
+
+        unsafe {
+            let ptr: [*]mut T = this.data as [*]mut T;
+
+            let mut i: usize = this.data.len;
+            while (i > index) {
+                ptr[i] = ptr[i - 1];
+                i -= 1;
+            }
+
+            this.data.write_uninit(index, value);
+            this.data.len += 1;
+        }
+    }
+
+    func contains(&this, value: &T): bool {
+        let mut i: usize = 0;
+
+        while (i < this.data.len) {
+            if (this.get(i) == value) {
+                return true;
+            }
+
+            i += 1;
+        }
+
+        return false;
+    }
+
+    func remove(&mut this, index: usize): T {
+        if (index >= this.data.len) {
+            debug.debug_panic("ArrayList::remove index out of bounds");
+        }
+
+        unsafe {
+            let ptr: [*]mut T = this.data as [*]mut T;
+            let value: T = ptr[index];
+
+            let mut i: usize = index;
+            while (i + 1 < this.data.len) {
+                ptr[i] = ptr[i + 1];
+                i += 1;
+            }
+
+            this.data.len -= 1;
+            return value;
+        }
+    }
+
+    func swap_remove(&mut this, index: usize): T {
+        if (index >= this.data.len) {
+            debug.debug_panic("ArrayList::swap_remove index out of bounds");
+        }
+
+        unsafe {
+            let ptr: [*]mut T = this.data as [*]mut T;
+
+            this.data.len -= 1;
+
+            if (index == this.data.len) {
+                return ptr[index];
+            }
+
+            let value: T = ptr[index];
+            ptr[index] = ptr[this.data.len];
+
+            return value;
+        }
+    }
+
+    func drain(&mut this): ArrayListDrain<T, A> {
+        let mut drained: ArrayList<T, A> =
+            ArrayList.with_capacity_in<T, A>(this.data.len, this.alloc);
+
+        unsafe {
+            let ptr: [*]mut T = this.data as [*]mut T;
+
+            let mut i: usize = 0;
+            while (i < this.data.len) {
+                drained.push(ptr[i]);
+                i += 1;
+            }
+
+            this.data.len = 0;
+        }
+
+        return ArrayListDrain<T, A> {
+            data: drained,
+            index: 0,
+        };
+    }
+
     func as_slice(&this): &[]T {
         return this.data[0..<this.data.len];
     }
@@ -128,5 +258,26 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
                 $drop_in_place(&mut ptr[this.data.len]);
             }
         }
+    }
+}
+
+impl<T, A: Allocator> ArrayListDrain<T, A> {
+    func next(&mut this): ?T {
+        if (this.index >= this.data.len()) {
+            return null;
+        }
+
+        let value: T = this.data.pop();
+        this.index += 1;
+
+        return value;
+    }
+
+    func len(&this): usize {
+        if (this.index >= this.data.len()) {
+            return 0;
+        }
+
+        return this.data.len() - this.index;
     }
 }

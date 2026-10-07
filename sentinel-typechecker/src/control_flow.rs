@@ -31,18 +31,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut arm_types = Vec::with_capacity(arms.len());
         let mut arm_move_states = Vec::with_capacity(arms.len());
 
-        let ob_branch = self.begin_obligation_branch();
-        let mut ob_arms = Vec::with_capacity(arms.len());
-
         let inval_before = self.invalidated_provenances.clone();
         let mut inval_after = inval_before.clone();
         for arm in arms {
             self.invalidated_provenances = inval_before.clone();
-            self.restore_obligations(&ob_branch);
             let (arm_type, arm_move_state) =
                 self.check_match_arm(expr, arm, &scrutinee_ty, expected, &move_state_before);
             let diverges = matches!(arm_type, HirType::Never);
-            ob_arms.push((self.end_obligation_arm(&ob_branch), diverges));
             if !diverges {
                 inval_after.extend(self.invalidated_provenances.drain());
             }
@@ -52,8 +47,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 arm_move_states.push(arm_move_state);
             }
         }
-
-        self.join_obligation_arms(ob_branch, ob_arms);
 
         self.invalidated_provenances = inval_after;
         self.move_state = arm_move_states
@@ -250,21 +243,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let move_state_before = self.move_state.clone();
         let inval_before = self.invalidated_provenances.clone();
         let non_null_before = self.non_null_state.clone();
-        let ob_branch = self.begin_obligation_branch();
 
         let then_value = self.check_if_then_branch(cond, then_block, expected);
         let then_inval = self.invalidated_provenances.clone();
         let then_move_state = self.move_state.clone();
         let then_non_null = self.non_null_state.clone();
         let then_diverges = matches!(then_value, HirType::Never);
-        let then_ob = self.end_obligation_arm(&ob_branch);
-        self.restore_obligations(&ob_branch);
 
         self.restore_state_for_else_branch(cond, &move_state_before, &non_null_before);
 
         self.invalidated_provenances = inval_before;
         let else_value = self.check_if_else_branch(cond, else_block, expected);
-        let else_ob = self.end_obligation_arm(&ob_branch);
         let else_inval = std::mem::take(&mut self.invalidated_provenances);
         let else_diverges = else_value
             .as_ref()
@@ -280,11 +269,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         };
         let else_move_state = self.move_state.clone();
         let else_non_null = self.non_null_state.clone();
-
-        self.join_obligation_arms(
-            ob_branch,
-            vec![(then_ob, then_diverges), (else_ob, else_diverges)],
-        );
 
         self.join_if_branch_states(
             then_move_state,

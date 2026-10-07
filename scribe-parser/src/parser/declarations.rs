@@ -102,6 +102,10 @@ where
                 });
 
                 self.cursor.consume(TokenKind::Comma);
+
+                if self.cursor.peek() == TokenKind::RBrace {
+                    break;
+                }
             }
 
             self.cursor.expect(TokenKind::RBrace)?;

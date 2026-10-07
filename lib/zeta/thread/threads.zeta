@@ -16,9 +16,9 @@ struct ThreadCtxHeader {
 // F-dependent. Only ever touched inside invoke_impl<F,R,A>.
 struct ThreadCtx<F, R, A: Allocator> {
     header: ThreadCtxHeader,   // MUST be first field
-    func_: F,
+    manual func_: F,
     slot: [*]mut ResultSlot<R, A>,
-    alloc: A,                 // needed to reclaim *this* block
+    alloc: A,
 }
 
 struct ResultSlot<R, A: Allocator> {
@@ -45,14 +45,14 @@ extern "C" func thread_entry(arg: [*]mut void): [*]mut void {
 
 func invoke_impl<F: func(): R, R, A: Allocator>(arg: [*]mut void): void {
     let raw: [*]mut ThreadCtx<F, R, A> = arg as [*]mut ThreadCtx<F, R, A>;
-
     let alloc: A = unsafe { (*raw).alloc };
-
     let slot: [*]mut ResultSlot<R, A> = unsafe { (*raw).slot };
 
-    let result: R = unsafe { (*raw).func_() };
-
-    unsafe { (*slot).result = result; }
+    {
+        let f: F = unsafe { (*raw).func_ };
+        let result: R = f();
+        unsafe { (*slot).result = result; }
+    } // f dropped here, ctx memory still valid
 
     let owned: ^ThreadCtx<F, R, A> = unsafe { $own(raw, alloc) };
 }
@@ -62,7 +62,18 @@ func reclaim_ctx<F: func(): R, R>(raw: [*]mut void, alloc: Mallocator): void {
         unsafe { $own(raw as [*]mut ThreadCtx<F, R, Mallocator>, alloc) };
 }
 
-func spawn<F: Send + func(): R, R>(f: F): JoinHandle<R, Mallocator> {
+func start_raw(ctx: [*]mut void): Pthread {
+    let mut tid: Pthread = uninit;
+    let ret: i32 = unsafe {
+        libc.pthread_create(&mut tid, null, thread_entry as [*]const void, ctx)
+    };
+    if (ret != 0) {
+        debug.debug_panic("pthread_create failed");
+    }
+    return tid;
+}
+
+func spawn<F: Send + &static + func(): R, R: Send>(f: F): JoinHandle<R, Mallocator> {
     let alloc: Mallocator = Mallocator {};
 
     let slot: ^ResultSlot<R, Mallocator> =

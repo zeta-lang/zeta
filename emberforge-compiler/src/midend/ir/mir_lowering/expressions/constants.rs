@@ -211,6 +211,18 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
         } else if let Some(const_expr) = self.constants.get(name) {
             self.lower_expr(const_expr)
+        } else if let Some((addr, ty)) = self.lower_static_addr(*name) {
+            if Self::is_aggregate_ssa_type(&ty) || matches!(ty, SsaType::Array(..)) {
+                addr // aggregates are carried by address
+            } else {
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::Load {
+                    dest,
+                    ptr: Operand::Value(addr),
+                });
+                self.current_block_data.value_types.insert(dest, ty);
+                dest
+            }
         } else if let Some(func) = self.funcs.get(name).or_else(|| self.global_funcs.get(name)) {
             let dest = self.current_block_data.fresh_value();
             let ty = SsaType::FuncPointer {
@@ -471,5 +483,17 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 v
             }
         }
+    }
+
+    pub(crate) fn lower_static_addr(&mut self, name: StrId) -> Option<(Value, SsaType)> {
+        let ty = self.registry.statics.borrow().get(&name)?.ty.clone();
+        let v = self.current_block_data.fresh_value();
+        self.emit(Instruction::GlobalAddr { dest: v, name });
+        let vt = match &ty {
+            SsaType::Array(..) => ty.clone(),
+            _ => SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())),
+        };
+        self.current_block_data.value_types.insert(v, vt);
+        Some((v, ty))
     }
 }

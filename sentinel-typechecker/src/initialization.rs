@@ -1,6 +1,8 @@
 use ir::{
     errors::type_error::TypeErrorKind,
-    hir::{AssignmentOperator, HirExpr, HirFunc, HirParam, HirStmt, HirType, RefKind, StrId},
+    hir::{
+        AssignmentOperator, HirExpr, HirFunc, HirParam, HirStmt, HirType, Operator, RefKind, StrId,
+    },
     ir_hasher::{FxHashMap, HashSet},
 };
 
@@ -89,6 +91,12 @@ pub enum InitNode {
     },
 }
 
+impl InitNode {
+    pub fn is_fully_init(&self) -> bool {
+        matches!(self, InitNode::Whole(InitStatus::Initialized))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IntervalSet {
     // sorted, non-overlapping, non-adjacent ranges [start, end)
@@ -149,7 +157,228 @@ impl IntervalSet {
     }
 }
 
+pub struct CountedFill {
+    root: StrId,
+    path: Vec<StrId>,
+    start: i64,
+    end: i64,
+    len: usize,
+    entry: InitNode,
+}
+
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
+    fn expr_is_straightline(e: &HirExpr<'a, 'bump>) -> bool {
+        match e {
+            HirExpr::Number(..)
+            | HirExpr::Decimal(..)
+            | HirExpr::String(..)
+            | HirExpr::Boolean(..)
+            | HirExpr::Char(..)
+            | HirExpr::Null(_)
+            | HirExpr::Ident(..)
+            | HirExpr::This { .. }
+            | HirExpr::Undefined { .. } => true,
+            HirExpr::Binary { left, right, .. }
+            | HirExpr::Comparison { left, right, .. }
+            | HirExpr::Assignment {
+                target: left,
+                value: right,
+                ..
+            } => Self::expr_is_straightline(left) && Self::expr_is_straightline(right),
+            HirExpr::Index { object, index, .. } => {
+                Self::expr_is_straightline(object) && Self::expr_is_straightline(index)
+            }
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
+                Self::expr_is_straightline(object)
+            }
+            HirExpr::Deref { expr, .. }
+            | HirExpr::Cast { expr, .. }
+            | HirExpr::Ref { expr, .. } => Self::expr_is_straightline(expr),
+            HirExpr::StructInit { args, .. } => {
+                args.iter().all(|f| Self::expr_is_straightline(&f.value))
+            }
+            HirExpr::Call { callee, args, .. } => {
+                Self::expr_is_straightline(callee)
+                    && args.iter().all(|a| Self::expr_is_straightline(a))
+            }
+            // blocks, if/match exprs, lambdas: may contain break/continue
+            _ => false,
+        }
+    }
+
+    fn is_plus_one_of(stmt: &HirStmt<'a, 'bump>, i: StrId) -> bool {
+        let HirStmt::Expr(HirExpr::Assignment {
+            target, op, value, ..
+        }) = stmt
+        else {
+            return false;
+        };
+        if !matches!(target, HirExpr::Ident(n, _) if *n == i) {
+            return false;
+        }
+        match (op, value) {
+            (AssignmentOperator::AddAssign, HirExpr::Number(1, _)) => true,
+            (
+                AssignmentOperator::Assign,
+                HirExpr::Binary {
+                    left,
+                    op: Operator::Add,
+                    right,
+                    ..
+                },
+            ) => {
+                matches!(&**left, HirExpr::Ident(n, _) if *n == i)
+                    && matches!(&**right, HirExpr::Number(1, _))
+            }
+            _ => false,
+        }
+    }
+
+    /// Recognise `while (i < N) { ...straight-line...; arr[i] = v; ...; i += 1; }`
+    /// where `i` is a known constant `S < N` on entry. Returns the arrays that are
+    /// definitely filled over `[S, N)` when the loop exits.
+    pub fn detect_counted_fills(
+        &mut self,
+        cond: &HirExpr<'a, 'bump>,
+        body: &HirStmt<'a, 'bump>,
+    ) -> Vec<CountedFill> {
+        let mut out = Vec::new();
+
+        let HirExpr::Comparison {
+            left, op, right, ..
+        } = cond
+        else {
+            return out;
+        };
+        let (HirExpr::Ident(i, _), HirExpr::Number(n, _)) = (&**left, &**right) else {
+            return out;
+        };
+        let i = *i;
+        let end = match op {
+            Operator::LessThan => *n,
+            Operator::LessThanOrEqual => match n.checked_add(1) {
+                Some(e) => e,
+                None => return out,
+            },
+            _ => return out,
+        };
+        let Some(&start) = self.const_locals.get(&i) else {
+            return out;
+        };
+        if start >= end {
+            return out; // body may never run
+        }
+
+        let HirStmt::Block { body: stmts, .. } = body else {
+            return out;
+        };
+        let Some((last, rest)) = stmts.split_last() else {
+            return out;
+        };
+        if !Self::is_plus_one_of(last, i) {
+            return out;
+        }
+
+        // Exactly one write to `i` in the whole body (the increment).
+        let (mut writes, mut reads) = (Vec::new(), Vec::new());
+        self.collect_root_accesses_stmt(body, i, &mut writes, &mut reads);
+        if writes.iter().filter(|(p, _)| p.is_empty()).count() != 1 {
+            return out;
+        }
+
+        // Nothing before the increment may skip it or the fill (no break/continue/else/catch).
+        for s in rest {
+            let ok = match s {
+                HirStmt::Let {
+                    value,
+                    else_block,
+                    catch_pattern,
+                    ..
+                } => {
+                    else_block.is_none()
+                        && catch_pattern.is_none()
+                        && Self::expr_is_straightline(value)
+                }
+                HirStmt::Const(c) => Self::expr_is_straightline(&c.value),
+                HirStmt::Expr(e) => Self::expr_is_straightline(e),
+                _ => false,
+            };
+            if !ok {
+                return out;
+            }
+        }
+
+        for s in rest {
+            let HirStmt::Expr(HirExpr::Assignment {
+                target, op, value, ..
+            }) = s
+            else {
+                continue;
+            };
+            if !matches!(op, AssignmentOperator::Assign) || matches!(value, HirExpr::Uninit { .. })
+            {
+                continue;
+            }
+            let HirExpr::Index { object, index, .. } = target else {
+                continue;
+            };
+            if !matches!(index, HirExpr::Ident(n, _) if *n == i) {
+                continue;
+            }
+            let HirType::Array(_, len) = self.peek_type(object) else {
+                continue;
+            };
+            if end > len as i64 {
+                continue;
+            }
+            let Some((root, path)) = self.static_field_path(object) else {
+                continue;
+            };
+            let Some(node) = self.init_state.get(&root) else {
+                continue;
+            };
+            let entry = Self::node_at_path_ref(node, &path).clone();
+            out.push(CountedFill {
+                root,
+                path,
+                start,
+                end,
+                len,
+                entry,
+            });
+        }
+        out
+    }
+
+    pub fn apply_counted_fills(&mut self, fills: Vec<CountedFill>) {
+        for f in fills {
+            let mut ranges = IntervalSet::default();
+            match &f.entry {
+                InitNode::Whole(InitStatus::Initialized) => continue, // already fully init
+                InitNode::Array { ranges: r, .. } => {
+                    for &(s, e) in &r.ranges {
+                        ranges.insert(s, e);
+                    }
+                }
+                _ => {}
+            }
+            let Some(node) = self.init_state.get_mut(&f.root) else {
+                continue;
+            };
+            // several fills of the same array in one loop accumulate
+            if let InitNode::Array { ranges: cur, .. } = Self::node_at_path_ref(node, &f.path) {
+                for &(s, e) in &cur.ranges {
+                    ranges.insert(s, e);
+                }
+            }
+            ranges.insert(f.start, f.end);
+            *Self::node_at_path_mut(node, &f.path) = InitNode::Array {
+                ranges,
+                len: Some(f.len),
+            };
+        }
+    }
+
     pub fn optimistically_mark_mut_target_init(&mut self, expr: &HirExpr<'a, 'bump>) {
         match expr {
             HirExpr::Ident(_, _) | HirExpr::FieldAccess { .. } | HirExpr::Get { .. } => {
@@ -269,15 +498,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Self::mark_field_init_node(node, path);
     }
 
-    pub fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
-        let node = self
-            .init_state
-            .entry(root)
-            .or_insert(InitNode::Whole(InitStatus::Initialized));
-        let target = Self::node_at_path_mut(node, path);
-        *target = InitNode::Whole(InitStatus::Uninitialized);
-    }
-
     pub fn mark_field_init_node(node: &mut InitNode, path: &[StrId]) {
         let Some((head, rest)) = path.split_first() else {
             *node = InitNode::Whole(InitStatus::Initialized);
@@ -321,10 +541,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         end: i64,
         len: Option<usize>,
     ) {
-        if path.is_empty()
-            && let InitNode::Whole(InitStatus::Initialized) = node
-        {
-            return;
+        if let InitNode::Whole(InitStatus::Initialized) = node {
+            return; // was: only checked when path.is_empty()
         }
 
         if let Some((head, rest)) = path.split_first() {
@@ -345,7 +563,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
         match node {
             InitNode::Array { ranges, .. } => ranges.insert(start, end),
-
             InitNode::Whole(InitStatus::Initialized) => {}
             _ => {
                 let mut ranges = IntervalSet::default();
@@ -353,6 +570,70 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 *node = InitNode::Array { ranges, len };
             }
         }
+    }
+
+    pub fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
+        let root_ty = self
+            .context
+            .get_variable(&str_id_to_string(root))
+            .map(|(_, t)| t);
+        let mut node = self
+            .init_state
+            .remove(&root)
+            .unwrap_or(InitNode::Whole(InitStatus::Initialized));
+        self.set_uninit_at(&mut node, path, root_ty);
+        self.init_state.insert(root, node);
+    }
+
+    fn set_uninit_at(&self, node: &mut InitNode, path: &[StrId], ty: Option<HirType<'a, 'bump>>) {
+        let Some((head, rest)) = path.split_first() else {
+            *node = InitNode::Whole(InitStatus::Uninitialized);
+            return;
+        };
+
+        if let InitNode::Whole(s) = node {
+            let s = s.clone();
+            match ty.as_ref().and_then(|t| self.struct_fields_of(t)) {
+                Some(fields) => {
+                    let mut m = FxHashMap::default();
+                    for (fname, _) in &fields {
+                        m.insert(*fname, InitNode::Whole(s.clone()));
+                    }
+                    *node = InitNode::Struct(m);
+                }
+                None => {
+                    // Can't enumerate siblings: degrade to Maybe (strict, never unsound).
+                    *node = InitNode::Whole(InitStatus::Maybe);
+                    return;
+                }
+            }
+        }
+
+        let child_ty = ty
+            .as_ref()
+            .and_then(|t| self.struct_fields_of(t))
+            .and_then(|fs| fs.into_iter().find(|(n, _)| n == head).map(|(_, t)| t));
+
+        let InitNode::Struct(map) = node else {
+            *node = InitNode::Whole(InitStatus::Maybe);
+            return;
+        };
+        let child = map
+            .entry(*head)
+            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
+        self.set_uninit_at(child, rest, child_ty);
+    }
+
+    fn struct_fields_of(
+        &self,
+        ty: &HirType<'a, 'bump>,
+    ) -> Option<Vec<(StrId, HirType<'a, 'bump>)>> {
+        let t = Self::peel_indirections(*Self::strip_ref(ty));
+        let HirType::Struct { name, .. } = t else {
+            return None;
+        };
+        let def = self.context.get_struct(&str_id_to_string(name))?;
+        Some(def.fields.iter().map(|f| (f.name, f.field_type)).collect())
     }
 
     pub fn check_init_read_path(&mut self, root: StrId, path: &[StrId], root_str: &str) {
@@ -374,6 +655,58 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 root_str,
                 path.iter().map(|s| format!(".{}", s)).collect::<String>()
             ))),
+        }
+    }
+
+    fn node_exact<'n>(node: &'n InitNode, path: &[StrId]) -> Option<&'n InitNode> {
+        let Some((h, rest)) = path.split_first() else {
+            return Some(node);
+        };
+        match node {
+            InitNode::Struct(m) => m.get(h).and_then(|c| Self::node_exact(c, rest)),
+            _ => None,
+        }
+    }
+
+    pub fn check_init_read_path_typed(
+        &mut self,
+        root: StrId,
+        path: &[StrId],
+        root_str: &str,
+        ty: &HirType<'a, 'bump>,
+    ) {
+        if self.suppress_init_read {
+            return;
+        }
+        let Some(node) = self.init_state.get(&root).cloned() else {
+            return;
+        };
+        let status = match Self::node_exact(&node, path) {
+            Some(n @ InitNode::Struct(_)) if matches!(ty, HirType::Struct { .. }) => {
+                self.status_typed(n, ty)
+            }
+            _ => Self::status_at_path(&node, path),
+        };
+        let shown: String = path.iter().map(|s| format!(".{}", s)).collect();
+        match status {
+            InitStatus::Initialized => {}
+            InitStatus::Uninitialized => self.record(TypeErrorKind::Generic(format!(
+                "use of uninitialized value `{}{}`: not assigned since `uninit`",
+                root_str, shown
+            ))),
+            InitStatus::Maybe => self.record(TypeErrorKind::Generic(format!(
+                "use of possibly uninitialized value `{}{}`: not initialized on all control-flow paths",
+                root_str, shown
+            ))),
+        }
+    }
+
+    fn status_typed(&self, node: &InitNode, ty: &HirType<'a, 'bump>) -> InitStatus {
+        match (node, ty) {
+            (InitNode::Struct(_), HirType::Struct { name, .. }) => {
+                self.status_for_whole_struct(node, *name)
+            }
+            _ => Self::status_at_path(node, &[]),
         }
     }
 
@@ -813,7 +1146,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         for field in def.fields.iter() {
             let status = map
                 .get(&field.name)
-                .map(|n| Self::status_at_path(n, &[]))
+                .map(|n| self.status_typed(n, &field.field_type))
                 .unwrap_or(InitStatus::Uninitialized);
             match status {
                 InitStatus::Initialized => any_init = true,

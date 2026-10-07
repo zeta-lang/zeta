@@ -197,7 +197,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         span: &SourceSpan<'a>,
     ) -> Value {
         if let HirExpr::Ident(scope_name, _) = object {
-            if !self.var_map.contains_key(scope_name) {
+            if !self.var_map.contains_key(scope_name)
+                && !self.is_static_name(scope_name)
+                && !self.constants.contains_key(scope_name)
+            {
                 let mangled_struct_name = self
                     .resolve_static_receiver_struct_name(*scope_name, field)
                     .or_else(|| self.primitive_type_key(*scope_name));
@@ -355,7 +358,17 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
         }
 
-        let recv_arg = self.coerce_receiver_to_param(obj_val, param_types.first());
+        let recv_arg = match (object, param_types.first()) {
+            (HirExpr::Ident(n, _), Some(SsaType::Pointer(..))) if self.is_static_name(n) => {
+                let (addr, ty) = self.lower_static_addr(*n).expect("static vanished");
+                if Self::is_aggregate_ssa_type(&ty) {
+                    obj_val // aggregates are already carried by address
+                } else {
+                    addr // scalar static: pass its real address, not a spilled copy
+                }
+            }
+            _ => self.coerce_receiver_to_param(obj_val, param_types.first()),
+        };
         operands.push(Operand::Value(recv_arg));
         for (i, a) in args.iter().enumerate() {
             if Self::is_move_by_value(param_types.get(i + 1).unwrap_or(&SsaType::I64)) {

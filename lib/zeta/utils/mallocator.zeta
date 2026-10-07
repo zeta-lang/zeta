@@ -44,6 +44,17 @@ impl RawMallocator by RawAllocator {
 
 struct Mallocator {}
 
+impl Mallocator by Clone {
+    func clone(&this): Mallocator {
+        return Mallocator {};
+    }
+}
+
+impl Mallocator by Copy {}
+
+unsafe impl Mallocator by Send {}
+unsafe impl Mallocator by Sync {}
+
 impl Mallocator by Allocator {
     func alloc<T>(&this): ^T {
         let ptr: [*]mut u8 = unsafe {

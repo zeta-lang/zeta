@@ -18,11 +18,16 @@ use crate::{
     initialization::{BareImportKind, InitNode, InitStatus, IntervalSet},
     move_state::MoveState,
     naming::{operator_symbol, str_id_to_string, type_to_string},
+    statics,
     type_checker::SymbolId,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     fn loan_on(&mut self, e: &HirExpr<'a, 'bump>) -> Option<LoanId> {
+        if self.is_static_place(e) {
+            return None;
+        }
+
         let p = self.resolve_place(e)?;
         self.borrow_checker.loan_for_place(p).copied()
     }
@@ -343,14 +348,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
+        let static_target = match target {
+            HirExpr::Ident(n, _) if self.is_static_ident(*n) => Some(*n),
+            _ => None,
+        };
+        if let (Some(n), AssignmentOperator::Assign) = (static_target, op) {
+            self.static_assign_backfill.insert(
+                Self::expr_key(target),
+                statics::StaticAssignInfo {
+                    drop_old: self.is_whole_init(n),
+                },
+            );
+        }
         let target_type = self.check_expr_as_place(target);
 
-        if let Some(place) = self.resolve_place(target) {
-            self.check_borrow_use(target, place, BorrowKind::Mutable);
+        if !self.is_static_place(target) {
+            if let Some(place) = self.resolve_place(target) {
+                self.check_borrow_use(target, place, BorrowKind::Mutable);
+            }
         }
 
         if let HirExpr::Ident(name, ..) = target {
             self.move_state.clear(*name);
+            self.const_locals.remove(name);
         }
 
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
@@ -384,7 +404,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         if let HirExpr::Ident(name, _) = target {
             let var_name = str_id_to_string(*name);
-            if self.context.is_local_binding(&var_name) && !self.context.is_mutable(&var_name) {
+            if self.context.is_local_binding(&var_name)
+                && !self.context.is_mutable(&var_name)
+                && static_target.is_none()
+            {
                 self.record(TypeErrorKind::Generic(format!(
                     "cannot assign to `{}`: it is not declared `mut`",
                     var_name
@@ -398,7 +421,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         match target {
             HirExpr::Ident(name, _) => {
-                if is_uninit_value && self.is_definitely_initialized(*name, &[]) {
+                if is_uninit_value
+                    && static_target.is_none()
+                    && self.is_definitely_initialized(*name, &[])
+                {
                     self.record(TypeErrorKind::Generic(format!(
                         "cannot assign `uninit` to `{}`: it is already initialized; \
                          `uninit` may only be assigned to a variable that isn't initialized yet",
@@ -414,6 +440,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.mark_whole_uninit(*name);
                 } else {
                     self.mark_field_init(*name, &[]);
+                }
+                if static_target.is_some()
+                    && !is_uninit_value
+                    && matches!(op, AssignmentOperator::Assign)
+                {
+                    self.fn_static_assigned.insert(*name);
                 }
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
@@ -975,6 +1007,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let Some((symbol_id, ty)) = self.context.get_variable(&var_name) {
+            self.note_static_access(*name);
             self.check_ident_init_read(*name, &var_name, &ty);
             self.point_locals_used
                 .entry(self.current_point)
@@ -1328,7 +1361,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some((root, mut path)) = self.static_field_path(object) {
             path.push(field);
             let root_str = str_id_to_string(root);
-            self.check_init_read_path(root, &path, &root_str);
+            self.check_init_read_path_typed(root, &path, &root_str, &ty);
         }
 
         ty

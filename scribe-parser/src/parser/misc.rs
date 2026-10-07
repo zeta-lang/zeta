@@ -80,6 +80,9 @@ where
 
         self.cursor.bump(); // consume '<'
 
+        // Never inherit a half-consumed `>>` from an earlier failed/finished parse.
+        self.pending_close_angle = 0;
+
         let mut generics = Vec::new();
         let mut has_seen_default = false;
 
@@ -112,7 +115,7 @@ where
                     } else {
                         types.push(self.parse_type()?);
                     }
-                    if !self.cursor.consume(TokenKind::Add) {
+                    if self.pending_close_angle > 0 || !self.cursor.consume(TokenKind::Add) {
                         break;
                     }
                 }
@@ -121,18 +124,19 @@ where
                 &[]
             };
 
-            let default_type = if self.cursor.consume(TokenKind::Assign) {
-                has_seen_default = true;
-                Some(self.parse_type()?)
-            } else {
-                if has_seen_default {
-                    return Err(DiagnosticError::new(
-                        ParseErrorKind::GenericWithoutDefaultAfterDefault,
-                        span,
-                    ));
-                }
-                None
-            };
+            let default_type =
+                if self.pending_close_angle == 0 && self.cursor.consume(TokenKind::Assign) {
+                    has_seen_default = true;
+                    Some(self.parse_type()?)
+                } else {
+                    if has_seen_default {
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::GenericWithoutDefaultAfterDefault,
+                            span,
+                        ));
+                    }
+                    None
+                };
 
             generics.push(Generic {
                 type_name: name,
@@ -144,7 +148,7 @@ where
                 min_provenance,
             });
 
-            if !self.cursor.consume(TokenKind::Comma) {
+            if self.pending_close_angle > 0 || !self.cursor.consume(TokenKind::Comma) {
                 break;
             }
         }
@@ -948,6 +952,13 @@ where
                     let mut args: Vec<Type<'a, 'bump>> = Vec::new();
                     loop {
                         args.push(Self::parse_type_impl(bump, cursor, pending)?);
+
+                        // A split `>>` left a pending `>` for us: this list ends here,
+                        // whatever token (`,`, `+`, `=`) follows in the source.
+                        if *pending > 0 {
+                            *pending -= 1;
+                            break;
+                        }
 
                         if cursor.peek() == TokenKind::Comma {
                             cursor.advance();

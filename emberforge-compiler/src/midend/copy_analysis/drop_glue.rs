@@ -73,6 +73,7 @@ impl DropGlueRegistry {
         };
 
         let mut has_own_drop: HashMap<StrId, bool> = HashMap::default();
+
         for &name in &struct_names {
             is_droppable.insert(name, false);
             has_own_drop.insert(name, implements_drop(name));
@@ -272,6 +273,7 @@ impl DropGlueBuilder {
             if field.manual {
                 continue;
             }
+
             let offset = offsets
                 .and_then(|m| m.get(&field.name))
                 .copied()

@@ -211,6 +211,12 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         for group in &groups {
             for &module_idx in group {
                 if let Some(stmts) = module_stmts.get(&module_idx) {
+                    self.ctx.module_idx = module_idx;
+                    self.pre_register_type_names(stmts);
+                }
+            }
+            for &module_idx in group {
+                if let Some(stmts) = module_stmts.get(&module_idx) {
                     self.lower_module_types(stmts, module_idx);
                 }
             }

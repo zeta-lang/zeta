@@ -598,9 +598,12 @@ impl Lexer {
                                 column += 1;
                                 push!(TokenKind::Ellipsis, start_line, start_col);
                             }
-                            _ => {
+                            b'=' => {
+                                pos += 1;
+                                column += 1;
                                 push!(TokenKind::DotDotEq, start_line, start_col);
                             }
+                            _ => {}
                         }
                     } else {
                         push!(TokenKind::Dot, start_line, start_col);

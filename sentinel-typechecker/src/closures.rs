@@ -5,10 +5,10 @@ use ir::{
     borrow_checker::{BorrowKind, IndexContainer, Interval, LoanId},
     errors::type_error::TypeErrorKind,
     hir::{
-        effect_path_is_prefix, effect_segment_eq, pattern_bound_names, static_effect_path,
         CaptureMode, ClosureKind, ClosureLowering, HirClosureCapture, HirEffectSegment,
         HirErrorHandlerPattern, HirExpr, HirFunc, HirGeneric, HirMatchArm, HirParam, HirStmt,
-        HirType, InterpolationPart, RefKind, StrId,
+        HirType, InterpolationPart, RefKind, StrId, effect_path_is_prefix, effect_segment_eq,
+        pattern_bound_names, static_effect_path,
     },
     ir_hasher::FxHashMap,
     span::SourceSpan,
@@ -48,7 +48,7 @@ impl From<BorrowKind> for UseLevel {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Usage {
+pub struct Usage {
     level: UseLevel,
     mutated: bool,
 }
@@ -63,8 +63,9 @@ impl Default for Usage {
 }
 
 #[derive(Default)]
-pub(super) struct ClosureFrame<'bump> {
-    entries: Vec<(StrId, Vec<HirEffectSegment<'bump>>, Usage)>,
+pub struct ClosureFrame<'bump> {
+    pub entries: Vec<(StrId, Vec<HirEffectSegment<'bump>>, Usage)>,
+    pub static_uses: Vec<StrId>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -115,7 +116,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    fn expr_from_path(
+    pub fn expr_from_path(
         &self,
         root: StrId,
         path: &[HirEffectSegment<'bump>],
@@ -467,7 +468,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let (mut any_move, mut any_mut) = (false, false);
 
         for (i, (root, path, usage)) in frame.entries.iter().enumerate() {
-            let mode = if is_move {
+            // Read-only use of a `Copy` value: copy it into the closure. While the closure
+            // lives the shared loan would forbid outside mutation anyway, so this is
+            // equivalent for local closures, and it lets `&static` closures (threads.spawn)
+            // read plain `Copy` data without borrowing the enclosing frame.
+            let read_copy = !is_move && usage.level == UseLevel::Read && {
+                let pe = self.expr_from_path(*root, path, span);
+                let pt = self.peek_type(&pe);
+                self.copy_analysis.borrow().type_is_copy(&pt)
+            };
+            let mode = if is_move || read_copy {
                 CaptureMode::ByValue
             } else {
                 match usage.level {
@@ -645,6 +655,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .iter()
                 .map(|(r, p)| (*r, p.clone(), Usage::default()))
                 .collect(),
+            static_uses: Vec::default(),
         });
         let old_context = std::mem::replace(&mut self.context, lambda_context);
         let body_ty = self.check_stmt(body);

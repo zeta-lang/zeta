@@ -500,6 +500,82 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 type_args,
                 span,
             } => {
+                // `S { f: Generic.new() }` with no explicit type args: use `S` itself as
+                // the expected type so each field value is monomorphized against its
+                // declared field type (this is what `return S { .. }` already got).
+                if let (HirExpr::Ident(n, _), None) = (&**name, type_args) {
+                    let key = self.resolve_struct_key(*n);
+                    if self.ctx.structs.borrow().contains_key(&key) {
+                        let expected = HirType::Struct {
+                            name: key,
+                            field_types: &[],
+                            type_args: &[],
+                        };
+                        if let Some(done) = self
+                            .try_monomorphize_struct_init_with_expected_type(expr, &expected, subs)
+                        {
+                            return done;
+                        }
+                    }
+                }
+
+                // `S<T> { f: Generic.new() }` with explicit type args: instantiate `S` first,
+                // then monomorphize each field value against its declared field type.
+                if let (HirExpr::Ident(struct_name, ident_span), Some(targs)) = (&**name, type_args)
+                {
+                    let resolved_targs: Vec<HirType> = targs
+                        .iter()
+                        .map(|t| {
+                            let s = substitute_type(t, subs, &self.bump);
+                            self.instantiate_type_recursively(s, *span)
+                        })
+                        .collect();
+                    if !resolved_targs.iter().any(contains_unresolved_generic) {
+                        if let Some(new_struct) = instantiate_struct_for_types(
+                            self.ctx,
+                            &self.instantiated_structs,
+                            &self.instantiated_struct_origins,
+                            &self.instantiated_enums,
+                            &self.instantiated_enum_origins,
+                            *struct_name,
+                            &resolved_targs,
+                            &&self.bump,
+                        ) {
+                            let field_tys: FxHashMap<StrId, HirType> = self
+                                .ctx
+                                .structs
+                                .borrow()
+                                .get(&new_struct.name)
+                                .map(|s| s.fields.iter().map(|f| (f.name, f.field_type)).collect())
+                                .unwrap_or_default();
+                            let new_args: Vec<HirFieldInit<'a, 'bump>> = args
+                                .iter()
+                                .map(|a| HirFieldInit {
+                                    name: a.name,
+                                    name_span: a.name_span,
+                                    value: match field_tys
+                                        .get(&a.name)
+                                        .filter(|t| !contains_unresolved_generic(t))
+                                    {
+                                        Some(t) => self.monomorphize_expr_with_expected_type(
+                                            &a.value, t, subs,
+                                        ),
+                                        None => self.monomorphize_expr(&a.value, subs),
+                                    },
+                                })
+                                .collect();
+                            let args_slice = self.bump.alloc_slice(&new_args);
+                            let new_name_expr = HirExpr::Ident(new_struct.name, *ident_span);
+                            return HirExpr::StructInit {
+                                name: self.bump.alloc_value_immutable(new_name_expr),
+                                args: args_slice,
+                                type_args: None,
+                                span: *span,
+                            };
+                        }
+                    }
+                }
+
                 let new_args: Vec<HirFieldInit<'a, 'bump>> = args
                     .iter()
                     .map(|a| HirFieldInit {
@@ -1499,11 +1575,45 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     HirParam::This { .. } => None,
                 })
                 .collect();
+            // A hoisted closure literal (`StructInit { name: __closure_env_N }`) binds the
+            // `F: func(..)` generic to its env struct.
+            for (declared_ty, arg) in declared_types.iter().zip(args.iter()) {
+                if let (
+                    HirType::Generic(g),
+                    HirExpr::StructInit {
+                        name,
+                        type_args: None,
+                        ..
+                    },
+                ) = (declared_ty, arg)
+                {
+                    if let HirExpr::Ident(env_name, _) = &**name {
+                        let is_closure_param =
+                            type_params
+                                .iter()
+                                .find(|p| p.name == *g)
+                                .map_or(false, |p| {
+                                    p.constraints
+                                        .iter()
+                                        .any(|c| matches!(c, HirType::Lambda { .. }))
+                                });
+                        if self.env_structs.contains_key(env_name) && is_closure_param {
+                            inner_subs.insert(*g, self.closure_env_type(*env_name));
+                        }
+                    }
+                }
+            }
             self.infer_missing_generics(
                 type_params,
                 &declared_types,
                 args,
                 outer_subs,
+                &mut inner_subs,
+            );
+            // Generics that only appear in closure constraints, e.g. `R` in `F: func(): R`.
+            self.infer_generics_from_closure_constraints(
+                type_params,
+                &inner_subs.clone(),
                 &mut inner_subs,
             );
             if inner_subs.len() != type_params.len() {

@@ -398,6 +398,12 @@ where
         }
     }
 
+    pub(crate) fn lower_static_dynamic_init(&mut self, name: StrId, value: &HirExpr<'a, 'bump>) {
+        let (addr, ty) = self.lower_static_addr(name).expect("static vanished");
+        let init = self.lower_init_operand(value, &ty);
+        self.store_init(addr, 0, &ty, init);
+    }
+
     pub(crate) fn lower_body(&mut self, body: Option<HirStmt<'a, 'bump>>) {
         if let Some(b) = body {
             match b {
@@ -782,7 +788,7 @@ where
 
     pub(crate) fn finish(self) {
         // let n = self.current_block_data.func.name.as_str();
-        // if n.contains("_eq") {
+        // if n.contains("thread") {
         //     println!("{}'s MIR:", n);
         //     for b in &self.current_block_data.func.blocks {
         //         println!("bb{}:", b.id.0);
@@ -792,6 +798,10 @@ where
         //     }
         // }
         self.current_block_data.finish()
+    }
+
+    pub(crate) fn expr_key(expr: &HirExpr<'a, 'bump>) -> usize {
+        expr as *const HirExpr<'a, 'bump> as usize
     }
 }
 

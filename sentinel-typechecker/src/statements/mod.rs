@@ -7,7 +7,6 @@ use ir::{
 
 use crate::{
     TypeChecker,
-    borrow_lifetime::{Holder, ObligationBranch},
     initialization::{InitNode, InitStatus},
     naming::type_to_string,
     str_id_to_string,
@@ -182,16 +181,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         self.context.enter_loop();
 
-        let speculative = self.begin_obligation_branch();
         let entry_state = self.move_state.clone();
         let init_entry = self.init_state.clone();
         let (converged_entry, converged_init) =
             self.converge_loop_states(body, entry_state, init_entry);
-        self.abort_obligation_branch(speculative);
         self.move_state = converged_entry;
         self.init_state = converged_init;
 
-        let br = self.begin_obligation_branch();
         self.check_stmt(body);
 
         self.context.exit_loop();
@@ -199,9 +195,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(inc) = increment {
             self.check_expr(inc);
         }
-
-        let body_arm = self.end_obligation_arm(&br);
-        self.join_obligation_loop(br, body_arm);
 
         None
     }
@@ -221,19 +214,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         self.context.enter_loop();
 
-        let speculative = self.begin_obligation_branch();
         let entry_state = self.move_state.clone();
         let init_entry = self.init_state.clone();
         let (converged_entry, converged_init) =
             self.converge_loop_states(body, entry_state, init_entry);
-        self.abort_obligation_branch(speculative);
         self.move_state = converged_entry;
         self.init_state = converged_init;
 
-        let br = self.begin_obligation_branch();
         self.check_stmt(body);
-        let body_arm = self.end_obligation_arm(&br);
-        self.join_obligation_loop(br, body_arm);
 
         self.context.exit_loop();
         None
@@ -339,22 +327,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let result = self.types_compatible(ty, &inner);
                     self.recover(result, ());
 
-                    let br = self.begin_obligation_branch();
-                    self.discharge_unbound_obligations();
-
                     let else_context = self.context.create_child_scope();
                     let old_context = std::mem::replace(&mut self.context, else_context);
-                    let else_ty = self.check_stmt(else_block);
+                    self.check_stmt(else_block);
                     self.context = old_context;
-
-                    let else_diverges = matches!(else_ty, Some(HirType::Never));
-                    let else_arm = self.end_obligation_arm(&br);
-                    self.restore_obligations(&br);
-                    let cont_arm = self.end_obligation_arm(&br);
-                    self.join_obligation_arms(
-                        br,
-                        vec![(else_arm, else_diverges), (cont_arm, false)],
-                    );
                 }
                 _ => {
                     self.record(TypeErrorKind::Generic(format!(
@@ -442,33 +418,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        self.bind_obligations_to(*name);
-
         None
-    }
-
-    pub fn abort_obligation_branch(&mut self, br: ObligationBranch) {
-        let prev = self.suppress_errors;
-        self.suppress_errors = true;
-        let _ = self.end_obligation_arm(&br);
-
-        self.suppress_errors = prev;
-        self.restore_obligations(&br);
-        self.obligation_branches.pop();
-    }
-
-    pub fn discharge_unbound_obligations(&mut self) {
-        let idxs: Vec<usize> = self
-            .borrow_obligations
-            .iter()
-            .enumerate()
-            .filter(|(_, ob)| {
-                !ob.discharged && matches!(ob.holder, Holder::Pending | Holder::InFlight(_))
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in idxs {
-            self.discharge(i);
-        }
     }
 }

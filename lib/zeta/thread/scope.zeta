@@ -1,0 +1,175 @@
+// I am aware that this file is completely unoptimized.. but for now, it's stable.
+package zeta::thread::scope;
+
+import zeta::utils::mallocator.Mallocator;
+import zeta::utils.ArrayList;
+import zeta::libc.Pthread;
+import zeta::libc;
+import zeta::debug;
+import zeta::result.Result;
+
+import zeta::sync::arc.Arc;
+import zeta::sync::mutex.Mutex;
+import zeta::sync::mutex.MutexGuard;
+
+import zeta::thread::threads;
+import zeta::thread::threads.ThreadCtxHeader;
+
+// Scoped threads: `scope(|s| { s.spawn(...); ... })` joins every thread that is
+// still running when the closure returns, so spawned closures may borrow from
+// the enclosing function. No `Arc`, no `static` bound -- only `Send`.
+
+struct ScopedThread {
+    tid: Pthread,
+    joined: bool,
+}
+
+struct ScopeState {
+    threads: ArrayList<ScopedThread, Mallocator>,
+}
+
+struct Scope {
+    state: Mutex<ScopeState>,
+}
+
+// Shared between the worker thread and the handle, so dropping the handle early
+// can never free memory the worker is about to write.
+struct ScopedSlot<R> {
+    manual result: ?R,
+}
+
+struct ScopedCtx<F, R> {
+    header: ThreadCtxHeader,   // MUST be first field
+    func_: F,
+    slot: Arc<ScopedSlot<R>>,
+}
+
+struct ScopedJoinHandle<R> {
+    scope: &alias Scope,
+    index: usize,
+    slot: Arc<ScopedSlot<R>>,
+}
+
+func invoke_scoped<F: func(): R, R>(arg: [*]mut void): void {
+    let raw: [*]mut ScopedCtx<F, R> = arg as [*]mut ScopedCtx<F, R>;
+    let alloc: Mallocator = Mallocator {};
+
+    let slot: [*]mut ScopedSlot<R> = unsafe { (*raw).slot.as_ptr() };
+
+    let result: R = unsafe { (*raw).func_() };
+
+    // Published by pthread_join in whoever joins this thread.
+    unsafe { (*slot).result = result; }
+
+    // Frees the ctx and releases the worker's Arc reference.
+    let owned: ^ScopedCtx<F, R> = unsafe { $own(raw, alloc) };
+}
+
+impl Scope {
+    func new(): Scope {
+        return Scope {
+            state: Mutex.new(ScopeState { threads: ArrayList.new() }),
+        };
+    }
+
+    func spawn<F: Send + func(): R, R: Send>(&alias this, f: F): ScopedJoinHandle<R> {
+        let alloc: Mallocator = Mallocator {};
+
+        let slot: Arc<ScopedSlot<R>> = Arc.new(ScopedSlot<R> { result: null });
+
+        let ctx: ^ScopedCtx<F, R> = alloc.new(ScopedCtx<F, R> {
+            header: ThreadCtxHeader {
+                invoke: invoke_scoped<F, R>,
+            },
+            func_: f,
+            slot: slot.clone(),
+        });
+
+        let raw_ctx: [*]mut void = unsafe { $leak(ctx) } as [*]mut void;
+        let tid: Pthread = unsafe { threads.start_raw(raw_ctx) };
+
+        let mut guard: MutexGuard<ScopeState> = this.state.lock();
+        let state: &mut ScopeState = guard.get_mut();
+        let index: usize = state.threads.len();
+        state.threads.push(ScopedThread { tid, joined: false });
+
+        return ScopedJoinHandle<R> {
+            scope: this,
+            index,
+            slot,
+        };
+    }
+
+    func join_all(&alias this) {
+        let mut i: usize = 0;
+
+        while (true) {
+            let mut tid: Pthread = uninit;
+            let mut pending: bool = false;
+
+            {
+                let mut guard: MutexGuard<ScopeState> = this.state.lock();
+
+                if (i >= guard.get().threads.len()) {
+                    break;
+                }
+
+                let t: &mut ScopedThread = guard.get_mut().threads.get_mut(i);
+                tid = t.tid;
+                pending = !t.joined;
+                t.joined = true;
+            }
+
+            if (pending) {
+                let mut retval: [*]mut void = uninit;
+                unsafe { libc.pthread_join(tid, &mut retval); }
+            }
+
+            i += 1;
+        }
+    }
+}
+
+impl<R> ScopedJoinHandle<R> {
+    func join(mut this): Result<R, i32> {
+        let mut tid: Pthread = uninit;
+        let mut pending: bool = false;
+
+        {
+            let mut guard: MutexGuard<ScopeState> = this.scope.state.lock();
+            let t: &mut ScopedThread = guard.get_mut().threads.get_mut(this.index);
+            tid = t.tid;
+            pending = !t.joined;
+            t.joined = true;
+        }
+
+        if (pending) {
+            let mut retval: [*]mut void = uninit;
+            let ret: i32 = unsafe { libc.pthread_join(tid, &mut retval) };
+
+            if (ret != 0) {
+                return Result.Err { error: ret };
+            }
+        }
+
+        let slot: [*]mut ScopedSlot<R> = this.slot.as_ptr();
+        let result: ?R = unsafe { (*slot).result };
+        if (result == null) {
+            $unreachable();
+        }
+
+        return Result.Ok { value: result };
+    }
+}
+
+func scope<F: func(&alias Scope): R, R>(body: F): R {
+    let mut s: Scope = Scope.new();
+
+    let result: R = body(&alias s);
+
+    // Everything the body spawned and did not join finishes before any borrow
+    // it captured can end.
+    s.join_all();
+
+    return result;
+}

@@ -22,6 +22,7 @@ use ir::hir::StrId;
 use ir::ir_hasher::FxHashBuilder;
 use ir::layout::TargetInfo;
 use ir::layout::sizeof_ssa;
+use ir::registry::global_registry::StaticInit;
 use ir::ssa_ir::{
     AtomicOrdering, BasicBlock, BinOp, BlockId, CastKind, Function, Instruction, Module, Operand,
     SsaType, UnOp, Value, inst_is_terminator,
@@ -48,6 +49,8 @@ pub struct CraneliftBackend {
     current_sret_var: Option<Variable>,
     cpu_relax_func: FuncId,
     global_data: HashMap<StrId, DataId, FxHashBuilder>,
+    static_data: HashMap<StrId, DataId, FxHashBuilder>,
+    string_bytes: HashMap<StrId, DataId, FxHashBuilder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +120,46 @@ impl CraneliftBackend {
             current_sret_var: None,
             cpu_relax_func,
             global_data: HashMap::with_hasher(FxHashBuilder),
+            static_data: HashMap::with_hasher(FxHashBuilder),
+            string_bytes: HashMap::with_hasher(FxHashBuilder),
+        }
+    }
+
+    fn declare_statics(&mut self, module: &Module) {
+        for (name, def) in &module.statics {
+            if self.static_data.contains_key(name) {
+                continue;
+            }
+            let sym = format!("__zeta_static_{}", self.context.resolve_string(name));
+            let l = ir::layout::layout_of_ssa(&def.ty, self.target)
+                .unwrap_or_else(|e| panic!("static `{}`: no layout: {:?}", sym, e));
+            let id = self
+                .module
+                .declare_data(&sym, Linkage::Local, true, false) // writable, NOT tls
+                .unwrap_or_else(|e| panic!("declare static {}: {:?}", sym, e));
+            let mut d = DataDescription::new();
+            let size = l.size.max(1);
+            match &def.init {
+                StaticInit::Zero => d.define_zeroinit(size),
+                StaticInit::Bytes(b) => {
+                    let mut b = b.clone();
+                    b.resize(size, 0);
+                    d.define(b.into_boxed_slice());
+                }
+                StaticInit::Relocated { bytes, relocs } => {
+                    let mut b = bytes.clone();
+                    b.resize(size, 0);
+                    d.define(b.into_boxed_slice());
+                    for r in relocs {
+                        let bytes_id = self.get_or_create_string_bytes(&r.string);
+                        let gv = self.module.declare_data_in_data(bytes_id, &mut d);
+                        d.write_data_addr(r.offset as u32, gv, 0);
+                    }
+                }
+            }
+            d.set_align(l.align.max(1) as u64);
+            self.module.define_data(id, &d).unwrap();
+            self.static_data.insert(*name, id);
         }
     }
 
@@ -2129,6 +2172,16 @@ impl CraneliftBackend {
                     }
                 }
             }
+            Instruction::GlobalAddr { dest, name } => {
+                let id = *self
+                    .static_data
+                    .get(name)
+                    .unwrap_or_else(|| panic!("GlobalAddr: undeclared static {:?}", name));
+                let gv = self.module.declare_data_in_func(id, &mut builder.func);
+                let addr = builder.ins().global_value(self.addr_type(), gv);
+                let var = self.declare_and_def_addr_var(builder, addr, "GlobalAddr");
+                var_map.insert(*dest, var);
+            }
         }
     }
 
@@ -2165,6 +2218,24 @@ impl CraneliftBackend {
 
         self.string_data.insert(vm_str, ZetaDataId(desc_id));
         desc_id
+    }
+
+    fn get_or_create_string_bytes(&mut self, s: &StrId) -> DataId {
+        let key = *s;
+        if let Some(id) = self.string_bytes.get(&key) {
+            return *id;
+        }
+        let n = self.string_bytes.len();
+        let bytes = self.context.resolve_bytes(s);
+        let id = self
+            .module
+            .declare_data(&format!("t_sstrb_{n}"), Linkage::Local, false, false)
+            .unwrap();
+        let mut bd = DataDescription::new();
+        bd.define(bytes.to_vec().into_boxed_slice());
+        self.module.define_data(id, &bd).unwrap();
+        self.string_bytes.insert(key, id);
+        id
     }
 
     fn emit_main_wrapper(&mut self, zeta_main_fid: FuncId) {
@@ -2273,6 +2344,7 @@ impl CraneliftBackend {
 
 impl Backend for CraneliftBackend {
     fn emit_module(&mut self, module: &Module) {
+        self.declare_statics(module);
         let mut zeta_main_fid = None;
 
         for (name, func) in &module.functions {

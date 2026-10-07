@@ -205,56 +205,88 @@ impl AliasReasoner {
             return MemoryRelation::Overlap;
         }
 
-        match (
-            self.compare_linear(&lhs.lower, &rhs.lower),
-            self.compare_linear(&lhs.upper, &rhs.upper),
-        ) {
-            (Some(true), Some(true)) => {
-                return MemoryRelation::Overlap;
-            }
-            (Some(false), Some(false)) => {
-                return MemoryRelation::Disjoint;
-            }
-            _ => {}
+        let (llo, lhi) = Self::half_open(lhs);
+        let (rlo, rhi) = Self::half_open(rhs);
+
+        // Disjoint iff one ends at or before the other starts.
+        if self.provably_le(&lhi, &rlo, 0) || self.provably_le(&rhi, &llo, 0) {
+            return MemoryRelation::Disjoint;
+        }
+        // Definitely overlapping iff each starts strictly before the other ends.
+        if self.provably_le(&llo, &rhi, 1) && self.provably_le(&rlo, &lhi, 1) {
+            return MemoryRelation::Overlap;
         }
 
         if lhs.lower == rhs.lower {
             return MemoryRelation::Overlap;
         }
-
         if self
             .equal
             .get(&lhs.lower)
-            .is_some_and(|set| set.contains(&rhs.lower))
+            .is_some_and(|s| s.contains(&rhs.lower))
         {
             return MemoryRelation::Overlap;
         }
 
-        if self
-            .not_equal
-            .get(&lhs.lower)
-            .is_some_and(|set| set.contains(&rhs.lower))
-        {
-            return MemoryRelation::Disjoint;
+        // "different lower bound => disjoint" is only valid for single-element indices.
+        let both_points = lhs.lower == lhs.upper && rhs.lower == rhs.upper;
+        if both_points {
+            if self
+                .not_equal
+                .get(&lhs.lower)
+                .is_some_and(|s| s.contains(&rhs.lower))
+            {
+                return MemoryRelation::Disjoint;
+            }
+            if self
+                .less_than
+                .get(&lhs.lower)
+                .is_some_and(|s| s.contains(&rhs.lower))
+                || self
+                    .less_than
+                    .get(&rhs.lower)
+                    .is_some_and(|s| s.contains(&lhs.lower))
+            {
+                return MemoryRelation::Disjoint;
+            }
         }
-
-        if self
-            .less_than
-            .get(&lhs.lower)
-            .is_some_and(|set| set.contains(&rhs.lower))
-        {
-            return MemoryRelation::Disjoint;
-        }
-
-        // LessEqual doesn't prove disjointness.
 
         for (left, right) in &self.disjoint_intervals {
             if self.interval_matches(lhs, rhs, left, right) {
                 return MemoryRelation::Disjoint;
             }
         }
-
         MemoryRelation::Unknown
+    }
+
+    fn half_open(iv: &Interval) -> (Bound, Bound) {
+        if iv.lower == iv.upper {
+            (
+                iv.lower.clone(),
+                Bound::Offset {
+                    base: Box::new(iv.lower.clone()),
+                    offset: 1,
+                },
+            )
+        } else {
+            (iv.lower.clone(), iv.upper.clone())
+        }
+    }
+
+    /// Can we prove `a + k <= b`?
+    fn provably_le(&self, a: &Bound, b: &Bound, k: i64) -> bool {
+        let (ab, ao) = Self::decompose_offset(a);
+        let (bb, bo) = Self::decompose_offset(b);
+        if let (Some(x), Some(y)) = (self.resolve_const(ab), self.resolve_const(bb)) {
+            return x.saturating_add(ao).saturating_add(k) <= y.saturating_add(bo);
+        }
+        if ab == bb || self.compare_linear(ab, bb) == Some(true) {
+            return ao + k <= bo;
+        }
+        if self.less_than.get(ab).is_some_and(|s| s.contains(bb)) {
+            return ao + k <= bo + 1; // a < b means a + 1 <= b
+        }
+        false
     }
 
     pub fn retract_equal(&mut self, lhs: &Bound, rhs: &Bound) {

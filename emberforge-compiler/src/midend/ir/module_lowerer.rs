@@ -2,13 +2,16 @@ use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry}
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
-    Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStruct, HirType, StrId,
-    ThisPassingKind,
+    Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStmt, HirStruct, HirType,
+    Operator, StrId, ThisPassingKind,
 };
 use ir::hir_utils::hir_contains_this;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
-use ir::registry::global_registry::GlobalRegistry;
+use ir::registry::global_registry::{
+    GlobalRegistry, StaticDef, StaticInit, StaticReloc, static_flag_name,
+};
+use ir::span::SourceSpan;
 use ir::ssa_ir::{AllocatorKind, Function, Module, SsaType};
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -57,6 +60,7 @@ where
     instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     registry: GlobalRegistry<'r, 'bump>,
+    dynamic_static_inits: Vec<(StrId, HirExpr<'a, 'bump>)>,
 }
 
 impl<'a, 'cx, 'r, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
@@ -118,6 +122,7 @@ where
             instantiated_functions,
             instantiated_struct_methods,
             registry,
+            dynamic_static_inits: Vec::new(),
         }
     }
 
@@ -270,6 +275,22 @@ where
                         self.constants.insert(c.name, c.value.clone());
                     }
                     _ => {}
+                }
+            }
+        }
+
+        for &idx in compilation_order {
+            for item in hir_modules[idx].items {
+                if let Hir::Stmt(HirStmt::Let {
+                    name,
+                    ty,
+                    value,
+                    is_static: true,
+                    span,
+                    ..
+                }) = item
+                {
+                    self.register_static_def(*name, ty, value, *span);
                 }
             }
         }
@@ -432,7 +453,10 @@ where
                             multi_place: _,
                         } => match kind {
                             ThisPassingKind::Move | ThisPassingKind::MoveMut => SsaType::Dyn,
-                            _ => SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::Dyn)),
+                            _ => SsaType::Pointer(
+                                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                                Box::new(SsaType::Dyn),
+                            ),
                         },
                     })
                     .collect::<Vec<_>>();
@@ -466,13 +490,243 @@ where
             .insert(hir_iface.name, defaults);
     }
 
+    fn register_static_def(
+        &mut self,
+        name: StrId,
+        ty: &HirType<'a, 'bump>,
+        value: &HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) {
+        let target = ir::layout::TargetInfo { ptr_bytes: 8 };
+        let ssa_ty = lower_type_hir(ty, &self.enums, &self.module.structs);
+        let size = ir::layout::sizeof_ssa(&ssa_ty, target)
+            .unwrap_or_else(|e| panic!("static `{name}`: unknown size at {span}: {e:?}"));
+
+        let init = match value {
+            HirExpr::Uninit { .. } | HirExpr::Undefined { .. } => StaticInit::Zero,
+            _ => {
+                let mut bytes = vec![0u8; size];
+                let mut relocs: Vec<StaticReloc> = Vec::new();
+                if self.write_static_init(value, &ssa_ty, &mut bytes, 0, &mut relocs, 0) {
+                    if relocs.is_empty() {
+                        StaticInit::Bytes(bytes)
+                    } else {
+                        StaticInit::Relocated { bytes, relocs }
+                    }
+                } else {
+                    // calls, enums (for now), unary minus, generic structs...: init at top of `main`
+                    self.dynamic_static_inits.push((name, value.clone()));
+                    StaticInit::Zero
+                }
+            }
+        };
+        // `undefined` is zeroed but initialized; only `uninit` starts uninitialized.
+        let initialized = !matches!(value, HirExpr::Uninit { .. });
+
+        let def = StaticDef {
+            name,
+            ty: ssa_ty,
+            init,
+            symbol: format!("__zeta_static_{}", name),
+        };
+        let flag_name = static_flag_name(&self.context, name);
+        let flag = StaticDef {
+            name: flag_name,
+            ty: SsaType::U8,
+            init: if initialized {
+                StaticInit::Bytes(vec![1])
+            } else {
+                StaticInit::Zero
+            },
+            symbol: format!("__zeta_static_{}", flag_name),
+        };
+
+        for d in [def, flag] {
+            self.registry.statics.borrow_mut().insert(d.name, d.clone());
+            self.module.statics.insert(d.name, d);
+        }
+    }
+
+    fn const_int(&self, e: &HirExpr<'a, 'bump>, depth: u32) -> Option<i64> {
+        if depth > 16 {
+            return None;
+        }
+        match e {
+            HirExpr::Number(n, _) => Some(*n as i64),
+            HirExpr::Cast { expr, .. } => self.const_int(expr, depth + 1),
+            HirExpr::Ident(n, _) => self
+                .constants
+                .get(n)
+                .and_then(|c| self.const_int(c, depth + 1)),
+            HirExpr::Binary {
+                left, op, right, ..
+            } => {
+                let l = self.const_int(left, depth + 1)?;
+                let r = self.const_int(right, depth + 1)?;
+                match op {
+                    Operator::Add => Some(l.wrapping_add(r)),
+                    Operator::Subtract => Some(l.wrapping_sub(r)),
+                    Operator::Multiply => Some(l.wrapping_mul(r)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn write_static_init(
+        &self,
+        e: &HirExpr<'a, 'bump>,
+        ty: &SsaType,
+        out: &mut [u8],
+        base: usize,
+        relocs: &mut Vec<StaticReloc>,
+        depth: u32,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let target = ir::layout::TargetInfo { ptr_bytes: 8 };
+        match (ty, e) {
+            (_, HirExpr::Undefined { .. }) | (_, HirExpr::Uninit { .. }) => true, // zeroed
+            (SsaType::Nullable(_) | SsaType::Pointer(..), HirExpr::Null(_)) => true, // 0 / tag 0
+
+            // str = { ptr, len }; ptr is a relocation to the raw bytes
+            (SsaType::String, HirExpr::String(s, _)) if out.len() == 16 => {
+                let len = self.context.resolve_bytes(s).len();
+                out[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+                relocs.push(StaticReloc {
+                    offset: base,
+                    string: *s,
+                });
+                true
+            }
+
+            (SsaType::F32, HirExpr::Decimal(d, _)) if out.len() == 4 => {
+                out.copy_from_slice(&(*d as f32).to_le_bytes());
+                true
+            }
+            (SsaType::F64, HirExpr::Decimal(d, _)) if out.len() == 8 => {
+                out.copy_from_slice(&(*d as f64).to_le_bytes());
+                true
+            }
+            (SsaType::F32, _) if out.len() == 4 => match self.const_int(e, 0) {
+                Some(i) => {
+                    out.copy_from_slice(&(i as f32).to_le_bytes());
+                    true
+                }
+                None => false,
+            },
+            (SsaType::F64, _) if out.len() == 8 => match self.const_int(e, 0) {
+                Some(i) => {
+                    out.copy_from_slice(&(i as f64).to_le_bytes());
+                    true
+                }
+                None => false,
+            },
+            (SsaType::Bool, HirExpr::Boolean(b, _)) if !out.is_empty() => {
+                out[0] = *b as u8;
+                true
+            }
+            (SsaType::Char, HirExpr::Char(c, _)) if out.len() == 4 => {
+                out.copy_from_slice(&(*c as u32).to_le_bytes());
+                true
+            }
+            (t, _) if t.is_integer() && t != &SsaType::Char => match self.const_int(e, 0) {
+                Some(i) if out.len() <= 16 => {
+                    let b = (i as i128).to_le_bytes();
+                    out.copy_from_slice(&b[..out.len()]);
+                    true
+                }
+                _ => false,
+            },
+            (SsaType::Array(inner, n), HirExpr::ArrayLiteral { elements, .. }) => {
+                let Ok(stride) = ir::layout::sizeof_ssa(inner, target) else {
+                    return false;
+                };
+                if elements.len() > *n || stride * elements.len() > out.len() {
+                    return false;
+                }
+                elements.iter().enumerate().all(|(i, el)| {
+                    self.write_static_init(
+                        el,
+                        inner,
+                        &mut out[i * stride..(i + 1) * stride],
+                        base + i * stride,
+                        relocs,
+                        depth + 1,
+                    )
+                })
+            }
+            (SsaType::User(sname, _, ftys), HirExpr::StructInit { args, .. }) => {
+                let Some(def) = self.module.structs.get(sname) else {
+                    return false;
+                };
+                let Some(offs) = self.struct_field_offsets.get(sname) else {
+                    return false;
+                };
+                args.iter().all(|a| {
+                    let Some(idx) = def.fields.iter().position(|f| f.name == a.name) else {
+                        return false;
+                    };
+                    let Some(&off) = offs.get(&a.name) else {
+                        return false;
+                    };
+                    let fty = &ftys[idx];
+                    let Ok(sz) = ir::layout::sizeof_ssa(fty, target) else {
+                        return false;
+                    };
+                    if off + sz > out.len() {
+                        return false;
+                    }
+                    self.write_static_init(
+                        &a.value,
+                        fty,
+                        &mut out[off..off + sz],
+                        base + off,
+                        relocs,
+                        depth + 1,
+                    )
+                })
+            }
+            (SsaType::Tuple(tys), HirExpr::Tuple(es, _)) if tys.len() == es.len() => {
+                let mut cursor = 0usize;
+                for (t, el) in tys.iter().zip(es.iter()) {
+                    let Ok(l) = ir::layout::layout_of_ssa(t, target) else {
+                        return false;
+                    };
+                    cursor = ir::layout::round_up_to_align(cursor, l.align);
+                    if cursor + l.size > out.len() {
+                        return false;
+                    }
+                    if !self.write_static_init(
+                        el,
+                        t,
+                        &mut out[cursor..cursor + l.size],
+                        base + cursor,
+                        relocs,
+                        depth + 1,
+                    ) {
+                        return false;
+                    }
+                    cursor += l.size;
+                }
+                true
+            }
+            (_, HirExpr::Ident(n, _)) => self.constants.get(n).map_or(false, |c| {
+                self.write_static_init(c, ty, out, base, relocs, depth + 1)
+            }),
+            _ => false,
+        }
+    }
+
     fn compute_field_offsets(&mut self, hir_struct: &HirStruct<'a, 'bump>) {
         let mut offsets = HashMap::default();
         let mut current_offset = 0usize;
 
         for f in hir_struct.fields.iter() {
             let field_ssa_ty = lower_type_hir(&f.field_type, &self.enums, &self.module.structs);
-            if let SsaType::User(n, _,  fs) = &field_ssa_ty {
+            if let SsaType::User(n, _, fs) = &field_ssa_ty {
                 if fs.is_empty() {
                     if let Some(def) = self.module.structs.get(n) {
                         assert!(
@@ -578,6 +832,12 @@ where
             .remove(&hir_fn.name)
             .expect("function signature should already be registered");
 
+        let static_inits: Vec<(StrId, HirExpr<'a, 'bump>)> = if hir_fn.name.as_str() == "main" {
+            self.dynamic_static_inits.clone()
+        } else {
+            Vec::new()
+        };
+
         let mut fl = FunctionLowerer::new(
             &mut function,
             hir_fn,
@@ -608,10 +868,14 @@ where
             self.registry.clone(), // here
         )
         .unwrap();
+        for (name, value) in &static_inits {
+            fl.lower_static_dynamic_init(*name, value);
+        }
+
         fl.lower_body(hir_fn.body);
         fl.finish();
 
-        self.module.functions.insert(hir_fn.name, function); // cannot borrow self.module.functions as mutable because it is also borrowed as immutable
+        self.module.functions.insert(hir_fn.name, function);
     }
 
     /// A hoisted closure fn is named `__closure_fn_N` and takes its env first:

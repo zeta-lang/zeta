@@ -1,17 +1,16 @@
 use ir::{
     borrow_checker::LoanId,
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirFunc, HirParam, HirType, StrId, ThisPassingKind},
+    hir::{CaptureMode, HirExpr, HirFunc, HirParam, HirType, ProvenanceRoot, StrId},
     nll_cfg::PointId,
 };
 
 use crate::{
+    TypeChecker,
     auto_traits::AutoTrait,
-    borrow_lifetime::{
-        CalleeConcurrency, Holder, ObState, ObligationArm, ObligationBranch, SuspensionReport,
-    },
+    borrow_lifetime::{CalleeConcurrency, SuspensionReport},
     naming::type_to_string,
-    str_id_to_string, TypeChecker,
+    str_id_to_string,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -32,6 +31,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let mut cc = CalleeConcurrency::default();
         for g in generics.iter() {
+            let is_static = g
+                .min_provenance
+                .is_some_and(|m| matches!(m.root, ProvenanceRoot::Static));
+            if is_static {
+                for (i, pty) in &normal {
+                    if matches!(pty, HirType::Generic(n) if *n == g.name) {
+                        cc.static_params.push(*i);
+                    }
+                }
+            }
             let traits: Vec<AutoTrait> = g
                 .constraints
                 .iter()
@@ -46,14 +55,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
             for (i, pty) in &normal {
                 if matches!(pty, HirType::Generic(n) if *n == g.name) {
-                    if !traits.is_empty() {
-                        cc.auto_bounds.push((*i, traits.clone()));
-                    }
+                    cc.auto_bounds.push((*i, traits.clone()));
                 }
             }
         }
 
-        if !cc.auto_bounds.is_empty() || !cc.borrow_until.is_empty() {
+        if !cc.auto_bounds.is_empty() || !cc.static_params.is_empty() {
             self.callee_concurrency.insert(func.name, cc);
         }
     }
@@ -73,54 +80,95 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.check_arg_auto_bounds(arg, traits);
             }
         }
-        self.begin_borrow_until(func.name, &cc.borrow_until, args);
+        for idx in &cc.static_params {
+            if let Some(arg) = args.get(*idx) {
+                self.check_arg_static_bound(func.name, arg);
+            }
+        }
     }
 
-    pub fn on_method_call(
-        &mut self,
-        receiver: &HirExpr<'a, 'bump>,
-        method: &str,
-        this_kind: &ThisPassingKind,
-    ) {
-        let consumes = matches!(this_kind, ThisPassingKind::Move | ThisPassingKind::MoveMut);
-        let recv = match receiver {
-            HirExpr::Ident(n, _) => Some(*n),
+    /// `T: &static` — the argument may not hold a borrow of anything that is not `&static`.
+    /// A closure that captures a local by reference holds exactly such a borrow.
+    fn check_arg_static_bound(&mut self, callee: StrId, arg: &HirExpr<'a, 'bump>) {
+        let callee_name = str_id_to_string(callee);
+        let mut problems: Vec<String> = Vec::new();
+
+        let captures = match arg {
+            HirExpr::Lambda { body, .. } => self
+                .closure_table
+                .get(&Self::stmt_key(body))
+                .map(|l| l.captures.clone()),
             _ => None,
         };
 
-        let hits: Vec<usize> = self
-            .borrow_obligations
-            .iter()
-            .enumerate()
-            .filter(|(_, ob)| {
-                if ob.discharged {
-                    return false;
+        if let (HirExpr::Lambda { span, .. }, Some(caps)) = (arg, captures) {
+            for c in caps.iter() {
+                let who = str_id_to_string(c.source);
+                match c.mode {
+                    CaptureMode::ByRef(kind) => problems.push(format!(
+                        "the closure borrows `{who}` ({kind:?}), which is not `&static`; \
+                         use `move` and share it through an `Arc` (or use `thread::scope`)"
+                    )),
+                    CaptureMode::ByValue => {
+                        let place = self.expr_from_path(c.source, c.source_path, *span);
+                        let ty = self.peek_type(&place);
+                        if Self::type_holds_nonstatic_ref(&ty) {
+                            problems.push(format!(
+                                "the closure moves `{who}` of type `{}`, which contains a \
+                                 non-`&static` reference",
+                                type_to_string(&ty)
+                            ));
+                        }
+                    }
                 }
-                let by_method = ob.methods.iter().any(|m| m.as_str() == method);
-                let by_move = ob.on_move && consumes;
-                if !(by_method || by_move) {
-                    return false;
-                }
-                match (ob.holder, recv) {
-                    (Holder::Local(h), Some(n)) => h == n,
-                    (Holder::InFlight(h), Some(n)) => h == n && consumes,
-                    (Holder::Pending, None) => true, // spawn(..).join()
-                    _ => false,
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
+            }
+        } else {
+            let ty = self.peek_type(arg);
+            if Self::type_holds_nonstatic_ref(&ty) {
+                problems.push(format!(
+                    "argument of type `{}` contains a non-`&static` reference",
+                    type_to_string(&ty)
+                ));
+            }
+        }
 
-        for i in hits {
-            self.discharge(i);
+        for p in problems {
+            self.record(TypeErrorKind::Generic(format!(
+                "`{callee_name}` requires `&static` here, but {p}"
+            )));
+        }
+    }
+
+    fn type_holds_nonstatic_ref(ty: &HirType<'a, 'bump>) -> bool {
+        match ty {
+            HirType::Ref {
+                inner, provenance, ..
+            } => {
+                !provenance.is_some_and(|p| matches!(p.root, ProvenanceRoot::Static))
+                    || Self::type_holds_nonstatic_ref(inner)
+            }
+            HirType::Struct {
+                field_types,
+                type_args,
+                ..
+            } => field_types
+                .iter()
+                .chain(type_args.iter())
+                .any(Self::type_holds_nonstatic_ref),
+            HirType::Enum { type_args, .. } => type_args.iter().any(Self::type_holds_nonstatic_ref),
+            HirType::SafePointer { inner, .. }
+            | HirType::UnsafePointer { inner, .. }
+            | HirType::Nullable(inner)
+            | HirType::Array(inner, _)
+            | HirType::Slice(inner) => Self::type_holds_nonstatic_ref(inner),
+            HirType::OwnedPointer { inner, .. } => Self::type_holds_nonstatic_ref(inner),
+            HirType::Tuple(ts) => ts.iter().any(Self::type_holds_nonstatic_ref),
+            _ => false,
         }
     }
 
     /// Call at the start of `check_function`.
     pub fn begin_concurrency_function(&mut self, func: &HirFunc<'a, 'bump>) {
-        self.borrow_obligations.clear();
-        self.pinned_loans.clear();
-        self.obligation_branches.clear();
         self.current_fn_bounds.clear();
         if let Some(gs) = func.generics {
             for g in gs.iter() {
@@ -128,121 +176,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.current_fn_bounds.insert(g.name, bounds);
             }
         }
-    }
-
-    fn snapshot_obligation_states(&self) -> Vec<ObState> {
-        self.borrow_obligations
-            .iter()
-            .map(|o| ObState {
-                discharged: o.discharged,
-                holder: o.holder,
-            })
-            .collect()
-    }
-
-    pub fn begin_obligation_branch(&mut self) -> ObligationBranch {
-        let base_len = self.borrow_obligations.len();
-        self.obligation_branches.push(base_len);
-        ObligationBranch {
-            base_len,
-            base: self.snapshot_obligation_states(),
-        }
-    }
-
-    /// Closes one arm. Obligations created inside the arm die with it, so anything still
-    /// outstanding there is a dropped handle.
-    pub fn end_obligation_arm(&mut self, br: &ObligationBranch) -> ObligationArm {
-        let local: Vec<usize> = (br.base_len..self.borrow_obligations.len())
-            .filter(|&i| !self.borrow_obligations[i].discharged)
-            .collect();
-        for i in local {
-            let msg = self.outstanding_message(i, "at the end of this branch");
-            self.record(TypeErrorKind::Generic(msg));
-        }
-
-        let tail = self.borrow_obligations.split_off(br.base_len);
-        for ob in tail {
-            for l in ob.loans {
-                self.pinned_loans.remove(&l);
-                self.borrow_checker.end_loan_now(l);
-            }
-        }
-
-        ObligationArm {
-            states: self.snapshot_obligation_states(),
-        }
-    }
-
-    /// Resets the path state to what it was when the branch started (for the next arm).
-    pub fn restore_obligations(&mut self, br: &ObligationBranch) {
-        for (i, st) in br.base.iter().enumerate() {
-            if let Some(ob) = self.borrow_obligations.get_mut(i) {
-                ob.discharged = st.discharged;
-                ob.holder = st.holder;
-            }
-        }
-    }
-
-    /// Joins the arms that can fall through. An obligation is discharged afterwards only if
-    /// it is discharged on all of them, and must have the same holder on the ones where it
-    /// is still outstanding.
-    pub fn join_obligation_arms(&mut self, br: ObligationBranch, arms: Vec<(ObligationArm, bool)>) {
-        self.obligation_branches.pop();
-        if arms.is_empty() {
-            return;
-        }
-
-        let mut live: Vec<&ObligationArm> =
-            arms.iter().filter(|(_, d)| !*d).map(|(a, _)| a).collect();
-        if live.is_empty() {
-            // Every arm diverges: the code after the join is unreachable.
-            live = arms.iter().map(|(a, _)| a).collect();
-        }
-
-        let mut conflicted: Vec<usize> = Vec::new();
-        for i in 0..br.base_len {
-            let states: Vec<ObState> = live.iter().map(|a| a.states[i]).collect();
-            let discharged = states.iter().all(|s| s.discharged);
-
-            let (holder, conflict) = if discharged {
-                (states[0].holder, false)
-            } else {
-                let outstanding: Vec<Holder> = states
-                    .iter()
-                    .filter(|s| !s.discharged)
-                    .map(|s| s.holder)
-                    .collect();
-                let first = outstanding[0];
-                (first, outstanding.iter().any(|h| *h != first))
-            };
-
-            let ob = &mut self.borrow_obligations[i];
-            ob.discharged = discharged;
-            ob.holder = holder;
-            if conflict {
-                conflicted.push(i);
-            }
-        }
-
-        for i in conflicted {
-            let callee = str_id_to_string(self.borrow_obligations[i].callee);
-            self.record(TypeErrorKind::Generic(format!(
-                "the handle from `{callee}` is held by different variables (or moved) on different \
-                 branches, so its `borrow_until` obligation can't be tracked past this join; keep \
-                 it in one variable on every branch"
-            )));
-            self.borrow_obligations[i].discharged = true;
-        }
-
-        self.flush_deferred_releases();
-    }
-
-    /// Loops: the body may run zero times, so the state after the loop is the join of the
-    /// state before it and the state after one pass through the body.
-    pub fn join_obligation_loop(&mut self, br: ObligationBranch, body: ObligationArm) {
-        self.restore_obligations(&br);
-        let skipped = self.end_obligation_arm(&br);
-        self.join_obligation_arms(br, vec![(body, false), (skipped, false)]);
     }
 
     pub fn analyze_suspension(&self, point: PointId) -> SuspensionReport {
@@ -254,17 +187,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .collect();
         frame_locals.sort_by_key(|l| str_id_to_string(*l));
 
-        let mut borrows_across: Vec<LoanId> = self
+        let borrows_across: Vec<LoanId> = self
             .loan_owners
             .iter()
             .filter(|(_, owner)| self.local_used_after(point, **owner))
             .map(|(l, _)| *l)
             .collect();
-        for l in self.pinned_loans.iter() {
-            if !borrows_across.contains(l) {
-                borrows_across.push(*l);
-            }
-        }
 
         SuspensionReport {
             frame_locals,

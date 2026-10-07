@@ -164,6 +164,37 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 Some(self.borrow_checker.project_deref(base))
             }
 
+            HirExpr::Slice {
+                object,
+                start,
+                end,
+                inclusive,
+                ..
+            } => match self.peek_type(object) {
+                HirType::Array(_, _) | HirType::Slice(_) => {
+                    let base = self.resolve_place(object)?;
+                    let interval = self.slice_interval(start, end, *inclusive);
+                    Some(self.borrow_checker.project_index(
+                        base,
+                        interval,
+                        IndexContainer::Primitive,
+                    ))
+                }
+                HirType::OwnedPointer { inner, .. }
+                    if matches!(*inner, HirType::Slice(_) | HirType::Array(_, _)) =>
+                {
+                    let base = self.resolve_place(object)?;
+                    let deref_base = self.borrow_checker.project_deref(base);
+                    let interval = self.slice_interval(start, end, *inclusive);
+                    Some(self.borrow_checker.project_index(
+                        deref_base,
+                        interval,
+                        IndexContainer::Primitive,
+                    ))
+                }
+                _ => None,
+            },
+
             HirExpr::Index { object, index, .. } => match self.peek_type(object) {
                 HirType::Array(_, _) | HirType::Slice(_) => {
                     let base = self.resolve_place(object)?;
@@ -336,7 +367,35 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Bound::Opaque(self.next_opaque_id)
     }
 
+    pub fn const_eval(&self, expr: &HirExpr<'a, 'bump>) -> Option<i64> {
+        match expr {
+            HirExpr::Number(v, _) => Some(*v),
+            HirExpr::Ident(name, _) => {
+                let (sym, _) = self.context.get_variable(&str_id_to_string(*name))?;
+                self.const_symbols.get(&sym).copied()
+            }
+            HirExpr::Binary {
+                left, op, right, ..
+            } => {
+                let l = self.const_eval(left)?;
+                let r = self.const_eval(right)?;
+                match op {
+                    Operator::Add => l.checked_add(r),
+                    Operator::Subtract => l.checked_sub(r),
+                    Operator::Multiply => l.checked_mul(r),
+                    Operator::Divide if r != 0 => l.checked_div(r),
+                    Operator::Modulo if r != 0 => l.checked_rem(r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn expr_to_bound(&mut self, expr: &HirExpr<'a, 'bump>) -> Bound {
+        if let Some(c) = self.const_eval(expr) {
+            return Bound::Const(c);
+        }
         match expr {
             HirExpr::Number(value, _) => Bound::Const(*value),
             HirExpr::Ident(name, _) => Bound::Symbol(*name),
@@ -492,6 +551,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expr: &HirExpr<'a, 'bump>,
         ty: &HirType<'a, 'bump>,
     ) {
+        if self.is_static_place(expr) {
+            return;
+        }
+
         if let Some((root, path)) = self.effect_path_of(expr) {
             self.note_capture_use(root, &path, closures::UseLevel::Read);
         }
@@ -1837,5 +1900,30 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 method_name, name, wants, name, has
             )));
         }
+    }
+
+    pub fn slice_interval(
+        &mut self,
+        start: &HirExpr<'a, 'bump>,
+        end: &HirExpr<'a, 'bump>,
+        inclusive: bool,
+    ) -> Interval {
+        let lower = self.expr_to_bound(start);
+        let mut upper = self.expr_to_bound(end);
+        if inclusive {
+            // half-open: `a..=b` is `[a, b+1)`
+            upper = match upper {
+                Bound::Const(c) => Bound::Const(c + 1),
+                Bound::Offset { base, offset } => Bound::Offset {
+                    base,
+                    offset: offset + 1,
+                },
+                other => Bound::Offset {
+                    base: Box::new(other),
+                    offset: 1,
+                },
+            };
+        }
+        Interval { lower, upper }
     }
 }

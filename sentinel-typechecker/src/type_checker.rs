@@ -4,11 +4,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::borrow_lifetime::{BorrowObligation, CalleeConcurrency};
-use crate::closures;
 use crate::initialization::{BindingMode, InitNode, ModuleImports};
 use crate::move_state::MoveState;
 use crate::naming::{str_id_to_string, type_to_string};
 use crate::type_context::TypeContext;
+use crate::{closures, statics};
 use codex_dependency_graph::DepGraph;
 use ir::analysis_context::CopyAnalysisCtx;
 use ir::ast::FuncSafety;
@@ -137,6 +137,16 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) obligation_branches: Vec<usize>,
     pub(crate) generic_bounds: FxHashMap<StrId, Vec<String>>,
     pub(crate) module_consts: FxHashMap<usize, FxHashMap<StrId, HirType<'a, 'bump>>>,
+    pub(crate) const_locals: FxHashMap<StrId, i64>,
+    pub(crate) const_symbols: FxHashMap<SymbolId, i64>,
+    pub(crate) module_statics: FxHashMap<usize, FxHashMap<StrId, statics::StaticDecl<'a, 'bump>>>,
+    pub(crate) static_symbols: FxHashMap<SymbolId, StrId>,
+    pub(crate) static_summaries: FxHashMap<StrId, statics::StaticSummary>,
+    pub(crate) cur_statics: Vec<StrId>,
+    pub(crate) fn_static_accessed: HashSet<StrId>,
+    pub(crate) fn_static_assigned: HashSet<StrId>,
+    pub(crate) static_whole_target: Option<StrId>,
+    pub(crate) static_assign_backfill: FxHashMap<usize, statics::StaticAssignInfo>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -206,6 +216,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             obligation_branches: Vec::new(),
             generic_bounds: FxHashMap::default(),
             module_consts: FxHashMap::default(),
+            const_locals: FxHashMap::default(),
+            const_symbols: FxHashMap::default(),
+            static_assign_backfill: FxHashMap::default(),
+            fn_static_accessed: HashSet::default(),
+            fn_static_assigned: HashSet::default(),
+            static_whole_target: Option::None,
+            cur_statics: Vec::default(),
+            static_summaries: FxHashMap::default(),
+            static_symbols: FxHashMap::default(),
+            module_statics: FxHashMap::default(),
         }
     }
 
@@ -451,6 +471,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         .or_default()
                         .insert(c.name, c.ty);
                 }
+                Hir::Stmt(HirStmt::Let {
+                    name,
+                    ty,
+                    value,
+                    is_static: true,
+                    span,
+                    ..
+                }) => {
+                    self.register_static(module_idx, *name, *ty, value, *span);
+                }
                 Hir::Impl(i) => {
                     let target = i.target.to_string();
                     if let Some(interface) = i.interface {
@@ -657,17 +687,55 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.occurrences
             .retain(|(_, _, _, m, _, _)| *m != module_idx);
         self.context.current_module_idx = module_idx;
+        let mut funcs: Vec<(&HirFunc<'a, 'bump>, Option<&'bump [HirGeneric<'a, 'bump>]>)> =
+            Vec::new();
         for item in module.items {
-            if let Hir::Func(func) = item {
-                self.check_function_in(func, None);
-            }
-            if let Hir::Impl(i) = item {
-                if let Some(methods) = i.methods {
-                    for func in methods {
-                        self.check_function_in(func, i.generics);
+            match item {
+                Hir::Func(f) => funcs.push((f, None)),
+                Hir::Impl(i) => {
+                    if let Some(ms) = i.methods {
+                        for f in ms {
+                            funcs.push((f, i.generics));
+                        }
                     }
                 }
+                _ => {}
             }
+        }
+        let used: Vec<HashSet<StrId>> = funcs.iter().map(|(f, _)| self.idents_used_in(f)).collect();
+        let mut done = vec![false; funcs.len()];
+        let mut order = Vec::with_capacity(funcs.len());
+        fn visit(
+            i: usize,
+            funcs: &[(&HirFunc<'_, '_>, Option<&[HirGeneric<'_, '_>]>)],
+            used: &[HashSet<StrId>],
+            done: &mut [bool],
+            order: &mut Vec<usize>,
+        ) {
+            if done[i] {
+                return;
+            }
+            done[i] = true; // marking first makes recursion/cycles terminate
+            for (j, (g, _)) in funcs.iter().enumerate() {
+                if used[i].contains(&g.name) || used[i].contains(&g.unmangled_name) {
+                    visit(j, funcs, used, done, order);
+                }
+            }
+            order.push(i);
+        }
+        for i in 0..funcs.len() {
+            visit(i, &funcs, &used, &mut done, &mut order);
+        }
+        for i in order {
+            let (f, g) = funcs[i];
+            self.check_function_in(f, g);
+        }
+
+        self.occurrences
+            .retain(|(_, _, _, m, _, _)| *m != module_idx);
+        self.context.current_module_idx = module_idx;
+
+        for item in module.items {
             if let Hir::Struct(ty_struct) = item {
                 let Some(struct_interfaces) = self
                     .context
@@ -741,6 +809,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.init_state = FxHashMap::default();
         self.non_null_state = FxHashMap::default();
         self.local_ref_kind = FxHashMap::default();
+        self.const_locals.clear();
 
         self.begin_concurrency_function(func);
 
@@ -828,6 +897,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
+        self.declare_statics_in_scope(&mut func_context);
+
         func_context.current_return_type = func.return_type;
 
         if let Some(body) = func.body {
@@ -851,6 +922,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.check_return_provenance(func);
 
         self.borrow_checker.end_scope();
+        self.finish_static_summary(func);
         self.current_fn = None;
         if func.function_metadata.func_safety == FuncSafety::Unsafe {
             self.unsafe_depth -= 1;
@@ -966,7 +1038,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ..
             } => {
                 self.set_span(*span);
-                self.check_let_stmt(name, ty, value, mutable, else_block, span)
+                let r = self.check_let_stmt(name, ty, value, mutable, else_block, span);
+                match value {
+                    HirExpr::Number(n, _) => {
+                        self.const_locals.insert(*name, *n);
+                    }
+                    _ => {
+                        self.const_locals.remove(name);
+                    }
+                }
+                // immutable binding with a compile-time-constant initialiser
+                if !*mutable {
+                    if let Some(c) = self.const_eval(value) {
+                        if let Some((sym, _)) = self.context.get_variable(&str_id_to_string(*name))
+                        {
+                            self.const_symbols.insert(sym, c);
+                        }
+                    }
+                }
+                r
             }
             HirStmt::Return(expr, span) => {
                 self.set_span(*span);
@@ -983,7 +1073,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.check_if_branches(cond, *then_block, *else_block, None)
             }
             // TODO: add spans to While, For and Const stmts
-            HirStmt::While { cond, body } => self.check_while_stmt(cond, body),
+            HirStmt::While { cond, body } => {
+                // Snapshot before checking: the body's `i += 1` clears the constant,
+                // and the entry init state is needed to merge the filled range.
+                let fills = self.detect_counted_fills(cond, body);
+                let r = self.check_while_stmt(cond, body);
+                self.apply_counted_fills(fills);
+                r
+            }
 
             HirStmt::For {
                 init,
@@ -1048,7 +1145,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 args,
                 span,
                 type_args,
-            } => self.check_call_expr(expr, callee, args, span, type_args, Some(expected)),
+            } => {
+                let t = self.check_call_expr(expr, callee, args, span, type_args, Some(expected));
+                self.apply_static_call_effects(callee, *span);
+                t
+            }
             HirExpr::Number(_, span) if self.is_integer(Self::peel_nullable(expected)) => {
                 self.set_span(*span);
                 *Self::peel_nullable(expected)
@@ -1216,6 +1317,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     symbol_id,
                     false,
                 ));
+                self.note_static_access(*name);
                 ty
             }
             HirExpr::FieldAccess {
@@ -1397,7 +1499,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 args,
                 span,
                 type_args,
-            } => self.check_call_expr(expr, callee, args, span, type_args, None),
+            } => {
+                let t = self.check_call_expr(expr, callee, args, span, type_args, None);
+                self.apply_static_call_effects(callee, *span);
+                t
+            }
             HirExpr::FieldAccess {
                 object,
                 field,
@@ -1432,7 +1538,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
             } => {
                 self.set_span(*span);
-                self.check_assignment_expr(target, op, value)
+                self.static_assignment_pre(target, op);
+                let t = self.check_assignment_expr(target, op, value);
+                self.static_assignment_post(value);
+                t
             }
             HirExpr::InterpolatedString(parts) => {
                 for part in *parts {
@@ -1483,6 +1592,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ref_kind,
                 span,
             } => {
+                if let Some(t) = self.check_static_ref(expr, *ref_kind, *span) {
+                    return t;
+                }
                 let ty = self.check_ref_expr(expr, *ref_kind, *span, true);
                 if matches!(ref_kind, RefKind::Unique | RefKind::Alias) {
                     self.optimistically_mark_mut_target_init(expr);

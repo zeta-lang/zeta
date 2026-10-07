@@ -8,13 +8,56 @@ use ir::{
 };
 
 use crate::{
+    TypeChecker,
     initialization::BareImportKind,
     naming::{str_id_to_string, type_to_string},
-    type_checker::{SymbolId, SLICE_PRIMITIVES},
-    TypeChecker,
+    type_checker::{SLICE_PRIMITIVES, SymbolId},
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
+    /// `&alias this` is a shared-mutable access: it must be checked as `Alias`
+    /// (compatible with other aliases), never as `Shared` (which conflicts with
+    /// an existing alias loan) nor `Mutable`.
+    fn receiver_borrow_kind(kind: &ThisPassingKind, requires_mut: bool) -> BorrowKind {
+        match kind {
+            ThisPassingKind::RefAlias => BorrowKind::Alias,
+            _ if requires_mut => BorrowKind::Mutable,
+            _ => BorrowKind::Shared,
+        }
+    }
+
+    /// Loan currently attached to the place behind each `&x` / `&mut x` / `&alias x`
+    /// argument, taken BEFORE the arguments are checked.
+    fn ref_arg_loans_before(&mut self, args: &[HirExpr<'a, 'bump>]) -> Vec<Option<LoanId>> {
+        args.iter()
+            .map(|a| match a {
+                HirExpr::Ref { expr, .. } => self
+                    .resolve_place(expr)
+                    .and_then(|p| self.borrow_checker.loan_for_place(p).copied()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// End loans the argument borrows created, for calls (closure calls) whose result
+    /// cannot keep them alive. Without this the loan lives to the end of the block and
+    /// a later `&alias`/`&mut` use of the same local is reported as a conflict.
+    fn end_new_ref_arg_loans(&mut self, args: &[HirExpr<'a, 'bump>], before: &[Option<LoanId>]) {
+        for (arg, prev) in args.iter().zip(before.iter()) {
+            let HirExpr::Ref { expr, .. } = arg else {
+                continue;
+            };
+            let Some(place) = self.resolve_place(expr) else {
+                continue;
+            };
+            if let Some(loan) = self.borrow_checker.loan_for_place(place).copied() {
+                if Some(loan) != *prev {
+                    self.borrow_checker.end_loan_now(loan);
+                }
+            }
+        }
+    }
+
     pub fn check_module_access_expr(
         &mut self,
         access: &&ir::hir::HirModuleAccess<'a, 'bump>,
@@ -433,6 +476,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                 if self.context.is_local_binding(&lookup_name) {
                     let callee_type = self.check_expr(callee);
+                    let loans_before = self.ref_arg_loans_before(args);
                     return match callee_type {
                         HirType::Lambda {
                             params,
@@ -449,10 +493,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 self.check_and_record_value_use(arg, &arg_type);
                                 self.recover(self.types_compatible(pt, &arg_type), ());
                             }
+                            if !self.return_type_may_alias(return_type) {
+                                self.end_new_ref_arg_loans(args, &loans_before);
+                            }
                             *return_type
                         }
                         HirType::Generic(g) if self.fn_closure_constraints.contains_key(&g) => {
-                            self.check_closure_call(g, args)
+                            let ret = self.check_closure_call(g, args);
+                            if !self.return_type_may_alias(&ret) {
+                                self.end_new_ref_arg_loans(args, &loans_before);
+                            }
+                            ret
                         }
                         _ => {
                             self.record(TypeErrorKind::Generic(format!(
@@ -720,11 +771,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             ) {
                                 self.check_and_record_value_use(object, &obj_type);
                             } else if let Some(place) = self.resolve_place(object) {
-                                let borrow_kind = if requires_mut {
-                                    BorrowKind::Mutable
-                                } else {
-                                    BorrowKind::Shared
-                                };
+                                let borrow_kind = Self::receiver_borrow_kind(kind, requires_mut);
                                 self.check_borrow_use(object, place, borrow_kind);
                             }
                         }
@@ -817,11 +864,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if let Some(params) = func.params {
                     let mut receiver_multi_place_loans: Vec<LoanId> = Vec::new();
 
-                    let this_kind = match params.first() {
-                        Some(HirParam::This { kind, .. }) => Some(kind),
-                        _ => None,
-                    };
-
                     if let Some(HirParam::This {
                         kind,
                         multi_place,
@@ -856,16 +898,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 self.check_and_record_value_use(object, &obj_type);
                             } else if !has_precise_template {
                                 if let Some(place) = self.resolve_place(object) {
-                                    let borrow_kind = if requires_mut {
-                                        BorrowKind::Mutable
-                                    } else {
-                                        BorrowKind::Shared
-                                    };
+                                    let borrow_kind =
+                                        Self::receiver_borrow_kind(kind, requires_mut);
 
+                                    // Pass the RECEIVER, not the call expression: provenance (and
+                                    // capture effects) are derived from the place being accessed.
+                                    // With the call expr, `access_provenance` is None, so a use
+                                    // through `let state: &mut T = ..; state.m()` looked like a
+                                    // competing access to the very loan `state` holds.
                                     if !requires_mut && !self.return_type_may_alias(&ret_ty) {
-                                        self.check_borrow_use_shell(expr, place, borrow_kind);
+                                        self.check_borrow_use_shell(object, place, borrow_kind);
                                     } else {
-                                        self.check_borrow_use(expr, place, borrow_kind);
+                                        self.check_borrow_use(object, place, borrow_kind);
                                     }
                                 }
                             }
@@ -901,10 +945,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
                     let arg_loans = self.check_all_func_args(args, normal_params, None, Some(func));
                     self.apply_callee_concurrency(&func, args);
-
-                    if let Some(kind) = this_kind {
-                        self.on_method_call(object, field.as_str(), kind);
-                    }
 
                     let loan =
                         self.finalize_call_loans(Some(object), args, arg_loans, &ret_ty, template);

@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirExpr, HirMatchArm, HirModuleAccess, HirStmt, HirType, StrId},
+    hir::{HirExpr, HirMatchArm, HirModuleAccess, HirParam, HirStmt, HirType, StrId},
     ir_hasher::{FxHashMap, HashMap},
 };
 
@@ -377,7 +377,28 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
         let new_args: Vec<HirExpr> = args
             .iter()
-            .map(|a| self.monomorphize_expr(a, outer_subs))
+            .enumerate()
+            .map(|(i, a)| {
+                let declared = base_func
+                    .params
+                    .and_then(|ps| ps.get(i))
+                    .and_then(|p| match p {
+                        HirParam::Normal { param_type, .. } => Some(*param_type),
+                        HirParam::This { .. } => None,
+                    });
+                match declared {
+                    Some(pt) => {
+                        let st = substitute_type(&pt, &inner_subs, &self.bump);
+                        let st = self.instantiate_type_recursively(st, *span);
+                        if contains_unresolved_generic(&st) {
+                            self.monomorphize_expr(a, outer_subs)
+                        } else {
+                            self.monomorphize_expr_with_expected_type(a, &st, outer_subs)
+                        }
+                    }
+                    None => self.monomorphize_expr(a, outer_subs),
+                }
+            })
             .collect();
         let args_slice = self.bump.alloc_slice(&new_args);
 

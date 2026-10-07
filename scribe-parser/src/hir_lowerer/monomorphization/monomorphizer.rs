@@ -12,7 +12,7 @@ use crate::hir_lowerer::monomorphization::assertions::{
 
 use super::naming::suffix_for_subs;
 use super::type_substitution::substitute_type;
-use ir::hir::{Hir, HirFunc, HirModule, HirParam, HirType, StrId};
+use ir::hir::{Hir, HirField, HirFunc, HirModule, HirParam, HirType, StrId};
 use ir::ir_hasher::FxHashMap;
 use zetaruntime::string_pool::StringPool;
 
@@ -116,11 +116,24 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 // Hoisted closure env structs live only in the module items; make
                 // them visible to field_type_of / closure_env_type / layout lookups.
                 Hir::Struct(s) if self.env_structs.contains_key(&s.name) => {
-                    self.ctx
-                        .structs
-                        .borrow_mut()
-                        .entry(s.name)
-                        .or_insert_with(|| (**s).clone());
+                    let new_fields: Vec<HirField<'a, 'bump>> = s
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            let sub = substitute_type(&f.field_type, &empty_subs, &self.bump);
+                            HirField {
+                                name: f.name,
+                                field_type: self
+                                    .instantiate_type_recursively(sub, Default::default()),
+                                visibility: f.visibility,
+                                manual: f.manual,
+                            }
+                        })
+                        .collect();
+                    let mut ns = (**s).clone();
+                    ns.fields = self.bump.alloc_slice(&new_fields);
+                    self.ctx.structs.borrow_mut().insert(ns.name, ns.clone());
+                    new_items.push(Hir::Struct(self.bump.alloc_value_immutable(ns)));
                 }
                 _ => {}
             }
@@ -267,6 +280,26 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         }
                     }
                     new_items.push(Hir::Interface(self.bump.alloc_value_immutable(new_iface)));
+                }
+                Hir::Struct(s) if self.env_structs.contains_key(&s.name) => {
+                    let new_fields: Vec<HirField<'a, 'bump>> = s
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            let sub = substitute_type(&f.field_type, &empty_subs, &self.bump);
+                            HirField {
+                                name: f.name,
+                                field_type: self
+                                    .instantiate_type_recursively(sub, Default::default()),
+                                visibility: f.visibility,
+                                manual: f.manual,
+                            }
+                        })
+                        .collect();
+                    let mut ns = (**s).clone();
+                    ns.fields = self.bump.alloc_slice(&new_fields);
+                    self.ctx.structs.borrow_mut().insert(ns.name, ns.clone());
+                    new_items.push(Hir::Struct(self.bump.alloc_value_immutable(ns)));
                 }
                 Hir::Impl(i) => {
                     let mut new_impl = (*i).clone();

@@ -308,6 +308,8 @@ impl fmt::Display for SsaType {
 }
 
 use crate::ast::FuncModifiers;
+use crate::registry::global_registry::StaticDef;
+use fxhash::FxHashMap;
 use smallvec::SmallVec;
 use zetaruntime::string_pool::StringPool;
 
@@ -453,6 +455,10 @@ pub enum Instruction {
         dest: Value,
         base: Operand,
         offset: usize,
+    },
+    GlobalAddr {
+        dest: Value,
+        name: StrId,
     },
 }
 
@@ -632,7 +638,7 @@ pub struct InterfaceLayout {
     pub methods: SmallVec<StrId, 12>, // names in declaration order
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Module<'a, 'bump>
 where
     'bump: 'a,
@@ -646,6 +652,24 @@ where
     pub struct_layouts: HashMap<StrId, StructLayout>,
     pub interface_layouts: HashMap<StrId, InterfaceLayout>,
     pub struct_interface_vtables: HashMap<(StrId, StrId), VTableInfo>,
+    pub statics: HashMap<StrId, StaticDef>,
+}
+
+impl<'a, 'bump> Module<'a, 'bump> {
+    pub fn new() -> Self {
+        Self {
+            functions: HashMap::default(),
+            structs: HashMap::default(),
+            interfaces: HashMap::default(),
+            enums: HashMap::default(),
+            types: HashMap::default(),
+
+            struct_layouts: HashMap::default(),
+            interface_layouts: HashMap::default(),
+            struct_interface_vtables: HashMap::default(),
+            statics: HashMap::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -654,12 +678,6 @@ pub enum Type {
     Bool,
     Str,
     Enum(StrId),
-}
-
-impl<'a, 'bump> Module<'a, 'bump> {
-    pub fn new() -> Module<'a, 'bump> {
-        Module::default()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,7 +1,34 @@
 use crate::attributes::{AttrTarget, KnownKind};
 use crate::hir::{HirEnum, HirExpr, HirFunc, HirInterface, HirStruct, HirType, StrId};
 use crate::ir_hasher::FxHashMap;
+use crate::ssa_ir::SsaType;
 use std::{cell::RefCell, rc::Rc};
+
+#[derive(Debug, Clone)]
+pub struct StaticDef {
+    pub name: StrId,
+    pub ty: SsaType,
+    pub init: StaticInit,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticReloc {
+    /// byte offset inside the static where an 8-byte pointer is written
+    pub offset: usize,
+    /// the pointer targets this string's raw bytes
+    pub string: StrId,
+}
+
+#[derive(Debug, Clone)]
+pub enum StaticInit {
+    Zero,
+    Bytes(Vec<u8>),
+    Relocated {
+        bytes: Vec<u8>,
+        relocs: Vec<StaticReloc>,
+    },
+}
 
 #[derive(Clone, Default)]
 pub struct ModuleSymbols {
@@ -43,6 +70,7 @@ pub struct GlobalRegistry<'a, 'bump> {
     pub enum_owner_module: Rc<RefCell<FxHashMap<StrId, usize>>>,
     owned_by_module: Rc<RefCell<FxHashMap<StrId, ModuleSymbols>>>,
     pub known: Rc<RefCell<FxHashMap<(KnownKind, StrId), AttrTarget>>>,
+    pub statics: Rc<RefCell<FxHashMap<StrId, StaticDef>>>,
 }
 
 impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
@@ -64,6 +92,7 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
             enum_owner_module: Rc::new(RefCell::new(FxHashMap::default())),
             instantiated_functions: Rc::new(RefCell::new(FxHashMap::default())),
             known: Rc::new(RefCell::new(FxHashMap::default())),
+            statics: Rc::new(RefCell::new(FxHashMap::default())),
         }
     }
 
@@ -102,4 +131,8 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
     pub fn record_owned(&self, module: StrId, symbols: ModuleSymbols) {
         self.owned_by_module.borrow_mut().insert(module, symbols);
     }
+}
+
+pub fn static_flag_name(pool: &zetaruntime::string_pool::StringPool, name: StrId) -> StrId {
+    StrId(pool.intern(&format!("{}__init", name)))
 }

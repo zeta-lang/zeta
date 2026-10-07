@@ -177,6 +177,7 @@ pub enum ParseErrorKind {
     EmptyString,
     UnsupportedDisjointBorrow,
     GenericWithoutDefaultAfterDefault,
+    DuplicateProvenanceBound,
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -254,6 +255,7 @@ impl fmt::Display for ParseErrorKind {
                 f,
                 "generic parameter without a default cannot follow a parameter with a default"
             ),
+            ParseErrorKind::DuplicateProvenanceBound => todo!(),
         }
     }
 }

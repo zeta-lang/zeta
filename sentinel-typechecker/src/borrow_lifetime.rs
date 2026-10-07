@@ -4,24 +4,7 @@ use ir::{
     hir::{HirExpr, StrId},
 };
 
-use crate::{auto_traits::AutoTrait, str_id_to_string, TypeChecker};
-
-#[derive(Clone, Debug)]
-pub struct BorrowUntilSpec {
-    /// Index among the callee's `Normal` params (the receiver is not counted).
-    pub param_index: usize,
-    /// `Ret.<method>` endpoints.
-    pub methods: Vec<StrId>,
-    /// `move Ret` endpoint.
-    pub on_move: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CalleeConcurrency {
-    pub borrow_until: Vec<BorrowUntilSpec>,
-    /// (normal param index, Send/Sync bounds on that param's generic type)
-    pub auto_bounds: Vec<(usize, Vec<AutoTrait>)>,
-}
+use crate::{TypeChecker, auto_traits::AutoTrait, str_id_to_string};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holder {
@@ -62,6 +45,14 @@ pub struct ObligationArm {
     pub(crate) states: Vec<ObState>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CalleeConcurrency {
+    /// (normal param index, Send/Sync bounds on that param's generic type)
+    pub auto_bounds: Vec<(usize, Vec<AutoTrait>)>,
+    /// Normal param indices whose generic is declared `&static`.
+    pub static_params: Vec<usize>,
+}
+
 pub struct SuspensionReport {
     /// Locals that live in the async frame across the suspension.
     pub frame_locals: Vec<StrId>,
@@ -70,34 +61,6 @@ pub struct SuspensionReport {
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
-    pub fn begin_borrow_until(
-        &mut self,
-        callee: StrId,
-        specs: &[BorrowUntilSpec],
-        args: &[HirExpr<'a, 'bump>],
-    ) {
-        for spec in specs {
-            let Some(arg) = args.get(spec.param_index) else {
-                continue;
-            };
-            let loans = self.detach_arg_loans(arg);
-            if loans.is_empty() {
-                continue; // nothing borrowed, nothing to track
-            }
-            for &l in &loans {
-                self.pinned_loans.insert(l);
-            }
-            self.borrow_obligations.push(BorrowObligation {
-                callee,
-                loans,
-                holder: Holder::Pending,
-                methods: spec.methods.clone(),
-                on_move: spec.on_move,
-                discharged: false,
-            });
-        }
-    }
-
     /// Takes the loans that the argument holds out of the "ends with the call" bookkeeping.
     fn detach_arg_loans(&mut self, arg: &HirExpr<'a, 'bump>) -> Vec<LoanId> {
         match arg {
@@ -190,21 +153,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let ob = &self.borrow_obligations[idx];
         let callee = str_id_to_string(ob.callee);
         match ob.holder {
-                Holder::Local(h) => format!(
-                    "`{}` goes out of scope {scope} with an outstanding `borrow_until` obligation \
+            Holder::Local(h) => format!(
+                "`{}` goes out of scope {scope} with an outstanding `borrow_until` obligation \
                      from `{callee}`; call one of its discharging operations first, \
                      because dropping the handle does not stop the computation",
-                    str_id_to_string(h)
-                ),
-                Holder::Pending => format!(
-                    "the value returned by `{callee}` carries a `borrow_until` obligation and must be \
+                str_id_to_string(h)
+            ),
+            Holder::Pending => format!(
+                "the value returned by `{callee}` carries a `borrow_until` obligation and must be \
                      bound to a variable; dropping it would detach the computation from the borrows it holds"
-                ),
-                Holder::InFlight(_) => format!(
-                    "the handle from `{callee}` was moved somewhere that cannot discharge its \
+            ),
+            Holder::InFlight(_) => format!(
+                "the handle from `{callee}` was moved somewhere that cannot discharge its \
                      `borrow_until` obligation; only moving it into another local transfers the obligation"
-                ),
-            }
+            ),
+        }
     }
 
     /// Call after `Expr`, `Return` and `Break` statements.

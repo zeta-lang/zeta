@@ -14,6 +14,7 @@ pub mod ref_effects;
 pub mod ref_provenance;
 pub mod references;
 pub mod statements;
+pub mod statics;
 pub mod type_checker;
 pub mod type_context;
 pub mod types;
