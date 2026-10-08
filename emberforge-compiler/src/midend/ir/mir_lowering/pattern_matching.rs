@@ -341,34 +341,20 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     None
                 };
 
-                if let Some(pointee_ty) = zero_cost_pointee {
-                    let zero = self.current_block_data.fresh_value();
-                    self.emit(Instruction::Const {
-                        dest: zero,
-                        ty: SsaType::Pointer(
-                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
-                            Box::new(pointee_ty.clone()),
-                        ),
-                        value: Operand::ConstInt(0),
-                    });
-                    self.current_block_data.value_types.insert(
-                        zero,
-                        SsaType::Pointer(
-                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
-                            Box::new(pointee_ty),
-                        ),
-                    );
-
+                if let Some(_pointee_ty) = zero_cost_pointee {
                     let cmp = self.current_block_data.fresh_value();
+
                     self.emit(Instruction::Binary {
                         dest: cmp,
                         op: BinOp::Eq,
                         left: Operand::Value(scrutinee),
-                        right: Operand::Value(zero),
+                        right: Operand::ConstInt(0),
                     });
+
                     self.current_block_data
                         .value_types
                         .insert(cmp, SsaType::Bool);
+
                     Some(cmp)
                 } else if ty.is_tagged_nullable() {
                     let tag_val = self.current_block_data.fresh_value();

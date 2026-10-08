@@ -85,7 +85,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let Some(pointee) = field_ty.nullable_pointer_repr() else {
             return val;
         };
-        let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee.clone()));
+        let ptr_ty = SsaType::Pointer(
+            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+            Box::new(pointee.clone()),
+        );
         match self.value_type(val).cloned() {
             Some(SsaType::Nullable(_)) | Some(SsaType::Null) => {
                 let dest = self.new_value();
@@ -361,18 +364,26 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
     /// `T` -> `T?`. Pointer-optimized: the bits already are the value.
     /// Tagged: fresh slot, tag = some, payload written after the tag.
-    pub(super) fn wrap_into_nullable(&mut self, val: Value, ty: &SsaType) -> Value {
-        if ty.nullable_pointer_repr().is_some() {
+    pub(super) fn wrap_into_nullable(&mut self, val: Value, inner: &SsaType) -> Value {
+        let nullable_ty = SsaType::Nullable(Box::new(inner.clone()));
+
+        if nullable_ty.nullable_pointer_repr().is_some() {
             return val;
         }
+
         let slot = self.current_block_data.fresh_value();
+
         self.emit(Instruction::StackAlloc {
             dest: slot,
-            ty: ty.clone(),
+            ty: nullable_ty.clone(),
             count: 1,
         });
-        self.current_block_data.value_types.insert(slot, ty.clone());
-        self.store_field_value(slot, 0, ty, val);
+
+        self.current_block_data
+            .value_types
+            .insert(slot, nullable_ty.clone());
+
+        self.store_field_value(slot, 0, &nullable_ty, val);
         slot
     }
 
@@ -384,7 +395,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             SsaType::Nullable(inner)
                 if matches!(
                     inner.as_ref(),
-                    SsaType::Pointer(_, _) | SsaType::Owned(_) | SsaType::User(_, _,  _)
+                    SsaType::Pointer(_, _) | SsaType::Owned(_) | SsaType::User(_, _, _)
                 ) =>
             {
                 self.unwrap_known_nonnull(val, &ty)

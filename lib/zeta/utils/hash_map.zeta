@@ -135,7 +135,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
 
     func get(&this, key: &K): ?&V {
         let index: usize = key.hash() % this.buckets.cap;
-        let current: ?&Entry<K, V> = &this.buckets[index];
+        let current: ?&Entry<K, V> = unsafe { &this.buckets[index] };
 
         match (current) {
             case null -> {

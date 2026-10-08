@@ -83,7 +83,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
     }
 
     func get(&this, index: usize): &T {
-        return &this.data[index];
+        return unsafe { &this.data[index] };
     }
 
     func get_mut(&mut this, index: usize): &mut T {
@@ -94,7 +94,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         return if (index >= this.data.len) {
             null
         } else {
-            &this.data[index]
+            unsafe { &this.data[index] }
         };
     }
 
@@ -102,7 +102,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         return if (index >= this.data.len) {
             null
         } else {
-            &mut this.data[index]
+            unsafe { &mut this.data[index] }
         };
     }
 
@@ -232,7 +232,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
     }
 
     func as_slice(&this): &[]T {
-        return this.data[0..<this.data.len];
+        return unsafe { this.data[0..<this.data.len] };
     }
 
     func clear(&mut this) {

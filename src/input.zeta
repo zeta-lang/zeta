@@ -296,6 +296,9 @@ func test_array_list_try_get_mut(): i64 {
     list.push(2);
     list.push(3);
 
+    let resultttttt: &mut i64 = list.get_mut(1);
+    io.stdout().writeln(resultttttt.to_string().as_str());
+
     let result: ?&mut i64 = list.try_get_mut(1);
 
     match (result) {

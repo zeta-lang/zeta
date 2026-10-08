@@ -1064,6 +1064,23 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 }
             },
 
+            (HirStmt::UnsafeBlock { body }, _) => {
+                self.unsafe_depth += 1;
+                let v = match body {
+                    HirStmt::Block { body, .. } => self.lower_block_value_inner(body, expected),
+                    other => {
+                        self.lower_stmt(other);
+                        if self.block_terminated() {
+                            self.unreachable_value()
+                        } else {
+                            self.unit_value()
+                        }
+                    }
+                };
+                self.unsafe_depth -= 1;
+                v
+            }
+
             (
                 HirStmt::If {
                     cond,

@@ -897,7 +897,10 @@ where
                 object,
                 index,
                 span: _,
-            } => self.lower_index_expr(object, index),
+            } => {
+                println!("[INDEX] object={:?}, index={:?}", object, index);
+                self.lower_index_expr(object, index)
+            }
             HirExpr::ArrayLiteral { elements, span: _ } => self.lower_array_literal(elements),
             HirExpr::GenericIdent(..) => unreachable!(),
             HirExpr::Cast {
@@ -909,7 +912,14 @@ where
                 args,
                 span,
             } => self.lower_intrinsic_expr(*kind, type_args, args, *span),
-            HirExpr::Block { body, .. } => self.lower_block_value(body),
+            HirExpr::Block {
+                body, is_unsafe, ..
+            } => {
+                self.unsafe_depth += usize::from(*is_unsafe);
+                let v = self.lower_block_value(body);
+                self.unsafe_depth -= usize::from(*is_unsafe);
+                v
+            }
             HirExpr::Match { expr, arms, span } => self.lower_match_expr(expr, arms, *span),
             HirExpr::Range { start, end, .. } => self.lower_range_expr(start, end),
             HirExpr::Slice {

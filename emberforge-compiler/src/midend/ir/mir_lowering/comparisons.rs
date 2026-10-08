@@ -244,25 +244,19 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     loaded
                 }
             };
-            let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee));
-            let zero = self.current_block_data.fresh_value();
-            self.emit(Instruction::Const {
-                dest: zero,
-                ty: ptr_ty.clone(),
-                value: Operand::ConstInt(0),
-            });
-            self.current_block_data.value_types.insert(zero, ptr_ty);
-
             let cmp = self.current_block_data.fresh_value();
+
             self.emit(Instruction::Binary {
                 dest: cmp,
                 op: cmp_op,
                 left: Operand::Value(val),
-                right: Operand::Value(zero),
+                right: Operand::ConstInt(0),
             });
+
             self.current_block_data
                 .value_types
                 .insert(cmp, SsaType::Bool);
+
             return cmp;
         }
 

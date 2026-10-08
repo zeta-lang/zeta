@@ -164,6 +164,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 *inner
             }
 
+            HirType::OwnedPointer { inner, .. } if matches!(*inner, HirType::Slice(_)) => {
+                if !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                        "indexing an owned slice requires an unsafe block".to_string(),
+                    ));
+                }
+
+                match *inner {
+                    HirType::Slice(element) => *element,
+                    _ => unreachable!(),
+                }
+            }
+
             _ => match *Self::strip_ref(&object_ty) {
                 HirType::Array(inner, _) => *inner,
                 HirType::Slice(inner) => *inner,
@@ -296,6 +309,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             s.push_str(&str_id_to_string(*seg));
         }
         s
+    }
+
+    fn is_owned_slice(ty: &HirType<'a, 'bump>) -> bool {
+        matches!(ty, HirType::OwnedPointer { inner, .. } if matches!(**inner, HirType::Slice(_)))
     }
 
     pub fn check_assignment_expr(
@@ -825,24 +842,41 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if matches!(*Self::strip_ref(&object_ty), HirType::Array(..)) {
             self.check_slice_range_init(object, start, end);
         }
-        match *Self::strip_ref(&object_ty) {
-            HirType::Array(inner, _) | HirType::Slice(inner) => HirType::Slice(inner),
-            HirType::UnsafePointer { inner, .. } => {
+        match object_ty {
+            HirType::OwnedPointer { inner, .. } if matches!(*inner, HirType::Slice(_)) => {
                 if !self.in_unsafe() {
                     self.record(TypeErrorKind::Generic(
-                        "slicing a `[*]T` requires an unsafe block".into(),
+                        "slicing an owned slice requires an unsafe block".into(),
                     ));
                 }
-                HirType::Slice(inner)
+
+                match *inner {
+                    HirType::Slice(inner) => HirType::Slice(inner),
+                    _ => unreachable!(),
+                }
             }
-            HirType::String => HirType::String,
-            _ => {
-                self.record(TypeErrorKind::Generic(format!(
-                    "cannot slice type `{}`",
-                    type_to_string(&object_ty)
-                )));
-                HirType::Unknown
-            }
+
+            _ => match *Self::strip_ref(&object_ty) {
+                HirType::Array(inner, _) | HirType::Slice(inner) => HirType::Slice(inner),
+
+                HirType::UnsafePointer { inner, .. } => {
+                    if !self.in_unsafe() {
+                        self.record(TypeErrorKind::Generic(
+                            "slicing a `[*]T` requires an unsafe block".into(),
+                        ));
+                    }
+                    HirType::Slice(inner)
+                }
+
+                HirType::String => HirType::String,
+                _ => {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "cannot slice type `{}`",
+                        type_to_string(&object_ty)
+                    )));
+                    HirType::Unknown
+                }
+            },
         }
     }
 
@@ -1248,8 +1282,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    fn builtin_slice_field(ty: &HirType<'a, 'bump>, field: StrId) -> Option<HirType<'a, 'bump>> {
+    fn builtin_slice_field(
+        &mut self,
+        ty: &HirType<'a, 'bump>,
+        field: StrId,
+    ) -> Option<HirType<'a, 'bump>> {
         let (mut t, mut owned) = (*ty, false);
+
         loop {
             match t {
                 HirType::Ref { inner, .. } | HirType::SafePointer { inner, .. } => t = *inner,
@@ -1260,13 +1299,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 _ => break,
             }
         }
+
         match (t, field.as_str()) {
             (HirType::Slice(_) | HirType::Array(..), "len") => Some(HirType::Usize),
+
             (HirType::Slice(_), "cap") if owned => Some(HirType::Usize),
-            (HirType::Slice(e), "ptr") => Some(HirType::UnsafePointer {
-                inner: e,
-                mutability_state: ir::ast::MutabilityState::Mut,
-            }),
+
+            (HirType::Slice(e), "ptr") => {
+                if owned && !self.in_unsafe() {
+                    self.record(TypeErrorKind::Generic(
+                        "accessing `.ptr` of an owned slice requires an unsafe block".into(),
+                    ));
+                }
+
+                Some(HirType::UnsafePointer {
+                    inner: e,
+                    mutability_state: MutabilityState::Mut,
+                })
+            }
+
             _ => None,
         }
     }
@@ -1277,7 +1328,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         field: StrId,
     ) -> HirType<'a, 'bump> {
         let obj_type = self.check_expr_suppressed(object);
-        if let Some(t) = Self::builtin_slice_field(&obj_type, field) {
+        if let Some(t) = self.builtin_slice_field(&obj_type, field) {
             return t;
         }
 
@@ -1601,7 +1652,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         field: StrId,
     ) -> HirType<'a, 'bump> {
         let obj_type = self.check_expr_suppressed(object);
-        if let Some(t) = Self::builtin_slice_field(&obj_type, field) {
+        if let Some(t) = self.builtin_slice_field(&obj_type, field) {
             return t;
         }
         let Some(mut stripped) = self.field_receiver_type(object, &obj_type) else {
