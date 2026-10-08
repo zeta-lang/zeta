@@ -131,16 +131,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .map_or(true, |n| n.is_fully_init())
     }
 
-    pub(crate) fn note_static_access(&mut self, name: StrId) {
+    pub(crate) fn note_static_use(&mut self, name: StrId, mutating: bool) {
         if !self.is_static_ident(name) {
             return;
         }
         self.fn_static_accessed.insert(name);
-        if let Some(f) = self.closure_frames.borrow_mut().last_mut() {
-            if !f.static_uses.contains(&name) {
-                f.static_uses.push(name);
+        for f in self.closure_frames.borrow_mut().iter_mut() {
+            match f.static_uses.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, m)) => *m |= mutating,
+                None => f.static_uses.push((name, mutating)),
             }
         }
+    }
+
+    pub(crate) fn note_static_access(&mut self, name: StrId) {
+        self.note_static_use(name, false);
     }
 
     fn plain_assign(op: &AssignmentOperator) -> bool {
@@ -152,6 +157,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         target: &HirExpr<'a, 'bump>,
         op: &AssignmentOperator,
     ) {
+        if let Some(root) = Self::static_root(target) {
+            if self.is_static_ident(root) {
+                self.note_static_use(root, true);
+            }
+        }
         if let HirExpr::Ident(n, _) = target {
             if self.is_static_ident(*n) && Self::plain_assign(op) {
                 self.static_whole_target = Some(*n);
@@ -209,6 +219,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             )));
             kind = RefKind::Alias; // avoid cascading errors
         }
+        if kind != RefKind::Shared {
+            self.note_static_use(root, true);
+        }
         let inner = self.check_expr_as_place(expr); // requires INITIALIZED
         Some(HirType::Ref {
             inner: self.context.bump.alloc_value(inner),
@@ -218,9 +231,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     /// Call this where spawned-closure captures are checked for Send, with frame.static_uses.
-    pub(crate) fn check_static_thread_bounds(&mut self, uses: &[StrId], span: SourceSpan<'a>) {
+    pub(crate) fn check_static_thread_bounds(
+        &mut self,
+        uses: &[(StrId, bool)],
+        span: SourceSpan<'a>,
+    ) {
         self.set_span(span);
-        for &name in uses {
+        for &(name, mutated) in uses {
             let Some((_, ty)) = self.context.get_variable(&str_id_to_string(name)) else {
                 continue;
             };
@@ -231,9 +248,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     type_to_string(&ty)
                 )));
             }
-            if !self.implements_auto(&ty, AutoTrait::Sync) {
+            if mutated && !self.implements_auto(&ty, AutoTrait::Sync) {
                 self.record(TypeErrorKind::Generic(format!(
-                    "static `{}` of type `{}` is used across a thread boundary but is not `Sync`",
+                    "static `{}` of type `{}` is mutated or aliased across a thread boundary \
+                     but is not `Sync`",
                     name,
                     type_to_string(&ty)
                 )));

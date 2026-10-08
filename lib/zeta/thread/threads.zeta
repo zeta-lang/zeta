@@ -125,16 +125,15 @@ impl<R, A: Allocator> JoinHandle<R, A> {
             return Result.Err { error: ret };
         }
 
-        let result: ?R = unsafe { (*this.inner.slot).result };
-        if (result == null) {
+        let taken: ?R = unsafe { $replace(&mut (*this.inner.slot).result, null) };
+        if (taken == null) {
             $unreachable();
         }
 
         unsafe { $drop_in_place(&mut this.inner); }
-
         $mem_forget(this);
 
-        return Result.Ok { value: result };
+        return Result.Ok { value: taken };
     }
 }
 

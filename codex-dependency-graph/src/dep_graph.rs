@@ -1416,6 +1416,9 @@ impl DepGraph {
             Expr::Unary { operand, .. } => {
                 self.walk_expr(operand, from_node, module_idx, pool);
             }
+            Expr::OrElse { value, .. } => {
+                self.walk_expr(value, from_node, module_idx, pool);
+            }
             Expr::ArrayIndex { expr, index, .. } => {
                 self.walk_expr(expr, from_node, module_idx, pool);
                 self.walk_expr(index, from_node, module_idx, pool);

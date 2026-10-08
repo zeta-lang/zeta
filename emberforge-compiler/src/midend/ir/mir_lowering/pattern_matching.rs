@@ -2,7 +2,7 @@ use ir::{
     hir::{HirEnum, HirExpr, HirMatchArm, HirPattern, HirStmt, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
-    span::{self, SourceSpan},
+    span::SourceSpan,
     ssa_ir::{BinOp, BlockId, Instruction, Operand, SsaType, Value},
 };
 
@@ -842,7 +842,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             let HirStmt::Block { body, span: _ } = arm.body else {
                 panic!("match arm body must be a block")
             };
+            self.cond_depth += 1;
             let arm_val = self.lower_block_value_inner(body, expected);
+            self.cond_depth -= 1;
             let arm_scope = self.scope_stack.pop().unwrap();
             if !self.block_terminated() {
                 self.emit_scope_drops(&arm_scope, span);

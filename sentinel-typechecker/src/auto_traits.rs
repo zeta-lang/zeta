@@ -5,11 +5,11 @@ use ir::{
 };
 
 use crate::{
+    TypeChecker,
     closures::{capture_mode_text, required_for_capture},
     naming::type_to_string,
     str_id_to_string,
     type_checker::ImplCondition,
-    TypeChecker,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -120,9 +120,23 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirType::DynInterface(name, _) => str_id_to_string(*name) == tr.name(),
 
-            // Primitives, `never`, `void`, `null`, unresolved types (avoid cascading errors).
-            // Closure values are checked through their captures at the call that requires
-            // `Send`/`Sync` (see `check_closure_auto_bounds`).
+            HirType::I8
+            | HirType::I16
+            | HirType::I32
+            | HirType::I64
+            | HirType::I128
+            | HirType::U8
+            | HirType::U16
+            | HirType::U32
+            | HirType::U64
+            | HirType::U128
+            | HirType::Usize
+            | HirType::Isize
+            | HirType::F32
+            | HirType::F64
+            | HirType::Boolean
+            | HirType::Char => tr == AutoTrait::Send,
+
             _ => true,
         }
     }
@@ -367,6 +381,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             need.name(),
                         )));
                     }
+                }
+            }
+        }
+
+        if let HirExpr::Lambda { body, span, .. } = lambda {
+            if !traits.is_empty() {
+                if let Some(uses) = self.closure_static_uses.get(&Self::stmt_key(body)).cloned() {
+                    self.check_static_thread_bounds(&uses, *span);
                 }
             }
         }

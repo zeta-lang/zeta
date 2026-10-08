@@ -6,18 +6,18 @@ pub mod initialization;
 pub mod names;
 
 use ir::{
-    hir::{AssignmentOperator, HirExpr, HirType, StrId},
+    hir::{AssignmentOperator, DropKind, HirExpr, HirType, StrId},
     ir_conversion::{assign_op_to_bin_op, lower_type_hir},
     layout::TargetInfo,
     span::SourceSpan,
-    ssa_ir::{BinOp, Instruction, Operand, SsaType, Value, cast_kind},
+    ssa_ir::{BinOp, Instruction, Operand, SsaPointerKind, SsaType, Value, cast_kind},
 };
 
 use crate::midend::{
     copy_analysis::drop_tracking::Tri,
     ir::mir_lowering::{
         FunctionLowerer,
-        lowerer::{FieldInitVal, IndexedContainer},
+        lowerer::{CallOwn, FieldInitVal, IndexedContainer, TempPlace},
     },
 };
 
@@ -257,8 +257,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 span,
             } => self.handle_field_access(op, rhs, object, *field, *span),
 
-            HirExpr::Deref { expr, span: _ } => {
+            HirExpr::Deref { expr, span } => {
                 let ptr = self.lower_expr(expr);
+                if matches!(op, AssignmentOperator::Assign) {
+                    self.drop_old_through_reference(ptr, expr, *span);
+                }
                 self.handle_deref_assign(ptr, rhs, op)
             }
 
@@ -319,7 +322,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
                 let rhs_v = match op {
                     AssignmentOperator::Assign => {
-                        let val = self.lower_expr(value);
+                        let val = rhs;
                         let elem_drop_kind = self.drop_kind_for_ssa_type(&elem_ty, object);
                         if elem_drop_kind.is_droppable() {
                             let base_val = self.lower_expr(object);
@@ -333,10 +336,8 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                     (IndexedContainer::Array(len), HirExpr::Number(n, _)) => {
                                         *n >= 0 && (*n as usize) < *len
                                     }
-
                                     (IndexedContainer::BorrowedSlice, _)
                                     | (IndexedContainer::OwnedSlice, _) => true,
-
                                     (IndexedContainer::Array(_), _) => false,
                                 };
 
@@ -391,7 +392,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                             .value_types
                             .insert(cur, elem_ty.clone());
 
-                        let rhs = self.lower_expr(value);
                         let result = self.current_block_data.fresh_value();
                         self.emit(Instruction::Binary {
                             dest: result,
@@ -488,6 +488,33 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(crate) fn lower_expr_as_receiver(&mut self, object: &HirExpr<'a, 'bump>) -> Value {
         let v = self.lower_expr_as_receiver_raw(object);
         self.canonicalize_receiver(v)
+    }
+
+    fn drop_old_through_reference(
+        &mut self,
+        ptr: Value,
+        ptr_expr: &HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) {
+        let pointee = match self.value_type(ptr).cloned() {
+            Some(SsaType::Pointer(kind, inner)) => {
+                if matches!(kind, SsaPointerKind::RefAlias | SsaPointerKind::RefMut) {
+                    *inner
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+        // Structs only: `drop_kind_for_ssa_type` answers from the *expression* for other
+        // types, which for an owned-pointer local would free the pointer itself, not its pointee.
+        if !matches!(pointee, SsaType::User(..)) {
+            return;
+        }
+        let kind = self.drop_kind_for_ssa_type(&pointee, ptr_expr);
+        if kind.is_droppable() {
+            self.emit_indexed_element_drop(&kind, ptr, span);
+        }
     }
 
     pub(crate) fn canonicalize_receiver(&mut self, v: Value) -> Value {
@@ -820,5 +847,157 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         };
         self.store_init(addr, 0, &ty, init); // Uninit => no store
         result
+    }
+
+    pub(super) fn expr_key(e: &HirExpr<'_, '_>) -> usize {
+        e as *const _ as usize
+    }
+
+    /// `foo().a.b` -> returns the call node, with `out = [a, b]`.
+    fn temp_place_path<'e>(
+        object: &'e HirExpr<'a, 'bump>,
+        field: StrId,
+        out: &mut Vec<StrId>,
+    ) -> Option<&'e HirExpr<'a, 'bump>> {
+        match object {
+            HirExpr::Call { .. } | HirExpr::InterfaceCall { .. } => {
+                out.push(field);
+                Some(object)
+            }
+            HirExpr::FieldAccess {
+                object: o,
+                field: f,
+                ..
+            }
+            | HirExpr::Get {
+                object: o,
+                field: f,
+                ..
+            } => {
+                let call = Self::temp_place_path(o, *f, out)?;
+                out.push(field);
+                Some(call)
+            }
+            _ => None,
+        }
+    }
+
+    fn struct_of_ssa(ty: &SsaType) -> Option<StrId> {
+        match ty {
+            SsaType::User(n, _, _) => Some(*n),
+            SsaType::Pointer(_, i) | SsaType::Owned(i) => Self::struct_of_ssa(i),
+            _ => None,
+        }
+    }
+
+    /// Type of the field reached by `path` starting at struct `root`.
+    fn chain_final_type(&self, root: StrId, path: &[StrId]) -> Option<HirType<'a, 'bump>> {
+        let mut name = root;
+        let mut ty = None;
+        for (i, f) in path.iter().enumerate() {
+            let fld = self
+                .structs
+                .get(&name)?
+                .fields
+                .iter()
+                .find(|x| x.name == *f)?;
+            ty = Some(fld.field_type);
+            if i + 1 < path.len() {
+                name = fld.field_type.nominal_type_name()?;
+            }
+        }
+        ty
+    }
+
+    /// Lowers the root call of `object.field` once and, if it owns a droppable value,
+    /// adopts it as a hidden temp. Returns None if there is no root call, or an outer
+    /// frame already handled it.
+    pub(super) fn begin_temp_place(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        field: StrId,
+        for_move: bool,
+    ) -> Option<TempPlace> {
+        let mut path = Vec::new();
+        let call = Self::temp_place_path(object, field, &mut path)?;
+        let key = Self::expr_key(call);
+        if self.expr_overrides.contains_key(&key) {
+            return None;
+        }
+        let v = self.lower_expr(call);
+        self.expr_overrides.insert(key, v);
+
+        let owned = self.owned_call_results.get(&v).copied();
+        let root_struct = match owned {
+            Some(CallOwn::Struct(n)) => Some(n),
+            _ => self
+                .current_block_data
+                .value_types
+                .get(&v)
+                .and_then(Self::struct_of_ssa),
+        };
+        let adopt = match (owned, for_move) {
+            (None, _) => false,
+            (Some(_), false) => true,
+            (Some(CallOwn::Struct(_)), true) => true,
+            // by-value read through an owned pointer: only safe for plain scalars,
+            // since an inline aggregate would be carried by address into freed memory
+            (Some(CallOwn::Callee(_)), true) => root_struct
+                .and_then(|r| self.chain_final_type(r, &path))
+                .map_or(false, |t| Self::is_plain_scalar(&t)),
+        };
+        let tmp = if adopt {
+            self.adopt_call_temp(call, v)
+        } else {
+            None
+        };
+        if let Some(t) = tmp {
+            self.call_temps.insert(key, t);
+        }
+        Some(TempPlace {
+            key,
+            tmp,
+            path,
+            root_struct,
+        })
+    }
+
+    /// Does a by-value read of this place move something droppable out of the temp?
+    /// Unknown => assume yes (leak, don't double-free).
+    pub(super) fn temp_field_moves_out(&self, tp: &TempPlace) -> bool {
+        let Some(root) = tp.root_struct else {
+            return true;
+        };
+        match self.chain_final_type(root, &tp.path) {
+            Some(t) => !matches!(t.try_drop_kind_with(None), Some(DropKind::Undroppable)),
+            None => true,
+        }
+    }
+
+    pub(super) fn end_temp_place(&mut self, tp: TempPlace, moved_out: bool) {
+        self.expr_overrides.remove(&tp.key);
+        if moved_out {
+            if let Some(tmp) = tp.tmp {
+                // Only first-level fields are tracked. Moving `foo().a.b` marks `a` moved,
+                // which leaks a's other fields instead of risking a double free.
+                self.drop_state.mark_field_moved(tmp, tp.path[0]);
+            }
+        }
+    }
+
+    /// For `foo().a.consume()` where `consume` takes `this` by value.
+    pub(super) fn mark_temp_place_moved(&mut self, place: &HirExpr<'a, 'bump>) {
+        let (HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. }) =
+            place
+        else {
+            return;
+        };
+        let mut path = Vec::new();
+        let Some(call) = Self::temp_place_path(object, *field, &mut path) else {
+            return;
+        };
+        if let Some(&tmp) = self.call_temps.get(&Self::expr_key(call)) {
+            self.drop_state.mark_field_moved(tmp, path[0]);
+        }
     }
 }

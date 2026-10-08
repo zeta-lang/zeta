@@ -25,6 +25,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 Some(t) => self.lower_arg_expected(a, t),
                 None => self.lower_expr(a),
             };
+            if matches!(pty, Some(SsaType::Pointer(..))) {
+                self.adopt_call_temp(a, v);
+            }
             ops.push(Operand::Value(v));
         }
         ops
@@ -84,10 +87,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 args: arg_ops,
             });
 
-            let ret_ty = self
+            let func = self
                 .funcs
                 .get(&mangled)
-                .or_else(|| self.global_funcs.get(&mangled))
+                .or_else(|| self.global_funcs.get(&mangled));
+
+            let ret_ty = func
                 .map(|f| f.ret_type.clone())
                 .unwrap_or_else(|| {
                     panic!(
@@ -95,6 +100,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         mangled
                     )
                 });
+            self.note_call_result(dest, &ret_ty, mangled);
             self.current_block_data.value_types.insert(dest, ret_ty);
             return dest;
         }
@@ -251,7 +257,8 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
         }
 
-        let obj_val: Value = self.lower_expr_as_receiver(object);
+        let raw_recv = self.lower_expr_as_receiver_raw(object);
+        let obj_val = self.canonicalize_receiver(raw_recv);
         let mut operands: SmallVec<Operand, 8> = SmallVec::new();
 
         let maybe_cls_name_ssa: Option<SsaType> =
@@ -263,7 +270,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 .and_then(Self::classify_indexed_container)
                 .is_some()
             {
-                return self.lower_slice_primitive(prim, object, obj_val, args);
+                let r = self.lower_slice_primitive(prim, object, obj_val, args);
+                self.adopt_call_temp(object, raw_recv);
+                return r;
             }
         }
 
@@ -355,6 +364,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 .unwrap_or(false);
             if receiver_is_moved {
                 self.record_arg_move(object);
+                self.mark_temp_place_moved(object);
+            } else if !param_types.is_empty() {
+                self.adopt_call_temp(object, raw_recv);
             }
         }
 
@@ -532,6 +544,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     .get(&actual_func_name)
                     .map(|f| f.ret_type.clone())
                     .unwrap_or(SsaType::I64);
+                self.note_call_result(dest, &ret_ty, actual_func_name);
                 self.current_block_data.value_types.insert(dest, ret_ty);
                 return Some(dest);
             }

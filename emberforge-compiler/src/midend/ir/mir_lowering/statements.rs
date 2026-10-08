@@ -1,7 +1,9 @@
 use ir::{
     hir::{DropKind, HirErrorHandlerPattern, HirExpr, HirStmt, HirType, StrId},
     ir_conversion::lower_type_hir,
+    layout::TargetInfo,
     span::SourceSpan,
+    ssa_ir::{Instruction, Operand, SsaType, Value},
 };
 
 use crate::midend::{
@@ -33,6 +35,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         self.record_move_if_any(value);
         let expected_ssa = lower_type_hir(ty, self.enums, self.structs);
         let mut val = self.lower_expr_expected(value, &expected_ssa);
+        val = self.copy_if_place_alias(value, val, &expected_ssa);
 
         if let Some(pat) = catch_pattern {
             self.lower_catch(val, pat);
@@ -77,6 +80,61 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 rest,
             );
         }
+    }
+
+    fn copy_if_place_alias(
+        &mut self,
+        value: &HirExpr<'a, 'bump>,
+        val: Value,
+        expected: &SsaType,
+    ) -> Value {
+        if !matches!(
+            value,
+            HirExpr::FieldAccess { .. }
+                | HirExpr::Get { .. }
+                | HirExpr::Index { .. }
+                | HirExpr::Deref { .. }
+        ) {
+            return val;
+        }
+        let inline_agg = match expected {
+            SsaType::User(..) | SsaType::Enum { .. } | SsaType::Tuple(_) => true,
+            t @ SsaType::Nullable(_) => t.is_tagged_nullable(),
+            _ => false,
+        };
+        if !inline_agg {
+            return val;
+        }
+        // field reads of inline aggregates come back as `Pointer(expected)`, or as `expected` itself
+        let aliases = match self.value_type(val) {
+            Some(t) if t == expected => true,
+            Some(SsaType::Pointer(_, inner)) => inner.as_ref() == expected,
+            _ => false,
+        };
+        let size = ir::layout::sizeof_ssa(expected, TargetInfo { ptr_bytes: 8 }).unwrap_or(0);
+        if !aliases || size == 0 {
+            return val;
+        }
+        let tmp = self.new_value();
+        self.emit(Instruction::StackAlloc {
+            dest: tmp,
+            ty: expected.clone(),
+            count: 1,
+        });
+        self.current_block_data
+            .value_types
+            .insert(tmp, expected.clone());
+        let n = self.new_value();
+        self.emit(Instruction::Const {
+            dest: n,
+            ty: SsaType::Usize,
+            value: Operand::ConstInt(size as i64),
+        });
+        self.current_block_data
+            .value_types
+            .insert(n, SsaType::Usize);
+        self.emit_memcpy(tmp, val, n);
+        tmp
     }
 
     fn add_to_scope_stack_for_drops(

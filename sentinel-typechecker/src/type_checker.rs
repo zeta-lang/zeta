@@ -147,6 +147,7 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) fn_static_assigned: HashSet<StrId>,
     pub(crate) static_whole_target: Option<StrId>,
     pub(crate) static_assign_backfill: FxHashMap<usize, statics::StaticAssignInfo>,
+    pub(crate) closure_static_uses: FxHashMap<usize, Vec<(StrId, bool)>>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -226,6 +227,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             static_summaries: FxHashMap::default(),
             static_symbols: FxHashMap::default(),
             module_statics: FxHashMap::default(),
+            closure_static_uses: FxHashMap::default(),
         }
     }
 
@@ -1646,6 +1648,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     (),
                 );
                 HirType::Unknown
+            }
+            HirExpr::OrElse {
+                value,
+                else_body,
+                span,
+            } => {
+                self.set_span(*span);
+                self.check_or_else_expr(value, else_body)
             }
         }
     }

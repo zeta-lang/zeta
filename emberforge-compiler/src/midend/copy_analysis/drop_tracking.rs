@@ -218,6 +218,7 @@ pub fn record_move_if_any<'a, 'bump>(
     expr: &HirExpr,
 ) {
     match expr {
+        HirExpr::OrElse { value, .. } => record_move_if_any(scope_stack, drop_state, value),
         HirExpr::Ident(name, _) => {
             if local_is_droppable(scope_stack, *name).is_some() {
                 drop_state.mark_whole_moved(*name);

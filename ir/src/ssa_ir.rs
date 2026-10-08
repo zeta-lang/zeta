@@ -309,7 +309,6 @@ impl fmt::Display for SsaType {
 
 use crate::ast::FuncModifiers;
 use crate::registry::global_registry::StaticDef;
-use fxhash::FxHashMap;
 use smallvec::SmallVec;
 use zetaruntime::string_pool::StringPool;
 

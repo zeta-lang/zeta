@@ -86,7 +86,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         // RHS
         self.current_block_data.switch_to(rhs_bb);
-        let rhs = self.lower_expr(right);
+        let rhs = self.lower_expr_scoped(right);
         let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 
@@ -151,7 +151,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         // RHS
         self.current_block_data.switch_to(rhs_bb);
-        let rhs = self.lower_expr(right);
+        let rhs = self.lower_expr_scoped(right);
         let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 

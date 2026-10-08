@@ -119,6 +119,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 }
 
                 let val = self.lower_expr(other);
+                self.adopt_call_temp(other, val);
                 match self.current_block_data.value_types.get(&val).cloned() {
                     Some(SsaType::Pointer(_, inner_ty)) => (val, *inner_ty),
 
@@ -191,6 +192,20 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     }
 
     pub(crate) fn lower_field_addr(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        field: StrId,
+        span: &SourceSpan<'a>,
+    ) -> (Value, SsaType) {
+        let tp = self.begin_temp_place(object, field, false);
+        let r = self.lower_field_addr_inner(object, field, span);
+        if let Some(tp) = tp {
+            self.end_temp_place(tp, false);
+        }
+        r
+    }
+
+    pub(crate) fn lower_field_addr_inner(
         &mut self,
         object: &HirExpr<'a, 'bump>,
         field: StrId,

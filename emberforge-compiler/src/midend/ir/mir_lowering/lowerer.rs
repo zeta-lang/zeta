@@ -3,14 +3,15 @@ use crate::midend::copy_analysis::drop_tracking::{DropMoveState, DropScope};
 use crate::midend::ir::block_data::CurrentBlockData;
 use crate::midend::ir::mir_lowering::control_flow::LoopCtx;
 use codex_dependency_graph::DepGraph;
+use ir::ast::FuncSafety;
 use ir::attributes::{AttrTarget, KnownKind};
-use ir::hir::{HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, StrId};
+use ir::hir::{DropKind, HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, StrId};
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::registry::global_registry::GlobalRegistry;
 use ir::ssa_ir::{
     AllocatorKind, AtomicOrdering, BasicBlock, BlockId, Function, Instruction, Operand, SsaType,
-    Value,
+    Value, cast_kind,
 };
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -44,6 +45,41 @@ pub(crate) enum FieldInitVal {
     Null,
     Uninit,
     Val(Value),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CallOwn {
+    Struct(StrId), // droppable struct returned by value
+    Callee(StrId), // `^T` / `^[]T` / `?^T`; kind comes from the callee's HIR signature
+}
+
+pub(crate) struct TempPlace {
+    pub key: usize,
+    pub tmp: Option<StrId>,
+    pub path: Vec<StrId>,
+    pub root_struct: Option<StrId>,
+}
+
+pub struct CalleeSig<'a, 'bump> {
+    pub ret: Option<HirType<'a, 'bump>>,
+    /// "this" for a `this` param, else the param name.
+    pub param_names: Vec<StrId>,
+}
+
+impl<'a, 'bump> CalleeSig<'a, 'bump> {
+    pub fn from_hir(f: &HirFunc<'a, 'bump>) -> Self {
+        CalleeSig {
+            ret: f.return_type,
+            param_names: f.params.map_or_else(Vec::new, |ps| {
+                ps.iter()
+                    .map(|p| match p {
+                        HirParam::This { .. } => StrId::from_static("this"),
+                        HirParam::Normal { name, .. } => *name,
+                    })
+                    .collect()
+            }),
+        }
+    }
 }
 
 pub struct FunctionLowerer<'f, 's, 'a, 'bump, 'r>
@@ -87,6 +123,15 @@ where
     pub(super) instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     pub(super) instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     pub(super) registry: GlobalRegistry<'r, 'bump>,
+    pub(super) owned_call_results: HashMap<Value, CallOwn>,
+    pub(super) temp_values: HashMap<StrId, Value>,
+    pub(super) pending_temps: Vec<StrId>,
+    pub(super) cond_depth: u32,
+    pub(super) next_temp: u32,
+    pub(super) func_sigs: &'s HashMap<StrId, CalleeSig<'a, 'bump>>,
+    pub(super) expr_overrides: HashMap<usize, Value>, // expr address -> pre-lowered value
+    pub(super) call_temps: HashMap<usize, StrId>,     // call expr address -> hidden temp
+    pub(super) unsafe_depth: usize,
 }
 
 impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r>
@@ -121,6 +166,7 @@ where
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
+        func_sigs: &'s HashMap<StrId, CalleeSig<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -150,6 +196,7 @@ where
             instantiated_functions,
             instantiated_struct_methods,
             registry,
+            func_sigs,
         )
     }
 
@@ -181,6 +228,7 @@ where
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
+        func_sigs: &'s HashMap<StrId, CalleeSig<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
         Self::new_internal(
             function,
@@ -210,6 +258,7 @@ where
             instantiated_functions,
             instantiated_struct_methods,
             registry,
+            func_sigs,
         )
     }
 
@@ -241,6 +290,7 @@ where
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
+        func_sigs: &'s HashMap<StrId, CalleeSig<'a, 'bump>>,
     ) -> Result<Self, std::alloc::AllocError> {
         let mut var_map = HashMap::default();
         let mut value_types = HashMap::default();
@@ -321,6 +371,15 @@ where
             instantiated_functions,
             instantiated_struct_methods,
             registry,
+            owned_call_results: HashMap::default(),
+            pending_temps: Vec::default(),
+            cond_depth: 0,
+            next_temp: 0,
+            temp_values: HashMap::default(),
+            call_temps: HashMap::default(),
+            expr_overrides: HashMap::default(),
+            func_sigs,
+            unsafe_depth: usize::from(hir_fn.function_metadata.func_safety == FuncSafety::Unsafe),
         })
     }
 
@@ -441,12 +500,42 @@ where
         stmt: &HirStmt<'a, 'bump>,
         rest: Option<&[HirStmt<'a, 'bump>]>,
     ) {
+        let mark = self.pending_temps.len();
+        self.lower_stmt_dispatch(stmt, rest);
+        let extend = matches!(stmt, HirStmt::Let { ty, .. } if !Self::is_plain_scalar(ty));
+        if extend {
+            self.pending_temps.truncate(mark); // stay in scope_stack until scope exit
+        } else {
+            self.drain_temps_since(mark, Default::default());
+        }
+    }
+
+    pub(super) fn lower_stmt_dispatch(
+        &mut self,
+        stmt: &HirStmt<'a, 'bump>,
+        rest: Option<&[HirStmt<'a, 'bump>]>,
+    ) {
+        let temp_mark = self.pending_temps.len();
+
         match stmt {
             HirStmt::Expr(expr) => {
-                let _ = self.lower_expr(expr);
+                let v = self.lower_expr(expr);
+                if matches!(expr, HirExpr::Call { .. } | HirExpr::InterfaceCall { .. }) {
+                    let kind = self
+                        .call_result_drop_kind(expr, v)
+                        .or_else(|| self.discarded_struct_result_kind(v));
+                    if let Some(kind) = kind {
+                        self.owned_call_results.remove(&v);
+                        if !self.block_terminated() {
+                            self.emit_drop_for_kind(&kind, v, None, Default::default());
+                        }
+                    }
+                }
             }
             HirStmt::UnsafeBlock { body } => {
+                self.unsafe_depth += 1;
                 self.lower_stmt(body);
+                self.unsafe_depth -= 1;
             }
             HirStmt::If {
                 cond,
@@ -522,6 +611,13 @@ where
             }
             _ => unimplemented!("Statement {:?} not yet lowered", stmt),
         }
+
+        if matches!(stmt, HirStmt::Let { .. }) {
+            // the binding may borrow from the temp: leave it in scope_stack until scope exit
+            self.pending_temps.truncate(temp_mark);
+        } else {
+            self.drain_temps_since(temp_mark, Default::default());
+        }
     }
 
     pub(super) fn static_field_path_mir(
@@ -567,6 +663,72 @@ where
         }
     }
 
+    pub(super) fn coerce_owned_ref(&mut self, v: Value, expected: &SsaType) -> Value {
+        let Some(have) = self.value_type(v).cloned() else {
+            return v;
+        };
+
+        match (&have, expected) {
+            // local `x: ^T`: `&x` is already the owned pointer word, only the type tag changes
+            (SsaType::Owned(pointee), SsaType::Pointer(_, want))
+                if !matches!(pointee.as_ref(), SsaType::Slice(_))
+                    && !matches!(want.as_ref(), SsaType::Owned(_)) =>
+            {
+                let dest = self.new_value();
+                self.emit(Instruction::Cast {
+                    dest,
+                    value: Operand::Value(v),
+                    kind: cast_kind(&have, expected),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, expected.clone());
+                dest
+            }
+
+            // address of a slot holding `^T`: load the pointer word out of it
+            (SsaType::Pointer(_, slot), SsaType::Pointer(k, want))
+                if matches!(slot.as_ref(), SsaType::Owned(p)
+                            if !matches!(p.as_ref(), SsaType::Slice(_)))
+                    && !matches!(want.as_ref(), SsaType::Owned(_)) =>
+            {
+                let SsaType::Owned(pointee) = slot.as_ref() else {
+                    unreachable!()
+                };
+                let dest = self.new_value();
+                self.emit(Instruction::Load {
+                    dest,
+                    ptr: Operand::Value(v),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, SsaType::Pointer(k.clone(), pointee.clone()));
+                dest
+            }
+
+            // address of a slot holding `?^T`: the pointer-optimized nullable bits are the pointer
+            (SsaType::Pointer(_, slot), SsaType::Nullable(want))
+                if !expected.is_tagged_nullable()
+                    && !slot.is_tagged_nullable()
+                    && matches!(slot.as_ref(), SsaType::Nullable(n)
+                            if matches!(n.as_ref(), SsaType::Owned(_)))
+                    && matches!(want.as_ref(), SsaType::Pointer(..)) =>
+            {
+                let dest = self.new_value();
+                self.emit(Instruction::Load {
+                    dest,
+                    ptr: Operand::Value(v),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(dest, expected.clone());
+                dest
+            }
+
+            _ => v,
+        }
+    }
+
     pub(super) fn lower_expr_expected(
         &mut self,
         expr: &HirExpr<'a, 'bump>,
@@ -602,14 +764,43 @@ where
                 self.lower_if_expr_inner(&cond, then_block, *else_block, *span, Some(expected))
             }
 
-            HirExpr::Block { body, .. } => self.lower_block_value_inner(body, Some(expected)),
+            HirExpr::Block {
+                body, is_unsafe, ..
+            } => {
+                self.unsafe_depth += usize::from(*is_unsafe);
+                let v = self.lower_block_value(body);
+                self.unsafe_depth -= usize::from(*is_unsafe);
+                v
+            }
 
-            _ => self.lower_expr(expr),
+            _ => {
+                let v = self.lower_expr(expr);
+                self.coerce_owned_ref(v, expected)
+            }
         }
     }
 
     pub fn lower_expr(&mut self, expr: &HirExpr<'a, 'bump>) -> Value {
+        if !self.expr_overrides.is_empty() {
+            if let Some(&v) = self.expr_overrides.get(&Self::expr_key(expr)) {
+                return v;
+            }
+        }
         match expr {
+            HirExpr::OrElse {
+                value,
+                else_body,
+                span,
+            } => {
+                let v = self.lower_expr(value);
+                let blk = HirStmt::Block {
+                    body: else_body,
+                    span: *span,
+                };
+                let blk_ref = &blk;
+                self.lower_nullable_unwrap(v, &blk_ref)
+            }
+
             HirExpr::Null(_) => self.lower_expr_null(),
             HirExpr::Number(n, _) => self.lower_expr_number(*n),
 
@@ -772,6 +963,17 @@ where
         }
     }
 
+    pub(super) fn discarded_struct_result_kind(&self, v: Value) -> Option<DropKind<'a, 'bump>> {
+        match self.value_type(v)? {
+            SsaType::User(name, _, _)
+                if self.glue_registry.is_droppable(*name) || self.struct_owns_chain(*name) =>
+            {
+                Some(DropKind::Type(*name))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn value_type(&self, v: Value) -> Option<&SsaType> {
         self.current_block_data.value_types.get(&v)
     }
@@ -788,7 +990,10 @@ where
 
     pub(crate) fn finish(self) {
         // let n = self.current_block_data.func.name.as_str();
-        // if n.contains("thread") {
+        // if n.contains("__closure_fn_29")
+        //     || n.contains("invoke_scoped___closure_env_25_i64")
+        //     || n.contains("ScopedJoinHandle_zeta_thread_scope_join_i64")
+        // {
         //     println!("{}'s MIR:", n);
         //     for b in &self.current_block_data.func.blocks {
         //         println!("bb{}:", b.id.0);
@@ -798,10 +1003,6 @@ where
         //     }
         // }
         self.current_block_data.finish()
-    }
-
-    pub(crate) fn expr_key(expr: &HirExpr<'a, 'bump>) -> usize {
-        expr as *const HirExpr<'a, 'bump> as usize
     }
 }
 

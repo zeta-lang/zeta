@@ -80,7 +80,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         let index: usize = key.hash() % bucket_count;
 
         // Replace an existing value.
-        let current: ?^Entry<K, V> = this.buckets[index];
+        let current: ?^Entry<K, V> = $replace(this.buckets[index], null);
 
         match (current) {
             case null -> {},
@@ -135,7 +135,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
 
     func get(&this, key: &K): ?&V {
         let index: usize = key.hash() % this.buckets.cap;
-        let current: ?^Entry<K, V> = this.buckets[index];
+        let current: ?&Entry<K, V> = &this.buckets[index];
 
         match (current) {
             case null -> {
@@ -152,7 +152,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
                             return null;
                         },
                         case next_node -> {
-                            node = next_node;
+                            node = &next_node;
                         }
                     }
                 }
@@ -162,7 +162,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
 
     func get_mut(&mut this, key: &K): ?&mut V {
         let index: usize = key.hash() % this.buckets.cap;
-        let current: ?^Entry<K, V> = this.buckets[index];
+        let current: ?&mut Entry<K, V> = &mut this.buckets[index];
 
         match (current) {
             case null -> {
@@ -179,7 +179,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
                             return null;
                         },
                         case next_node -> {
-                            node = next_node;
+                            node = &mut next_node;
                         }
                     }
                 }
@@ -194,7 +194,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
     func remove(&mut this, key: &K): ?V {
         let index: usize = key.hash() % this.buckets.cap;
 
-        let current: ?^Entry<K, V> = this.buckets[index];
+        let current: ?^Entry<K, V> = $replace(this.buckets[index], null);
         let mut previous: ?^Entry<K, V> = null;
 
         match (current) {

@@ -1,5 +1,6 @@
 use ir::{
     hir::{HirExpr, StrId},
+    ir_conversion::lower_type_hir,
     layout::TargetInfo,
     ssa_ir::{BinOp, Instruction, Operand, SsaType, Value},
 };
@@ -83,9 +84,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             left: Operand::Value(base_addr),
             right: Operand::Value(offset_v),
         });
-        self.current_block_data
-            .value_types
-            .insert(ptr_v, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ty.clone())));
+        self.current_block_data.value_types.insert(
+            ptr_v,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ty.clone()),
+            ),
+        );
 
         let len_v = self.current_block_data.fresh_value();
         self.emit(Instruction::Binary {
@@ -100,7 +105,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         let fat_ptr = self.current_block_data.fresh_value();
         let fat_ty = SsaType::Tuple(vec![
-            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ty.clone())),
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ty.clone()),
+            ),
             SsaType::Usize,
         ]);
         self.emit(Instruction::StackAlloc {
@@ -147,7 +155,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
     }
 
-    pub(super) fn split_indexable(&mut self, base: Value) -> (Value, SsaType, Option<Operand>) {
+    pub(super) fn split_indexable_raw(&mut self, base: Value) -> (Value, SsaType, Option<Operand>) {
         let base_ty = self
             .current_block_data
             .value_types
@@ -163,9 +171,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     base: Operand::Value(base),
                     offset: 0,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(data_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::U8)));
+                self.current_block_data.value_types.insert(
+                    data_ptr,
+                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::U8)),
+                );
                 let len_v = self.current_block_data.fresh_value();
                 self.emit(Instruction::LoadField {
                     dest: len_v,
@@ -189,9 +198,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     base: Operand::Value(base),
                     offset: 0,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(data_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_inner.clone())));
+                self.current_block_data.value_types.insert(
+                    data_ptr,
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(elem_inner.clone()),
+                    ),
+                );
                 let len_v = self.current_block_data.fresh_value();
                 self.emit(Instruction::LoadField {
                     dest: len_v,
@@ -221,9 +234,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     base: Operand::Value(base),
                     offset: 0,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(data_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_inner.clone())));
+                self.current_block_data.value_types.insert(
+                    data_ptr,
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(elem_inner.clone()),
+                    ),
+                );
                 let len_v = self.current_block_data.fresh_value();
                 self.emit(Instruction::LoadField {
                     dest: len_v,
@@ -258,9 +275,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     base: Operand::Value(base),
                     offset: 0,
                 });
-                self.current_block_data
-                    .value_types
-                    .insert(data_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new((**inner).clone())));
+                self.current_block_data.value_types.insert(
+                    data_ptr,
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new((**inner).clone()),
+                    ),
+                );
                 let len_v = self.current_block_data.fresh_value();
                 self.emit(Instruction::LoadField {
                     dest: len_v,
@@ -281,9 +302,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         base: Operand::Value(base),
                         offset: 0,
                     });
-                    self.current_block_data
-                        .value_types
-                        .insert(data_ptr, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new((**inner).clone())));
+                    self.current_block_data.value_types.insert(
+                        data_ptr,
+                        SsaType::Pointer(
+                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                            Box::new((**inner).clone()),
+                        ),
+                    );
                     let len_v = self.current_block_data.fresh_value();
                     self.emit(Instruction::LoadField {
                         dest: len_v,
@@ -299,6 +324,40 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             },
 
             other => panic!("[lower_index_base_len] cannot index into {:?}", other),
+        }
+    }
+
+    pub(super) fn split_indexable(&mut self, base: Value) -> (Value, SsaType, Option<Operand>) {
+        let (ptr, elem, len) = self.split_indexable_raw(base);
+        let elem = self.complete_ssa_ty(&elem);
+        (ptr, elem, len)
+    }
+
+    /// A struct type that arrived with an empty field list although its definition has
+    /// fields would size as a ZST. Rebuild it from the definition.
+    fn complete_ssa_ty(&self, ty: &SsaType) -> SsaType {
+        match ty {
+            SsaType::User(name, orig, fields) if fields.is_empty() => {
+                match self.structs.get(name) {
+                    Some(def) if !def.fields.is_empty() => {
+                        let fs = def
+                            .fields
+                            .iter()
+                            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
+                            .collect();
+                        SsaType::User(*name, orig.clone(), fs)
+                    }
+                    _ => ty.clone(),
+                }
+            }
+            SsaType::Pointer(k, inner) => {
+                SsaType::Pointer(k.clone(), Box::new(self.complete_ssa_ty(inner)))
+            }
+            SsaType::Owned(inner) => SsaType::Owned(Box::new(self.complete_ssa_ty(inner))),
+            SsaType::Slice(inner) => SsaType::Slice(Box::new(self.complete_ssa_ty(inner))),
+            SsaType::Array(inner, n) => SsaType::Array(Box::new(self.complete_ssa_ty(inner)), *n),
+            SsaType::Nullable(inner) => SsaType::Nullable(Box::new(self.complete_ssa_ty(inner))),
+            _ => ty.clone(),
         }
     }
 
@@ -418,9 +477,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             left: Operand::Value(base_ptr),
             right: Operand::Value(offset_v),
         });
-        self.current_block_data
-            .value_types
-            .insert(addr_v, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(elem_ty.clone())));
+        self.current_block_data.value_types.insert(
+            addr_v,
+            SsaType::Pointer(
+                ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                Box::new(elem_ty.clone()),
+            ),
+        );
 
         (addr_v, elem_ty)
     }

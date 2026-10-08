@@ -109,6 +109,17 @@ where
                         };
                     }
 
+                    TokenKind::Else => {
+                        let span = self.cursor.peek_token().span;
+                        self.cursor.advance();
+                        let block = self.parse_block()?;
+                        lhs = Expr::OrElse {
+                            value: self.bump.alloc_value_immutable(lhs),
+                            else_block: self.bump.alloc_value_immutable(block),
+                            span,
+                        };
+                    }
+
                     TokenKind::Lt if self.is_generic_argument_list() => {
                         self.cursor.advance();
 

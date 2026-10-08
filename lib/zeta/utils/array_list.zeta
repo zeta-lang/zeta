@@ -2,20 +2,23 @@ package zeta::utils::array_list;
 
 import zeta::libc;
 import zeta::debug;
+import zeta::io;
 import zeta::alloc::allocator.Allocator;
 import zeta::utils::mallocator.Mallocator;
 
-public struct ArrayList<T, A: Allocator = Mallocator> {
+import zeta::lang::traits.Clone;
+
+public struct ArrayList<T, A: Allocator + Clone = Mallocator> {
     data: ^this.alloc []T,
     alloc: A,
 }
 
-struct ArrayListDrain<T, A: Allocator = Mallocator> {
+struct ArrayListDrain<T, A: Allocator + Clone = Mallocator> {
     data: ArrayList<T, A>,
     index: usize,
 }
 
-impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
+impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
     func new(): ArrayList<T, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return ArrayList<T, Mallocator> {
@@ -59,9 +62,7 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
     }
 
     func push(&mut this, value: T) {
-        if (this.data.len == this.data.cap) {
-            this.grow();
-        }
+        this.reserve(1);
 
         unsafe {
             this.data.write_uninit(this.data.len, value);
@@ -115,17 +116,6 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         unsafe { return &mut ptr[index] };
     }
 
-    func grow(&mut this) {
-        let new_cap: usize =
-            if (this.data.cap == 0) {
-                16
-            } else {
-                this.data.cap * 2
-            };
-
-        this.data = this.alloc.realloc(this.data, new_cap);
-    }
-
     func reserve(&mut this, additional: usize) {
         let required: usize = this.data.len + additional;
 
@@ -144,7 +134,9 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
             new_cap *= 2;
         }
 
-        this.data = this.alloc.realloc(this.data, new_cap);
+        unsafe {
+            this.data = this.alloc.realloc(this.data, new_cap);
+        }
     }
 
     func insert(&mut this, index: usize, value: T) {
@@ -225,18 +217,12 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
 
     func drain(&mut this): ArrayListDrain<T, A> {
         let mut drained: ArrayList<T, A> =
-            ArrayList.with_capacity_in<T, A>(this.data.len, this.alloc);
+            ArrayList.with_capacity_in<T, A>(this.data.len, this.alloc.clone());
 
-        unsafe {
-            let ptr: [*]mut T = this.data as [*]mut T;
-
-            let mut i: usize = 0;
-            while (i < this.data.len) {
-                drained.push(ptr[i]);
-                i += 1;
-            }
-
-            this.data.len = 0;
+        let mut i: usize = 0;
+        while (i < this.data.len) {
+            drained.push(this.pop());
+            i += 1;
         }
 
         return ArrayListDrain<T, A> {
@@ -255,7 +241,11 @@ impl<T, A: Allocator = Mallocator> ArrayList<T, A> {
         while (this.data.len > 0) {
             unsafe {
                 this.data.len -= 1;
-                $drop_in_place(&mut ptr[this.data.len]);
+
+
+                let slot: &mut T = &mut ptr[this.data.len];
+
+                $drop_in_place(slot);
             }
         }
     }

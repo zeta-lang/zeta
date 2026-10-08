@@ -5,10 +5,10 @@ use ir::{
 };
 
 use crate::{
+    TypeChecker,
     naming::type_to_string,
     str_id_to_string,
     type_checker::{LocalSymbolId, SymbolId},
-    TypeChecker,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -108,13 +108,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             (
                 OwnedPointer {
                     inner: ia,
-                    allocator: aa,
+                    allocator: _,
                 },
                 OwnedPointer {
                     inner: ib,
-                    allocator: ab,
+                    allocator: _,
                 },
-            ) => aa == ab && self.types_structurally_equal(ia, ib),
+            ) => self.types_structurally_equal(ia, ib),
             (Array(ia, la), Array(ib, lb)) => la == lb && self.types_structurally_equal(ia, ib),
             (Slice(ia), Slice(ib)) => self.types_structurally_equal(ia, ib),
             (Tuple(ta), Tuple(tb)) => {
@@ -171,6 +171,48 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    pub(crate) fn owned_ref_coerces(
+        &self,
+        expected: &HirType<'a, 'bump>,
+        found: &HirType<'a, 'bump>,
+    ) -> bool {
+        let HirType::Ref {
+            inner: f_inner,
+            ref_kind: fk,
+            ..
+        } = found
+        else {
+            return false;
+        };
+
+        match (expected, *f_inner) {
+            // &^T  ->  &T
+            (
+                HirType::Ref {
+                    inner: e_inner,
+                    ref_kind: ek,
+                    ..
+                },
+                HirType::OwnedPointer { inner: pointee, .. },
+            ) if !matches!(pointee, HirType::Slice(_)) => {
+                fk.coerces_to(*ek) && self.types_compatible(e_inner, pointee).is_ok()
+            }
+            // &?^T  ->  ?&T
+            (
+                HirType::Nullable(e),
+                HirType::Nullable(HirType::OwnedPointer { inner: pointee, .. }),
+            ) if !matches!(pointee, HirType::Slice(_)) => match e {
+                HirType::Ref {
+                    inner: e_inner,
+                    ref_kind: ek,
+                    ..
+                } => fk.coerces_to(*ek) && self.types_compatible(e_inner, pointee).is_ok(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     pub fn types_compatible(
         &self,
         expected: &HirType<'a, 'bump>,
@@ -192,6 +234,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     return Ok(());
                 }
             }
+        }
+
+        if self.owned_ref_coerces(expected, found) {
+            return Ok(());
         }
 
         if let HirType::Ref {

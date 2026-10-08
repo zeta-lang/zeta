@@ -99,6 +99,21 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub(super) fn lower_expr(&self, expr: &Expr<'a, 'bump>) -> HirExpr<'a, 'bump> {
         match expr {
+            Expr::OrElse {
+                value,
+                else_block,
+                span,
+            } => {
+                let v = self.lower_expr(value);
+                let HirStmt::Block { body, .. } = self.lower_block(else_block) else {
+                    unreachable!()
+                };
+                HirExpr::OrElse {
+                    value: self.ctx.bump.alloc_value_immutable(v),
+                    else_body: body,
+                    span: *span,
+                }
+            }
             Expr::Null { span } => HirExpr::Null(*span),
             Expr::Ref {
                 expr,
@@ -1046,16 +1061,20 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
     pub fn infer_type(&self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
         match expr {
+            HirExpr::OrElse { value, .. } => match self.infer_type(value) {
+                HirType::Nullable(inner) => *inner,
+                _ => HirType::Unknown,
+            },
             HirExpr::This { .. } => self
                 .ctx
                 .current_this_type
                 .borrow()
                 .unwrap_or(HirType::Unknown),
-            HirExpr::Number(_, _) => HirType::I32,
-            HirExpr::Decimal(_, _) => HirType::F64,
-            HirExpr::Boolean(_, _) => HirType::Boolean,
-            HirExpr::String(_, _) => HirType::String,
-            HirExpr::Undefined { span: _, ty } => *ty,
+            HirExpr::Number(..) => HirType::I32,
+            HirExpr::Decimal(..) => HirType::F64,
+            HirExpr::Boolean(..) => HirType::Boolean,
+            HirExpr::String(..) => HirType::String,
+            HirExpr::Undefined { ty, .. } => *ty,
 
             HirExpr::Ident(name, _) => self
                 .ctx
@@ -1063,18 +1082,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 .borrow()
                 .get(name)
                 .cloned()
-                .unwrap_or_else(|| panic!("unknown identifier {:?}", name)),
+                .unwrap_or(HirType::Unknown),
 
             HirExpr::Binary {
                 left, op, right, ..
             } => {
-                let lt = self.infer_type(left);
-                let rt = self.infer_type(right);
-
-                if lt != rt {
-                    panic!("type mismatch: {:?} vs {:?}", lt, rt);
+                let (lt, rt) = (self.infer_type(left), self.infer_type(right));
+                if lt != rt || matches!(lt, HirType::Unknown) {
+                    return HirType::Unknown;
                 }
-
                 match op {
                     Operator::Equals
                     | Operator::NotEquals
@@ -1084,38 +1100,23 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     | Operator::LessThanOrEqual
                     | Operator::LogicalAnd
                     | Operator::LogicalOr => HirType::Boolean,
-
                     _ => lt,
                 }
             }
 
-            HirExpr::Call { callee, .. } => match **callee {
-                HirExpr::Ident(name, _) => {
-                    let f = self.ctx.functions.borrow();
-                    f.get(&name).expect("unknown function").return_type.unwrap()
-                }
-                other => panic!("invalid call target: {other:?}"),
-            },
-
-            HirExpr::InterfaceCall {
-                interface, callee, ..
-            } => {
-                let iface = self.ctx.interfaces.borrow();
-                let iface = iface.get(interface).unwrap();
-
-                let method = match **callee {
-                    HirExpr::FieldAccess { field, .. } => field,
-                    _ => unreachable!(),
+            HirExpr::Call { callee, .. } => {
+                let name = match **callee {
+                    HirExpr::Ident(n, _) => Some(n),
+                    HirExpr::ModuleAccess(acc) => self.resolve_module_function(acc),
+                    _ => None,
                 };
-
-                iface
-                    .methods
-                    .unwrap()
-                    .iter()
-                    .find(|m| m.name == method)
-                    .unwrap()
-                    .return_type
-                    .unwrap()
+                let Some(name) = name else {
+                    return HirType::Unknown;
+                };
+                match self.ctx.functions.borrow().get(&name) {
+                    Some(f) if f.generics.is_none() => f.return_type.unwrap_or(HirType::Void),
+                    _ => HirType::Unknown,
+                }
             }
 
             HirExpr::StructInit {
@@ -1158,17 +1159,14 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             HirExpr::FieldAccess { object, field, .. } => {
                 self.infer_field_access_type(object, *field)
             }
-
             HirExpr::Assignment { value, .. } => self.infer_type(value),
-
             HirExpr::ExprList { list, .. } => list
                 .last()
                 .map(|e| self.infer_type(e))
                 .unwrap_or(HirType::Void),
-
             HirExpr::Comparison { .. } => HirType::Boolean,
 
-            _ => panic!("infer_type not implemented for {:?}", expr),
+            _ => HirType::Unknown,
         }
     }
 
@@ -1206,7 +1204,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 panic!("field access on interface")
             }
 
-            _ => panic!("todo"),
+            _ => HirType::Unknown,
         }
     }
 

@@ -65,7 +65,7 @@ impl Default for Usage {
 #[derive(Default)]
 pub struct ClosureFrame<'bump> {
     pub entries: Vec<(StrId, Vec<HirEffectSegment<'bump>>, Usage)>,
-    pub static_uses: Vec<StrId>,
+    pub static_uses: Vec<(StrId, bool)>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -344,7 +344,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirExpr::Ref { expr: inner, .. }
             | HirExpr::Deref { expr: inner, .. }
-            | HirExpr::Cast { expr: inner, .. } => self.fv_expr(inner, bound, out),
+            | HirExpr::Cast { expr: inner, .. }
+            | HirExpr::OrElse { value: inner, .. } => self.fv_expr(inner, bound, out),
             HirExpr::Slice {
                 object, start, end, ..
             } => {
@@ -595,7 +596,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let free = Self::coalesce_free_paths(
             raw_free
                 .into_iter()
-                .filter(|(root, _)| self.is_enclosing_local(*root))
+                .filter(|(root, _)| self.is_enclosing_local(*root) && !self.is_static_ident(*root))
                 .collect(),
         );
 
@@ -725,6 +726,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let key = Self::stmt_key(body);
+        self.closure_static_uses
+            .insert(key, frame.static_uses.clone());
         let (env_name, fn_name) = match self.closure_table.get(&key) {
             Some(prev) => (prev.env_name, prev.fn_name),
             None => {

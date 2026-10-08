@@ -58,7 +58,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let vars_before = self.var_map.clone();
         let mut live_vars: Vec<(BlockId, HashMap<StrId, Value>)> = Vec::new();
         let mut live_drop: Vec<DropMoveState<'a, 'bump>> = Vec::new();
-        let cond = self.lower_expr(condition);
+        let cond = self.lower_expr_scoped(condition);
         let narrowed_before = self.narrowed_fields.clone();
 
         let then_bb = self.current_block_data.new_block();
@@ -221,7 +221,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let header_drop = self.loop_header_state();
         self.drop_state = header_drop.clone();
 
-        let cond_val = self.lower_expr(cond);
+        let cond_val = self.lower_expr_scoped(cond);
         let cond_end = self.current_block_data.current_block;
         self.emit(Instruction::Branch {
             cond: Operand::Value(cond_val),
@@ -306,7 +306,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let mut cond_end = cond_bb;
         match condition {
             Some(cond_expr) => {
-                let cond_val = self.lower_expr(cond_expr);
+                let cond_val = self.lower_expr_scoped(cond_expr);
                 cond_end = self.current_block_data.current_block;
                 self.emit(Instruction::Branch {
                     cond: Operand::Value(cond_val),
@@ -364,7 +364,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         self.narrowed_fields.clear();
         self.drop_state = header_drop.clone();
         if let Some(inc_expr) = increment {
-            let _ = self.lower_expr(inc_expr);
+            let _ = self.lower_expr_scoped(inc_expr);
         }
         if !self.block_terminated() {
             let tail_bb = self.current_block_data.current_block;
@@ -551,7 +551,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let drop_before = self.drop_state.clone();
         let mut live_drop = Vec::new();
         let narrowed_before = self.narrowed_fields.clone();
-        let cond_val = self.lower_expr(cond);
+        let cond_val = self.lower_expr_scoped(cond);
         let pre_if_bb = self.current_block_data.current_block;
         let vars_before = self.var_map.clone();
 
@@ -1001,7 +1001,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             let instr = if Self::is_aggregate_ssa_type(ty) {
                 Instruction::Const {
                     dest: dummy,
-                    ty: SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(ty.clone())),
+                    ty: SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(ty.clone()),
+                    ),
                     value: Operand::ConstInt(0),
                 }
             } else {

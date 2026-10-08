@@ -1,5 +1,6 @@
 use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry};
 use crate::midend::ir::mir_lowering::FunctionLowerer;
+use crate::midend::ir::mir_lowering::lowerer::CalleeSig;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
     Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStmt, HirStruct, HirType,
@@ -61,6 +62,7 @@ where
     instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     registry: GlobalRegistry<'r, 'bump>,
     dynamic_static_inits: Vec<(StrId, HirExpr<'a, 'bump>)>,
+    func_sigs: HashMap<StrId, CalleeSig<'a, 'bump>>,
 }
 
 impl<'a, 'cx, 'r, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
@@ -123,7 +125,12 @@ where
             instantiated_struct_methods,
             registry,
             dynamic_static_inits: Vec::new(),
+            func_sigs: HashMap::default(),
         }
+    }
+
+    fn register_sig(&mut self, f: &HirFunc<'a, 'bump>) {
+        self.func_sigs.insert(f.name, CalleeSig::from_hir(f));
     }
 
     fn register_enum(&mut self, hir_enum: &ir::hir::HirEnum<'a, 'bump>) {
@@ -245,6 +252,7 @@ where
                                     &self.context,
                                 );
                                 self.module.functions.insert(f.name, f);
+                                self.register_sig(func);
 
                                 // Closure fns are callable through their env: `env.__call(args)`.
                                 if let Some(env) = Self::closure_env_of(func) {
@@ -387,6 +395,7 @@ where
     }
 
     fn register_method_signature(&mut self, hir_method: &HirFunc<'a, 'bump>) {
+        self.register_sig(hir_method);
         let func = Function::from_signature(
             hir_method,
             &self.module.structs,
@@ -478,6 +487,7 @@ where
                         &self.context,
                     );
                     self.module.functions.insert(func.name, func);
+                    self.register_sig(m);
                     defaults.insert(m.unmangled_name, *m);
                 }
             }
@@ -865,7 +875,8 @@ where
             &self.constants,
             self.instantiated_functions.clone(),
             self.instantiated_struct_methods.clone(),
-            self.registry.clone(), // here
+            self.registry.clone(),
+            &self.func_sigs,
         )
         .unwrap();
         for (name, value) in &static_inits {

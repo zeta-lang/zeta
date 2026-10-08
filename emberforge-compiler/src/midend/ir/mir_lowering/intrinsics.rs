@@ -32,8 +32,8 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let (addr, ty) = self.lower_place_addr(place, span);
         let init = self.lower_init_operand(new_expr, &ty);
 
-        // replaces matches with a match expression
-        let inline = Self::is_aggregate_ssa_type(&ty);
+        let inline = Self::is_aggregate_ssa_type(&ty)
+            && !matches!(&ty, SsaType::Owned(i) if !matches!(i.as_ref(), SsaType::Slice(_)));
 
         let old = if inline {
             // Slot is overwritten in place, so snapshot the old bytes first.

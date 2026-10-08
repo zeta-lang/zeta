@@ -638,6 +638,11 @@ pub enum HirExpr<'a, 'bump>
 where
     'bump: 'a,
 {
+    OrElse {
+        value: &'bump HirExpr<'a, 'bump>,
+        else_body: &'bump [HirStmt<'a, 'bump>],
+        span: SourceSpan<'a>,
+    },
     Intrinsic {
         kind: IntrinsicKind,
         type_args: &'bump [HirType<'a, 'bump>], // the <T> part
@@ -1060,19 +1065,41 @@ where
     }
 
     pub fn drop_kind(&self) -> DropKind<'a, 'bump> {
-        match self {
+        self.drop_kind_with(None)
+    }
+
+    pub fn drop_kind_with(
+        &self,
+        default_alloc: Option<ProvenanceAnnotation<'bump>>,
+    ) -> DropKind<'a, 'bump> {
+        self.try_drop_kind_with(default_alloc)
+            .expect("owned pointer has no allocator and no default was supplied")
+    }
+
+    /// `None` means an owned pointer somewhere inside had no allocator and no default.
+    /// A `?^T` with an unresolved allocator degrades to `Undroppable` (leak) instead.
+    pub fn try_drop_kind_with(
+        &self,
+        default_alloc: Option<ProvenanceAnnotation<'bump>>,
+    ) -> Option<DropKind<'a, 'bump>> {
+        Some(match self {
+            HirType::OwnedPointer { inner, allocator } => DropKind::OwnedPointer {
+                pointee: Box::new(inner.try_drop_kind_with(default_alloc)?),
+                pointee_ty: **inner,
+                allocator: allocator.or(default_alloc)?,
+            },
+            HirType::Nullable(inner) => match inner.try_drop_kind_with(default_alloc) {
+                None | Some(DropKind::Undroppable) => DropKind::Undroppable,
+                Some(k) => DropKind::Nullable {
+                    inner: Box::new(k),
+                    inner_ty: **inner,
+                },
+            },
             HirType::Struct { name, .. }
             | HirType::Enum { name, .. }
             | HirType::DynInterface(name, _) => DropKind::Type(*name),
-
-            HirType::OwnedPointer { inner, allocator } => DropKind::OwnedPointer {
-                pointee: Box::new(inner.drop_kind()),
-                pointee_ty: **inner,
-                allocator: allocator.expect("drop_kind called before ImplicitParam resolution"),
-            },
-
             HirType::Slice(inner) => {
-                let element = inner.drop_kind();
+                let element = inner.try_drop_kind_with(default_alloc)?;
                 if element.is_droppable() {
                     DropKind::Slice {
                         element: Box::new(element),
@@ -1082,9 +1109,8 @@ where
                     DropKind::Undroppable
                 }
             }
-
             _ => DropKind::Undroppable,
-        }
+        })
     }
 
     pub fn nominal_type_name(&self) -> Option<StrId> {
@@ -1128,6 +1154,10 @@ pub enum DropKind<'a, 'bump> {
         element_ty: HirType<'a, 'bump>,
     },
     Undroppable,
+    Nullable {
+        inner: Box<DropKind<'a, 'bump>>,
+        inner_ty: HirType<'a, 'bump>,
+    },
 }
 
 impl<'a, 'bump> DropKind<'a, 'bump> {

@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
 use zetaruntime::string_pool::StringPool;
 
@@ -198,6 +199,9 @@ pub fn owned_chains_of<'a, 'bump>(
         return out;
     };
     for f in hir_struct.fields.iter() {
+        if f.manual {
+            continue;
+        }
         let Some((node_ty, node_struct, ann)) = owned_link_parts(&f.field_type) else {
             continue;
         };
@@ -247,6 +251,9 @@ pub(crate) fn is_struct_owns_chain<'a, 'bump>(
         return false;
     };
     for f in hir_struct.fields.iter() {
+        if f.manual {
+            continue;
+        }
         let Some((_, node_struct, _)) = owned_link_parts(&f.field_type) else {
             continue;
         };
@@ -278,6 +285,7 @@ pub struct DropEmitter<'x, 'a, 'bump, 'f> {
     pub glue_registry: &'x DropGlueRegistry,
     pub instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     pub instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+    pub bump: &'bump GrowableBump<'bump>,
 }
 
 impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
@@ -292,6 +300,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         glue_registry: &'x DropGlueRegistry,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
+        bump: &'bump GrowableBump<'bump>,
     ) -> Self {
         Self {
             current_block_data,
@@ -304,6 +313,33 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             glue_registry,
             instantiated_functions,
             instantiated_struct_methods,
+            bump,
+        }
+    }
+
+    fn emit_struct_drop<R: AllocatorResolver>(
+        &mut self,
+        struct_name: StrId,
+        val: Value,
+        owner: Option<StrId>,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        match self.glue_registry.glue_name_for(struct_name) {
+            Some(glue) => self.emit(Instruction::Call {
+                dest: None,
+                func: Operand::FunctionRef(glue),
+                args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
+            }),
+            None => self.emit_owned_chain_field_drops(
+                struct_name,
+                val,
+                owner,
+                drop_state,
+                resolver,
+                span,
+            ),
         }
     }
 
@@ -744,13 +780,43 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             && drop_state.map_or(false, |ds| ds.has_any_field_moves(owner.unwrap()));
 
         match pointee {
+            DropKind::Nullable {
+                inner: n_inner,
+                inner_ty: n_ty,
+            } => {
+                let loaded = self.current_block_data.fresh_value();
+                self.emit(Instruction::Load {
+                    dest: loaded,
+                    ptr: Operand::Value(ptr_val),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(loaded, lower_type_hir(pointee_ty, self.enums, self.structs));
+                self.emit_nullable_drop(n_inner, n_ty, loaded, owner, drop_state, resolver, span);
+                self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+            }
             DropKind::Type(struct_name) => match (kind, partial_move) {
                 (AllocatorKind::Owning, false) => {
                     self.emit_owning_free_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
                 }
                 (AllocatorKind::Owning, true) | (AllocatorKind::RawOnly, true) => {
                     if let (Some(o), Some(ds)) = (owner, drop_state) {
-                        self.emit_partial_struct_field_drops(o, *struct_name, ptr_val, ds);
+                        self.emit_partial_struct_field_drops(
+                            o,
+                            *struct_name,
+                            ptr_val,
+                            ds,
+                            resolver,
+                            span,
+                        );
+                        self.emit_owned_chain_field_drops(
+                            *struct_name,
+                            ptr_val,
+                            Some(o),
+                            Some(ds),
+                            resolver,
+                            span,
+                        );
                     }
                     self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
                 }
@@ -858,13 +924,43 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             && drop_state.map_or(false, |ds| ds.has_any_field_moves(owner.unwrap()));
 
         match pointee {
+            DropKind::Nullable {
+                inner: n_inner,
+                inner_ty: n_ty,
+            } => {
+                let loaded = self.current_block_data.fresh_value();
+                self.emit(Instruction::Load {
+                    dest: loaded,
+                    ptr: Operand::Value(ptr_val),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(loaded, lower_type_hir(pointee_ty, self.enums, self.structs));
+                self.emit_nullable_drop(n_inner, n_ty, loaded, owner, drop_state, resolver, span);
+                self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
+            }
             DropKind::Type(struct_name) => match (kind, partial_move) {
                 (AllocatorKind::Owning, false) => {
                     self.emit_owning_free_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
                 }
                 (AllocatorKind::Owning, true) | (AllocatorKind::RawOnly, true) => {
                     if let (Some(o), Some(ds)) = (owner, drop_state) {
-                        self.emit_partial_struct_field_drops(o, *struct_name, ptr_val, ds);
+                        self.emit_partial_struct_field_drops(
+                            o,
+                            *struct_name,
+                            ptr_val,
+                            ds,
+                            resolver,
+                            span,
+                        );
+                        self.emit_owned_chain_field_drops(
+                            *struct_name,
+                            ptr_val,
+                            Some(o),
+                            Some(ds),
+                            resolver,
+                            span,
+                        );
                     }
                     self.emit_free_raw_call(alloc_val, alloc_cls_name, pointee_ty, ptr_val);
                 }
@@ -978,6 +1074,109 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         (addr, field_ty)
     }
 
+    /// Drop a *value* of the given kind (not an address).
+    pub fn emit_value_drop<R: AllocatorResolver>(
+        &mut self,
+        kind: &DropKind<'a, 'bump>,
+        val: Value,
+        owner: Option<StrId>,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        match kind {
+            DropKind::Type(struct_name) => {
+                self.emit_struct_drop(*struct_name, val, owner, drop_state, resolver, span);
+            }
+            DropKind::OwnedPointer {
+                pointee,
+                pointee_ty,
+                allocator,
+            } => {
+                self.emit_owned_pointer_drop(
+                    owner, pointee, pointee_ty, allocator, val, true, drop_state, resolver, span,
+                );
+            }
+            DropKind::Slice {
+                element,
+                element_ty,
+            } => {
+                self.emit_slice_loop_drop(element, element_ty, val, resolver, span);
+            }
+            DropKind::Nullable { inner, inner_ty } => {
+                self.emit_nullable_drop(inner, inner_ty, val, owner, drop_state, resolver, span);
+            }
+            DropKind::Undroppable => {}
+        }
+    }
+
+    /// `if val != null { drop(inner) }` for a pointer-optimized `?T` value.
+    pub fn emit_nullable_drop<R: AllocatorResolver>(
+        &mut self,
+        inner: &DropKind<'a, 'bump>,
+        inner_ty: &HirType<'a, 'bump>,
+        val: Value,
+        owner: Option<StrId>,
+        drop_state: Option<&DropMoveState<'a, 'bump>>,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        if !inner.is_droppable() {
+            return;
+        }
+        let Some(ty) = self.current_block_data.value_types.get(&val).cloned() else {
+            return;
+        };
+        // Tagged nullables (`?Struct`, `?i32`, ...) aren't handled yet: the tag layout
+        // needs a LoadField + compare here. They leak.
+        let Some(pointee) = ty.nullable_pointer_repr().cloned() else {
+            return;
+        };
+        let ptr_ty = SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(pointee));
+
+        let zero = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: zero,
+            ty: ptr_ty.clone(),
+            value: Operand::ConstInt(0),
+        });
+        self.current_block_data.value_types.insert(zero, ptr_ty);
+
+        let is_null = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: is_null,
+            op: BinOp::Eq,
+            left: Operand::Value(val),
+            right: Operand::Value(zero),
+        });
+        self.current_block_data
+            .value_types
+            .insert(is_null, SsaType::Bool);
+
+        let drop_bb = self.current_block_data.new_block();
+        let after_bb = self.current_block_data.new_block();
+        self.emit(Instruction::Branch {
+            cond: Operand::Value(is_null),
+            then_bb: after_bb,
+            else_bb: drop_bb,
+        });
+
+        self.current_block_data.switch_to(drop_bb);
+        let inner_ssa = lower_type_hir(inner_ty, self.enums, self.structs);
+        let payload = self.current_block_data.fresh_value();
+        self.emit(Instruction::Cast {
+            dest: payload,
+            value: Operand::Value(val),
+            kind: cast_kind(&inner_ssa, &inner_ssa),
+        });
+        self.current_block_data
+            .value_types
+            .insert(payload, inner_ssa);
+        self.emit_value_drop(inner, payload, owner, drop_state, resolver, span);
+        self.emit(Instruction::Jump { target: after_bb });
+        self.current_block_data.switch_to(after_bb);
+    }
+
     pub fn emit_element_drop<R: AllocatorResolver>(
         &mut self,
         kind: &DropKind<'a, 'bump>,
@@ -986,22 +1185,24 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         span: SourceSpan<'a>,
     ) {
         match kind {
+            DropKind::Nullable { inner, inner_ty } => {
+                let Some(SsaType::Pointer(_, loaded_ty)) =
+                    self.current_block_data.value_types.get(&elem_addr).cloned()
+                else {
+                    return;
+                };
+                let loaded = self.current_block_data.fresh_value();
+                self.emit(Instruction::Load {
+                    dest: loaded,
+                    ptr: Operand::Value(elem_addr),
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(loaded, *loaded_ty);
+                self.emit_nullable_drop(inner, inner_ty, loaded, None, None, resolver, span);
+            }
             DropKind::Type(struct_name) => {
-                if let Some(glue) = self.glue_registry.glue_name_for(*struct_name) {
-                    self.emit(Instruction::Call {
-                        dest: None,
-                        func: Operand::FunctionRef(glue),
-                        args: SmallVec::from_slice_copy(&[Operand::Value(elem_addr)]),
-                    });
-                }
-                self.emit_owned_chain_field_drops(
-                    *struct_name,
-                    elem_addr,
-                    None,
-                    None,
-                    resolver,
-                    span,
-                );
+                self.emit_struct_drop(*struct_name, elem_addr, None, None, resolver, span);
             }
             DropKind::OwnedPointer {
                 pointee,
@@ -1238,11 +1439,22 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 this_val: node,
                 inner: &mut *resolver,
             };
+            let node_default_alloc =
+                find_allocator_field(self.structs, self.allocator_kind, chain.node_struct).map(
+                    |fld| ProvenanceAnnotation {
+                        root: hir::ProvenanceRoot::ThisRoot,
+                        path: self
+                            .bump
+                            .alloc_slice_copy(&[hir::ProvenancePathSegment::Field(fld)]),
+                    },
+                );
             for f in node_struct.fields.iter() {
                 if f.name == chain.link_field {
                     continue;
                 }
-                let kind = f.field_type.drop_kind();
+                let Some(kind) = f.field_type.try_drop_kind_with(node_default_alloc) else {
+                    continue; // no allocator resolvable: leak instead of panic
+                };
                 if !kind.is_droppable() {
                     continue;
                 }
@@ -1430,59 +1642,103 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         self.current_block_data.switch_to(after_bb);
     }
 
-    pub fn emit_partial_struct_field_drops(
+    fn field_default_alloc(
+        &self,
+        struct_name: StrId,
+        field: &hir::HirField<'a, 'bump>,
+    ) -> Option<ProvenanceAnnotation<'bump>> {
+        let (owned, nullable) = match field.field_type {
+            HirType::Nullable(i) => (*i, true),
+            t => (t, false),
+        };
+        let HirType::OwnedPointer { inner, .. } = owned else {
+            return None;
+        };
+        if let Some(af) = find_allocator_field(self.structs, self.allocator_kind, struct_name) {
+            return Some(ProvenanceAnnotation {
+                root: hir::ProvenanceRoot::ThisRoot,
+                path: self
+                    .bump
+                    .alloc_slice_copy(&[hir::ProvenancePathSegment::Field(af)]),
+            });
+        }
+        if nullable {
+            return None; // the Deref hop below can't walk a nullable slot
+        }
+        let HirType::Struct { name, .. } = *inner else {
+            return None;
+        };
+        let af = find_allocator_field(self.structs, self.allocator_kind, name)?;
+        Some(ProvenanceAnnotation {
+            root: hir::ProvenanceRoot::ThisRoot,
+            path: self.bump.alloc_slice_copy(&[
+                hir::ProvenancePathSegment::Field(field.name),
+                hir::ProvenancePathSegment::Deref,
+                hir::ProvenancePathSegment::Field(af),
+            ]),
+        })
+    }
+
+    /// Drops every field of `struct_name` at `base` that hasn't been moved out.
+    /// Owned chain heads are skipped: callers walk those via `emit_owned_chain_field_drops`.
+    pub fn emit_partial_struct_field_drops<R: AllocatorResolver>(
         &mut self,
         owner: StrId,
         struct_name: StrId,
         base: Value,
         drop_state: &DropMoveState<'a, 'bump>,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
     ) {
-        let Some(hir_struct) = self.structs.get(&struct_name) else {
+        let structs = self.structs;
+        let offsets_map = self.struct_field_offsets;
+        let Some(hir_struct) = structs.get(&struct_name) else {
             return;
         };
-        let Some(offsets) = self.struct_field_offsets.get(&struct_name) else {
+        let Some(offsets) = offsets_map.get(&struct_name) else {
             return;
         };
+        let chain_heads: Vec<StrId> =
+            owned_chains_of(structs, offsets_map, self.allocator_kind, struct_name)
+                .into_iter()
+                .map(|c| c.head_field)
+                .collect();
 
         for field in hir_struct.fields.iter().rev() {
-            if drop_state.is_field_moved(owner, field.name) {
+            if field.manual
+                || drop_state.is_field_moved(owner, field.name)
+                || chain_heads.contains(&field.name)
+            {
                 continue;
             }
-            let HirType::Struct {
-                name: field_struct_name,
-                ..
-            } = &field.field_type
-            else {
-                continue;
+            let default_alloc = self.field_default_alloc(struct_name, field);
+            let Some(kind) = field.field_type.try_drop_kind_with(default_alloc) else {
+                continue; // unresolvable allocator: leak rather than guess
             };
-            let Some(field_glue) = self.glue_registry.glue_name_for(*field_struct_name) else {
+            if !kind.is_droppable() {
                 continue;
-            };
+            }
             let Some(&offset) = offsets.get(&field.name) else {
                 continue;
             };
-            let field_ptr = self.current_block_data.fresh_value();
-            self.current_block_data.value_types.insert(
-                field_ptr,
-                SsaType::Pointer(
-                    ir::ssa_ir::SsaPointerKind::UnsafeMut,
-                    Box::new(SsaType::User(
-                        *field_struct_name,
-                        *field_struct_name,
-                        vec![],
-                    )),
-                ),
-            );
+
+            let fty = lower_type_hir(&field.field_type, self.enums, self.structs);
+            let addr = self.current_block_data.fresh_value();
             self.emit(Instruction::FieldAddr {
-                dest: field_ptr,
+                dest: addr,
                 base: Operand::Value(base),
                 offset,
             });
-            self.emit(Instruction::Call {
-                dest: None,
-                func: Operand::FunctionRef(field_glue),
-                args: SmallVec::from_slice_copy(&[Operand::Value(field_ptr)]),
-            });
+            self.current_block_data.value_types.insert(
+                addr,
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(fty)),
+            );
+
+            let mut this_resolver = ThisRebased {
+                this_val: base,
+                inner: &mut *resolver,
+            };
+            self.emit_element_drop(&kind, addr, &mut this_resolver, span);
         }
     }
 }

@@ -21,8 +21,14 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
         }
 
+        let tp = self.begin_temp_place(object, field, true);
         let obj_val = self.lower_expr_as_receiver(object);
-        self.field_access_from_value(obj_val, field, span)
+        let r = self.field_access_from_value(obj_val, field, span);
+        if let Some(tp) = tp {
+            let moved = self.temp_field_moves_out(&tp);
+            self.end_temp_place(tp, moved);
+        }
+        r
     }
 
     /// Same as `lower_field_access_expr`, but takes an already-lowered receiver
@@ -57,7 +63,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
 
         let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-            Some(SsaType::User(name, _,  _)) => *name,
+            Some(SsaType::User(name, _, _)) => *name,
             Some(SsaType::Pointer(_, inner)) => fun_name(inner),
             other => panic!(
                 "Could not determine object's struct for FieldAccess: {:?} at span {span}",
@@ -201,9 +207,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         if matches!(op, AssignmentOperator::Assign) {
             let cls_name = match self.current_block_data.value_types.get(&obj_val) {
-                Some(SsaType::User(name, _,  _)) => Some(*name),
+                Some(SsaType::User(name, _, _)) => Some(*name),
                 Some(SsaType::Pointer(_, inner)) => {
-                    if let SsaType::User(name, _,  _) = inner.as_ref() {
+                    if let SsaType::User(name, _, _) = inner.as_ref() {
                         Some(*name)
                     } else {
                         None
@@ -241,11 +247,14 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                 });
                                 self.current_block_data.value_types.insert(
                                     field_addr,
-                                    SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(lower_type_hir(
-                                        &f.field_type,
-                                        self.enums,
-                                        self.structs,
-                                    ))),
+                                    SsaType::Pointer(
+                                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                                        Box::new(lower_type_hir(
+                                            &f.field_type,
+                                            self.enums,
+                                            self.structs,
+                                        )),
+                                    ),
                                 );
                                 self.emit_nullable_owned_field_overwrite_drop(
                                     field_addr, owned_ty, span,
@@ -316,9 +325,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             let len_val = self.new_value();
             let cap_val = self.new_value();
 
-            self.current_block_data
-                .value_types
-                .insert(ptr_val, SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::I8)));
+            self.current_block_data.value_types.insert(
+                ptr_val,
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(SsaType::I8)),
+            );
             self.current_block_data
                 .value_types
                 .insert(len_val, SsaType::Usize);
@@ -394,7 +404,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
     pub(crate) fn get_field_offset(&mut self, obj: &Value, field: StrId) -> usize {
         let cls_name = match self.current_block_data.value_types.get(obj) {
-            Some(SsaType::User(name, _,  _)) => name,
+            Some(SsaType::User(name, _, _)) => name,
             Some(SsaType::Pointer(_, inner)) => &fun_name(inner),
             Some(SsaType::Owned(inner)) => &fun_name(inner),
             other => panic!(

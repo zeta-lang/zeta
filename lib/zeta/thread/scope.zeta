@@ -58,10 +58,11 @@ func invoke_scoped<F: func(): R, R>(arg: [*]mut void): void {
 
     let result: R = unsafe { (*raw).func_() };
 
-    // Published by pthread_join in whoever joins this thread.
     unsafe { (*slot).result = result; }
 
-    // Frees the ctx and releases the worker's Arc reference.
+    // Release the worker's Arc reference; $own below only frees the memory.
+    unsafe { $drop_in_place(&mut (*raw).slot); }
+
     let owned: ^ScopedCtx<F, R> = unsafe { $own(raw, alloc) };
 }
 
@@ -148,17 +149,23 @@ impl<R> ScopedJoinHandle<R> {
             let ret: i32 = unsafe { libc.pthread_join(tid, &mut retval) };
 
             if (ret != 0) {
+                unsafe { $drop_in_place(&mut this.slot); }
+                $mem_forget(this);
                 return Result.Err { error: ret };
             }
         }
 
         let slot: [*]mut ScopedSlot<R> = this.slot.as_ptr();
-        let result: ?R = unsafe { (*slot).result };
-        if (result == null) {
+
+        let taken: ?R = unsafe { $replace(&mut (*slot).result, null) };
+        if (taken == null) {
             $unreachable();
         }
 
-        return Result.Ok { value: result };
+        unsafe { $drop_in_place(&mut this.slot); }
+        $mem_forget(this);
+
+        return Result.Ok { value: taken };
     }
 }
 

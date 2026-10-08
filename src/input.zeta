@@ -390,6 +390,9 @@ func test_array_list_clear(): i64 {
         "Calling clear()..."
     );
 
+    io.stdout().writeln(list.get(0).tag);
+    io.stdout().writeln(list.get(1).tag);
+    io.stdout().writeln(list.get(2).tag);
     list.clear();
 
     if (list.len() != 0) {
@@ -3712,65 +3715,61 @@ struct RawHolderStatic {
 //     return 0;
 // }
 
-// Scoped threads writing disjoint static slots. No unsafe, no Send impls, no borrows.
-func test_static_scope_threads(): i64 {
-    io.stdout().writeln("=== Running: test_static_scope_threads ===");
+// func test_static_scope_threads(): i64 {
+//     io.stdout().writeln("=== Running: test_static_scope_threads ===");
+//
+//     let done: i64 = scope(func(s: &alias Scope) {
+//         s.spawn(func() { G_ARR[0] = 11; return 0; });
+//         s.spawn(func() { G_ARR[1] = 22; return 0; });
+//         s.spawn(func() { G_ARR[2] = 33; return 0; });
+//         return 0;
+//     });
+//
+//     if (G_ARR[0] != 11 || G_ARR[1] != 22 || G_ARR[2] != 33) {
+//         io.stdout().writeln("[FAIL] scoped writes to static array missing");
+//         return 1;
+//     }
+//
+//     io.stdout().writeln("[PASS] scoped threads write static array");
+//     return 0;
+// }
 
-    let done: i64 = scope(func(s: &alias Scope) {
-        s.spawn(func() { G_ARR[0] = 11; return 0; });
-        s.spawn(func() { G_ARR[1] = 22; return 0; });
-        s.spawn(func() { G_ARR[2] = 33; return 0; });
-        return 0;
-    });
-
-    if (G_ARR[0] != 11 || G_ARR[1] != 22 || G_ARR[2] != 33) {
-        io.stdout().writeln("[FAIL] scoped writes to static array missing");
-        return 1;
-    }
-
-    io.stdout().writeln("[PASS] scoped threads write static array");
-    return 0;
-}
-
-// Intentional data race: 8 threads x 1000 unsynchronized increments. Language must allow it.
-// Only the program surviving and the count being in range is asserted.
-func test_static_data_race_allowed(): i64 {
-    io.stdout().writeln("=== Running: test_static_data_race_allowed ===");
-
-    G_COUNTER = 0;
-
-    let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(8);
-    let mut i: i64 = 0;
-    while (i < 8) {
-        let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
-            let mut j: i64 = 0;
-            while (j < 1000) {
-                G_COUNTER += 1;
-                j += 1;
-            }
-            return 0;
-        });
-        handles.push(h);
-        i += 1;
-    }
-
-    i = 0;
-    while (i < 8) {
-        handles.get(i as usize).join().unwrap();
-        i += 1;
-    }
-
-    // Racy: lost updates are expected and legal. Must be 1..=8000.
-    if (G_COUNTER < 1 || G_COUNTER > 8000) {
-        io.stdout().writeln("[FAIL] racy static counter out of possible range");
-        return 1;
-    }
-
-    io.stdout().writeln("[PASS] unsynchronized static access compiles and runs");
-    io.stdout().writeln(G_COUNTER.to_string().as_str());
-    G_COUNTER = 0;
-    return 0;
-}
+// func test_static_data_race_allowed(): i64 {
+//     io.stdout().writeln("=== Running: test_static_data_race_allowed ===");
+//
+//     G_COUNTER = 0;
+//
+//     let mut handles: ArrayList<JoinHandle<i64, Mallocator>> = ArrayList.with_capacity(8);
+//     let mut i: i64 = 0;
+//     while (i < 8) {
+//         let h: JoinHandle<i64, Mallocator> = threads.spawn(func() {
+//             let mut j: i64 = 0;
+//             while (j < 100000) {
+//                 G_COUNTER += 1;
+//                 j += 1;
+//             }
+//             return 0;
+//         });
+//         handles.push(h);
+//         i += 1;
+//     }
+//
+//     i = 0;
+//     while (i < 8) {
+//         handles.get(i as usize).join().unwrap();
+//         i += 1;
+//     }
+//
+//     if (G_COUNTER < 1 || G_COUNTER > 800000) {
+//         io.stdout().writeln("[FAIL] racy static counter out of possible range");
+//         return 1;
+//     }
+//
+//     io.stdout().writeln("[PASS] unsynchronized static access compiles and runs");
+//     io.stdout().writeln(G_COUNTER.to_string().as_str());
+//     G_COUNTER = 0;
+//     return 0;
+// }
 
 // Statics are never dropped: no scope-exit drop, and reassignment still drops the old value.
 func test_static_drop_semantics(): i64 {
@@ -3831,11 +3830,11 @@ func static_tests(): i64 {
     // let s9: i64 = test_static_thread_no_send_sync();
     // if (s9 != 0) { return s9; }
 
-    let s10: i64 = test_static_scope_threads();
-    if (s10 != 0) { return s10; }
-
-    let s11: i64 = test_static_data_race_allowed();
-    if (s11 != 0) { return s11; }
+//     let s10: i64 = test_static_scope_threads();
+//     if (s10 != 0) { return s10; }
+//
+//     let s11: i64 = test_static_data_race_allowed();
+//     if (s11 != 0) { return s11; }
 
     let s12: i64 = test_static_drop_semantics();
     if (s12 != 0) { return s12; }

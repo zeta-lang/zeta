@@ -1794,4 +1794,42 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .at(self.current_span))
         }
     }
+
+    pub fn check_or_else_expr(
+        &mut self,
+        value: &HirExpr<'a, 'bump>,
+        else_body: &[HirStmt<'a, 'bump>],
+    ) -> HirType<'a, 'bump> {
+        let value_ty = self.check_expr(value);
+        self.check_and_record_value_use(value, &value_ty);
+
+        let inner = match value_ty {
+            HirType::Nullable(inner) => *inner,
+            HirType::Unknown => HirType::Unknown,
+            other => {
+                self.record(TypeErrorKind::Generic(format!(
+                    "`else` used on non-nullable type `{}`",
+                    type_to_string(&other)
+                )));
+                other
+            }
+        };
+
+        // The else body only runs when the value is null.
+        let before = self.move_state.clone();
+        let else_ty = self.check_block_expr(&else_body, &false);
+
+        if else_ty == HirType::Never {
+            // Diverges (return/break/panic): that path never reaches the code after us.
+            self.move_state = before;
+        } else {
+            if !matches!(inner, HirType::Unknown) {
+                let r = self.types_compatible(&inner, &else_ty);
+                self.recover(r, ());
+            }
+            self.move_state = MoveState::join(&before, &self.move_state);
+        }
+
+        inner
+    }
 }

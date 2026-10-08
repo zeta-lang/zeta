@@ -8,7 +8,7 @@ use ir::{
     },
 };
 
-use crate::{str_id_to_string, TypeChecker};
+use crate::{TypeChecker, str_id_to_string};
 
 #[derive(Clone)]
 pub enum UsedIndex {
@@ -222,6 +222,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             | HirExpr::GenericIdent(..)
             | HirExpr::ModuleAccess(_)
             | HirExpr::UnknownIntrinsic { .. } => {}
+            HirExpr::OrElse {
+                value: inner,
+                else_body,
+                span,
+            } => self.collect_root_accesses_expr(inner, root, writes, reads),
         }
     }
 

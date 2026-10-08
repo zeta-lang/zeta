@@ -3,6 +3,7 @@ use crate::midend::copy_analysis::drop_emitter::{
 };
 use crate::midend::ir::block_data::CurrentBlockData;
 use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
+use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap};
 use ir::registry::global_registry::GlobalRegistry;
@@ -88,10 +89,9 @@ impl DropGlueRegistry {
                 } else {
                     let structs = registry.structs.borrow();
                     match structs.get(&name) {
-                        Some(hir_struct) => hir_struct
-                            .fields
-                            .iter()
-                            .any(|f| Self::type_is_droppable(&f.field_type, &is_droppable)),
+                        Some(hir_struct) => hir_struct.fields.iter().any(|f| {
+                            Self::type_is_droppable(&f.field_type, &is_droppable, &context)
+                        }),
                         None => false,
                     }
                 };
@@ -125,16 +125,51 @@ impl DropGlueRegistry {
             .unwrap_or(false)
     }
 
+    fn resolve_struct_key<'a, 'bump>(
+        name: StrId,
+        ty: &HirType<'a, 'bump>,
+        known: &HashMap<StrId, bool>,
+        context: &Arc<StringPool>,
+    ) -> Option<StrId> {
+        if known.contains_key(&name) {
+            return Some(name);
+        }
+        let suffix = type_suffix_with_pool(context.clone(), ty);
+        let candidates = [
+            format!("{}_{}", name.as_str(), suffix.as_str()),
+            suffix.as_str().to_string(),
+        ];
+        for c in candidates {
+            let id = StrId(context.intern(&c));
+            if known.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Same lookup against a finished registry, for glue construction.
+    pub fn resolve_field_struct<'a, 'bump>(
+        &self,
+        name: StrId,
+        ty: &HirType<'a, 'bump>,
+        context: &Arc<StringPool>,
+    ) -> Option<StrId> {
+        Self::resolve_struct_key(name, ty, &self.is_droppable, context)
+    }
+
     fn type_is_droppable<'a, 'bump>(
         ty: &HirType<'a, 'bump>,
         is_droppable: &HashMap<StrId, bool>,
+        context: &Arc<StringPool>,
     ) -> bool {
         match ty {
-            HirType::Struct { name, .. } => is_droppable.get(name).copied().unwrap_or(false),
-            HirType::Nullable(inner) => Self::type_is_droppable(inner, is_droppable),
-            // Any owned pointer always needs some glue action (at minimum
-            // a free), regardless of whether its pointee is itself
-            // droppable, so it always forces the owner to be droppable too.
+            HirType::Struct { name, .. } => {
+                Self::resolve_struct_key(*name, ty, is_droppable, context)
+                    .and_then(|k| is_droppable.get(&k).copied())
+                    .unwrap_or(false)
+            }
+            HirType::Nullable(inner) => Self::type_is_droppable(inner, is_droppable, context),
             HirType::OwnedPointer { .. } => true,
             _ => false,
         }
@@ -289,7 +324,10 @@ impl DropGlueBuilder {
                     name: field_struct_name,
                     ..
                 } => {
-                    if let Some(field_glue) = glue_registry.glue_name_for(*field_struct_name) {
+                    let key = glue_registry
+                        .resolve_field_struct(*field_struct_name, &field.field_type, &context)
+                        .unwrap_or(*field_struct_name);
+                    if let Some(field_glue) = glue_registry.glue_name_for(key) {
                         field_drops.push(FieldDrop::Type {
                             offset,
                             glue: field_glue,
@@ -356,6 +394,7 @@ impl DropGlueBuilder {
             glue_registry,
             instantiated_functions.clone(),
             instantiated_struct_methods.clone(),
+            bump,
         );
         let mut resolver = GlueAllocatorResolver;
 
@@ -432,6 +471,14 @@ impl DropGlueBuilder {
             }
         }
 
+        emitter.emit_owned_chain_field_drops(
+            struct_name,
+            this_val,
+            None,
+            None,
+            &mut resolver,
+            SourceSpan::default(),
+        );
         cbd.bb().instructions.push(Instruction::Ret { value: None });
         cbd.finish();
 

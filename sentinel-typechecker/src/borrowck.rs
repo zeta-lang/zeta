@@ -561,6 +561,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(place) = self.resolve_place(expr) {
             self.check_borrow_use(expr, place, BorrowKind::Shared);
         }
+        self.check_no_move_out_of_borrow(expr, ty);
         match expr {
             HirExpr::Ident(name, _) => {
                 self.check_use(*name, None, ty);
@@ -575,6 +576,34 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A by-value read of a non-Copy value out of a place we don't own leaves two
+    /// owners (the old place and the new binding). In safe code that is an error;
+    /// unsafe code (stdlib internals) takes explicit responsibility.
+    fn check_no_move_out_of_borrow(&mut self, expr: &HirExpr<'a, 'bump>, ty: &HirType<'a, 'bump>) {
+        if self.in_unsafe() {
+            return;
+        }
+        if !matches!(
+            expr,
+            HirExpr::Deref { .. }
+                | HirExpr::Index { .. }
+                | HirExpr::FieldAccess { .. }
+                | HirExpr::Get { .. }
+        ) {
+            return;
+        }
+        if self.copy_analysis.borrow().type_is_copy(ty) {
+            return;
+        }
+        if self.place_is_behind_borrow(expr) {
+            self.record(TypeErrorKind::Generic(format!(
+                "cannot move a value of type `{}` out of a reference, pointer or slice; \
+                 it is not `Copy`. Use `$replace` to take it explicitly",
+                type_to_string(ty)
+            )));
         }
     }
 
@@ -1271,7 +1300,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 args.iter().any(|a| self.expr_references_local(a, local))
             }
             HirExpr::UnknownIntrinsic { .. } => unimplemented!(),
-            HirExpr::If { if_stmt, span: _ } => self.stmt_references_local(*if_stmt, local)
+            HirExpr::If { if_stmt, span: _ } => self.stmt_references_local(*if_stmt, local),
+            HirExpr::OrElse { value, else_body, span } => self.expr_references_local(value, local),
         }
     }
 
@@ -1553,6 +1583,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             | HirExpr::Uninit { .. }
             | HirExpr::Char(_, _) => {}
             HirExpr::UnknownIntrinsic { .. } => {}
+            HirExpr::OrElse { value, .. } => self.collect_locals_used_expr(value),
         }
     }
 

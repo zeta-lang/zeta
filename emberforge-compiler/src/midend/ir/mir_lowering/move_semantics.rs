@@ -9,16 +9,41 @@ use ir::{
     ssa_ir::{BinOp, Instruction, Operand, SsaType, Value, cast_kind},
 };
 use smallvec::SmallVec;
+use zetaruntime::intern_fmt;
 
 use crate::midend::{
     copy_analysis::{
-        drop_emitter::{DropEmitter, FnAllocatorResolver, is_struct_owns_chain},
+        drop_emitter::{
+            DropEmitter, FnAllocatorResolver, find_allocator_field, is_struct_owns_chain,
+        },
         drop_tracking::{DropLocal, DropScope, ScopeAction, Tri, record_move_if_any},
     },
-    ir::mir_lowering::FunctionLowerer,
+    ir::mir_lowering::{
+        FunctionLowerer,
+        lowerer::{CallOwn, CalleeSig},
+    },
 };
 
 impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
+    fn enclosing_allocator_provenance(&self) -> Option<ProvenanceAnnotation<'bump>> {
+        let this = *self.var_map.get(&StrId::from_static("this"))?;
+        let name = match self.current_block_data.value_types.get(&this)? {
+            SsaType::User(n, _, _) => *n,
+            SsaType::Pointer(_, i) => match i.as_ref() {
+                SsaType::User(n, _, _) => *n,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let f = find_allocator_field(self.structs, self.allocator_kind, name)?;
+        Some(ProvenanceAnnotation {
+            root: hir::ProvenanceRoot::ThisRoot,
+            path: self
+                .bump
+                .alloc_slice_copy(&[hir::ProvenancePathSegment::Field(f)]),
+        })
+    }
+
     pub(super) fn recover_owned_pointer_drop_kind(
         &self,
         declared_ty: &HirType<'a, 'bump>,
@@ -34,7 +59,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         let allocator = if let Some(alloc) = decl_alloc {
             alloc.clone()
-        } else if let Some(alloc) = self.infer_allocator_from_expr(value) {
+        } else if let Some(alloc) = self
+            .infer_allocator_from_expr(value)
+            .or_else(|| self.enclosing_allocator_provenance())
+        {
             alloc
         } else {
             return None;
@@ -52,6 +80,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         expr: &HirExpr<'a, 'bump>,
     ) -> Option<hir::ProvenanceAnnotation<'bump>> {
         match expr {
+            HirExpr::OrElse { value, .. } => self.infer_allocator_from_expr(value),
             HirExpr::Block { body, .. } => match body.last() {
                 Some(HirStmt::Expr(e)) => self.infer_allocator_from_expr(e),
                 _ => None,
@@ -343,14 +372,26 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         self.glue_registry,
                         self.instantiated_functions.clone(),
                         self.instantiated_struct_methods.clone(),
+                        self.bump,
                     );
 
                     match &drop_kind {
+                        DropKind::Nullable { inner, inner_ty } => {
+                            emitter.emit_nullable_drop(
+                                inner,
+                                inner_ty,
+                                val_to_drop,
+                                Some(name),
+                                Some(&self.drop_state),
+                                &mut resolver,
+                                span,
+                            );
+                        }
                         DropKind::Type(struct_name) => {
-                            chain_struct = Some(*struct_name);
                             let partial_move = self.drop_state.has_any_field_moves(name);
+                            let glue = self.glue_registry.glue_name_for(*struct_name);
                             if !partial_move {
-                                if let Some(glue) = self.glue_registry.glue_name_for(*struct_name) {
+                                if let Some(glue) = glue {
                                     self.emit(Instruction::Call {
                                         dest: None,
                                         func: Operand::FunctionRef(glue),
@@ -365,7 +406,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                     *struct_name,
                                     val_to_drop,
                                     &self.drop_state,
+                                    &mut resolver,
+                                    span,
                                 );
+                            }
+                            if partial_move || glue.is_none() {
+                                chain_struct = Some(*struct_name);
                             }
                         }
                         DropKind::OwnedPointer {
@@ -491,6 +537,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
     pub fn record_move_if_any(&mut self, expr: &HirExpr) {
         match expr {
+            HirExpr::OrElse { value, .. } => self.record_move_if_any(value),
             HirExpr::Ident(name, _) => {
                 if self.local_is_droppable(*name).is_some() {
                     self.drop_state.mark_whole_moved(*name);
@@ -528,7 +575,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     self.lower_stmt(stmt);
                 }
                 ScopeAction::DropLocal(local) => {
-                    let Some(&val) = self.var_map.get(&local.name) else {
+                    let Some(val) = self.local_value(local.name) else {
                         continue;
                     };
                     if matches!(local.kind, DropKind::Undroppable) {
@@ -541,7 +588,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     let Some(&val) = self.var_map.get(&local.name) else {
                         continue;
                     };
-                    if let Some(owned_ty) = self.nullable_owned_locals.get(&local.name).copied() {
+                    if let Some(owned_ty) = self.nullable_owned_locals.get(&local.name).copied()
+                        && !matches!(local.kind, DropKind::Nullable { .. })
+                    {
                         self.emit_nullable_owned_drop(
                             &local.kind,
                             owned_ty,
@@ -588,6 +637,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             self.glue_registry,
             self.instantiated_functions.clone(),
             self.instantiated_struct_methods.clone(),
+            self.bump,
         );
         emitter.emit_owned_chain_field_drops(
             struct_name,
@@ -697,6 +747,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn array_needs_flags(&self, name: StrId, rest: &[HirStmt<'a, 'bump>]) -> bool {
         pub(super) fn expr_touches(name: StrId, expr: &HirExpr) -> bool {
             match expr {
+                HirExpr::OrElse {
+                    value, else_body, ..
+                } => expr_touches(name, value) || stmts_touch(name, else_body),
                 HirExpr::Ident(n, _) => *n == name,
                 HirExpr::Assignment { target, value, .. } => {
                     expr_touches(name, target) || expr_touches(name, value)
@@ -887,12 +940,43 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         span: SourceSpan<'a>,
     ) {
         match kind {
+            DropKind::Nullable { inner, inner_ty } => {
+                let mut resolver = FnAllocatorResolver {
+                    var_map: &self.var_map,
+                    context: self.context.clone(),
+                    dep_graph: self.dep_graph,
+                };
+                let mut emitter = DropEmitter::new(
+                    &mut self.current_block_data,
+                    self.context.clone(),
+                    self.struct_mangled_map,
+                    self.struct_field_offsets,
+                    self.structs,
+                    self.enums,
+                    self.allocator_kind,
+                    self.glue_registry,
+                    self.instantiated_functions.clone(),
+                    self.instantiated_struct_methods.clone(),
+                    self.bump,
+                );
+                emitter.emit_nullable_drop(
+                    inner,
+                    inner_ty,
+                    val,
+                    local_name,
+                    Some(&self.drop_state),
+                    &mut resolver,
+                    span,
+                );
+            }
+
             DropKind::Type(struct_name) => {
                 match local_name {
                     Some(name) => {
                         let partial_move = self.drop_state.has_any_field_moves(name);
                         match (partial_move, self.glue_registry.glue_name_for(*struct_name)) {
                             (false, Some(glue)) => {
+                                // glue covers owned chains
                                 self.emit(Instruction::Call {
                                     dest: None,
                                     func: Operand::FunctionRef(glue),
@@ -900,36 +984,53 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                 });
                             }
                             _ => {
-                                let mut emitter = DropEmitter::new(
-                                    &mut self.current_block_data,
-                                    self.context.clone(),
-                                    self.struct_mangled_map,
-                                    self.struct_field_offsets,
-                                    self.structs,
-                                    self.enums,
-                                    self.allocator_kind,
-                                    self.glue_registry,
-                                    self.instantiated_functions.clone(),
-                                    self.instantiated_struct_methods.clone(),
-                                );
-                                emitter.emit_partial_struct_field_drops(
-                                    name,
+                                {
+                                    let mut resolver = FnAllocatorResolver {
+                                        var_map: &self.var_map,
+                                        context: self.context.clone(),
+                                        dep_graph: self.dep_graph,
+                                    };
+                                    let mut emitter = DropEmitter::new(
+                                        &mut self.current_block_data,
+                                        self.context.clone(),
+                                        self.struct_mangled_map,
+                                        self.struct_field_offsets,
+                                        self.structs,
+                                        self.enums,
+                                        self.allocator_kind,
+                                        self.glue_registry,
+                                        self.instantiated_functions.clone(),
+                                        self.instantiated_struct_methods.clone(),
+                                        self.bump,
+                                    );
+                                    emitter.emit_partial_struct_field_drops(
+                                        name,
+                                        *struct_name,
+                                        val,
+                                        &self.drop_state,
+                                        &mut resolver,
+                                        span,
+                                    );
+                                }
+                                // glue wasn't called, so walk chains (skips moved heads)
+                                self.emit_owned_chain_drops_for_local(
                                     *struct_name,
                                     val,
-                                    &self.drop_state,
+                                    local_name,
+                                    span,
                                 );
                             }
                         }
                     }
                     None => match self.glue_registry.glue_name_for(*struct_name) {
-                        Some(glue) => {
-                            self.emit(Instruction::Call {
-                                dest: None,
-                                func: Operand::FunctionRef(glue),
-                                args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
-                            });
+                        Some(glue) => self.emit(Instruction::Call {
+                            dest: None,
+                            func: Operand::FunctionRef(glue),
+                            args: SmallVec::from_slice_copy(&[Operand::Value(val)]),
+                        }),
+                        None if self.struct_owns_chain(*struct_name) => {
+                            self.emit_owned_chain_drops_for_local(*struct_name, val, None, span);
                         }
-                        None if self.struct_owns_chain(*struct_name) => {}
                         None => panic!(
                             "no drop glue registered for struct `{}`; every droppable \
                              struct should have glue built by DropGlueBuilder::build_all",
@@ -937,8 +1038,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         ),
                     },
                 }
-                // Glue doesn't cover `?^Node` chains, so walk them here.
-                self.emit_owned_chain_drops_for_local(*struct_name, val, local_name, span);
             }
 
             DropKind::OwnedPointer {
@@ -962,6 +1061,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     self.glue_registry,
                     self.instantiated_functions.clone(),
                     self.instantiated_struct_methods.clone(),
+                    self.bump,
                 );
                 emitter.emit_owned_pointer_drop(
                     local_name,
@@ -1355,6 +1455,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             self.glue_registry,
             self.instantiated_functions.clone(),
             self.instantiated_struct_methods.clone(),
+            self.bump,
         );
         emitter.emit_element_drop(drop_kind, addr, &mut resolver, span);
     }
@@ -1372,10 +1473,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         if f.manual {
             return;
         }
+        let default_alloc = self.enclosing_allocator_provenance();
         let drop_kind = if nullable_owned.is_some() {
-            DropKind::Undroppable // already handled above
+            DropKind::Undroppable
         } else {
-            f.field_type.drop_kind()
+            f.field_type.drop_kind_with(default_alloc)
         };
         if drop_kind.is_droppable() {
             let is_uninit = owner.map_or(false, |o| self.drop_state.is_field_moved(o, field));
@@ -1409,6 +1511,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     self.glue_registry,
                     self.instantiated_functions.clone(),
                     self.instantiated_struct_methods.clone(),
+                    self.bump,
                 );
                 match &drop_kind {
                     DropKind::OwnedPointer {
@@ -1453,7 +1556,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                             );
                         }
                     }
-                    DropKind::Type(_) => {
+                    DropKind::Type(_) | DropKind::Nullable { .. } => {
                         emitter.emit_element_drop(&drop_kind, field_addr, &mut resolver, span);
                     }
                     DropKind::Slice {
@@ -1472,5 +1575,201 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 }
             }
         }
+    }
+
+    pub fn is_plain_scalar(ty: &HirType) -> bool {
+        matches!(
+            ty,
+            HirType::I8
+                | HirType::I16
+                | HirType::I32
+                | HirType::I64
+                | HirType::I128
+                | HirType::U8
+                | HirType::U16
+                | HirType::U32
+                | HirType::U64
+                | HirType::U128
+                | HirType::F32
+                | HirType::F64
+                | HirType::Boolean
+                | HirType::Char
+                | HirType::Usize
+                | HirType::Isize
+                | HirType::Void
+        )
+    }
+
+    /// SSA value of a local, or of a hidden temp.
+    pub(super) fn local_value(&self, name: StrId) -> Option<Value> {
+        self.var_map
+            .get(&name)
+            .or_else(|| self.temp_values.get(&name))
+            .copied()
+    }
+
+    pub(super) fn note_call_result(&mut self, dest: Value, ret_ty: &SsaType, callee: StrId) {
+        match ret_ty {
+            SsaType::User(name, _, _)
+                if self.glue_registry.is_droppable(*name) || self.struct_owns_chain(*name) =>
+            {
+                self.owned_call_results.insert(dest, CallOwn::Struct(*name));
+            }
+            SsaType::Owned(_) => {
+                self.owned_call_results
+                    .insert(dest, CallOwn::Callee(callee));
+            }
+            t if t.nullable_pointer_repr().is_some() => {
+                self.owned_call_results
+                    .insert(dest, CallOwn::Callee(callee));
+            }
+            _ => {}
+        }
+    }
+
+    /// Rewrite an allocator provenance written in the callee's frame (`this.alloc`,
+    /// a param name) into the caller's frame, using the call's receiver and args.
+    fn rebase_call_allocator(
+        &self,
+        call: &HirExpr<'a, 'bump>,
+        sig: &CalleeSig<'a, 'bump>,
+        ann: ProvenanceAnnotation<'bump>,
+    ) -> Option<ProvenanceAnnotation<'bump>> {
+        let (HirExpr::Call { callee, args, .. } | HirExpr::InterfaceCall { callee, args, .. }) =
+            call
+        else {
+            return None;
+        };
+        let this_id = StrId::from_static("this");
+        let has_this = sig.param_names.first().is_some_and(|n| *n == this_id);
+        let receiver = match callee {
+            HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } if has_this => {
+                Some(&**object)
+            }
+            _ => None,
+        };
+        let base = match ann.root {
+            hir::ProvenanceRoot::ThisRoot => self.infer_provenance(receiver?)?,
+            hir::ProvenanceRoot::Var(p) if p == this_id => self.infer_provenance(receiver?)?,
+            hir::ProvenanceRoot::Var(p) => {
+                let pos = sig.param_names.iter().position(|n| *n == p)?;
+                let idx = if has_this { pos.checked_sub(1)? } else { pos };
+                self.infer_provenance(args.get(idx)?)?
+            }
+            hir::ProvenanceRoot::Global { .. } | hir::ProvenanceRoot::Static => return Some(ann),
+            hir::ProvenanceRoot::ImplicitParam(_) => return None,
+        };
+        let mut segs: Vec<hir::ProvenancePathSegment> = base.path.to_vec();
+        segs.extend_from_slice(ann.path);
+        Some(ProvenanceAnnotation {
+            root: base.root,
+            path: self.bump.alloc_slice_copy(&segs),
+        })
+    }
+
+    /// What dropping this call's result means, or None => leak (unknown / unsafe to guess).
+    pub(super) fn call_result_drop_kind(
+        &self,
+        call: &HirExpr<'a, 'bump>,
+        val: Value,
+    ) -> Option<DropKind<'a, 'bump>> {
+        match *self.owned_call_results.get(&val)? {
+            CallOwn::Struct(name) => Some(DropKind::Type(name)),
+            CallOwn::Callee(callee) => {
+                let sig = self.func_sigs.get(&callee)?;
+                let (owned, nullable) = match sig.ret? {
+                    HirType::Nullable(inner) => (*inner, true),
+                    other => (other, false),
+                };
+                let HirType::OwnedPointer { inner, allocator } = owned else {
+                    return None;
+                };
+                let allocator = match allocator {
+                    Some(a) => self.rebase_call_allocator(call, sig, a)?,
+                    None => self.infer_allocator_from_expr(call)?,
+                };
+                let kind = DropKind::OwnedPointer {
+                    pointee: Box::new(inner.try_drop_kind_with(None)?),
+                    pointee_ty: *inner,
+                    allocator,
+                };
+                Some(if nullable {
+                    DropKind::Nullable {
+                        inner: Box::new(kind),
+                        inner_ty: owned,
+                    }
+                } else {
+                    kind
+                })
+            }
+        }
+    }
+
+    /// Borrow site: register the call result as a hidden local that drops at scope exit
+    /// (or earlier, when `drain_temps_since` runs).
+    pub(super) fn adopt_call_temp(
+        &mut self,
+        expr: &HirExpr<'a, 'bump>,
+        val: Value,
+    ) -> Option<StrId> {
+        if !matches!(expr, HirExpr::Call { .. } | HirExpr::InterfaceCall { .. }) {
+            return None;
+        }
+        if self.cond_depth > 0 {
+            return None;
+        }
+        let kind = self.call_result_drop_kind(expr, val)?;
+        self.owned_call_results.remove(&val);
+        let id = self.next_temp;
+        self.next_temp += 1;
+        let tmp = StrId(intern_fmt!(self.context, "__tmp{}", id));
+        self.temp_values.insert(tmp, val);
+        self.scope_stack
+            .last_mut()
+            .unwrap()
+            .actions
+            .push(ScopeAction::DropLocal(DropLocal { name: tmp, kind }));
+        self.pending_temps.push(tmp);
+        Some(tmp)
+    }
+
+    pub(super) fn drain_temps_since(&mut self, mark: usize, span: SourceSpan<'a>) {
+        if self.pending_temps.len() <= mark {
+            return;
+        }
+        let temps: Vec<StrId> = self.pending_temps.drain(mark..).collect();
+        for tmp in temps.into_iter().rev() {
+            let mut action = None;
+            for scope in self.scope_stack.iter_mut().rev() {
+                if let Some(i) = scope
+                    .actions
+                    .iter()
+                    .position(|a| matches!(a, ScopeAction::DropLocal(l) if l.name == tmp))
+                {
+                    action = Some(scope.actions.remove(i));
+                    break;
+                }
+            }
+            // `None` means the scope already popped and dropped it (an if/else arm tail).
+            if let (Some(ScopeAction::DropLocal(l)), Some(&val)) =
+                (action, self.temp_values.get(&tmp))
+            {
+                if !self.block_terminated() {
+                    self.emit_drop_for_kind(&l.kind, val, Some(tmp), span);
+                }
+            }
+            self.temp_values.remove(&tmp);
+            self.drop_state.reset_local(tmp);
+            self.call_temps.retain(|_, t| *t != tmp);
+        }
+    }
+
+    /// Lower an expression whose temporaries die at its end (conditions, `&&`/`||` RHS,
+    /// `for` increments).
+    pub(super) fn lower_expr_scoped(&mut self, e: &HirExpr<'a, 'bump>) -> Value {
+        let m = self.pending_temps.len();
+        let v = self.lower_expr(e);
+        self.drain_temps_since(m, Default::default());
+        v
     }
 }

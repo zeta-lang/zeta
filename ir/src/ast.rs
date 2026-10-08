@@ -406,6 +406,11 @@ pub enum Expr<'a, 'bump>
 where
     'bump: 'a,
 {
+    OrElse {
+        value: &'bump Expr<'a, 'bump>,
+        else_block: &'bump Block<'a, 'bump>,
+        span: SourceSpan<'a>,
+    },
     Attributed {
         attrs: &'bump [Attribute<'a, 'bump>],
         expr: &'bump Expr<'a, 'bump>,
