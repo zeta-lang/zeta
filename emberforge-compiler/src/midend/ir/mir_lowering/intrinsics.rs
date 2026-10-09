@@ -101,76 +101,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         span: SourceSpan<'a>,
     ) -> Value {
         use ir::hir::IntrinsicKind;
-        use ir::ssa_ir::IntrinsicOp;
 
         match kind {
-            IntrinsicKind::DropInPlace => {
-                let ptr = self.lower_expr(&args[0]);
-                let kind = match type_args.first() {
-                    Some(t) => t.drop_kind(),
-                    None => {
-                        let pointee = match self.value_type(ptr).cloned() {
-                            Some(SsaType::Pointer(_, inner)) => *inner,
-                            Some(other) => other,
-                            None => SsaType::Void,
-                        };
-                        match pointee {
-                            SsaType::User(name, _, _) => DropKind::Type(name),
-                            _ => DropKind::Undroppable,
-                        }
-                    }
-                };
-                self.emit_indexed_element_drop(&kind, ptr, span);
-                ptr
-            }
+            IntrinsicKind::DropInPlace => self.emit_drop_in_place_intrinsic(type_args, args, span),
             IntrinsicKind::FnPtr => {
                 panic!("fn_ptr intrinsic is not supported");
             }
-            IntrinsicKind::Leak => {
-                // Mark `ctx` moved so emit_scope_drops skips it, and clear array flags if any.
-                self.record_arg_move(&args[0]);
-
-                let mut src = self.lower_expr(&args[0]);
-                let mut src_ty = self.current_block_data.value_types[&src].clone();
-
-                let dst_ty = match &src_ty {
-                    // ^[T]: take the data pointer (word 0), like lower_cast_expr does
-                    SsaType::Owned(inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
-                        let SsaType::Slice(elem) = inner.as_ref() else {
-                            unreachable!()
-                        };
-                        let ptr = self.current_block_data.fresh_value();
-                        self.emit(Instruction::LoadField {
-                            dest: ptr,
-                            base: Operand::Value(src),
-                            offset: 0,
-                        });
-                        let ptr_ty = SsaType::Pointer(
-                            ir::ssa_ir::SsaPointerKind::UnsafeMut,
-                            Box::new((**elem).clone()),
-                        );
-                        self.current_block_data
-                            .value_types
-                            .insert(ptr, ptr_ty.clone());
-                        src = ptr;
-                        src_ty = ptr_ty.clone();
-                        ptr_ty
-                    }
-                    SsaType::Owned(inner) => {
-                        SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, inner.clone())
-                    }
-                    other => panic!("$leak: expected owned pointer, got {:?}", other),
-                };
-
-                let dest = self.current_block_data.fresh_value();
-                self.emit(Instruction::Cast {
-                    dest,
-                    value: Operand::Value(src),
-                    kind: cast_kind(&src_ty, &dst_ty),
-                });
-                self.current_block_data.value_types.insert(dest, dst_ty);
-                dest
-            }
+            IntrinsicKind::Leak => self.emit_leak_intrinsic(args),
             IntrinsicKind::Replace => {
                 let place_expr: &HirExpr<'a, 'bump> = match &args[0] {
                     HirExpr::Ref { expr, .. } => expr,
@@ -178,277 +115,19 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 };
                 self.lower_replace_intrinsic(place_expr, &args[1], &span)
             }
-            IntrinsicKind::Reinterpret => {
-                let src = self.lower_expr(&args[0]);
-                let src_ty = self
-                    .current_block_data
-                    .value_types
-                    .get(&src)
-                    .cloned()
-                    .expect("$reinterpret: source value has no known type");
-                let target_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
-
-                if src_ty == target_ty {
-                    src
-                } else {
-                    let kind = cast_kind(&src_ty, &target_ty);
-                    let dest = self.current_block_data.fresh_value();
-                    self.emit(Instruction::Cast {
-                        dest,
-                        value: Operand::Value(src),
-                        kind,
-                    });
-                    self.current_block_data.value_types.insert(dest, target_ty);
-                    dest
-                }
-            }
-            IntrinsicKind::Unreachable => {
-                let msg = self.current_block_data.fresh_value();
-                let msg_str = StrId::from_static("entered unreachable code");
-                self.emit(Instruction::Const {
-                    dest: msg,
-                    ty: SsaType::String,
-                    value: Operand::ConstString(msg_str),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(msg, SsaType::String);
-
-                self.emit_debug_panic(msg);
-
-                let dest = self.current_block_data.fresh_value();
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Void);
-                dest
-            }
+            IntrinsicKind::Reinterpret => self.emit_reinterpret_intrinsic(type_args, args),
+            IntrinsicKind::Unreachable => self.emit_unreachable_intrinsic(),
             IntrinsicKind::SizeOf | IntrinsicKind::AlignOf | IntrinsicKind::TypeName => {
-                let query_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
-                let op = match kind {
-                    IntrinsicKind::SizeOf => IntrinsicOp::SizeOf,
-                    IntrinsicKind::AlignOf => IntrinsicOp::AlignOf,
-                    IntrinsicKind::TypeName => IntrinsicOp::TypeName,
-                    _ => unreachable!(),
-                };
-
-                let dest = self.current_block_data.fresh_value();
-                self.emit(Instruction::Intrinsic {
-                    dest: Some(dest),
-                    op,
-                    query_ty: Some(query_ty),
-                    args: SmallVec::new(),
-                });
-
-                let result_ty = match kind {
-                    IntrinsicKind::SizeOf | IntrinsicKind::AlignOf => SsaType::Usize,
-                    IntrinsicKind::TypeName => SsaType::String,
-                    _ => unreachable!(),
-                };
-                self.current_block_data.value_types.insert(dest, result_ty);
-                dest
+                self.emit_native_intrinsic(kind, type_args)
             }
 
-            IntrinsicKind::AssertAlign => {
-                let ptr_val = self.lower_expr(&args[0]);
-                let align_val = self.lower_expr(&args[1]);
+            IntrinsicKind::AssertAlign => self.emit_assert_align_intrinsic(args),
 
-                // mask = align - 1; misaligned if (ptr & mask) != 0
-                let one = self.current_block_data.fresh_value();
-                self.emit(Instruction::Const {
-                    dest: one,
-                    ty: SsaType::Usize,
-                    value: Operand::ConstInt(1),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(one, SsaType::Usize);
+            IntrinsicKind::AssumeInit => self.emit_assume_init_intrinsic(args),
 
-                let mask = self.current_block_data.fresh_value();
-                self.emit(Instruction::Binary {
-                    dest: mask,
-                    op: BinOp::Sub,
-                    left: Operand::Value(align_val),
-                    right: Operand::Value(one),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(mask, SsaType::Usize);
+            IntrinsicKind::MemForget => self.emit_mem_forget_intrinsic(args),
 
-                let masked = self.current_block_data.fresh_value();
-                self.emit(Instruction::Binary {
-                    dest: masked,
-                    op: BinOp::BitAnd,
-                    left: Operand::Value(ptr_val),
-                    right: Operand::Value(mask),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(masked, SsaType::Usize);
-
-                let zero = self.current_block_data.fresh_value();
-                self.emit(Instruction::Const {
-                    dest: zero,
-                    ty: SsaType::Usize,
-                    value: Operand::ConstInt(0),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(zero, SsaType::Usize);
-
-                let is_misaligned = self.current_block_data.fresh_value();
-                self.emit(Instruction::Binary {
-                    dest: is_misaligned,
-                    op: BinOp::Ne,
-                    left: Operand::Value(masked),
-                    right: Operand::Value(zero),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(is_misaligned, SsaType::Bool);
-
-                let panic_bb = self.current_block_data.new_block();
-                let cont_bb = self.current_block_data.new_block();
-
-                self.emit(Instruction::Branch {
-                    cond: Operand::Value(is_misaligned),
-                    then_bb: panic_bb,
-                    else_bb: cont_bb,
-                });
-
-                self.current_block_data.switch_to(panic_bb);
-                let msg = self.current_block_data.fresh_value();
-                let msg_str = StrId::from_static("alignment assertion failed");
-                self.emit(Instruction::Const {
-                    dest: msg,
-                    ty: SsaType::String,
-                    value: Operand::ConstString(msg_str),
-                });
-                self.current_block_data
-                    .value_types
-                    .insert(msg, SsaType::String);
-                self.emit_debug_panic(msg);
-
-                self.current_block_data.switch_to(cont_bb);
-                let dest = self.current_block_data.fresh_value();
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Void);
-                dest
-            }
-
-            IntrinsicKind::AssumeInit => {
-                if let HirExpr::FieldAccess { object, field, .. }
-                | HirExpr::Get { object, field, .. } = &args[0]
-                {
-                    let owner = match &**object {
-                        HirExpr::This { .. } => Some(StrId::from_static("this")),
-                        HirExpr::Ident(root, _) => Some(*root),
-                        _ => None,
-                    };
-                    if let Some(o) = owner {
-                        self.drop_state.mark_field_initialized(o, *field);
-                    }
-                }
-                let dest = self.current_block_data.fresh_value();
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Void);
-                dest
-            }
-
-            IntrinsicKind::MemForget => {
-                // Mark moved so emit_scope_drops skips it, then evaluate and discard.
-                // No instruction is needed: the forgetting is the absence of a drop.
-                self.record_arg_move(&args[0]);
-                let _ = self.lower_expr(&args[0]);
-
-                let dest = self.current_block_data.fresh_value();
-                self.current_block_data
-                    .value_types
-                    .insert(dest, SsaType::Void);
-                dest
-            }
-
-            IntrinsicKind::Own => {
-                let ptr_val = self.lower_expr(&args[0]);
-                let ptr_ty = self
-                    .current_block_data
-                    .value_types
-                    .get(&ptr_val)
-                    .cloned()
-                    .expect("$own: pointer arg has no known type");
-                let pointee_ty = match &ptr_ty {
-                    SsaType::Pointer(_, inner) => (**inner).clone(),
-                    other => {
-                        panic!("$own: expected pointer-typed first arg, got {:?}", other)
-                    }
-                };
-
-                let len_cap_exprs = if args.len() == 4 {
-                    Some((&args[2], &args[3]))
-                } else {
-                    None
-                };
-
-                match len_cap_exprs {
-                    // Owned slice: {ptr, len, cap} fat pointer, 24 bytes.
-                    Some((len_expr, cap_expr)) => {
-                        let len_val = self.lower_expr(len_expr);
-                        let cap_val = self.lower_expr(cap_expr);
-
-                        let fat_ptr = self.current_block_data.fresh_value();
-                        let fat_ptr_layout_ty = SsaType::Tuple(vec![
-                            SsaType::Pointer(
-                                ir::ssa_ir::SsaPointerKind::UnsafeMut,
-                                Box::new(pointee_ty.clone()),
-                            ),
-                            SsaType::Usize, // len
-                            SsaType::Usize, // cap
-                        ]);
-                        self.emit(Instruction::StackAlloc {
-                            dest: fat_ptr,
-                            ty: fat_ptr_layout_ty,
-                            count: 1,
-                        });
-
-                        let slice_ty =
-                            SsaType::Owned(Box::new(SsaType::Slice(Box::new(pointee_ty))));
-                        self.current_block_data
-                            .value_types
-                            .insert(fat_ptr, slice_ty);
-
-                        self.emit(Instruction::StoreField {
-                            base: Operand::Value(fat_ptr),
-                            offset: 0,
-                            value: Operand::Value(ptr_val),
-                        });
-                        self.emit(Instruction::StoreField {
-                            base: Operand::Value(fat_ptr),
-                            offset: 8,
-                            value: Operand::Value(len_val),
-                        });
-                        self.emit(Instruction::StoreField {
-                            base: Operand::Value(fat_ptr),
-                            offset: 16,
-                            value: Operand::Value(cap_val),
-                        });
-
-                        fat_ptr
-                    }
-
-                    None => {
-                        let owned_ty = SsaType::Owned(Box::new(pointee_ty));
-                        let dest = self.current_block_data.fresh_value();
-                        self.emit(Instruction::Cast {
-                            dest,
-                            value: Operand::Value(ptr_val),
-                            kind: cast_kind(&ptr_ty, &owned_ty),
-                        });
-                        self.current_block_data.value_types.insert(dest, owned_ty);
-                        dest
-                    }
-                }
-            }
+            IntrinsicKind::Own => self.emit_own_intrinsic(args),
             IntrinsicKind::AtomicLoad
             | IntrinsicKind::AtomicStore
             | IntrinsicKind::AtomicSwap
@@ -460,21 +139,375 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             | IntrinsicKind::AtomicFetchXor
             | IntrinsicKind::AtomicFence => self.lower_atomic(kind, type_args, args),
 
-            IntrinsicKind::CpuRelax => {
-                self.emit(Instruction::Intrinsic {
-                    dest: None,
-                    op: IntrinsicOp::CpuRelax,
-                    query_ty: None,
-                    args: SmallVec::new(),
+            IntrinsicKind::CpuRelax => self.emit_cpu_relax_intrinsic(),
+        }
+    }
+
+    fn emit_cpu_relax_intrinsic(&mut self) -> Value {
+        self.emit(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::CpuRelax,
+            query_ty: None,
+            args: SmallVec::new(),
+        });
+
+        let dest = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::Void);
+        dest
+    }
+
+    fn emit_own_intrinsic(&mut self, args: &[HirExpr<'a, 'bump>]) -> Value {
+        let ptr_val = self.lower_expr(&args[0]);
+        let ptr_ty = self
+            .current_block_data
+            .value_types
+            .get(&ptr_val)
+            .cloned()
+            .expect("$own: pointer arg has no known type");
+        let pointee_ty = match &ptr_ty {
+            SsaType::Pointer(_, inner) => (**inner).clone(),
+            other => {
+                panic!("$own: expected pointer-typed first arg, got {:?}", other)
+            }
+        };
+
+        let len_cap_exprs = if args.len() == 4 {
+            Some((&args[2], &args[3]))
+        } else {
+            None
+        };
+
+        match len_cap_exprs {
+            // Owned slice: {ptr, len, cap} fat pointer, 24 bytes.
+            Some((len_expr, cap_expr)) => {
+                let len_val = self.lower_expr(len_expr);
+                let cap_val = self.lower_expr(cap_expr);
+
+                let fat_ptr = self.current_block_data.fresh_value();
+                let fat_ptr_layout_ty = SsaType::Tuple(vec![
+                    SsaType::Pointer(
+                        ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                        Box::new(pointee_ty.clone()),
+                    ),
+                    SsaType::Usize, // len
+                    SsaType::Usize, // cap
+                ]);
+                self.emit(Instruction::StackAlloc {
+                    dest: fat_ptr,
+                    ty: fat_ptr_layout_ty,
+                    count: 1,
                 });
 
-                let dest = self.current_block_data.fresh_value();
+                let slice_ty = SsaType::Owned(Box::new(SsaType::Slice(Box::new(pointee_ty))));
                 self.current_block_data
                     .value_types
-                    .insert(dest, SsaType::Void);
+                    .insert(fat_ptr, slice_ty);
+
+                self.emit(Instruction::StoreField {
+                    base: Operand::Value(fat_ptr),
+                    offset: 0,
+                    value: Operand::Value(ptr_val),
+                });
+                self.emit(Instruction::StoreField {
+                    base: Operand::Value(fat_ptr),
+                    offset: 8,
+                    value: Operand::Value(len_val),
+                });
+                self.emit(Instruction::StoreField {
+                    base: Operand::Value(fat_ptr),
+                    offset: 16,
+                    value: Operand::Value(cap_val),
+                });
+
+                fat_ptr
+            }
+
+            None => {
+                let owned_ty = SsaType::Owned(Box::new(pointee_ty));
+                let dest = self.current_block_data.fresh_value();
+                self.emit(Instruction::Cast {
+                    dest,
+                    value: Operand::Value(ptr_val),
+                    kind: cast_kind(&ptr_ty, &owned_ty),
+                });
+                self.current_block_data.value_types.insert(dest, owned_ty);
                 dest
             }
         }
+    }
+
+    fn emit_mem_forget_intrinsic(&mut self, args: &[HirExpr<'a, 'bump>]) -> Value {
+        // Mark moved so emit_scope_drops skips it, then evaluate and discard.
+        // No instruction is needed: the forgetting is the absence of a drop.
+        self.record_arg_move(&args[0]);
+        let _ = self.lower_expr(&args[0]);
+
+        let dest = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::Void);
+        dest
+    }
+
+    fn emit_assume_init_intrinsic(&mut self, args: &[HirExpr<'a, 'bump>]) -> Value {
+        if let HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } =
+            &args[0]
+        {
+            let owner = match &**object {
+                HirExpr::This { .. } => Some(StrId::from_static("this")),
+                HirExpr::Ident(root, _) => Some(*root),
+                _ => None,
+            };
+            if let Some(o) = owner {
+                self.drop_state.mark_field_initialized(o, *field);
+            }
+        }
+        let dest = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::Void);
+        dest
+    }
+
+    fn emit_assert_align_intrinsic(&mut self, args: &[HirExpr<'a, 'bump>]) -> Value {
+        let ptr_val = self.lower_expr(&args[0]);
+        let align_val = self.lower_expr(&args[1]);
+
+        // mask = align - 1; misaligned if (ptr & mask) != 0
+        let one = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: one,
+            ty: SsaType::Usize,
+            value: Operand::ConstInt(1),
+        });
+        self.current_block_data
+            .value_types
+            .insert(one, SsaType::Usize);
+
+        let mask = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: mask,
+            op: BinOp::Sub,
+            left: Operand::Value(align_val),
+            right: Operand::Value(one),
+        });
+        self.current_block_data
+            .value_types
+            .insert(mask, SsaType::Usize);
+
+        let masked = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: masked,
+            op: BinOp::BitAnd,
+            left: Operand::Value(ptr_val),
+            right: Operand::Value(mask),
+        });
+        self.current_block_data
+            .value_types
+            .insert(masked, SsaType::Usize);
+
+        let zero = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: zero,
+            ty: SsaType::Usize,
+            value: Operand::ConstInt(0),
+        });
+        self.current_block_data
+            .value_types
+            .insert(zero, SsaType::Usize);
+
+        let is_misaligned = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: is_misaligned,
+            op: BinOp::Ne,
+            left: Operand::Value(masked),
+            right: Operand::Value(zero),
+        });
+        self.current_block_data
+            .value_types
+            .insert(is_misaligned, SsaType::Bool);
+
+        let panic_bb = self.current_block_data.new_block();
+        let cont_bb = self.current_block_data.new_block();
+
+        self.emit(Instruction::Branch {
+            cond: Operand::Value(is_misaligned),
+            then_bb: panic_bb,
+            else_bb: cont_bb,
+        });
+
+        self.current_block_data.switch_to(panic_bb);
+        let msg = self.current_block_data.fresh_value();
+        let msg_str = StrId::from_static("alignment assertion failed");
+        self.emit(Instruction::Const {
+            dest: msg,
+            ty: SsaType::String,
+            value: Operand::ConstString(msg_str),
+        });
+        self.current_block_data
+            .value_types
+            .insert(msg, SsaType::String);
+        self.emit_debug_panic(msg);
+
+        self.current_block_data.switch_to(cont_bb);
+        let dest = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::Void);
+        dest
+    }
+
+    fn emit_native_intrinsic(
+        &mut self,
+        kind: IntrinsicKind,
+        type_args: &[HirType<'a, 'bump>],
+    ) -> Value {
+        let query_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
+        let op = match kind {
+            IntrinsicKind::SizeOf => IntrinsicOp::SizeOf,
+            IntrinsicKind::AlignOf => IntrinsicOp::AlignOf,
+            IntrinsicKind::TypeName => IntrinsicOp::TypeName,
+            _ => unreachable!(),
+        };
+
+        let dest = self.current_block_data.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op,
+            query_ty: Some(query_ty),
+            args: SmallVec::new(),
+        });
+
+        let result_ty = match kind {
+            IntrinsicKind::SizeOf | IntrinsicKind::AlignOf => SsaType::Usize,
+            IntrinsicKind::TypeName => SsaType::String,
+            _ => unreachable!(),
+        };
+        self.current_block_data.value_types.insert(dest, result_ty);
+        dest
+    }
+
+    fn emit_unreachable_intrinsic(&mut self) -> Value {
+        let msg = self.current_block_data.fresh_value();
+        let msg_str = StrId::from_static("entered unreachable code");
+        self.emit(Instruction::Const {
+            dest: msg,
+            ty: SsaType::String,
+            value: Operand::ConstString(msg_str),
+        });
+        self.current_block_data
+            .value_types
+            .insert(msg, SsaType::String);
+
+        self.emit_debug_panic(msg);
+
+        let dest = self.current_block_data.fresh_value();
+        self.current_block_data
+            .value_types
+            .insert(dest, SsaType::Void);
+        dest
+    }
+
+    fn emit_reinterpret_intrinsic(
+        &mut self,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+    ) -> Value {
+        let src = self.lower_expr(&args[0]);
+        let src_ty = self
+            .current_block_data
+            .value_types
+            .get(&src)
+            .cloned()
+            .expect("$reinterpret: source value has no known type");
+        let target_ty = lower_type_hir(&type_args[0], self.enums, self.structs);
+
+        if src_ty == target_ty {
+            src
+        } else {
+            let kind = cast_kind(&src_ty, &target_ty);
+            let dest = self.current_block_data.fresh_value();
+            self.emit(Instruction::Cast {
+                dest,
+                value: Operand::Value(src),
+                kind,
+            });
+            self.current_block_data.value_types.insert(dest, target_ty);
+            dest
+        }
+    }
+
+    fn emit_leak_intrinsic(&mut self, args: &[HirExpr<'a, 'bump>]) -> Value {
+        // Mark `ctx` moved so emit_scope_drops skips it, and clear array flags if any.
+        self.record_arg_move(&args[0]);
+
+        let mut src = self.lower_expr(&args[0]);
+        let mut src_ty = self.current_block_data.value_types[&src].clone();
+
+        let dst_ty = match &src_ty {
+            // ^[T]: take the data pointer (word 0), like lower_cast_expr does
+            SsaType::Owned(inner) if matches!(inner.as_ref(), SsaType::Slice(_)) => {
+                let SsaType::Slice(elem) = inner.as_ref() else {
+                    unreachable!()
+                };
+                let ptr = self.current_block_data.fresh_value();
+                self.emit(Instruction::LoadField {
+                    dest: ptr,
+                    base: Operand::Value(src),
+                    offset: 0,
+                });
+                let ptr_ty = SsaType::Pointer(
+                    ir::ssa_ir::SsaPointerKind::UnsafeMut,
+                    Box::new((**elem).clone()),
+                );
+                self.current_block_data
+                    .value_types
+                    .insert(ptr, ptr_ty.clone());
+                src = ptr;
+                src_ty = ptr_ty.clone();
+                ptr_ty
+            }
+            SsaType::Owned(inner) => {
+                SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, inner.clone())
+            }
+            other => panic!("$leak: expected owned pointer, got {:?}", other),
+        };
+
+        let dest = self.current_block_data.fresh_value();
+        self.emit(Instruction::Cast {
+            dest,
+            value: Operand::Value(src),
+            kind: cast_kind(&src_ty, &dst_ty),
+        });
+        self.current_block_data.value_types.insert(dest, dst_ty);
+        dest
+    }
+
+    fn emit_drop_in_place_intrinsic(
+        &mut self,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+        span: SourceSpan<'a>,
+    ) -> Value {
+        let ptr = self.lower_expr(&args[0]);
+        let kind = match type_args.first() {
+            Some(t) => t.drop_kind(),
+            None => {
+                let pointee = match self.value_type(ptr).cloned() {
+                    Some(SsaType::Pointer(_, inner)) => *inner,
+                    Some(other) => other,
+                    None => SsaType::Void,
+                };
+                match pointee {
+                    SsaType::User(name, _, _) => DropKind::Type(name),
+                    _ => DropKind::Undroppable,
+                }
+            }
+        };
+        self.emit_indexed_element_drop(&kind, ptr, span);
+        ptr
     }
 
     pub(super) fn lower_atomic(
