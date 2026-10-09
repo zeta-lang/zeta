@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "zeta-compiler-api"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "codex-dependency-graph",
  "emberforge-compiler",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "zeta-lang"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "clap",
  "mimalloc",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "zeta-lsp"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "zetaup"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "clap",
  "flate2",

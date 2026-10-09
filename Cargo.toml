@@ -2,7 +2,7 @@ cargo-features = ["codegen-backend"]
 
 [package]
 name = "zeta-lang"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 edition = "2024"
 
 [profile.release]
