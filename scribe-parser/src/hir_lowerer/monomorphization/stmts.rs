@@ -79,19 +79,15 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 mutable,
                 is_static,
                 catch_pattern,
-                else_block,
                 span,
                 manual,
             } => {
                 let subd_ty = substitute_type(ty, substitutions, &self.bump);
 
-                let new_value = self
-                    .try_monomorphize_assoc_call(value, &subd_ty, substitutions)
-                    .unwrap_or_else(|| {
-                        self.monomorphize_expr_with_expected_type(value, &subd_ty, substitutions)
-                    });
-
                 let new_ty = self.instantiate_type_recursively(subd_ty, *span);
+
+                let new_value =
+                    self.monomorphize_expr_with_expected_type(value, &new_ty, substitutions);
                 self.ctx.variable_types.borrow_mut().insert(*name, new_ty);
 
                 HirStmt::Let {
@@ -101,7 +97,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     mutable: *mutable,
                     is_static: *is_static,
                     catch_pattern: *catch_pattern,
-                    else_block: *else_block,
                     span: *span,
                     manual: *manual,
                 }
@@ -207,8 +202,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let HirExpr::ModuleAccess(acc) = &**callee else {
             return None;
         };
-        // `foo(...)` via a named import lowers to ModuleAccess { path: [foo], member: "" }.
-        // That's a free function, not `Type.method(...)`.
         if acc.member.is_empty() {
             return None;
         }

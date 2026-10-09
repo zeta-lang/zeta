@@ -13,9 +13,8 @@ struct ThreadCtxHeader {
     invoke: &func(arg: [*]mut void): void,
 }
 
-// F-dependent. Only ever touched inside invoke_impl<F,R,A>.
 struct ThreadCtx<F, R, A: Allocator> {
-    header: ThreadCtxHeader,   // MUST be first field
+    header: ThreadCtxHeader,
     manual func_: F,
     slot: [*]mut ResultSlot<R, A>,
     alloc: A,
@@ -52,7 +51,7 @@ func invoke_impl<F: func(): R, R, A: Allocator>(arg: [*]mut void): void {
         let f: F = unsafe { (*raw).func_ };
         let result: R = f();
         unsafe { (*slot).result = result; }
-    } // f dropped here, ctx memory still valid
+    }
 
     let owned: ^ThreadCtx<F, R, A> = unsafe { $own(raw, alloc) };
 }

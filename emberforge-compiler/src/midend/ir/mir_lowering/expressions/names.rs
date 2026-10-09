@@ -9,8 +9,12 @@ use crate::{midend::ir::mir_lowering::FunctionLowerer, optimized_string_bufferin
 impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn resolve_receiver_target_key(&self, ty: &SsaType) -> Option<StrId> {
         match ty {
-            SsaType::User(name, _,  _) => Some(*name),
-            SsaType::Enum { name, unmangled_name: _, .. } => Some(*name),
+            SsaType::User(name, _, _) => Some(*name),
+            SsaType::Enum {
+                name,
+                unmangled_name: _,
+                ..
+            } => Some(*name),
             SsaType::Interface(name, _) => Some(*name),
             SsaType::Pointer(_, inner) | SsaType::Owned(inner) => {
                 self.resolve_receiver_target_key(inner)
@@ -42,7 +46,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             SsaType::Char => prim("char"),
             SsaType::Slice(elem) | SsaType::Array(elem, _) => {
                 let elem_key = match elem.as_ref() {
-                    SsaType::User(n, _,  _) => Some(*n),
+                    SsaType::User(n, _, _) => Some(*n),
                     other => self.builtin_target_key(other),
                 };
                 if let Some(ek) = elem_key {
@@ -235,7 +239,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let dest = self.current_block_data.fresh_value();
         self.emit(Instruction::Const {
             dest,
-            ty: SsaType::I64, // TODO: this is a placeholder; refined once type info flows through
+            ty: SsaType::I64, // TODO: refined once type info flows through
             value: Operand::GlobalRef(mangled),
         });
         self.current_block_data

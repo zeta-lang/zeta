@@ -223,26 +223,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_deref_expr(&mut self, expr: &&HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
         let mut inner_ty = self.check_expr(expr);
-        if let HirType::Nullable(inner) = inner_ty {
-            if let Some((root, path)) = self.static_field_path(expr) {
-                if self.is_non_null(root, &path) {
-                    inner_ty = *inner;
-                }
-            }
-        }
+        inner_ty = self.refine_non_null_expr_type(expr, inner_ty);
+
         if let Some(base) = self.resolve_place(expr) {
             let place = self.borrow_checker.project_deref(base);
             self.check_borrow_use(expr, place, BorrowKind::Shared);
         }
+
         match inner_ty {
             HirType::Ref { inner, .. } => *inner,
+
             HirType::SafePointer { inner, .. } => {
                 if !self.in_unsafe() {
                     self.record(TypeErrorKind::Generic(
                         "dereferencing a raw pointer requires an unsafe block".into(),
                     ));
                 }
-
                 *inner
             }
 
@@ -252,10 +248,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "dereferencing an unsafe pointer requires an unsafe block".into(),
                     ));
                 }
-
                 *inner
             }
+
             HirType::OwnedPointer { inner, .. } => *inner,
+
             _ => {
                 self.record(TypeErrorKind::Generic(format!(
                     "cannot dereference non-pointer type `{}`",
@@ -309,10 +306,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             s.push_str(&str_id_to_string(*seg));
         }
         s
-    }
-
-    fn is_owned_slice(ty: &HirType<'a, 'bump>) -> bool {
-        matches!(ty, HirType::OwnedPointer { inner, .. } if matches!(**inner, HirType::Slice(_)))
     }
 
     pub fn check_assignment_expr(
@@ -1882,5 +1875,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         inner
+    }
+
+    pub fn refine_non_null_expr_type(
+        &self,
+        expr: &HirExpr<'a, 'bump>,
+        ty: HirType<'a, 'bump>,
+    ) -> HirType<'a, 'bump> {
+        let HirType::Nullable(inner) = ty else {
+            return ty;
+        };
+
+        let Some((root, path)) = self.static_field_path(expr) else {
+            return ty;
+        };
+
+        if self.is_non_null(root, &path) {
+            *inner
+        } else {
+            ty
+        }
     }
 }

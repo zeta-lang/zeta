@@ -291,14 +291,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             let ok = match s {
                 HirStmt::Let {
                     value,
-                    else_block,
                     catch_pattern,
                     ..
-                } => {
-                    else_block.is_none()
-                        && catch_pattern.is_none()
-                        && Self::expr_is_straightline(value)
-                }
+                } => catch_pattern.is_none() && Self::expr_is_straightline(value),
                 HirStmt::Const(c) => Self::expr_is_straightline(&c.value),
                 HirStmt::Expr(e) => Self::expr_is_straightline(e),
                 _ => false,

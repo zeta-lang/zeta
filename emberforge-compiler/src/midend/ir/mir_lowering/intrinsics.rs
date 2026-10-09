@@ -19,8 +19,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     ) -> Value {
         self.record_move_if_any(new_expr);
 
-        // Plain local: SSA rebind. Marking it moved first makes handle_ident skip
-        // the drop of the old value (it now belongs to the caller) and re-init it.
         if let HirExpr::Ident(name, ident_span) = place {
             let rhs = self.lower_expr(new_expr);
             let old = self.lower_expr(place);
@@ -36,7 +34,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             && !matches!(&ty, SsaType::Owned(i) if !matches!(i.as_ref(), SsaType::Slice(_)));
 
         let old = if inline {
-            // Slot is overwritten in place, so snapshot the old bytes first.
             let size = ir::layout::sizeof_ssa(&ty, TargetInfo { ptr_bytes: 8 })
                 .expect("$replace: slot type has no known size");
             let (alloc_ty, count) = match &ty {
@@ -72,7 +69,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             v
         };
 
-        // Deliberately no drop of the old contents: ownership moved into `old`.
         self.store_init(addr, 0, &ty, init);
 
         match self.static_field_path_mir(place) {
@@ -523,7 +519,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             let ptr = self.lower_expr(&args[0]);
             ops.push(Operand::Value(ptr));
 
-            // Ordering args are NOT operands; they're handled via succ/fail above.
             match kind {
                 IntrinsicKind::AtomicLoad => {}
                 IntrinsicKind::AtomicStore
@@ -696,14 +691,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     ) {
         match fail {
             None => self.emit_atomic_leaf(kind, s, s, ops, query_ty, result_ty, slot),
-            Some(OrdSel::Static(f)) => {
-                // `s` may only be known at runtime (we're inside a dispatch arm),
-                // so an illegal pair is a runtime panic in this arm, not a compile error.
-                match Self::validate_failure(s, f) {
-                    Some(f) => self.emit_atomic_leaf(kind, s, f, ops, query_ty, result_ty, slot),
-                    None => self.emit_atomic_bad_order(),
-                }
-            }
+            Some(OrdSel::Static(f)) => match Self::validate_failure(s, f) {
+                Some(f) => self.emit_atomic_leaf(kind, s, f, ops, query_ty, result_ty, slot),
+                None => self.emit_atomic_bad_order(),
+            },
             Some(OrdSel::Dynamic(fv)) => {
                 self.emit_ordering_dispatch(
                     fv,
@@ -715,7 +706,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
     }
 
-    /// Emit one concrete atomic intrinsic and store its result into `slot`.
     #[allow(clippy::too_many_arguments)]
     fn emit_atomic_leaf(
         &mut self,

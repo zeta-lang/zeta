@@ -31,9 +31,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         r
     }
 
-    /// Same as `lower_field_access_expr`, but takes an already-lowered receiver
-    /// value instead of re-lowering `object` from scratch. Use this whenever the
-    /// caller has already computed `obj_val` for the receiver.
     pub(crate) fn field_access_from_value(
         &mut self,
         obj_val: Value,
@@ -104,10 +101,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 offset,
             });
 
-            // A tagged nullable is represented *as* the pointer to its tag+payload
-            // slot, so the value must carry the Nullable type itself. Wrapping it in
-            // Pointer(..) hides it from every nullable-aware path (null checks,
-            // unwrap/narrowing, store_field_value's memcpy branch).
             let addr_ty = if field_type.is_tagged_nullable() {
                 field_type
             } else {

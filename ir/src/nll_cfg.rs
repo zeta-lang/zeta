@@ -109,7 +109,6 @@ impl CfgBuilder {
         match stmt {
             HirStmt::Let {
                 value,
-                else_block,
                 catch_pattern,
                 ..
             } => {
@@ -117,16 +116,6 @@ impl CfgBuilder {
 
                 let after = self.cfg.fresh();
                 self.cfg.edge(entry, after);
-
-                // `? else { .. }`: taken on the null path, converges with
-                // the normal path at `after` unless it itself diverges.
-                if let Some(else_stmt) = *else_block {
-                    let else_entry = self.cfg.fresh();
-                    self.cfg.edge(entry, else_entry);
-                    if let Some(tail) = self.visit_stmt(else_entry, else_stmt) {
-                        self.cfg.edge(tail, after);
-                    }
-                }
 
                 // `catch { .. }`: taken on the error path, one branch per
                 // handler arm
@@ -352,6 +341,9 @@ impl CfgBuilder {
         match expr {
             HirExpr::If { if_stmt, .. } => {
                 self.visit_stmt(entry, if_stmt);
+            }
+            HirExpr::OrElse { else_body, .. } => {
+                self.visit_block(entry, else_body);
             }
             HirExpr::Match {
                 expr: scrutinee,

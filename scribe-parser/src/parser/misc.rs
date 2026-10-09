@@ -874,6 +874,7 @@ where
                 if cursor.peek() != TokenKind::RParen {
                     loop {
                         types.push(Self::parse_type_impl(bump, cursor, pending)?);
+                        #[allow(unused_assignments)]
                         if cursor.peek() == TokenKind::Comma {
                             cursor.advance();
                             trailing_comma = true;

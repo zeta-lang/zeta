@@ -209,14 +209,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirStmt::Let {
                 name,
                 value,
-                else_block,
                 catch_pattern,
                 ..
             } => {
                 self.fv_expr(value, bound, out);
-                if let Some(b) = else_block {
-                    self.fv_stmt(b, bound, out);
-                }
+
                 if let Some(pattern) = catch_pattern {
                     match pattern {
                         HirErrorHandlerPattern::Single { body, .. } => {
@@ -344,8 +341,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirExpr::Ref { expr: inner, .. }
             | HirExpr::Deref { expr: inner, .. }
-            | HirExpr::Cast { expr: inner, .. }
-            | HirExpr::OrElse { value: inner, .. } => self.fv_expr(inner, bound, out),
+            | HirExpr::Cast { expr: inner, .. } => self.fv_expr(inner, bound, out),
+
+            HirExpr::OrElse {
+                value: inner,
+                else_body,
+                ..
+            } => {
+                if !else_body.is_empty() {
+                    let m = bound.len();
+                    for s in *else_body {
+                        self.fv_stmt(s, bound, out);
+                    }
+                    bound.truncate(m);
+                }
+                self.fv_expr(inner, bound, out)
+            }
             HirExpr::Slice {
                 object, start, end, ..
             } => {
@@ -712,8 +723,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             if *is_move {
                 for (i, c) in captures.iter().enumerate() {
+                    if !matches!(c.mode, CaptureMode::ByValue) {
+                        continue;
+                    }
                     if frame.entries[i].2.level == UseLevel::Move {
-                        continue; // body already recorded the move
+                        continue;
                     }
                     let place = self.expr_from_path(c.source, c.source_path, *span);
                     self.check_and_record_value_use(&place, &field_tys[i]);

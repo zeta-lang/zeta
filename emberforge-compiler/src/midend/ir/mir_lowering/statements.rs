@@ -28,7 +28,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         ty: &HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
         catch_pattern: &Option<HirErrorHandlerPattern<'a, 'bump>>,
-        else_block: &Option<&HirStmt<'a, 'bump>>,
         span: SourceSpan<'a>,
         manual: bool,
     ) {
@@ -39,9 +38,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         if let Some(pat) = catch_pattern {
             self.lower_catch(val, pat);
-        }
-        if let Some(else_stmts) = else_block {
-            val = self.lower_nullable_unwrap(val, else_stmts);
         }
 
         self.var_map.insert(name.clone(), val);

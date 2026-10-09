@@ -71,7 +71,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             else_bb,
         });
 
-        // then
         self.current_block_data.switch_to(then_bb);
         self.narrowed_fields = narrowed_before.clone();
         self.scope_stack.push(DropScope::default());
@@ -98,7 +97,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             self.emit(Instruction::Jump { target: merge_bb });
         }
 
-        // else
         self.drop_state = drop_before.clone();
         self.var_map = vars_before.clone();
         self.current_block_data.switch_to(else_bb);
@@ -718,13 +716,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             };
 
             self.current_block_data.switch_to(next_check_bb);
-            let cond = self.current_block_data.fresh_value();
-            self.emit(Instruction::Binary {
-                dest: cond,
-                op: BinOp::Eq,
-                left: Operand::Value(tag_val),
-                right: Operand::ConstInt(arm_tag as i64),
-            });
+            let cond = self.emit_eq_const(tag_val, arm_tag as i64);
             match fallthrough_bb {
                 Some(next) => {
                     self.emit(Instruction::Branch {
@@ -765,41 +757,53 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
     }
 
-    pub(super) fn lower_nullable_unwrap(
-        &mut self,
-        val: Value,
-        else_stmts: &HirStmt<'a, 'bump>,
-    ) -> Value {
-        let then_bb = self.current_block_data.new_block();
-        let else_bb = self.current_block_data.new_block();
+    fn normalize_nullable_operand(&mut self, val: Value, ty: SsaType) -> (Value, SsaType) {
+        if let SsaType::Pointer(_, inner) = &ty {
+            if let SsaType::Nullable(_) = &**inner {
+                let inner = (**inner).clone();
+                if inner.is_tagged_nullable() {
+                    // aggregates are represented by address: same thing
+                    return (val, inner);
+                }
+                // pointer-repr nullable stored in a slot: load the pointer out
+                let loaded = self.current_block_data.fresh_value();
+                self.emit(Instruction::LoadField {
+                    dest: loaded,
+                    base: Operand::Value(val),
+                    offset: 0,
+                });
+                self.current_block_data
+                    .value_types
+                    .insert(loaded, inner.clone());
+                return (loaded, inner);
+            }
+        }
+        (val, ty)
+    }
 
-        let ty = self
-            .current_block_data
-            .value_type(val)
-            .expect("nullable-unwrapped value must have a known SsaType")
-            .clone();
+    pub(super) fn emit_eq_const(&mut self, left: Value, right: i64) -> Value {
+        let dest = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest,
+            op: BinOp::Eq,
+            left: Operand::Value(left),
+            right: Operand::ConstInt(right),
+        });
+        let bool_ty = lower_type_hir(&HirType::Boolean, self.enums, self.structs);
+        self.current_block_data.value_types.insert(dest, bool_ty);
+        dest
+    }
 
+    fn emit_null_test(&mut self, val: Value, ty: &SsaType, span: SourceSpan<'a>) -> Value {
         if ty.nullable_pointer_repr().is_some() {
-            let cond = self.current_block_data.fresh_value();
-            self.emit(Instruction::Binary {
-                dest: cond,
-                op: BinOp::Eq,
-                left: Operand::Value(val),
-                right: Operand::ConstInt(0),
-            });
-            self.emit(Instruction::Branch {
-                cond: Operand::Value(cond),
-                then_bb: else_bb,
-                else_bb: then_bb,
-            });
-        } else if let SsaType::Nullable(_) = &ty {
-            let nullable_enum = StrId::from_static("__nullable");
+            return self.emit_eq_const(val, 0);
+        }
+        if let SsaType::Nullable(_) = ty {
             let null_tag = *self
                 .enum_variant_tags
-                .get(&nullable_enum)
+                .get(&StrId::from_static("__nullable"))
                 .and_then(|m| m.get(&StrId::from_static("null")))
                 .expect("__nullable enum's `null` tag missing from enum_variant_tags");
-
             let tag = self.current_block_data.fresh_value();
             self.emit(Instruction::LoadField {
                 dest: tag,
@@ -807,38 +811,102 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 offset: 0,
             });
             self.current_block_data.value_types.insert(tag, SsaType::U8);
-
-            let cond = self.current_block_data.fresh_value();
-            self.emit(Instruction::Binary {
-                dest: cond,
-                op: BinOp::Eq,
-                left: Operand::Value(tag),
-                right: Operand::ConstInt(null_tag as i64),
-            });
-            self.emit(Instruction::Branch {
-                cond: Operand::Value(cond),
-                then_bb: else_bb,
-                else_bb: then_bb,
-            });
-        } else {
-            panic!("`? else` used on non-nullable SsaType {:?}", ty);
+            return self.emit_eq_const(tag, null_tag as i64);
         }
+        panic!("`else` used on non-nullable SsaType {:?} at {span}", ty);
+    }
 
-        self.current_block_data.switch_to(else_bb);
-        let HirStmt::Block { body, span: _ } = else_stmts else {
-            unreachable!()
-        };
-        let saved = self.drop_state.clone();
+    pub(super) fn lower_or_else(
+        &mut self,
+        value: &HirExpr<'a, 'bump>,
+        else_body: &[HirStmt<'a, 'bump>],
+        span: SourceSpan<'a>,
+        expected: Option<&SsaType>, // the *unwrapped* type, if known
+    ) -> Value {
+        let raw = self.lower_expr(value);
+        let raw_ty = self
+            .value_type(raw)
+            .cloned()
+            .unwrap_or_else(|| panic!("`else` operand at {span} has no known SsaType"));
+        let (val, ty) = self.normalize_nullable_operand(raw, raw_ty);
+
+        // `x else { .. }` consumes `x`. Do it on both arms: when `x` is null there is
+        // nothing to drop, and a single state keeps the join trivial.
+        self.record_move_if_any(value);
+
+        let drop_after_move = self.drop_state.clone();
+        let vars_before = self.var_map.clone();
+        let narrowed_before = self.narrowed_fields.clone();
+
+        let is_null = self.emit_null_test(val, &ty, span);
+        let some_bb = self.current_block_data.new_block();
+        let none_bb = self.current_block_data.new_block();
+        let merge_bb = self.current_block_data.fresh_block();
+        self.emit(Instruction::Branch {
+            cond: Operand::Value(is_null),
+            then_bb: none_bb,
+            else_bb: some_bb,
+        });
+
+        self.current_block_data.switch_to(none_bb);
         self.scope_stack.push(DropScope::default());
-        self.lower_stmt_seq(body);
-        self.scope_stack.pop();
-        if !body.last().map_or(false, Self::stmt_diverges) {
-            panic!("`stmt? else {{}}` block must end in return, throw, break, or continue");
-        }
-        self.drop_state = saved;
+        let else_val = self.lower_block_value_inner(else_body, expected);
+        let else_scope = self.scope_stack.pop().unwrap();
 
-        self.current_block_data.switch_to(then_bb);
-        self.unwrap_known_nonnull(val, &ty)
+        // Divergence is a property of the lowered CFG, not of the last statement's syntax.
+        let else_edge = if self.block_terminated() {
+            None
+        } else {
+            self.emit_scope_drops(&else_scope, span);
+            // emit_scope_drops may have opened blocks: read the tail afterwards
+            let end = self.current_block_data.current_block;
+            let vars = self.var_map.clone();
+            let drops = self.drop_state.clone();
+            self.emit(Instruction::Jump { target: merge_bb });
+            Some((end, vars, drops))
+        };
+
+        self.current_block_data.switch_to(some_bb);
+        self.var_map = vars_before.clone();
+        self.drop_state = drop_after_move.clone();
+        self.narrowed_fields = narrowed_before.clone();
+        let unwrapped = self.unwrap_known_nonnull(val, &ty);
+
+        let Some((else_end, else_vars, else_drops)) = else_edge else {
+            return unwrapped; // else diverged: one path, no merge needed
+        };
+
+        let some_end = self.current_block_data.current_block;
+        let some_vars = self.var_map.clone();
+        let some_drops = self.drop_state.clone();
+        self.emit(Instruction::Jump { target: merge_bb });
+
+        self.narrowed_fields = narrowed_before;
+        self.current_block_data.push_block(merge_bb);
+        self.current_block_data.switch_to(merge_bb);
+        self.merge_var_maps(vec![(some_end, some_vars), (else_end, else_vars)]);
+        self.var_map.retain(|k, _| vars_before.contains_key(k)); // drop else-body locals
+        if let Some(j) = DropMoveState::join_all(vec![some_drops, else_drops]) {
+            self.drop_state = j;
+        }
+
+        let mut incoming: SmallVec<(BlockId, Value), 4> = SmallVec::new();
+        incoming.push((some_end, unwrapped));
+        incoming.push((else_end, else_val));
+        let result_ty = self.reconcile_phi_type(&incoming, span);
+        if result_ty == SsaType::Void {
+            return self.unit_value();
+        }
+        self.patch_diverging_edges(&mut incoming, &result_ty);
+        let result = self.current_block_data.fresh_value();
+        self.emit(Instruction::Phi {
+            dest: result,
+            incoming,
+        });
+        self.current_block_data
+            .value_types
+            .insert(result, result_ty);
+        result
     }
 
     pub(super) fn handle_continue_stmt(&mut self, span: SourceSpan<'a>) {

@@ -439,6 +439,66 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         method.return_type.unwrap_or(HirType::Void)
     }
 
+    /// True when `expr` reaches its value through an `&alias` reference that is not the
+    /// current method's own `this` (a method declared `&alias this` is responsible for itself;
+    /// its callers are checked here).
+    fn receiver_through_alias(&self, expr: &HirExpr<'a, 'bump>) -> bool {
+        if matches!(expr, HirExpr::This { .. }) {
+            return false;
+        }
+        if matches!(
+            self.peek_type(expr),
+            HirType::Ref {
+                ref_kind: RefKind::Alias,
+                ..
+            }
+        ) {
+            return true;
+        }
+        match expr {
+            HirExpr::Ident(n, _) => self.local_ref_kind.get(n) == Some(&RefKind::Alias),
+            HirExpr::FieldAccess { object, .. }
+            | HirExpr::Get { object, .. }
+            | HirExpr::Index { object, .. } => self.receiver_through_alias(object),
+            HirExpr::Deref { expr: inner, .. } => self.receiver_through_alias(inner),
+            _ => false,
+        }
+    }
+
+    /// Future hook: collections implementing a dedicated interface that handles concurrent
+    /// invalidation themselves. Nothing is exempt for now.
+    fn alias_invalidation_exempt(&self, _recv_ty: &HirType<'a, 'bump>) -> bool {
+        false
+    }
+
+    fn check_alias_receiver_invalidation(
+        &mut self,
+        object: &HirExpr<'a, 'bump>,
+        owner: StrId,
+        func: &HirFunc<'a, 'bump>,
+        method_name: &str,
+    ) {
+        if !self.receiver_through_alias(object) {
+            return;
+        }
+        let paths = self.analyze_invalidations(owner, func);
+        let Some(first) = paths.first() else { return };
+        if self.alias_invalidation_exempt(&self.peek_type(object)) {
+            return;
+        }
+        let what = first
+            .iter()
+            .map(|s| str_id_to_string(*s))
+            .collect::<Vec<_>>()
+            .join(".");
+        self.record(TypeErrorKind::Generic(format!(
+            "cannot call `{method_name}` through an `&alias` reference: it may invalidate \
+             `this.{what}` (reallocate it or change its length), which would invalidate other \
+             `&alias` references into the same value, possibly on another thread. Use `&mut` \
+             access instead"
+        )));
+    }
+
     pub fn check_call_expr(
         &mut self,
         expr: &HirExpr<'a, 'bump>,
@@ -816,6 +876,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         }
                     };
                 self.check_unsafe_call(&func, &format!("{}.{}", type_name, field));
+                self.check_alias_receiver_invalidation(
+                    object,
+                    struct_name_id,
+                    &func,
+                    field.as_str(),
+                );
 
                 let total_params = func.params.map(|p| p.len()).unwrap_or(0);
                 let expected_args = total_params.saturating_sub(1);

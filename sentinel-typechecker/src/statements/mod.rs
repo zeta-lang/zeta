@@ -120,11 +120,27 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .collect();
 
         let mut value = None;
+        let mut tail_borrows: Vec<StrId> = Vec::new();
         for (i, stmt) in body.iter().enumerate() {
+            // Arm tail tracking for the last statement only.
+            let tail_key = match stmt {
+                HirStmt::Expr(e) if i + 1 == body.len() => Some(Self::expr_key(e)),
+                _ => None,
+            };
+            let prev_tail = tail_key.map(|k| {
+                self.tail_borrows.clear();
+                self.tail_expr_key.replace(k)
+            });
+
             let old_context = std::mem::replace(&mut self.context, block_context);
             value = self.check_stmt(stmt);
             block_context = self.context.clone();
             self.context = old_context;
+
+            if let Some(prev) = prev_tail {
+                self.tail_expr_key = prev;
+                tail_borrows = std::mem::take(&mut self.tail_borrows);
+            }
 
             let after_point = self.stmt_after_points.get(&Self::stmt_key(stmt)).copied();
 
@@ -144,6 +160,47 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.borrow_checker.end_loan_now(loan_id);
                 self.loan_owners.remove(&loan_id);
             }
+        }
+
+        // Locals whose drop is observable (guard-like). Restricting to these avoids
+        // false positives on plain reference-typed locals.
+        let dropped: Vec<(StrId, StrId)> = local_names
+            .iter()
+            .rev()
+            .filter_map(|n| {
+                let (_, ty) = block_context.get_variable(&str_id_to_string(*n))?;
+                match ty {
+                    HirType::Struct { name, .. } | HirType::Enum { name, .. }
+                        if self.copy_analysis.borrow().implements_drop(name) =>
+                    {
+                        Some((*n, name))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // The tail value leaves the block with no owner, so no later use can catch it.
+        let mut reported: Vec<StrId> = Vec::new();
+        for l in &tail_borrows {
+            if reported.contains(l) {
+                continue;
+            }
+            if let Some((_, owner)) = dropped.iter().find(|(n, _)| n == l) {
+                reported.push(*l);
+                self.record(TypeErrorKind::Generic(format!(
+                    "this block's value borrows from `{}` (a `{}`), which is dropped at the \
+                     end of the block; the reference cannot outlive it",
+                    str_id_to_string(*l),
+                    str_id_to_string(*owner),
+                )));
+            }
+        }
+
+        // Anything derived from a dropped local is now invalid. Later uses through an
+        // outer local's provenance fail in `check_use` (`InvalidatedReference`).
+        for (n, _) in &dropped {
+            self.borrow_checker.kill_local_storage(*n);
         }
 
         self.borrow_checker.end_scope();
@@ -230,6 +287,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn check_expr_stmt(&mut self, e: &&HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
         let snap = self.snapshot_call_loan_keys();
         let ty = self.check_expr(e);
+
+        if self.tail_expr_key == Some(Self::expr_key(e)) && self.return_type_may_alias(&ty) {
+            let found: Vec<StrId> = self
+                .call_loans
+                .iter()
+                .filter(|(k, _)| !snap.contains(*k))
+                .filter_map(|(_, &id)| self.borrow_checker.loan(id))
+                .filter_map(|l| self.borrow_checker.root_local_of(l.place))
+                .collect();
+            self.tail_borrows = found;
+        }
+
         self.end_temp_call_loans(&snap);
         self.end_temp_closure_loans(&snap);
         Some(ty)
@@ -295,7 +364,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         ty: &HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
         mutable: &bool,
-        else_block: &Option<&HirStmt<'a, 'bump>>,
         span: &SourceSpan<'a>,
     ) -> Option<HirType<'a, 'bump>> {
         let var_name = str_id_to_string(*name);
@@ -313,6 +381,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             });
         }
 
+        let temp_snap = self.snapshot_call_loan_keys();
         let value_type = self.check_expr_expected(value, ty);
 
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
@@ -320,29 +389,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.check_and_record_value_use(value, &value_type);
         }
 
-        if let Some(else_block) = else_block {
-            match &value_type {
-                HirType::Nullable(inner) => {
-                    let inner = **inner;
-                    let result = self.types_compatible(ty, &inner);
-                    self.recover(result, ());
-
-                    let else_context = self.context.create_child_scope();
-                    let old_context = std::mem::replace(&mut self.context, else_context);
-                    self.check_stmt(else_block);
-                    self.context = old_context;
-                }
-                _ => {
-                    self.record(TypeErrorKind::Generic(format!(
-                        "`? else` used on non-nullable type `{}`",
-                        type_to_string(&value_type)
-                    )));
-                }
-            }
-        } else {
-            let result = self.types_compatible(ty, &value_type);
-            self.recover(result, ());
-        }
+        let result = self.types_compatible(ty, &value_type);
+        self.recover(result, ());
 
         if self.expr_is_dangling(value) {
             self.context.mark_dangling(var_name.clone());
@@ -416,6 +464,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                 }
             }
+        }
+
+        let leftover: Vec<usize> = self
+            .call_loans
+            .keys()
+            .copied()
+            .filter(|k| !temp_snap.contains(k))
+            .collect();
+        if self.return_type_may_alias(ty) {
+            // the value may still point through these temporaries: the new local keeps them alive
+            for k in leftover {
+                if let Some(id) = self.call_loans.remove(&k) {
+                    self.loan_owners.insert(id, *name);
+                }
+            }
+        } else {
+            // copied-out value (`i64` etc.): nothing borrows from the source any more
+            self.end_temp_call_loans(&temp_snap);
         }
 
         None

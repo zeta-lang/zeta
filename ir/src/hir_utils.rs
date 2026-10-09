@@ -44,7 +44,6 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             name, type_args, ..
         } => {
             if type_args.is_empty() {
-                // name is already the fully-resolved/mangled identity of this struct
                 **name
             } else {
                 // only real generic params recurse

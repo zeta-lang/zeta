@@ -15,6 +15,7 @@ use ir::hir::{Hir, HirEnum, HirModule, HirStruct, StrId};
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::registry::global_registry::GlobalRegistry;
 use scribe_parser::hir_lowerer::HirLowerer;
+use scribe_parser::hir_lowerer::dce::{DceConfig, DeadCodeEliminator};
 use scribe_parser::hir_lowerer::lambda_hoisting::LambdaHoister;
 use scribe_parser::hir_lowerer::monomorphization::Monomorphizer;
 use sentinel_typechecker::TypeChecker;
@@ -57,6 +58,13 @@ pub struct Compiler<'a, 'bump> {
     lowerer_bump: Box<GrowableBump<'bump>>,
     source_roots: Vec<PathBuf>,
     env_structs: FxHashMap<StrId, StrId>,
+    /// Modules that passed type checking, in the order they must be monomorphized.
+    pending_mono: Vec<usize>,
+    /// Lowerers kept until deferred monomorphization (mono runs against their ctx).
+    deferred_lowerers: Vec<HirLowerer<'a, 'bump>>,
+    /// module_idx -> index into `deferred_lowerers`.
+    deferred_lowerer_slot: FxHashMap<usize, usize>,
+    dce_enabled: bool,
 }
 
 impl<'a, 'bump> Compiler<'a, 'bump>
@@ -113,7 +121,15 @@ where
             loaded_sources: HashMap::default(),
             source_roots: Vec::default(),
             env_structs: FxHashMap::default(),
+            pending_mono: Vec::new(),
+            deferred_lowerers: Vec::new(),
+            deferred_lowerer_slot: FxHashMap::default(),
+            dce_enabled: true,
         })
+    }
+
+    pub fn set_dead_code_elimination(&mut self, enabled: bool) {
+        self.dce_enabled = enabled;
     }
 
     pub fn dep_graph(&self) -> &'a RefCell<DepGraph> {
@@ -426,9 +442,12 @@ where
         }
     }
 
-    fn monomorphize_module(&mut self, module_idx: usize, lowerer: &mut HirLowerer<'a, 'bump>) {
-        let checked_hir = self.hir_modules[&module_idx];
-
+    fn monomorphize_module(
+        &mut self,
+        module_idx: usize,
+        checked_hir: HirModule<'a, 'bump>,
+        lowerer: &mut HirLowerer<'a, 'bump>,
+    ) {
         let hoister = LambdaHoister::new(
             lowerer.ctx.bump,
             self.pool.clone(),
@@ -490,6 +509,9 @@ where
             self.registry.clone(),
             self.auto_imports.clone(),
         );
+
+        let lowerer_slot = self.deferred_lowerers.len();
+        let mut queued_any = false;
 
         let module_stmts: FxHashMap<usize, Vec<Stmt<'a, 'bump>>> = pending
             .iter()
@@ -558,8 +580,14 @@ where
             }
 
             for &module_idx in &ready {
-                self.monomorphize_module(module_idx, &mut lowerer);
+                self.pending_mono.push(module_idx);
+                self.deferred_lowerer_slot.insert(module_idx, lowerer_slot);
+                queued_any = true;
             }
+        }
+
+        if queued_any {
+            self.deferred_lowerers.push(lowerer);
         }
     }
 
@@ -572,7 +600,7 @@ where
         let mut lowerer = self.make_lowerer(&parsed);
         lowerer.lower_module_prototypes(&parsed.parse_result.statements, module_idx);
 
-        let Some(mut lowerer) =
+        let Some(lowerer) =
             self.lower_module_bodies_phase(module_idx, lowerer, parsed, &mut reporter)
         else {
             return reporter;
@@ -614,8 +642,59 @@ where
             return reporter;
         }
 
-        self.monomorphize_module(module_idx, &mut lowerer);
+        let slot = self.deferred_lowerers.len();
+        self.deferred_lowerers.push(lowerer);
+        self.deferred_lowerer_slot.insert(module_idx, slot);
+        self.pending_mono.push(module_idx);
         reporter
+    }
+
+    /// DCE over everything that passed type checking, then hoist + monomorphize.
+    fn run_deferred_monomorphization(&mut self) {
+        let order: Vec<usize> = std::mem::take(&mut self.pending_mono)
+            .into_iter()
+            .filter(|idx| self.hir_modules.contains_key(idx))
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        let mut lowerers = std::mem::take(&mut self.deferred_lowerers);
+        let slots = std::mem::take(&mut self.deferred_lowerer_slot);
+
+        let checked: Vec<HirModule<'a, 'bump>> =
+            order.iter().map(|idx| self.hir_modules[idx]).collect();
+        let pruned = self.eliminate_dead_code(checked);
+
+        for (module_idx, hir) in order.into_iter().zip(pruned) {
+            let slot = slots[&module_idx];
+            self.monomorphize_module(module_idx, hir, &mut lowerers[slot]);
+        }
+    }
+
+    fn eliminate_dead_code(&self, modules: Vec<HirModule<'a, 'bump>>) -> Vec<HirModule<'a, 'bump>> {
+        if !self.dce_enabled {
+            return modules;
+        }
+        let cfg = DceConfig::new(&self.pool);
+
+        // Library / object-only builds have no entry point: keep everything.
+        let has_entry = modules.iter().any(|m| {
+            m.items.iter().any(|it| {
+                matches!(it, Hir::Func(f)
+                    if cfg.entry_points.iter().any(|e| *e == f.name || *e == f.unmangled_name))
+            })
+        });
+        if !has_entry {
+            return modules;
+        }
+
+        let mut dce = DeadCodeEliminator::new(&cfg, self.scratch_bump_ref());
+        let out = dce.run(&modules);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ZETA_DCE_LIST").is_some() {
+            eprintln!("[zeta-debug] dce: {:?}", dce.stats);
+        }
+        out
     }
 
     pub fn emit(
@@ -625,6 +704,7 @@ where
         verbose: bool,
         emit_obj: bool,
     ) -> Result<PathBuf, BuildError<'a>> {
+        self.run_deferred_monomorphization();
         self.finalize_monomorphization();
         let missing: Vec<PathBuf> = self
             .hir_modules

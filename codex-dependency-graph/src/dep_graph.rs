@@ -137,8 +137,8 @@ pub struct UnresolvedImport {
 }
 
 /// Three-part key used to intern item nodes: (module, position-in-module, role).
-/// `role` is one of the static strings `"func_sig"`, `"func_body"`, `"type"`,
-/// `"const"`, `"trait"`, `"impl"`, `"module"`.
+/// `role` is one of the static strings "func_sig", "func_body", "type",
+/// "const", "trait", "impl", "module".
 type ItemKey = (usize, usize, &'static str);
 
 #[derive(Default, Debug)]
@@ -242,8 +242,6 @@ impl DepGraph {
         }
     }
 
-    /// Mangled name for a free function `name` declared in `module_idx`.
-    /// `extern "C"` functions are never mangled.
     pub fn mangle_free_function(
         &self,
         module_idx: usize,
@@ -258,16 +256,11 @@ impl DepGraph {
         Self::scoped_name(&segments, name, pool)
     }
 
-    /// Mangled name for a bare type (struct/enum/interface) `name`
-    /// declared in `module_idx`.
     pub fn mangle_type_name(&self, module_idx: usize, name: StrId, pool: &StringPool) -> StrId {
         let segments = self.package_mangle_segments(module_idx, pool);
         Self::scoped_name(&segments, name, pool)
     }
 
-    /// Mangled name for `struct_name`'s method `method_name`, where
-    /// `struct_name` is the type's own (already-mangled or bare) key and
-    /// `module_idx` is the module the *method* is declared in.
     pub fn mangle_struct_method(
         &self,
         module_idx: usize,
@@ -687,14 +680,10 @@ impl DepGraph {
         self.package_segments.get(&module_idx).map(|v| v.as_slice())
     }
 
-    /// True if any `import` statement anywhere in the graph never resolved to
-    /// a known module.
     pub fn has_unresolved_imports(&self) -> bool {
         !self.unresolved_imports.is_empty()
     }
 
-    /// Human-readable messages for every unresolved import, one per import
-    /// statement, naming the importing file and the path it tried to import.
     pub fn unresolved_import_messages(&self, pool: &StringPool) -> Vec<String> {
         self.unresolved_imports
             .iter()
@@ -752,7 +741,6 @@ impl DepGraph {
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect();
 
-            // Strip the `.zeta` extension from the last (file-name) component.
             if let Some(last) = expected_components.last_mut() {
                 if let Some(stem) = std::path::Path::new(last.as_str()).file_stem() {
                     *last = stem.to_string_lossy().into_owned();
@@ -938,7 +926,6 @@ impl DepGraph {
                             if let Some(real) = self.resolve_reexport(target, member) {
                                 self.register_import(module_idx, real);
                             }
-                            // A facade may only export things that exist.
                             if self.package_facades.contains(&module_idx)
                                 && self.lookup_symbol(member, target).is_none()
                             {
@@ -1485,9 +1472,7 @@ impl DepGraph {
                     self.walk_expr(element, from_node, module_idx, pool);
                 }
             }
-            Expr::Undefined { .. } | Expr::Uninit { .. } => {
-                // Nothing to do.
-            }
+            Expr::Undefined { .. } | Expr::Uninit { .. } => {}
             Expr::Cast {
                 expr,
                 target_type: _,
@@ -1583,7 +1568,6 @@ impl DepGraph {
                     self.add_ast_type_dep(from_node, b, module_idx, pool);
                 }
             }
-            // Primitive / infer / void / this, no named dependency.
             _ => {}
         }
     }
@@ -1638,8 +1622,6 @@ impl DepGraph {
         }
     }
 
-    /// Link stdlib modules to user modules: user code gets an implicit import
-    /// edge to each stdlib module.
     pub fn link_stdlib_to_user(&mut self, stdlib_module_idx: usize, user_module_indices: &[usize]) {
         for &user_idx in user_module_indices {
             self.register_import(user_idx, stdlib_module_idx);

@@ -27,7 +27,6 @@ impl<'a, 'bump> ParserDiagnosticsContext<'a, 'bump> {
         }
     }
 
-    /// Record an error, stamping it with the current context ancestry.
     pub fn record(&mut self, mut err: DiagnosticError<'a>) {
         err.context = self.context_stack.iter().rev().cloned().collect();
         self.errors.push(err);
@@ -49,12 +48,10 @@ impl<'a, 'bump> ParserDiagnosticsContext<'a, 'bump> {
         self.warnings.len()
     }
 
-    /// True when we've exceeded the error budget and should stop trying.
     pub fn error_limit_reached(&self) -> bool {
         self.errors.len() >= self.max_errors
     }
 
-    /// Take ownership of collected errors (consumes the context).
     pub fn into_errors(self) -> Vec<DiagnosticError<'a>> {
         self.errors
     }
@@ -89,7 +86,6 @@ impl<'a, 'bump> ParserDiagnosticsContext<'a, 'bump> {
         result
     }
 
-    /// Synchronisation tokens: structural anchors that delimit top-level items.
     fn is_sync_token(kind: TokenKind) -> bool {
         matches!(
             kind,

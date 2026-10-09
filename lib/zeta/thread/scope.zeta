@@ -174,8 +174,6 @@ func scope<F: func(&alias Scope): R, R>(body: F): R {
 
     let result: R = body(&alias s);
 
-    // Everything the body spawned and did not join finishes before any borrow
-    // it captured can end.
     s.join_all();
 
     return result;

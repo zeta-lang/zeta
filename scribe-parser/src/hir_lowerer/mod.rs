@@ -1,4 +1,5 @@
 pub mod context;
+pub mod dce;
 pub mod decl_lowering;
 pub mod expr_lowering;
 pub mod lambda_hoisting;

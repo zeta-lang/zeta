@@ -87,19 +87,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    /// `T: &static` — the argument may not hold a borrow of anything that is not `&static`.
+    /// `T: &static`; the argument may not hold a borrow of anything that is not `&static`.
     /// A closure that captures a local by reference holds exactly such a borrow.
     fn check_arg_static_bound(&mut self, callee: StrId, arg: &HirExpr<'a, 'bump>) {
         let callee_name = str_id_to_string(callee);
         let mut problems: Vec<String> = Vec::new();
 
-        let captures = match arg {
-            HirExpr::Lambda { body, .. } => self
-                .closure_table
-                .get(&Self::stmt_key(body))
-                .map(|l| l.captures.clone()),
-            _ => None,
+        let (captures, ret_ty) = match arg {
+            HirExpr::Lambda { body, .. } => match self.closure_table.get(&Self::stmt_key(body)) {
+                Some(l) => (Some(l.captures.clone()), Some(l.ret_ty)),
+                None => (None, None),
+            },
+            _ => (None, None),
         };
+
+        if let Some(rt) = ret_ty {
+            if Self::type_holds_nonstatic_ref(&rt) {
+                problems.push(format!(
+                    "the closure returns `{}`, which contains a non-`&static` reference; \
+                     copy the data out before the closure ends",
+                    type_to_string(&rt)
+                ));
+            }
+        }
 
         if let (HirExpr::Lambda { span, .. }, Some(caps)) = (arg, captures) {
             for c in caps.iter() {

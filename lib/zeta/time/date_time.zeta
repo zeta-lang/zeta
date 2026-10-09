@@ -550,7 +550,7 @@ impl DateTime by ToString {
     func to_string(&this): String<Mallocator> {
         let mut s: String<Mallocator> = String.new();
 
-        let y: String<Mallocator> = padded_u64(this.year as u64, 4); // line 535
+        let y: String<Mallocator> = padded_u64(this.year as u64, 4);
         s.push_str(y.as_str());
         s.push_byte('-' as u8);
         let mo: String<Mallocator> = padded_u64(this.month as u64, 2);

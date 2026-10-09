@@ -514,7 +514,6 @@ where
         mutable: bool,
         is_static: bool,
         catch_pattern: Option<HirErrorHandlerPattern<'a, 'bump>>,
-        else_block: Option<&'bump HirStmt<'a, 'bump>>,
         span: SourceSpan<'a>,
         manual: bool,
     },
@@ -1305,7 +1304,7 @@ pub struct ClosureLowering<'a, 'bump> {
     pub env_ty: HirType<'a, 'bump>,
     pub captures: Vec<HirClosureCapture<'bump>>,
     /// Resolved parameter / return types (annotation, else from the generic
-    /// constraint). The hoister must use these, not `HirLambdaParam::param_type`.
+    /// constraint).
     pub param_tys: Vec<HirType<'a, 'bump>>,
     pub ret_ty: HirType<'a, 'bump>,
     pub kind: ClosureKind,

@@ -84,7 +84,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirType::SafePointer { .. } | HirType::UnsafePointer { .. } => false,
 
             // ^T: Send <-> T: Send, ^T: Sync <-> T: Sync.
-            // TODO: allocator rules (the allocator provenance must also be `tr`).
             HirType::OwnedPointer { inner, .. } => self.auto_in(inner, tr, env, visiting),
 
             HirType::Nullable(inner) | HirType::Array(inner, _) | HirType::Slice(inner) => {

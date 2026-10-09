@@ -56,7 +56,6 @@ pub fn enum_layout_of_ssa(
 
     let tag_size = 8usize;
     let tag_offset = 0usize;
-    // payload must start on its own alignment boundary, not just right after the tag
     let payload_offset = round_up_to_align(tag_size, max_payload.align.max(1));
     let struct_align = max_payload.align.max(tag_size);
     let size = round_up_to_align(payload_offset + max_payload.size, struct_align);
@@ -93,7 +92,7 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
         SsaType::Dyn => Ok(Layout { size: 8, align: 8 }),
 
         // Tuples/structs: sequential fields with padding between and at end to struct align.
-        SsaType::Tuple(fields) | SsaType::User(_, _,  fields) => {
+        SsaType::Tuple(fields) | SsaType::User(_, _, fields) => {
             let mut off = 0usize;
             let mut max_align = 1usize;
             for fty in fields {
@@ -112,20 +111,11 @@ pub fn layout_of_ssa(ty: &SsaType, target: TargetInfo) -> Result<Layout, LayoutE
         // Enums/sum types: Simple tagged union:
         SsaType::Enum { variants, .. } => Ok(enum_layout_of_ssa(variants, target)?.layout),
 
-        SsaType::I128 => Ok(Layout {
-            size: 16,
-            align: 16,
-        }),
+        SsaType::I128 => Ok(Layout { size: 16, align: 8 }),
         SsaType::Isize => Ok(Layout { size: 8, align: 8 }),
         SsaType::Usize => Ok(Layout { size: 8, align: 8 }),
-        SsaType::String => Ok(Layout {
-            size: 16,
-            align: 16,
-        }),
-        SsaType::U128 => Ok(Layout {
-            size: 16,
-            align: 16,
-        }),
+        SsaType::String => Ok(Layout { size: 16, align: 8 }),
+        SsaType::U128 => Ok(Layout { size: 16, align: 8 }),
         SsaType::Pointer(_, _) => Ok(Layout {
             size: target.ptr_bytes as usize,
             align: target.ptr_bytes as usize,

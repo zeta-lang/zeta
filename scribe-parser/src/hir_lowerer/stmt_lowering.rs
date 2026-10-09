@@ -396,19 +396,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         });
 
-        let else_block = l.else_block.map(|block| {
-            // `? else` is only legal when final_type (or the catch-unwrapped type) is nullable.
-            /*
-            if final_type.inner_if_nullable().is_none() {
-                self.ctx
-                    .diag
-                    .borrow_mut()
-                    .record_error("`? else` used on a non-nullable type", l.span);
-            }
-            */
-            self.ctx.bump.alloc_value_immutable(self.lower_block(block))
-        });
-
         self.ctx
             .variable_types
             .borrow_mut()
@@ -421,7 +408,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             mutable: l.mutable,
             is_static: l.is_static,
             catch_pattern,
-            else_block,
             span: l.span,
             manual: l.manual,
         }

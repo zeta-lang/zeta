@@ -1,8 +1,4 @@
-use ir::{
-    borrow_checker::LoanId,
-    errors::type_error::TypeErrorKind,
-    hir::{HirExpr, StrId},
-};
+use ir::{borrow_checker::LoanId, errors::type_error::TypeErrorKind, hir::StrId};
 
 use crate::{TypeChecker, auto_traits::AutoTrait, str_id_to_string};
 
@@ -34,17 +30,6 @@ pub struct ObState {
     pub holder: Holder,
 }
 
-/// Handle returned by `begin_obligation_branch`.
-pub struct ObligationBranch {
-    pub(crate) base_len: usize,
-    pub(crate) base: Vec<ObState>,
-}
-
-/// Obligation state at the end of one arm of a branch.
-pub struct ObligationArm {
-    pub(crate) states: Vec<ObState>,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct CalleeConcurrency {
     /// (normal param index, Send/Sync bounds on that param's generic type)
@@ -61,29 +46,6 @@ pub struct SuspensionReport {
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
-    /// Takes the loans that the argument holds out of the "ends with the call" bookkeeping.
-    fn detach_arg_loans(&mut self, arg: &HirExpr<'a, 'bump>) -> Vec<LoanId> {
-        match arg {
-            HirExpr::Lambda { .. } => self
-                .closure_loans
-                .remove(&Self::expr_key(arg))
-                .unwrap_or_default(),
-            HirExpr::Ident(name, _) => {
-                let owned: Vec<LoanId> = self
-                    .loan_owners
-                    .iter()
-                    .filter(|(_, o)| **o == *name)
-                    .map(|(l, _)| *l)
-                    .collect();
-                for l in &owned {
-                    self.loan_owners.remove(l);
-                }
-                owned
-            }
-            _ => Vec::new(),
-        }
-    }
-
     /// NLL expiry must skip pinned loans: they end by discharge, never by liveness.
     pub fn is_loan_pinned(&self, id: LoanId) -> bool {
         self.pinned_loans.contains(&id)

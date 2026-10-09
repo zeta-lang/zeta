@@ -89,14 +89,6 @@ where
             None
         };
 
-        let else_block = if self.cursor.consume(TokenKind::Question) {
-            self.cursor.expect(TokenKind::Else)?;
-            let block = self.parse_block()?;
-            Some(self.bump.alloc_value_immutable(block))
-        } else {
-            None
-        };
-
         self.cursor.consume(TokenKind::Semicolon);
 
         let let_stmt = LetStmt {
@@ -106,7 +98,6 @@ where
             mutable: is_mut,
             is_static,
             catch_pattern,
-            else_block,
             span: token.span,
             manual: is_manual,
         };
@@ -127,14 +118,6 @@ where
             None
         };
 
-        let else_block = if self.cursor.consume(TokenKind::Question) {
-            self.cursor.expect(TokenKind::Else)?;
-            let block = self.parse_block()?;
-            Some(self.bump.alloc_value_immutable(block))
-        } else {
-            None
-        };
-
         self.cursor.consume(TokenKind::Semicolon);
 
         let let_stmt = LetStmt {
@@ -144,7 +127,6 @@ where
             mutable,
             is_static: false,
             catch_pattern,
-            else_block,
             span,
             manual: is_manual,
         };

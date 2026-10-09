@@ -1,6 +1,7 @@
 use ir::{
     hir::{HirEnum, HirExpr, HirMatchArm, HirPattern, HirStmt, StrId},
     ir_conversion::lower_type_hir,
+    ir_hasher::HashMap,
     layout::TargetInfo,
     span::SourceSpan,
     ssa_ir::{BinOp, BlockId, Instruction, Operand, SsaType, Value},
@@ -31,10 +32,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
             HirPattern::Array(elems) => {
                 let SsaType::Array(elem_ty, _) = scrutinee_ty.expect(
-                "[lower_pattern_test] array pattern has no scrutinee type; the type checker should have caught this"
-            ) else {
-                panic!("[lower_pattern_test] array pattern used on a non-array scrutinee");
-            };
+                    "[lower_pattern_test] array pattern has no scrutinee type; the type checker should have caught this"
+                ) else {
+                    panic!("[lower_pattern_test] array pattern used on a non-array scrutinee");
+                };
                 let elem_ty = (**elem_ty).clone();
                 let elem_size = ir::layout::sizeof_ssa(&elem_ty, TargetInfo { ptr_bytes: 8 })
                     .expect("[lower_pattern_test] array element type has no known size")
@@ -123,6 +124,23 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 );
             });
                 let hir_enum = self.resolve_enum_for_variant(enum_name);
+                let variant_types: Vec<Vec<SsaType>> = hir_enum
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        v.fields
+                            .iter()
+                            .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
+                            .collect()
+                    })
+                    .collect();
+
+                let enum_layout =
+                    ir::layout::enum_layout_of_ssa(&variant_types, TargetInfo { ptr_bytes: 8 })
+                        .unwrap_or_else(|e| {
+                            panic!("failed to compute layout for error enum: {:?}", e)
+                        });
+
                 let (expected_tag, variant_def) = hir_enum
                     .variants
                     .iter()
@@ -160,6 +178,8 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
                 let target = TargetInfo { ptr_bytes: 8 };
                 let mut cursor = 0usize;
+
+                let payload_offset = enum_layout.payload_offset;
                 for vf in variant_def.fields.iter() {
                     let field_ssa_ty = lower_type_hir(&vf.field_type, self.enums, self.structs);
                     let align = ir::layout::alignof_ssa(&field_ssa_ty, target).unwrap_or(8);
@@ -172,13 +192,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                             self.emit(Instruction::FieldAddr {
                                 dest: field_val,
                                 base: Operand::Value(scrutinee),
-                                offset: 8 + cursor,
+                                offset: payload_offset + cursor,
                             });
                         } else {
                             self.emit(Instruction::LoadField {
                                 dest: field_val,
                                 base: Operand::Value(scrutinee),
-                                offset: 8 + cursor,
+                                offset: payload_offset + cursor,
                             });
                         }
                         self.current_block_data
@@ -567,12 +587,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     }
                 } else {
                     let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
-                    panic!(
-                        "[bind_pattern] `{}` is neither a known struct nor is the scrutinee ({:?}) \
-                         an enum",
-                        name, scrutinee_ty
-                    );
-                });
+                        panic!(
+                            "[bind_pattern] `{}` is neither a known struct nor is the scrutinee ({:?}) \
+                             an enum",
+                            name, scrutinee_ty
+                        );
+                    });
 
                     let hir_enum = self.resolve_enum_for_variant(enum_name);
                     let variant_def = hir_enum
@@ -585,6 +605,24 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                 enum_name, name
                             )
                         });
+
+                    let variant_types: Vec<Vec<SsaType>> = hir_enum
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            v.fields
+                                .iter()
+                                .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
+                                .collect()
+                        })
+                        .collect();
+
+                    let enum_layout =
+                        ir::layout::enum_layout_of_ssa(&variant_types, TargetInfo { ptr_bytes: 8 })
+                            .unwrap_or_else(|e| {
+                                panic!("failed to compute layout for error enum: {:?}", e)
+                            });
+                    let payload_offset = enum_layout.payload_offset;
 
                     // Compute per-field payload offsets (tag occupies the first 8 bytes).
                     let target = TargetInfo { ptr_bytes: 8 };
@@ -603,13 +641,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                                 self.emit(Instruction::FieldAddr {
                                     dest: field_val,
                                     base: Operand::Value(scrutinee),
-                                    offset: 8 + cursor,
+                                    offset: payload_offset + cursor,
                                 });
                             } else {
                                 self.emit(Instruction::LoadField {
                                     dest: field_val,
                                     base: Operand::Value(scrutinee),
-                                    offset: 8 + cursor,
+                                    offset: payload_offset + cursor,
                                 });
                             }
                             self.current_block_data
@@ -685,7 +723,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 }
             }
             HirPattern::Tuple(elems) => {
-                // Mirror the same offset arithmetic used in lower_tuple_expr.
                 let field_types: Vec<SsaType> = match scrutinee_ty {
                     Some(SsaType::Tuple(fs)) => fs.clone(),
                     _ => vec![SsaType::I64; elems.len()],
@@ -743,6 +780,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         span: SourceSpan<'a>,
         expected: Option<&SsaType>,
     ) -> Value {
+        let mut live_vars: Vec<(BlockId, HashMap<StrId, Value>)> = Vec::new();
         let scrutinee_val = self.lower_expr(scrutinee);
         let scrutinee_ty = self
             .current_block_data
@@ -808,7 +846,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         func: Operand::FunctionRef(abort_fn),
                         args: SmallVec::new(),
                     });
-                    self.emit(Instruction::Ret { value: None }); // unreachable; abort() doesn't return
+                    // unreachable; abort() doesn't return
+                    // TODO: replace with a panic
+                    self.emit(Instruction::Ret { value: None });
                 }
                 (None, _) => {
                     self.emit(Instruction::Jump { target: body_bb });
@@ -835,7 +875,14 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             if !self.block_terminated() {
                 self.emit_scope_drops(&arm_scope, span);
                 live_drop.push(self.drop_state.clone());
-                let arm_end_bb = self.current_block_data.current_block; // read after the drops
+                let arm_end_bb = self.current_block_data.current_block;
+                let vars: HashMap<StrId, Value> = self
+                    .var_map
+                    .iter()
+                    .filter(|(k, _)| vars_before.contains_key(*k))
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                live_vars.push((arm_end_bb, vars));
                 self.emit(Instruction::Jump { target: merge_bb });
                 incoming.push((arm_end_bb, arm_val));
                 any_reachable = true;
@@ -854,6 +901,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         self.current_block_data.push_block(merge_bb);
         self.current_block_data.switch_to(merge_bb);
+        self.merge_var_maps(live_vars);
         if let Some(j) = DropMoveState::join_all(live_drop) {
             self.drop_state = j;
         }

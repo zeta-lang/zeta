@@ -7,7 +7,7 @@ use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation,
 use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap};
-use ir::layout::{Layout, TargetInfo, layout_of_ssa, sizeof_ssa};
+use ir::layout::{Layout, TargetInfo, alignof_ssa, layout_of_ssa, round_up_to_align, sizeof_ssa};
 use ir::span::SourceSpan;
 use ir::ssa_ir::{
     AllocatorKind, BinOp, BlockId, Instruction, IntrinsicOp, Operand, SsaType, Value, cast_kind,
@@ -1110,6 +1110,78 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         }
     }
 
+    fn emit_tagged_nullable_drop<R: AllocatorResolver>(
+        &mut self,
+        inner: &DropKind<'a, 'bump>,
+        inner_ty: &HirType<'a, 'bump>,
+        slot: Value,
+        resolver: &mut R,
+        span: SourceSpan<'a>,
+    ) {
+        if !inner.is_droppable() {
+            return;
+        }
+        let inner_ssa = lower_type_hir(inner_ty, self.enums, self.structs);
+        let payload_align =
+            alignof_ssa(&inner_ssa, TargetInfo { ptr_bytes: 8 }).unwrap_or_else(|e| {
+                panic!("emit_tagged_nullable_drop: no alignment for payload: {e:?}")
+            });
+        let payload_offset = round_up_to_align(1, payload_align);
+
+        let tag = self.current_block_data.fresh_value();
+        self.emit(Instruction::LoadField {
+            dest: tag,
+            base: Operand::Value(slot),
+            offset: 0,
+        });
+        self.current_block_data.value_types.insert(tag, SsaType::U8);
+
+        let zero = self.current_block_data.fresh_value();
+        self.emit(Instruction::Const {
+            dest: zero,
+            ty: SsaType::U8,
+            value: Operand::ConstInt(0),
+        });
+        self.current_block_data
+            .value_types
+            .insert(zero, SsaType::U8);
+
+        let is_null = self.current_block_data.fresh_value();
+        self.emit(Instruction::Binary {
+            dest: is_null,
+            op: BinOp::Eq,
+            left: Operand::Value(tag),
+            right: Operand::Value(zero),
+        });
+        self.current_block_data
+            .value_types
+            .insert(is_null, SsaType::Bool);
+
+        let drop_bb = self.current_block_data.new_block();
+        let after_bb = self.current_block_data.new_block();
+        self.emit(Instruction::Branch {
+            cond: Operand::Value(is_null),
+            then_bb: after_bb,
+            else_bb: drop_bb,
+        });
+
+        self.current_block_data.switch_to(drop_bb);
+        let payload_addr = self.current_block_data.fresh_value();
+        self.emit(Instruction::FieldAddr {
+            dest: payload_addr,
+            base: Operand::Value(slot),
+            offset: payload_offset,
+        });
+        self.current_block_data.value_types.insert(
+            payload_addr,
+            SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, Box::new(inner_ssa)),
+        );
+        // the payload is an element at an address, same as a struct field
+        self.emit_element_drop(inner, payload_addr, resolver, span);
+        self.emit(Instruction::Jump { target: after_bb });
+        self.current_block_data.switch_to(after_bb);
+    }
+
     /// `if val != null { drop(inner) }` for a pointer-optimized `?T` value.
     pub fn emit_nullable_drop<R: AllocatorResolver>(
         &mut self,
@@ -1127,8 +1199,21 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         let Some(ty) = self.current_block_data.value_types.get(&val).cloned() else {
             return;
         };
-        // Tagged nullables (`?Struct`, `?i32`, ...) aren't handled yet: the tag layout
-        // needs a LoadField + compare here. They leak.
+
+        // Tag-based nullable: `val` is the slot address, either typed as the
+        // nullable itself or as a pointer to it (an element address).
+        let is_tagged_slot = match &ty {
+            SsaType::Nullable(p) => !p.is_pointer(),
+            SsaType::Pointer(_, b) => {
+                matches!(b.as_ref(), SsaType::Nullable(p) if !p.is_pointer())
+            }
+            _ => false,
+        };
+        if is_tagged_slot {
+            self.emit_tagged_nullable_drop(inner, inner_ty, val, resolver, span);
+            return;
+        }
+
         let Some(pointee) = ty.nullable_pointer_repr().cloned() else {
             return;
         };
@@ -1453,7 +1538,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                     continue;
                 }
                 let Some(kind) = f.field_type.try_drop_kind_with(node_default_alloc) else {
-                    continue; // no allocator resolvable: leak instead of panic
+                    panic!("No resolveable allocator found for {node_default_alloc:?}.")
                 };
                 if !kind.is_droppable() {
                     continue;
@@ -1713,7 +1798,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             }
             let default_alloc = self.field_default_alloc(struct_name, field);
             let Some(kind) = field.field_type.try_drop_kind_with(default_alloc) else {
-                continue; // unresolvable allocator: leak rather than guess
+                panic!("No resolveable allocator found for {default_alloc:?}.")
             };
             if !kind.is_droppable() {
                 continue;

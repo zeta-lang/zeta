@@ -27,7 +27,7 @@ impl Instant {
         };
 
         if (result != 0) {
-            // This should eventually become a proper TimeError.
+            // TODO: This should eventually become a proper TimeError.
             debug.debug_panic("clock_gettime(CLOCK_MONOTONIC) failed");
         }
 

@@ -84,13 +84,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             else_bb: false_bb,
         });
 
-        // RHS
         self.current_block_data.switch_to(rhs_bb);
         let rhs = self.lower_expr_scoped(right);
         let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 
-        // FALSE
         self.current_block_data.switch_to(false_bb);
         let false_val = self.current_block_data.fresh_value();
 
@@ -102,7 +100,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         self.emit(Instruction::Jump { target: merge_bb });
 
-        // MERGE
         self.current_block_data.switch_to(merge_bb);
 
         let result = self.current_block_data.fresh_value();
@@ -136,7 +133,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             else_bb: rhs_bb,
         });
 
-        // TRUE
         self.current_block_data.switch_to(true_bb);
 
         let true_val = self.current_block_data.fresh_value();
@@ -149,13 +145,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         self.emit(Instruction::Jump { target: merge_bb });
 
-        // RHS
         self.current_block_data.switch_to(rhs_bb);
         let rhs = self.lower_expr_scoped(right);
         let rhs_end = self.current_block_data.current_block;
         self.emit(Instruction::Jump { target: merge_bb });
 
-        // MERGE
         self.current_block_data.switch_to(merge_bb);
 
         let result = self.current_block_data.fresh_value();
@@ -209,7 +203,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
         };
 
-        // `null == null`
         if ty == SsaType::Null {
             let v = self.current_block_data.fresh_value();
             self.emit(Instruction::Const {
@@ -229,7 +222,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             None
         };
 
-        if let Some(pointee) = pointee {
+        if let Some(_pointee) = pointee {
             let val = match src {
                 Src::Val(v) => v,
                 Src::Addr(a) => {
@@ -285,7 +278,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             return cmp;
         }
 
-        // Legacy fallback: compare the raw value against 0.
         let val = match src {
             Src::Val(v) => v,
             Src::Addr(a) => {

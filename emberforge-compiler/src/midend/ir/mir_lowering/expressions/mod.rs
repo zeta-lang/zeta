@@ -206,11 +206,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         object: &HirExpr<'a, 'bump>,
         index: &HirExpr<'a, 'bump>,
     ) -> Value {
-        println!(
-            "[INDEX_ADDR] object={:?}, index={:?}, unsafe_depth={}",
-            object, index, self.unsafe_depth
-        );
-
         if let HirExpr::Range {
             start,
             end,
@@ -511,8 +506,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             }
             _ => return,
         };
-        // Structs only: `drop_kind_for_ssa_type` answers from the *expression* for other
-        // types, which for an owned-pointer local would free the pointer itself, not its pointee.
         if !matches!(pointee, SsaType::User(..)) {
             return;
         }

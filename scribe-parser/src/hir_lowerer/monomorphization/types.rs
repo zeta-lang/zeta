@@ -590,9 +590,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         ty: HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
         let HirType::Enum {
-            name,
-            type_args,
-            variants: _,
+            name, type_args, ..
         } = &ty
         else {
             return ty;
@@ -600,12 +598,19 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         if type_args.is_empty() {
             return ty;
         }
+
+        let normalized: Vec<HirType> = type_args
+            .iter()
+            .map(|a| self.instantiate_type_recursively(*a, Default::default()))
+            .collect();
+        let normalized = self.bump.alloc_slice(&normalized);
+
         let Some(new_enum) = instantiate_enum_for_types(
             self.ctx,
             &self.instantiated_enums,
             &self.instantiated_enum_origins,
             *name,
-            type_args,
+            normalized,
             &self.bump,
         ) else {
             return ty;

@@ -135,7 +135,7 @@ impl CraneliftBackend {
                 .unwrap_or_else(|e| panic!("static `{}`: no layout: {:?}", sym, e));
             let id = self
                 .module
-                .declare_data(&sym, Linkage::Local, true, false) // writable, NOT tls
+                .declare_data(&sym, Linkage::Local, true, false)
                 .unwrap_or_else(|e| panic!("declare static {}: {:?}", sym, e));
             let mut d = DataDescription::new();
             let size = l.size.max(1);
@@ -215,7 +215,6 @@ impl CraneliftBackend {
         if let Some(f) = self.func_ids.get(&name) {
             return *f;
         }
-        // debug_panic(msg: str) -> void ; str is a pointer-sized value
         let mut sig = Signature::new(self.module.isa().default_call_conv());
         sig.params.push(AbiParam::new(types::I64));
         let fid = self
@@ -226,8 +225,6 @@ impl CraneliftBackend {
         fid
     }
 
-    /// Return a zero/default value of the function's return type (used after a
-    /// panic call, and for blocks that fall off the end).
     fn emit_zero_return(&mut self, builder: &mut FunctionBuilder, func: &Function) {
         if func.ret_type != SsaType::Void && Self::is_aggregate_ty(&func.ret_type) {
             let p = builder.use_var(self.current_sret_var.expect("sret var missing"));
@@ -253,8 +250,6 @@ impl CraneliftBackend {
         }
     }
 
-    /// If `cond` is true at runtime: call debug_panic(msg) and return.
-    /// Otherwise fall through in a fresh block. Never emits a trap.
     fn guard_or_panic(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -547,7 +542,6 @@ impl CraneliftBackend {
                     }
                 };
 
-                // Evaluate real values first so we can see their actual clif types.
                 let mut l_val = match left {
                     Operand::Value(v) => {
                         Some(builder.use_var(*var_map.get(v).expect("binary left undefined")))
@@ -703,10 +697,24 @@ impl CraneliftBackend {
                         BinOp::LogicalOr => unreachable!(),
                     }
                 };
-                let ty = func.value_types.get(dest).unwrap_or_else(|| {
-                    panic!("Could not find a value type for {dest:?}, op: {op:?}, {left:?}, {right:?} cranelift backend info: \ncurrent_sret_var: {:?} \nfunc_param_types: {:#?} \nfunc_ret_types: {:#?}", self.current_sret_var, self.func_param_types, self.func_ret_types)
-                });
-                let clif_ty = clif_type(ty);
+                let res_ty = builder.func.dfg.value_type(res);
+
+                // Binary instructions can temporarily lack an entry in func.value_types
+                // (notably comparison results produced by lowering). The Cranelift result
+                // already carries the authoritative machine type, so use it as a fallback
+                // instead of crashing after successfully emitting the instruction.
+                let clif_ty = match func.value_types.get(dest) {
+                    Some(ty) => clif_type(ty),
+                    None => {
+                        eprintln!(
+                            "WARNING [Binary]: missing SSA value type for {dest:?} \
+                            ({op:?}); using actual Cranelift result type {:?}. \
+                            This indicates an upstream IR type-map bug.",
+                            res_ty,
+                        );
+                        res_ty
+                    }
+                };
 
                 let res_ty = builder.func.dfg.value_type(res);
 
@@ -1712,7 +1720,7 @@ impl CraneliftBackend {
 
                     IntrinsicOp::TypeName => {
                         let ty: &SsaType = query_ty.as_ref().expect("TypeName requires query_ty");
-                        let name = format!("{:?}", ty); // TODO: SsaType has no Display
+                        let name = format!("{}", ty);
                         let interned = self.context.intern(&name);
                         let did = self.get_or_create_string(&StrId(interned));
                         let gv = self.module.declare_data_in_func(did, &mut builder.func);
@@ -2238,11 +2246,11 @@ impl CraneliftBackend {
         id
     }
 
-    fn emit_main_wrapper(&mut self, zeta_main_fid: FuncId) {
+    fn emit_main_wrapper(&mut self, zeta_main_fid: FuncId, args_init_fid: FuncId) {
         let mut sig = Signature::new(self.module.isa().default_call_conv());
         sig.params.push(AbiParam::new(types::I32)); // argc
-        sig.params.push(AbiParam::new(types::I64)); // argv (pointer)
-        sig.returns.push(AbiParam::new(types::I32)); // return int
+        sig.params.push(AbiParam::new(self.addr_type())); // argv
+        sig.returns.push(AbiParam::new(types::I32));
 
         let main_fid = self
             .module
@@ -2262,19 +2270,34 @@ impl CraneliftBackend {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
 
+        let argc = builder.block_params(entry)[0];
+        let argv = builder.block_params(entry)[1];
+
+        let argc_usize = builder.ins().uextend(self.addr_type(), argc);
+
+        // Call zeta::sys::args::init(argc, argv)
+        let init_ref = self
+            .module
+            .declare_func_in_func(args_init_fid, &mut builder.func);
+
+        builder.ins().call(init_ref, &[argc_usize, argv]);
+
         let zeta_main_ref = self
             .module
             .declare_func_in_func(zeta_main_fid, &mut builder.func);
+
         let call = builder.ins().call(zeta_main_ref, &[]);
 
-        let results: Vec<cranelift_codegen::ir::Value> = builder.inst_results(call).to_vec();
-        let ret_val = if !results.is_empty() {
-            builder.ins().ireduce(types::I32, results[0])
+        let results = builder.inst_results(call);
+
+        let ret_val = if let Some(&result) = results.first() {
+            builder.ins().ireduce(types::I32, result)
         } else {
             builder.ins().iconst(types::I32, 0)
         };
 
         builder.ins().return_(&[ret_val]);
+
         builder.seal_all_blocks();
         builder.finalize();
 
@@ -2431,8 +2454,14 @@ impl Backend for CraneliftBackend {
                     .expect("main function missing from module");
                 self.emit_function(main_func);
 
+                let args_init_name = StrId::from_static("zeta_sys_args_init");
+                let args_init_fid = *self
+                    .func_ids
+                    .get(&args_init_name)
+                    .expect("zeta_sys_args_init was not declared");
+
                 let fid = self.func_ids[&zeta_main_name];
-                self.emit_main_wrapper(fid);
+                self.emit_main_wrapper(fid, args_init_fid);
                 self.main_emitted = true;
             }
         }

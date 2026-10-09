@@ -953,7 +953,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
         }
 
-        //let named = self.ctx.named_imports.borrow().get(&name).copied();
         let imports = self.ctx.imported_modules.borrow();
 
         for module_idx in imports.values().copied() {

@@ -1,0 +1,13 @@
+package zeta::sys::args;
+
+static let mut ARGC: usize = 0;
+static let mut ARGV: [*]const [*]const u8 = null;
+
+public func init(argc: usize, argv: [*]const [*]const u8) {
+    ARGC = argc;
+    ARGV = argv;
+}
+
+public func argc(): usize { return ARGC; }
+
+public func argv_at(i: usize): [*]const u8 { return unsafe { ARGV[i] }; }

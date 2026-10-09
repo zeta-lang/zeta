@@ -74,3 +74,8 @@ extern "C" func getrandom(
     buflen: usize,
     flags: u32
 ): isize;
+
+extern "C" func strlen(s: [*]const u8): usize;
+
+// Returns null if the variable is not set.
+extern "C" func getenv(name: [*]const u8): ?[*]const u8;

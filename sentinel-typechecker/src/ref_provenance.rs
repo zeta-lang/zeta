@@ -12,8 +12,8 @@ use ir::{
 };
 
 use crate::{
-    naming::provenance_to_string, ref_effects::UsedIndex, str_id_to_string, TypeChecker,
-    TypeContext,
+    TypeChecker, TypeContext, naming::provenance_to_string, ref_effects::UsedIndex,
+    str_id_to_string,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -139,6 +139,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    fn peel_unsafe_block<'e>(e: &'e HirExpr<'a, 'bump>) -> &'e HirExpr<'a, 'bump> {
+        if let HirExpr::Block {
+            body,
+            is_unsafe: true,
+            ..
+        } = e
+        {
+            if let [HirStmt::Expr(inner)] = body {
+                return Self::peel_unsafe_block(inner);
+            }
+        }
+        e
+    }
+
     pub fn build_ref_template(func: &HirFunc<'a, 'bump>) -> RefTemplate {
         let Some(params) = func.params else {
             return RefTemplate::Opaque;
@@ -164,7 +178,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let [HirStmt::Return(Some(ret_expr), _span)] = body else {
             return RefTemplate::Opaque;
         };
-        let (expr, ref_kind) = match ret_expr {
+        let (expr, ref_kind) = match Self::peel_unsafe_block(ret_expr) {
             HirExpr::Ref {
                 expr,
                 ref_kind: mutable,
@@ -383,6 +397,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                     s.push(']');
                 }
+                UsedIndex::Dynamic => s.push_str("[?]"),
             }
         }
         s

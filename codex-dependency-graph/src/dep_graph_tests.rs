@@ -799,7 +799,6 @@ mod tests {
             value: value_expr,
             mutable: false,
             catch_pattern: None,
-            else_block: None,
             is_static: false,
             span: dummy_span(),
             manual: false,

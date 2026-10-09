@@ -2,6 +2,8 @@ package zeta::string;
 
 import zeta::io_channel.WriteChannel;
 import zeta::io_error.IOError;
+import zeta::libc;
+import zeta::debug;
 import zeta::utils::mallocator.Mallocator;
 import zeta::alloc::allocator.Allocator;
 import zeta::utils::array_list.ArrayList;
@@ -19,6 +21,31 @@ impl<A: Allocator = Mallocator> String<A> {
         let mut heap_string: String<Mallocator> = String.with_capacity_in<Mallocator>(string.len() + 16, alloc);
         heap_string.push_str(string);
         return heap_string;
+    }
+    /// Copies a NUL-terminated C string into a new `String`.
+    /// Fails if the bytes are not valid UTF-8.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and point to a NUL-terminated buffer
+    /// that stays valid for the duration of the call.
+    unsafe func from_cstr(ptr: [*]const u8): Result<String<Mallocator>, Utf8ConversionError> {
+        let len: usize = libc.strlen(ptr);
+        let bytes: &[]u8 = ptr[0..<len];
+
+        match (str.from_utf8(bytes)) {
+            case Result.Ok { value } -> {
+                return Result.Ok { value: String.from<Mallocator>(value) };
+            },
+            case Result.Err { error } -> {
+                return Result.Err { error };
+            },
+        }
+    }
+
+    unsafe func from_cstr_unchecked(ptr: [*]const u8): String<Mallocator> {
+        let len: usize = libc.strlen(ptr);
+        let bytes: &[]u8 = ptr[0..<len];
+        return String.from<Mallocator>(str.from_utf8_unchecked(bytes));
     }
     func with_capacity(capacity: usize): String<Mallocator> {
         let alloc: Mallocator = Mallocator {};

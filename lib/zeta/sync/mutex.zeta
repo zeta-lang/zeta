@@ -8,11 +8,13 @@ struct Mutex<T> {
     value: T,
 }
 
-unsafe impl<T> Mutex<T> by Send {}
-unsafe impl<T> Mutex<T> by Sync {}
+// Locking hands `T` to whichever thread gets the lock, so `T` must be `Send`.
+unsafe impl<T: Send> Mutex<T> by Send {}
+unsafe impl<T: Send> Mutex<T> by Sync {}
 
 struct MutexGuard<T> {
     mutex: &alias Mutex<T>,
+    ptr: [*]mut T,
 }
 
 impl<T> Mutex<T> {
@@ -31,17 +33,16 @@ impl<T> Mutex<T> {
         if (libc.pthread_mutex_lock(&alias this.raw as [*]mut libc.PthreadMutex) != 0) {
             libc.abort();
         }
-        return MutexGuard<T> {
-            mutex: this,
-        };
+        // only formed once the lock is held
+        let ptr: [*]mut T = &alias this.value as [*]mut T;
+        return MutexGuard<T> { mutex: this, ptr: ptr };
     }
 
     /// Returns null if the lock is already held.
     func try_lock(&alias this): ?MutexGuard<T> {
         if (libc.pthread_mutex_trylock(&alias this.raw as [*]mut libc.PthreadMutex) == 0) {
-            return MutexGuard<T> {
-                mutex: this,
-            };
+            let ptr: [*]mut T = &alias this.value as [*]mut T;
+            return MutexGuard<T> { mutex: this, ptr: ptr };
         }
         return null;
     }
@@ -55,21 +56,21 @@ impl<T> Mutex<T> by Drop {
 
 impl<T> MutexGuard<T> {
     func get(&this): &T {
-        return &this.mutex.value;
+        return unsafe { &(*this.ptr) };
     }
 
     func get_mut(&mut this): &mut T {
-        return &mut this.mutex.value;
+        return unsafe { &mut (*this.ptr) };
     }
 
     func set(&mut this, value: T) {
-        this.mutex.value = value;
+        *this.get_mut() = value;
     }
 }
 
 impl<T> MutexGuard<T> by Drop {
     func drop(mut this) {
-        if (libc.pthread_mutex_unlock(&mut this.mutex.raw as [*]mut libc.PthreadMutex) != 0) {
+        if (libc.pthread_mutex_unlock(&alias this.mutex.raw as [*]mut libc.PthreadMutex) != 0) {
             libc.abort();
         }
     }

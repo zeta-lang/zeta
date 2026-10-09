@@ -70,7 +70,7 @@ impl isize by ToString { func to_string(&this): String<Mallocator> { return i64_
 
 impl bool by ToString {
     func to_string(&this): String<Mallocator> {
-        if (*this) { return String.from("true"); } // line 73
+        if (*this) { return String.from("true"); }
         return String.from("false");
     }
 }

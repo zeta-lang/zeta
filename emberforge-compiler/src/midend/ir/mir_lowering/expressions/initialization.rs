@@ -164,7 +164,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .map(|f| lower_type_hir(&f.field_type, self.enums, self.structs))
             .collect();
 
-        // (field name, lowered type, is ref/pointer field, lowered init value)
         let mut inits: Vec<(StrId, SsaType, bool, FieldInitVal)> = Vec::with_capacity(args.len());
         for arg in args {
             let idx = hir_struct

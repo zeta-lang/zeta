@@ -54,17 +54,12 @@ fn lower_type_hir_inner(
         HirType::Struct {
             name, field_types, ..
         } => {
-            // Already expanding this struct further up the stack: we're behind a
-            // pointer (the only legal way to recurse). Pointer layout never looks
-            // at the pointee's fields, so stop here.
             if in_progress.contains(name) {
                 let unmangled = structs.get(name).map(|s| s.unmangled_name).unwrap_or(*name);
                 return SsaType::User(*name, unmangled, Vec::new());
             }
 
             match structs.get(name).filter(|s| s.generics.is_none()) {
-                // Registry is authoritative: ignore whatever `field_types` the
-                // HirType happened to carry (often `&[]`).
                 Some(def) => {
                     in_progress.push(*name);
                     let mut fields = Vec::with_capacity(def.fields.len());
@@ -106,7 +101,7 @@ fn lower_type_hir_inner(
                 };
             }
             let hir_enum = enums.get(name).unwrap_or_else(|| {
-                println!("enums: {:#?}", enums.keys().collect::<Vec<_>>());
+                println!("enums: {:?}", enums.keys().collect::<Vec<_>>());
                 panic!(
                     "lower_type_hir: enum `{}` not found in registry, it must be \
                              registered (post-monomorphization, under its final concrete name) \

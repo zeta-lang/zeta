@@ -49,12 +49,12 @@ impl<T, A: Allocator + Clone = Mallocator> Arc<T, A> {
         return Arc<T, A> { inner: this.inner, alloc: this.alloc.clone() };
     }
 
-    func get_shared(&this): &T {
+    func get(&this): &T {
         let r: &T = unsafe { &(*this.inner).value };
         return r;
     }
 
-    func get(&alias this): &alias T {
+    func get_alias(&alias this): &alias T {
         let r: &alias T = unsafe { &alias (*this.inner).value };
         return r;
     }

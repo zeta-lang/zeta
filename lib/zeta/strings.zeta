@@ -216,16 +216,12 @@ impl str {
                 str.from_utf8_unchecked(bytes[offset..<bytes.len])
             };
 
+            let mut w: usize = 0;
             match (decode_utf8_first(remainder)) {
-                case Result.Ok { value } -> {
-                    offset += value.width;
-                },
-                case Result.Err { error } -> {
-                    return Result.Err {
-                        error: Utf8ConversionError {},
-                    };
-                },
+                case Result.Ok { value } -> { w = value.width; },
+                case Result.Err { error } -> { return Result.Err { error: Utf8ConversionError {} }; },
             }
+            offset += w;
         }
 
         unsafe {

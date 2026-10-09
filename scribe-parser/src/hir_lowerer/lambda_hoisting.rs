@@ -123,15 +123,10 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 is_static,
                 mutable,
                 catch_pattern,
-                else_block,
                 span,
                 manual,
             } => {
                 let new_value = self.rewrite_expr(value);
-                let new_else = else_block.map(|e| {
-                    let r = self.rewrite_stmt(*e);
-                    &*self.bump.alloc_value_immutable(r)
-                });
                 HirStmt::Let {
                     name,
                     ty,
@@ -139,7 +134,6 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     mutable,
                     is_static,
                     catch_pattern,
-                    else_block: new_else,
                     span,
                     manual,
                 }

@@ -769,6 +769,20 @@ impl BorrowChecker {
         }
     }
 
+    pub fn kill_local_storage(&mut self, local: StrId) {
+        let Some(&place) = self.local_places.get(&local) else {
+            return;
+        };
+        if let Some(&s) = self.place_storage.get(&place) {
+            self.invalidate_storage(s);
+        }
+    }
+
+    pub fn root_local_of(&self, place: PlaceId) -> Option<StrId> {
+        let root = self.place_roots.get(&place)?;
+        self.place_to_local.get(root).copied()
+    }
+
     pub fn reallocate_place(&mut self, place: PlaceId) {
         let old_storage = self.place_storage[&place];
         let new_storage = self.alloc_storage_id();

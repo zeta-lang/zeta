@@ -69,6 +69,12 @@ pub enum SymbolId {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum InvalidationCause {
+    Reallocated(StrId), // callee that may reallocate
+    Dropped(StrId),     // type whose Drop ran (e.g. MutexGuard)
+}
+
 pub type NonNullState = FxHashMap<StrId, HashSet<Vec<StrId>>>;
 
 pub struct TypeChecker<'a, 'bump> {
@@ -128,7 +134,7 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) current_fn: Option<StrId>,
     pub(crate) fn_invalidates: FxHashMap<StrId, Vec<Vec<StrId>>>, // paths relative to `this`
     pub(crate) fn_this_calls: FxHashMap<StrId, Vec<StrId>>,
-    pub(crate) invalidated_provenances: FxHashMap<ProvenanceId, StrId>,
+    pub(crate) invalidated_provenances: FxHashMap<ProvenanceId, InvalidationCause>,
     pub(crate) invalidation_cache: FxHashMap<(StrId, StrId), Vec<Vec<StrId>>>,
     pub(crate) callee_concurrency: FxHashMap<StrId, CalleeConcurrency>,
     pub(crate) borrow_obligations: Vec<BorrowObligation>,
@@ -148,6 +154,8 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) static_whole_target: Option<StrId>,
     pub(crate) static_assign_backfill: FxHashMap<usize, statics::StaticAssignInfo>,
     pub(crate) closure_static_uses: FxHashMap<usize, Vec<(StrId, bool)>>,
+    pub(crate) tail_expr_key: Option<usize>,
+    pub(crate) tail_borrows: Vec<StrId>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -228,6 +236,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             static_symbols: FxHashMap::default(),
             module_statics: FxHashMap::default(),
             closure_static_uses: FxHashMap::default(),
+            tail_expr_key: None,
+            tail_borrows: Vec::default(),
         }
     }
 
@@ -1033,14 +1043,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ty,
                 value,
                 mutable,
-                else_block,
                 span,
                 is_static: _,
                 catch_pattern: _,
                 ..
             } => {
                 self.set_span(*span);
-                let r = self.check_let_stmt(name, ty, value, mutable, else_block, span);
+                let r = self.check_let_stmt(name, ty, value, mutable, span);
                 match value {
                     HirExpr::Number(n, _) => {
                         self.const_locals.insert(*name, *n);

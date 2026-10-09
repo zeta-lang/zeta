@@ -105,7 +105,6 @@ where
     pub mutable: bool,
     pub is_static: bool,
     pub catch_pattern: Option<ErrorHandlerPattern<'a, 'bump>>,
-    pub else_block: Option<&'bump Block<'a, 'bump>>,
     pub span: SourceSpan<'a>,
     pub manual: bool,
 }
@@ -1324,10 +1323,13 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                 }
                 Ok(())
             }
-            TypeKind::OwnedPointer {
-                inner,
-                allocator: _, // TODO: unignore
-            } => write!(f, "^{}", inner),
+            TypeKind::OwnedPointer { inner, allocator } => {
+                write!(f, "^")?;
+                if let Some(allocator) = allocator {
+                    write!(f, "{} ", allocator)?;
+                }
+                write!(f, "{}", inner)
+            }
             TypeKind::Never => f.write_str("never"),
             TypeKind::Tuple { values: _ } => todo!(),
         }?;

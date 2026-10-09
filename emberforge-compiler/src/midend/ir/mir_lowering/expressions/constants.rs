@@ -112,16 +112,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .value_types
             .insert(obj, tuple_ty.clone());
 
-        // Compute field offsets using the same alignment rules as layout_of_ssa.
         let target = ir::layout::TargetInfo { ptr_bytes: 8 };
         let mut cursor = 0usize;
-        for (i, (val, fty)) in elem_vals.iter().enumerate() {
+        for (val, fty) in elem_vals.iter() {
             let falign = ir::layout::alignof_ssa(fty, target).unwrap_or(8);
-            // Round up cursor to field alignment.
             cursor = (cursor + falign - 1) & !(falign - 1);
 
             if Self::is_aggregate_ssa_type(fty) {
-                // Aggregate: copy via memcpy (store_init handles this).
                 let addr = self.current_block_data.fresh_value();
                 self.emit(Instruction::FieldAddr {
                     dest: addr,
@@ -148,7 +145,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
             let fsize = ir::layout::sizeof_ssa(fty, target).unwrap_or(8);
             cursor += fsize;
-            let _ = i; // suppress unused warning
         }
 
         obj

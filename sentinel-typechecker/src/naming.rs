@@ -23,7 +23,23 @@ pub fn operator_symbol(op: &Operator) -> String {
         BitXor => "^",
         ShiftLeft => "<<",
         ShiftRight => ">>",
-        _ => return format!("{:?}", op), // TODO finish
+        Assign => "=",
+        AddAssign => "+=",
+        SubtractAssign => "-=",
+        MultiplyAssign => "*=",
+        DivideAssign => "/=",
+        ModuloAssign => "%=",
+        BitAndAssign => "&=",
+        BitOrAssign => "|=",
+        BitXorAssign => "^=",
+        ShiftLeftAssign => "<<=",
+        ShiftRightAssign => ">>=",
+        BitNot => "~",
+        LogicalNot => "!",
+        DerefUnsafe => "*",
+        Deref => "*",
+        Ref => "&",
+        RefMut => "&mut",
     }
     .to_string()
 }

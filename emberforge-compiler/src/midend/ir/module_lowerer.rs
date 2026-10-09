@@ -178,7 +178,7 @@ where
         for &idx in compilation_order {
             for item in hir_modules[idx].items {
                 if let Hir::Struct(s) = item {
-                    self.register_struct(*s); // only insert + mangled_map entry
+                    self.register_struct(*s);
                 }
             }
         }

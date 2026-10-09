@@ -106,9 +106,6 @@ impl<'a> ErrorReporter<'a> {
                 self.print_diagnostic(&diagnostic);
             }
             CompilerError::ParserError(pe) => {
-                // DiagnosticError already renders its own context chain and
-                // notes via pretty(); reuse it rather than re-deriving a
-                // Diagnostic from a message string we don't have.
                 if self.use_colors {
                     eprintln!("{}", pe.pretty());
                 } else {

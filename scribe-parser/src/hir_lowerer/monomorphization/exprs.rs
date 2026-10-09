@@ -24,6 +24,24 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirExpr<'a, 'bump> {
         match expr {
+            HirExpr::OrElse {
+                value,
+                else_body,
+                span,
+            } => {
+                let new_value = self.monomorphize_expr(value, subs);
+
+                let new_else_body: Vec<HirStmt> = else_body
+                    .iter()
+                    .map(|stmt| self.monomorphize_stmt(stmt, subs))
+                    .collect();
+
+                HirExpr::OrElse {
+                    value: self.bump.alloc_value_immutable(new_value),
+                    else_body: self.bump.alloc_slice(&new_else_body),
+                    span: *span,
+                }
+            }
             HirExpr::EnumInit {
                 enum_name,
                 variant,
@@ -216,11 +234,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     }
                 }
 
-                // Handle calls to generic free functions via a module path,
-                // e.g. `threads.spawn(func() { ... })`.
-                // The HIR lowerer leaves such callees as ModuleAccess when the
-                // function is not a re-exported facade, so the monomorphizer
-                // must resolve and instantiate them here.
                 if let (HirExpr::ModuleAccess(acc), None) = (&**callee, type_args) {
                     if let Some(func_name) = self.resolve_module_access_function(acc) {
                         let maybe_func = self.functions.borrow().get(&func_name).cloned();
@@ -922,6 +935,32 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirExpr<'a, 'bump> {
         match expr {
+            HirExpr::OrElse {
+                value,
+                else_body,
+                span,
+            } => {
+                let new_value = self.monomorphize_expr(value, subs);
+
+                let new_else_body = if let Some((last, rest)) = else_body.split_last() {
+                    let mut body: Vec<HirStmt> = rest
+                        .iter()
+                        .map(|stmt| self.monomorphize_stmt(stmt, subs))
+                        .collect();
+
+                    body.push(self.monomorphize_stmt_with_expected_type(last, expected_ty, subs));
+
+                    self.bump.alloc_slice(&body)
+                } else {
+                    self.bump.alloc_slice(&[])
+                };
+
+                HirExpr::OrElse {
+                    value: self.bump.alloc_value_immutable(new_value),
+                    else_body: new_else_body,
+                    span: *span,
+                }
+            }
             HirExpr::Match {
                 expr: scrutinee,
                 arms,
@@ -1797,7 +1836,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 let HirType::Struct { name: env_name, .. } = bound_ty else {
                     continue;
                 };
-                // Only consider closure env structs.
                 if !self.env_structs.contains_key(env_name) {
                     continue;
                 }
@@ -1858,9 +1896,6 @@ fn field_allocator_annotation<'a, 'bump>(
     else {
         return None;
     };
-
-    // The only shape we know how to resolve here: `this.<field>`, a single
-    // Field segment off ThisRoot. Anything else means the annotation exists
 
     let (hir::ProvenanceRoot::ThisRoot, [hir::ProvenancePathSegment::Field(field_name)]) =
         (ann.root, ann.path)

@@ -19,6 +19,7 @@ use crate::{
     TypeChecker, closures,
     naming::{provenance_to_string, type_to_string},
     str_id_to_string,
+    type_checker::InvalidationCause,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -995,6 +996,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.collect_param_reads_expr(a, param_index, has_this, templates);
                 }
             }
+            HirExpr::OrElse {
+                value, else_body, ..
+            } => {
+                self.collect_param_reads_expr(value, param_index, has_this, templates);
+                for s in else_body.iter() {
+                    self.collect_param_reads_stmt(s, param_index, has_this, templates);
+                }
+            }
             HirExpr::Lambda { .. } => {
                 // TODO: not descending
                 // into closure bodies means a captured parameter used
@@ -1018,14 +1027,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         match stmt {
             HirStmt::Let {
                 value,
-                else_block,
                 catch_pattern,
                 ..
             } => {
                 self.collect_param_reads_expr(value, param_index, has_this, templates);
-                if let Some(b) = else_block {
-                    self.collect_param_reads_stmt(b, param_index, has_this, templates);
-                }
                 if let Some(pattern) = catch_pattern {
                     match pattern {
                         HirErrorHandlerPattern::Single { body, .. } => {
@@ -1301,18 +1306,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirExpr::UnknownIntrinsic { .. } => unimplemented!(),
             HirExpr::If { if_stmt, span: _ } => self.stmt_references_local(*if_stmt, local),
-            HirExpr::OrElse { value, else_body, span } => self.expr_references_local(value, local),
+            HirExpr::OrElse { value, else_body, .. } => {
+                self.expr_references_local(value, local) || else_body.iter().any(|b| self.stmt_references_local(b, local))
+            },
         }
     }
 
     pub fn stmt_references_local(&self, stmt: &HirStmt<'a, 'bump>, local: StrId) -> bool {
         match stmt {
-            HirStmt::Let {
-                value, else_block, ..
-            } => {
-                self.expr_references_local(value, local)
-                    || else_block.is_some_and(|b| self.stmt_references_local(b, local))
-            }
+            HirStmt::Let { value, .. } => self.expr_references_local(value, local),
             HirStmt::Return(Some(e), _) | HirStmt::Break(Some(e), _) => {
                 self.expr_references_local(e, local)
             }
@@ -1377,14 +1379,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         match stmt {
             HirStmt::Let {
                 value,
-                else_block,
                 catch_pattern,
                 ..
             } => {
                 self.collect_locals_used_expr(value);
-                if let Some(b) = else_block {
-                    self.collect_locals_used_stmt(b);
-                }
                 if let Some(pattern) = catch_pattern {
                     match pattern {
                         HirErrorHandlerPattern::Single { body, .. } => {
@@ -1583,7 +1581,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             | HirExpr::Uninit { .. }
             | HirExpr::Char(_, _) => {}
             HirExpr::UnknownIntrinsic { .. } => {}
-            HirExpr::OrElse { value, .. } => self.collect_locals_used_expr(value),
+            HirExpr::OrElse {
+                value, else_body, ..
+            } => {
+                self.collect_locals_used_expr(value);
+                for stmt in *else_body {
+                    self.collect_locals_used_stmt(stmt);
+                }
+            }
         }
     }
 
@@ -1619,7 +1624,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     /// Every live loan on `place` or anything beneath it now points at freed memory.
-    pub fn invalidate_loans_under(&mut self, place: PlaceId, cause: StrId) {
+    pub fn invalidate_loans_under(&mut self, place: PlaceId, cause: InvalidationCause) {
         let hit: Vec<ProvenanceId> = self
             .borrow_checker
             .active_loans
@@ -1632,7 +1637,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    pub fn invalidating_call_for(&self, prov: ProvenanceId) -> Option<StrId> {
+    pub fn invalidating_call_for(&self, prov: ProvenanceId) -> Option<InvalidationCause> {
         let mut stack = vec![prov];
         let mut seen: HashSet<ProvenanceId> = HashSet::default();
         while let Some(p) = stack.pop() {
@@ -1651,13 +1656,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_provenance_still_valid(&mut self, prov: Option<ProvenanceId>) {
         let Some(prov) = prov else { return };
-        if let Some(cause) = self.invalidating_call_for(prov) {
-            self.record(TypeErrorKind::Generic(format!(
+        let Some(cause) = self.invalidating_call_for(prov) else {
+            return;
+        };
+        let msg = match cause {
+            InvalidationCause::Reallocated(c) => format!(
                 "the reference's lifetime has ended because it was invalidated \
                  (`{}` may reallocate the memory it points into)",
-                str_id_to_string(cause)
-            )));
-        }
+                str_id_to_string(c)
+            ),
+            InvalidationCause::Dropped(t) => format!(
+                "the reference's lifetime has ended: the `{}` it was borrowed from \
+                 has been dropped (for a lock guard, the lock is released)",
+                str_id_to_string(t)
+            ),
+        };
+        self.record(TypeErrorKind::Generic(msg));
     }
 
     /// Type of `path` (a chain of struct fields) starting at struct `owner`.
@@ -1716,8 +1730,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         // `this.<path> = ...` where the field is an owned pointer: the old
         // allocation dies (same rule check_assignment_expr uses in-function).
         for (path, index) in &writes {
-            if index.is_none()
-                && !path.is_empty()
+            if index.is_some() {
+                continue; // element write, not a structural change
+            }
+            // `this.<p>.len = ..` on an owned slice changes its extent: invalidates `<p>`.
+            if path.len() >= 2 && path.last().is_some_and(|s| s.as_str() == "len") {
+                let prefix = path[..path.len() - 1].to_vec();
+                if matches!(
+                    self.field_type_at(owner, &prefix),
+                    Some(HirType::OwnedPointer { inner, .. }) if matches!(*inner, HirType::Slice(_))
+                ) && !out.contains(&prefix)
+                {
+                    out.push(prefix);
+                }
+                continue;
+            }
+            if !path.is_empty()
                 && matches!(
                     self.field_type_at(owner, path),
                     Some(HirType::OwnedPointer { .. })
@@ -1891,29 +1919,28 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ThisPassingKind::RefAlias => RefKind::Alias,
             _ => return,
         };
-        let Some((root, path)) = self.static_field_path(object) else {
-            return;
+        let held = match self.peek_type(object) {
+            HirType::Ref { ref_kind, .. } => ref_kind,
+            _ => {
+                let Some((root, _)) = self.static_field_path(object) else {
+                    return;
+                };
+                let Some(&k) = self.local_ref_kind.get(&root) else {
+                    return;
+                };
+                k
+            }
         };
-        let Some(&held) = self.local_ref_kind.get(&root) else {
-            return;
-        };
-        // Only trust the root's kind when we're projecting through owned fields,
-        // not through a reference-typed field.
-        if !path.is_empty()
-            && matches!(
-                self.peek_type(object),
-                HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
-            )
-        {
-            return;
-        }
         let ok = match (held, needed) {
             (RefKind::Unique, _) => true,
             (RefKind::Alias, RefKind::Alias) => true,
             _ => false,
         };
         if !ok {
-            let name = str_id_to_string(root);
+            let name = self
+                .static_field_path(object)
+                .map(|(r, _)| str_id_to_string(r))
+                .unwrap_or_else(|| "this value".into());
             let (has, wants) = (
                 match held {
                     RefKind::Shared => "`&`",

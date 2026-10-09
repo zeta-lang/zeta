@@ -147,6 +147,28 @@ fn main() -> Result<(), CompilerError<'static>> {
     }
 }
 
+fn installed_stdlib_path() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+
+    let installed_exe = home
+        .join(".local")
+        .join("bin")
+        .join("zeta-lang")
+        .canonicalize()
+        .ok()?;
+
+    let running_exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+
+    // Only use the installed stdlib when this is the installed compiler.
+    if running_exe != installed_exe {
+        return None;
+    }
+
+    let stdlib = home.join(".local").join("share").join("zeta").join("lib");
+
+    stdlib.is_dir().then_some(stdlib)
+}
+
 fn run_compiler<'a, 'bump>(
     path: Option<PathBuf>,
     out_dir: &PathBuf,
@@ -161,6 +183,8 @@ where
 {
     let stdlib_path = if let Some(custom) = lib_override {
         custom
+    } else if let Some(installed) = installed_stdlib_path() {
+        installed
     } else {
         compiler_lib_path()?
     };

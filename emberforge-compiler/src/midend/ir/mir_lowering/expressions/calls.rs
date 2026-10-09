@@ -57,7 +57,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             return self.lower_null_ssa(param_ty);
         }
 
-        // Literals/arithmetic take the payload type, not the nullable wrapper.
         let v = match arg {
             HirExpr::Number(..) | HirExpr::Binary { .. } => self.lower_expr_expected(arg, inner),
             _ => self.lower_expr(arg),
@@ -374,9 +373,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             (HirExpr::Ident(n, _), Some(SsaType::Pointer(..))) if self.is_static_name(n) => {
                 let (addr, ty) = self.lower_static_addr(*n).expect("static vanished");
                 if Self::is_aggregate_ssa_type(&ty) {
-                    obj_val // aggregates are already carried by address
+                    obj_val
                 } else {
-                    addr // scalar static: pass its real address, not a spilled copy
+                    addr // real address
                 }
             }
             _ => self.coerce_receiver_to_param(obj_val, param_types.first()),
@@ -408,9 +407,22 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         method: StrId,
         args: &[HirExpr<'a, 'bump>],
     ) -> Value {
-        let struct_key = self
+        let direct_name = self
             .resolve_static_receiver_struct_name(type_name, method)
-            .or_else(|| self.primitive_type_key(type_name))
+            .and_then(|struct_key| {
+                self.struct_mangled_map
+                    .get(&struct_key)
+                    .and_then(|mmap| mmap.get(&method))
+                    .copied()
+            })
+            .or_else(|| {
+                self.primitive_type_key(type_name).and_then(|struct_key| {
+                    self.struct_mangled_map
+                        .get(&struct_key)
+                        .and_then(|mmap| mmap.get(&method))
+                        .copied()
+                })
+            })
             .or_else(|| {
                 let type_module_idx = self
                     .module_named_imports
@@ -425,30 +437,37 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     &self.context,
                 );
 
-                if self.struct_mangled_map.contains_key(&mangled) {
-                    Some(mangled)
-                } else {
-                    self.struct_mangled_map
-                        .keys()
-                        .find(|k| **k == type_name)
-                        .copied()
+                self.struct_mangled_map
+                    .get(&mangled)
+                    .and_then(|mmap| mmap.get(&method))
+                    .copied()
+            })
+            .or_else(|| {
+                let instantiated = self.instantiated_struct_methods.borrow();
+
+                if let Some(mmap) = instantiated.get(&type_name) {
+                    if let Some(&name) = mmap.get(&method) {
+                        return Some(name);
+                    }
                 }
+
+                let bare = self.context.resolve_string(&type_name);
+
+                instantiated.iter().find_map(|(key, mmap)| {
+                    let key_str = self.context.resolve_string(key);
+
+                    let matches_type = key_str == bare
+                        || key_str.starts_with(&format!("{bare}_"))
+                        || key_str.ends_with(&format!("_{bare}"))
+                        || key_str.contains(&format!("_{bare}_"));
+
+                    matches_type.then(|| mmap.get(&method).copied()).flatten()
+                })
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "[lower_static_call] could not resolve type {} for static call {}",
+                    "[lower_static_call] could not resolve static method {}.{}",
                     type_name, method,
-                )
-            });
-
-        let direct_name = *self
-            .struct_mangled_map
-            .get(&struct_key)
-            .and_then(|mmap| mmap.get(&method))
-            .unwrap_or_else(|| {
-                panic!(
-                    "[lower_static_call] struct `{}` has no static method `{}` in struct_mangled_map",
-                    struct_key, method,
                 )
             });
 
@@ -462,14 +481,16 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                if Self::is_move_by_value(param_types.get(i).unwrap()) {
+                if param_types.get(i).is_some_and(Self::is_move_by_value) {
                     self.record_arg_move(a);
                 }
+
                 Operand::Value(self.lower_expr(a))
             })
             .collect();
 
         let dest = self.current_block_data.fresh_value();
+
         self.emit(Instruction::Call {
             dest: Some(dest),
             func: Operand::FunctionRef(direct_name),
@@ -482,12 +503,18 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .or_else(|| self.global_funcs.get(&direct_name))
             .map(|f| f.ret_type.clone())
             .unwrap_or_else(|| {
+                println!(
+                    "all funcs: {:?}",
+                    self.funcs.iter().map(|f| f.0).collect::<Vec<_>>()
+                );
                 panic!(
                     "[lower_static_call] resolved `{}` but it isn't in funcs or global_funcs",
                     direct_name
                 )
             });
+
         self.current_block_data.value_types.insert(dest, ret_ty);
+
         dest
     }
 
@@ -731,7 +758,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             return obj_val;
         };
 
-        // Aggregates and existing pointers are already passed by address.
         let is_scalar = have.is_integer() || have.is_float() || have == SsaType::Bool;
         if !is_scalar {
             return obj_val;

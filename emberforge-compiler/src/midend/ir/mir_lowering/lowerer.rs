@@ -561,21 +561,11 @@ where
                 ty,
                 value,
                 catch_pattern,
-                else_block,
                 span,
                 manual,
                 ..
             } => {
-                self.handle_let_stmt(
-                    rest,
-                    name,
-                    ty,
-                    value,
-                    catch_pattern,
-                    else_block,
-                    *span,
-                    *manual,
-                );
+                self.handle_let_stmt(rest, name, ty, value, catch_pattern, *span, *manual);
             }
 
             HirStmt::Return(expr, span) => {
@@ -741,6 +731,12 @@ where
                 self.lower_expr_number_inner(*n, expected.clone())
             }
 
+            HirExpr::OrElse {
+                value,
+                else_body,
+                span,
+            } => self.lower_or_else(value, else_body, *span, Some(expected)),
+
             HirExpr::Binary {
                 left, op, right, ..
             } => self.lower_expr_binary_expected(left, op, right, Some(expected)),
@@ -791,15 +787,7 @@ where
                 value,
                 else_body,
                 span,
-            } => {
-                let v = self.lower_expr(value);
-                let blk = HirStmt::Block {
-                    body: else_body,
-                    span: *span,
-                };
-                let blk_ref = &blk;
-                self.lower_nullable_unwrap(v, &blk_ref)
-            }
+            } => self.lower_or_else(value, else_body, *span, None),
 
             HirExpr::Null(_) => self.lower_expr_null(),
             HirExpr::Number(n, _) => self.lower_expr_number(*n),
@@ -897,10 +885,7 @@ where
                 object,
                 index,
                 span: _,
-            } => {
-                println!("[INDEX] object={:?}, index={:?}", object, index);
-                self.lower_index_expr(object, index)
-            }
+            } => self.lower_index_expr(object, index),
             HirExpr::ArrayLiteral { elements, span: _ } => self.lower_array_literal(elements),
             HirExpr::GenericIdent(..) => unreachable!(),
             HirExpr::Cast {

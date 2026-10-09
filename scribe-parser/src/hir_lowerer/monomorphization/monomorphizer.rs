@@ -113,8 +113,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         functions.insert(f.name, (**f).clone());
                     }
                 }
-                // Hoisted closure env structs live only in the module items; make
-                // them visible to field_type_of / closure_env_type / layout lookups.
                 Hir::Struct(s) if self.env_structs.contains_key(&s.name) => {
                     let new_fields: Vec<HirField<'a, 'bump>> = s
                         .fields

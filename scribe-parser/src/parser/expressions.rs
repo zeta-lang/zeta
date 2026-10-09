@@ -731,6 +731,7 @@ where
                 if self.cursor.peek() != TokenKind::RParen {
                     loop {
                         exprs.push(self.parse_expr_inner(0, true)?);
+                        #[allow(unused_assignments)]
                         if self.cursor.peek() == TokenKind::Comma {
                             self.cursor.advance();
                             trailing_comma = true;

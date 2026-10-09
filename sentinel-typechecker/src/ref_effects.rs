@@ -12,8 +12,9 @@ use crate::{TypeChecker, str_id_to_string};
 
 #[derive(Clone)]
 pub enum UsedIndex {
-    Range(i64, i64),          // from a literal index or a slice
-    Place(StrId, Vec<StrId>), // from a stable field-path index
+    Range(i64, i64),
+    Place(StrId, Vec<StrId>),
+    Dynamic,
 }
 
 pub type EffectUsage = (Vec<StrId>, Option<UsedIndex>);
@@ -40,12 +41,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::Index { object, index, .. } => {
                 let (root, path) = self.static_field_path(object)?;
                 let used = match index {
-                    HirExpr::Number(i, _) => Some(UsedIndex::Range(*i, *i + 1)),
+                    HirExpr::Number(i, _) => UsedIndex::Range(*i, *i + 1),
                     other => self
                         .static_field_path(other)
-                        .map(|(r, p)| UsedIndex::Place(r, p)),
+                        .map(|(r, p)| UsedIndex::Place(r, p))
+                        .unwrap_or(UsedIndex::Dynamic),
                 };
-                Some((root, path, used))
+                Some((root, path, Some(used)))
             }
             _ => self.static_field_path(expr).map(|(r, p)| (r, p, None)),
         }
@@ -222,11 +224,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             | HirExpr::GenericIdent(..)
             | HirExpr::ModuleAccess(_)
             | HirExpr::UnknownIntrinsic { .. } => {}
-            HirExpr::OrElse {
-                value: inner,
-                else_body,
-                span,
-            } => self.collect_root_accesses_expr(inner, root, writes, reads),
+            HirExpr::OrElse { value: inner, .. } => {
+                self.collect_root_accesses_expr(inner, root, writes, reads)
+            }
         }
     }
 
@@ -240,14 +240,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         match stmt {
             HirStmt::Let {
                 value,
-                else_block,
                 catch_pattern,
                 ..
             } => {
                 self.collect_root_accesses_expr(value, root, writes, reads);
-                if let Some(b) = else_block {
-                    self.collect_root_accesses_stmt(b, root, writes, reads);
-                }
                 if let Some(pattern) = catch_pattern {
                     match pattern {
                         HirErrorHandlerPattern::Single { body, .. } => {
