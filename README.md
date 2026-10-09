@@ -203,7 +203,8 @@ mkdir -p ~/.local/bin
 mkdir -p ~/.local/share/zeta
 
 cp zeta-lang zeta-lsp zetaup ~/.local/bin/
-cp -r lib ~/.local/share/zeta/
+cp -r ./lib ~/.local/share/zeta/
+cp -r ./zeta_rt.c ~/.local/share/zeta/
 ```
 
 Add `~/.local/bin` to your `PATH` if needed:
