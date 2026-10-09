@@ -76,7 +76,8 @@ struct ZetaDataId(DataId);
 
 impl CraneliftBackend {
     pub fn new(context: Arc<StringPool>, optimize: bool, verbose: bool) -> Self {
-        let mut cranelift_builder = cranelift_codegen::settings::builder();
+        let mut cranelift_builder: cranelift::prelude::settings::Builder =
+            cranelift_codegen::settings::builder();
 
         cranelift_builder
             .set(
@@ -84,6 +85,8 @@ impl CraneliftBackend {
                 if optimize { "speed_and_size" } else { "none" },
             )
             .unwrap();
+
+        cranelift_builder.set("is_pic", "true").unwrap();
 
         if !cfg!(debug_assertions) {
             cranelift_builder.set("enable_verifier", "false").unwrap();
