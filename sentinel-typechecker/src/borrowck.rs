@@ -667,6 +667,42 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Some(ret_ty)
     }
 
+    fn ret_ref_kind(ty: &HirType<'a, 'bump>) -> Option<RefKind> {
+        match ty {
+            HirType::Ref { ref_kind, .. } => Some(*ref_kind),
+            HirType::Nullable(inner) | HirType::Array(inner, _) => Self::ret_ref_kind(inner),
+            HirType::Tuple(elems) => {
+                elems
+                    .iter()
+                    .filter_map(Self::ret_ref_kind)
+                    .max_by_key(|k| match k {
+                        RefKind::Unique => 2,
+                        RefKind::Alias => 1,
+                        RefKind::Shared => 0,
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    /// The template couldn't say which part of the receiver the result points into,
+    /// so assume it may point anywhere in it. Only for real `&`-family results: raw
+    /// and owned pointers are not borrow-tracked.
+    fn opaque_call_loan(
+        &mut self,
+        receiver: Option<&HirExpr<'a, 'bump>>,
+        ret_ty: &HirType<'a, 'bump>,
+    ) -> Option<LoanId> {
+        let kind = Self::ret_ref_kind(ret_ty)?;
+        let place = self.resolve_place(receiver?)?;
+        let result = match kind {
+            RefKind::Unique => self.borrow_checker.borrow_mut(place),
+            RefKind::Alias => self.borrow_checker.borrow_alias(place),
+            RefKind::Shared => self.borrow_checker.borrow_shared(place),
+        };
+        result.ok()
+    }
+
     pub fn finalize_call_loans(
         &mut self,
         receiver: Option<&HirExpr<'a, 'bump>>,
@@ -688,10 +724,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        let place = self.resolve_template_place(&template, receiver, args)?;
+        let place = match self.resolve_template_place(&template, receiver, args) {
+            Some(p) => p,
+            None => return self.opaque_call_loan(receiver, ret_ty),
+        };
 
+        let ret_ref = Self::peel_nullable(ret_ty);
         let result = if matches!(
-            ret_ty,
+            ret_ref,
             HirType::Ref {
                 ref_kind: RefKind::Unique,
                 ..
@@ -699,7 +739,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         ) {
             self.borrow_checker.borrow_mut(place)
         } else if matches!(
-            ret_ty,
+            ret_ref,
             HirType::Ref {
                 ref_kind: RefKind::Alias,
                 ..
@@ -1807,9 +1847,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if paths.is_empty() {
             return;
         }
-        let Some(base) = self.resolve_place(receiver) else {
+        let Some(mut base) = self.resolve_place(receiver) else {
             return;
         };
+        if matches!(
+            self.peek_type(receiver),
+            HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+        ) {
+            base = self.borrow_checker.project_deref(base);
+        }
         for path in paths {
             let mut place = base;
             for f in &path {

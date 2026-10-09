@@ -1,5 +1,5 @@
 use ir::{
-    borrow_checker::{LoanId, PlaceId},
+    borrow_checker::{BorrowKind, LoanId, PlaceId},
     errors::type_error::TypeErrorKind,
     hir::{
         HirExpr, HirMatchArm, HirPattern, HirStmt, HirType, ProvenanceAnnotation, RefKind, StrId,
@@ -27,6 +27,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         self.check_match_exhaustiveness(&scrutinee_ty, arms);
 
+        let scrutinee_loan = self.take_scrutinee_loan(expr);
+
         let move_state_before = self.move_state.clone();
         let mut arm_types = Vec::with_capacity(arms.len());
         let mut arm_move_states = Vec::with_capacity(arms.len());
@@ -35,8 +37,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut inval_after = inval_before.clone();
         for arm in arms {
             self.invalidated_provenances = inval_before.clone();
-            let (arm_type, arm_move_state) =
-                self.check_match_arm(expr, arm, &scrutinee_ty, expected, &move_state_before);
+            let (arm_type, arm_move_state) = self.check_match_arm(
+                expr,
+                arm,
+                &scrutinee_ty,
+                expected,
+                &move_state_before,
+                scrutinee_loan,
+            );
             let diverges = matches!(arm_type, HirType::Never);
             if !diverges {
                 inval_after.extend(self.invalidated_provenances.drain());
@@ -58,6 +66,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.join_branch_types(&arm_types, expected)
     }
 
+    fn take_scrutinee_loan(
+        &mut self,
+        scrutinee: &HirExpr<'a, 'bump>,
+    ) -> Option<(PlaceId, BorrowKind)> {
+        let id = self.call_loans.remove(&Self::expr_key(scrutinee))?;
+        let info = self.borrow_checker.loan(id).map(|l| (l.place, l.kind));
+        self.borrow_checker.end_loan_now(id);
+        info
+    }
+
     pub fn check_match_arm(
         &mut self,
         scrutinee: &HirExpr<'a, 'bump>,
@@ -65,6 +83,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         scrutinee_ty: &HirType<'a, 'bump>,
         expected: Option<&HirType<'a, 'bump>>,
         move_state_before: &MoveState,
+        scrutinee_loan: Option<(PlaceId, BorrowKind)>,
     ) -> (HirType<'a, 'bump>, MoveState) {
         let binding_mode = self.scrutinee_binding_mode(scrutinee);
         let scrutinee_place = self.resolve_place(scrutinee);
@@ -88,16 +107,49 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             scrutinee_place,
         );
 
+        let holders =
+            self.bind_arm_provenance(&arm.pattern, scrutinee_ty, binding_mode, scrutinee_loan);
+
         self.check_match_arm_guard(arm.guard);
 
-        let arm_type = self.check_block_tail_expected(arm.body, expected);
+        let arm_type = self.check_arm_body(arm.body, expected, &holders);
 
         self.context = old_context;
         self.borrow_checker.end_scope();
+        self.loan_owners.retain(|_, owner| !holders.contains(owner));
 
         self.cleanup_match_arm_bindings(&arm.pattern, scrutinee_ty);
-
         (arm_type, self.move_state.clone())
+    }
+
+    fn check_arm_body(
+        &mut self,
+        body: &HirStmt<'a, 'bump>,
+        expected: Option<&HirType<'a, 'bump>>,
+        holders: &[StrId],
+    ) -> HirType<'a, 'bump> {
+        let HirStmt::Block { body, span: _ } = body else {
+            unreachable!()
+        };
+        let dead: Vec<LoanId> = self
+            .loan_owners
+            .iter()
+            .filter(|(_, o)| holders.contains(o))
+            .filter(|(_, o)| !body.iter().any(|s| self.stmt_references_local(s, **o)))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            self.borrow_checker.end_loan_now(id);
+            self.loan_owners.remove(&id);
+        }
+        let Some((last, rest)) = body.split_last() else {
+            return HirType::Void;
+        };
+        for (i, s) in rest.iter().enumerate() {
+            self.check_stmt(s);
+            self.end_dead_block_loans(body, i, holders);
+        }
+        self.check_tail_expected(last, expected)
     }
 
     pub fn check_match_arm_pattern(
@@ -143,9 +195,72 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.collect_pattern_bindings(pattern, scrutinee_ty, &mut bound);
 
         for (name, _) in bound {
+            self.local_provenance.remove(&name);
             self.local_provenance_place.remove(&name);
             self.local_ref_kind.remove(&name);
         }
+    }
+
+    /// Returns the bindings that hold the re-created scrutinee loan.
+    pub fn bind_arm_provenance(
+        &mut self,
+        pattern: &HirPattern<'bump>,
+        scrutinee_ty: &HirType<'a, 'bump>,
+        mode: BindingMode,
+        loan: Option<(PlaceId, BorrowKind)>,
+    ) -> Vec<StrId> {
+        let mut holders = Vec::new();
+        if !matches!(mode, BindingMode::ByValue) {
+            return holders; // ByRef bindings get their own loan in register_pattern_bindings
+        }
+        let Some((place, kind)) = loan else {
+            return holders;
+        };
+
+        let mut bound = Vec::new();
+        self.collect_pattern_bindings(pattern, scrutinee_ty, &mut bound);
+        let refs: Vec<(StrId, HirType<'a, 'bump>)> = bound
+            .into_iter()
+            .filter(|(_, ty)| {
+                matches!(
+                    ty,
+                    HirType::Ref { .. }
+                        | HirType::SafePointer { .. }
+                        | HirType::UnsafePointer { .. }
+                )
+            })
+            .collect();
+        if refs.is_empty() {
+            return holders; // e.g. `case null`: no reference escapes, no loan
+        }
+
+        let result = match kind {
+            BorrowKind::Mutable => self.borrow_checker.borrow_mut(place),
+            BorrowKind::Alias => self.borrow_checker.borrow_alias(place),
+            BorrowKind::Shared => self.borrow_checker.borrow_shared(place),
+        };
+        let loan_id = match result {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = self.describe_borrow_error(&e, None);
+                self.record(TypeErrorKind::Generic(msg));
+                return holders;
+            }
+        };
+        let Some(prov) = self.borrow_checker.loan(loan_id).map(|l| l.provenance_id) else {
+            return holders;
+        };
+
+        for (name, ty) in refs {
+            self.local_provenance.insert(name, prov);
+            self.local_provenance_place.insert(name, place);
+            if let HirType::Ref { ref_kind, .. } = ty {
+                self.local_ref_kind.insert(name, ref_kind);
+            }
+            holders.push(name);
+        }
+        self.loan_owners.insert(loan_id, holders[0]);
+        holders
     }
 
     pub fn check_block_body(

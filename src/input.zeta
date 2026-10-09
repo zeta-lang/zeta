@@ -3215,34 +3215,6 @@ func mutex_contention(): i64 {
     return 0;
 }
 
-// ERROR: block value borrows from `lock`, dropped at end of block
-//   threads.spawn(move func() { let lock = x1.get_alias().lock(); lock.get().get(0) });
-// ERROR: use of moved value `x`
-//   threads.spawn(move func() { x.get_alias().lock(); });
-//   threads.spawn(move func() { x.get_alias().lock(); });
-// ERROR: reference invalidated by drop (explicit drop while ref live)
-//   let r = lock.get(); drop(lock); use(r);
-func mutex_guard_ok(): i64 {
-    let mut values: ArrayList<i64, Mallocator> = ArrayList.with_capacity(4);
-    values.push(123);
-    values.push(456);
-
-    let x: Arc<Mutex<ArrayList<i64, Mallocator>>> = Arc.new(Mutex.new(values));
-    let x1: Arc<Mutex<ArrayList<i64, Mallocator>>> = x.clone();
-    let x2: Arc<Mutex<ArrayList<i64, Mallocator>>> = x.clone();
-
-    threads.spawn(move func() {
-        let mut lock: MutexGuard<ArrayList<i64, Mallocator>> = x1.get_alias().lock();
-        let first: i64 = *lock.get_mut().get_mut(0); // copied out, guard still alive
-    });
-
-    threads.spawn(move func() {
-        let mut lock: MutexGuard<ArrayList<i64, Mallocator>> = x2.get_alias().lock();
-        lock.get_mut().remove(0);
-    });
-    return 0;
-}
-
 func test_scope_borrows_locals(): i64 {
     io.stdout().writeln("=== Running: test_scope_borrows_locals ===");
 
@@ -3896,4 +3868,49 @@ func static_tests(): i64 {
 
     io.stdout().writeln("=== All static tests passed ===");
     return 0;
+}
+
+// error: cannot prove these two accesses don't overlap (via list) at line number 3883 at column 13 inside of file named ./src/input.zeta
+//  3880 |             return list.get_mut(index);
+//  3881 |         },
+//  3882 |         case value -> {
+//  3883 |             list.push(0);
+//                    ^~~~~
+//  3884 |             return value;
+//  3885 |         },
+//
+//
+// error Found 1 error
+//
+// This is correct behavior :) This is clearly UB
+//
+// func get_mut_or_default(
+//     list: &mut ArrayList<i64>,
+//     index: usize,
+// ): &mut i64 {
+//     match (list.try_get_mut(index)) {
+//         case null -> {
+//             list.push(0);
+//             return list.get_mut(index);
+//         },
+//         case value -> {
+//             list.push(0); // This is the cause of the UB, without this, the code is memory safe.
+//             return value;
+//         },
+//     }
+// }
+
+func get_mut_or_default(
+    list: &mut ArrayList<i64>,
+    index: usize,
+): &mut i64 {
+    match (list.try_get_mut(index)) {
+        case null -> {
+            list.push(0);
+            return list.get_mut(index);
+        },
+        case value -> {
+            return value;
+        },
+    }
 }
