@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 use crate::main_structs::CompilerError;
@@ -13,10 +14,22 @@ pub fn link<'a>(objects: &[&str], output: &str, link_libc: bool) -> Result<(), C
 
     cmd.args(objects);
 
-    if std::path::Path::new("zeta_rt.c").exists() {
+    // Look for the runtime in the user's installed Zeta directory.
+    if let Some(home) = std::env::var_os("HOME") {
+        let runtime = PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("zeta")
+            .join("zeta_rt.c");
+
+        if runtime.is_file() {
+            cmd.arg(runtime);
+        } else if std::path::Path::new("zeta_rt.c").is_file() {
+            // Development fallback.
+            cmd.arg("zeta_rt.c");
+        }
+    } else if std::path::Path::new("zeta_rt.c").is_file() {
         cmd.arg("zeta_rt.c");
-    } else if std::path::Path::new("/home/flameyosflow/data/zeta-lang/zeta_rt.c").exists() {
-        cmd.arg("/home/flameyosflow/data/zeta-lang/zeta_rt.c");
     }
 
     cmd.arg("-o").arg(output);
