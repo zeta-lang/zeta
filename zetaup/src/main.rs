@@ -2,7 +2,7 @@ use std::{env::home_dir, path::PathBuf, time::Instant};
 
 use clap::{Parser, Subcommand};
 
-const GITHUB_REPO: &str = "Voxon-Development/zeta-lang";
+const GITHUB_REPO: &str = "zeta-lang/zeta";
 const TOOLCHAIN_ASSET_NAME: &str = "zeta-linux-x86_64.tar.gz";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
