@@ -1265,6 +1265,7 @@ version = "0.1.0"
 dependencies = [
  "codex-dependency-graph",
  "ir",
+ "smallvec 2.0.0-alpha.12",
  "zetaruntime",
 ]
 
