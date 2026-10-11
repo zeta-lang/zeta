@@ -3,20 +3,23 @@
 // A package clause starts every source file.
 package my::app;
 
-import zeta::utils::array_list;
+import zeta::utils::array_list.ArrayList;
+import zeta::io;
+import zeta::file.FileWriter;
+import zeta::buf_writer.BufWriter;
 import zeta::utils::mallocator.RawMallocator;
 import zeta::utils::mallocator.Mallocator;
 
 func main() {
-    let writer: StdOutWriter = zeta::io.stdout();
+    let mut writer: FileWriter = io.stdout();
     writer.writeln("Hello, world!");
 
     // for explicit buffering
-    let buf_writer: BufWriter = BufWriter::new(zeta::io.stdout());
+    let mut buf_writer: BufWriter<FileWriter> = BufWriter.new(writer);
     buf_writer.write("Hello");
     buf_writer.writeln(", world!");
     // you may choose to `buf_writer.flush()` or wait until the scope ends and Drop semantics does what it does best.
-  
+
   	// Call another function within this package.
   	beyond_hello();
 }
@@ -34,13 +37,13 @@ func beyond_hello() {
 func learn_types() {
   	// Short declaration usually gives you what you want.
   	a_string := "Learn Zeta!"; // string type.
-  
+
   	f := 3.14159; // f64, an 64-bit floating point number.
-  
+
   	// var syntax with initializers.
   	let u: u32 = 7; // Unsigned, but implementation dependent size as with int.
-  	let pi: f32 = 22 / 7;
-    
+  	let pi: f32 = (22.0 / 7);
+
   	learn_flow_control(); // Back in the flow.
 }
 
@@ -55,9 +58,9 @@ func learn_flow_control() {
     	// told you!
   	}
 
-    let u: boolean = true;
-    let a: boolean = false;
-    x := 42.0;
+    let u: bool = true;
+    let a: bool = false;
+    x := 42;
 
     match (x) {
         case 1 -> {},
@@ -65,8 +68,8 @@ func learn_flow_control() {
         case _ -> {},
     }
 
-    for (mut x := 0; x < 3; x += 1) {
-        // use x
+    for (mut i := 0; i < 3; i += 1) {
+        // use i
   	}
 
     borrow_checking_and_move_semantics();
@@ -84,7 +87,7 @@ struct Pair {
 
 impl Pair by Stringer {
     func to_string(): str {
-        return ...; // If you're new to programming, know ... means a placeholder, it is not a real value that would compile.
+        return ""; // If you're new to programming, know ... means a placeholder, it is not a real value that would compile.
     }
 }
 
@@ -139,13 +142,9 @@ func borrow_checking_and_move_semantics() {
         y: 20,
     };
 
-    let left: &mut Pair = &mut mut_pair;
-    let right: &mut Pair = &mut mut_pair;
+    let mut_ref: &mut Pair = &mut mut_pair;
 
-    // `left` is completely finished before `right` is used,
-    // so there is no conflict.
-    left.set_x(15);
-    right.set_x(30);
+    mut_ref.set_x(30);
 
     // Some values own heap memory.
     //
@@ -183,7 +182,7 @@ func borrow_checking_and_move_semantics() {
 
     // The following function intentionally contains examples that fail to
     // compile, demonstrating what Zeta's borrow checker prevents.
-    error_with_borrow_checking_and_move_semantics();
+    // error_with_borrow_checking_and_move_semantics();
 }
 
 func borrow_checking_and_move_semantics_with_arrays() {
@@ -197,9 +196,18 @@ func borrow_checking_and_move_semantics_with_arrays() {
     let a: &[4]i64 = &arr;
     let b: &[4]i64 = &arr;
 
+    // You're allowed to get immutable borrows
+    let abc: &i64 = &arr[0];
+
     // Multiple shared borrows may exist simultaneously and use it
     let first: &i64 = &a[0];
     let second: &i64 = &b[1];
+
+    // In fact, it's possible to get an exclusive alias to the second element even while we hold immutable references to `arr`.
+    // The compiler makes sure nothing overlaps.
+    let third: &mut i64 = &mut arr[2];
+
+    let len: usize = arr.len;
 
     // A mutable borrow allows modifying the array.
     //
@@ -219,14 +227,11 @@ func borrow_checking_and_move_semantics_with_arrays() {
     // `right` may safely modify different things in the same array.
     left[0] = 15;
 
-    // Both variables remain valid because every element was copied.
-    let x: i64 = arr[0];
-    let y: i64 = copied[0];
-
     // Modifying one array does not affect the other.
     arr[0] = 100;
 }
 
+// Comment this function away for the app to compile!
 func error_with_borrow_checking_and_move_semantics() {
     let mut pair: Pair = Pair {
         x: 1,
@@ -287,5 +292,6 @@ func error_with_borrow_checking_and_move_semantics() {
     let moved_pair: Pair = pair3;
     borrow2.set_x(10);
 }
+
 
 ```
