@@ -18,6 +18,10 @@ pub struct Cfg {
 }
 
 impl Cfg {
+    pub fn point_count(&self) -> usize {
+        self.next as usize
+    }
+
     fn fresh(&mut self) -> PointId {
         let id = PointId(self.next);
         self.next += 1;
