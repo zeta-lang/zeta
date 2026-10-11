@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Instant;
 
 use clap::{ArgMatches, CommandFactory, Error, FromArgMatches, Parser, Subcommand};
 use mimalloc::MiMalloc;
@@ -55,7 +54,6 @@ enum Commands {
 }
 
 fn main() -> Result<(), CompilerError<'static>> {
-    let start = Instant::now();
     let mut matches: ArgMatches = Cli::command().get_matches();
     let cli_result: Result<Cli, Error> =
         Cli::from_arg_matches_mut(&mut matches).map_err(|err: clap::error::Error| {
@@ -67,8 +65,6 @@ fn main() -> Result<(), CompilerError<'static>> {
         Ok(cli) => cli,
         Err(error) => {
             error.print().expect("failed to print error message");
-            let duration = start.elapsed();
-            println!("Operation completed in {:.2?}", duration);
             std::process::exit(error.exit_code());
         }
     };
@@ -115,9 +111,6 @@ fn main() -> Result<(), CompilerError<'static>> {
                 lib_override,
             )?;
 
-            let duration = start.elapsed();
-            println!("Operation completed in {:.2?}", duration);
-
             if verbose {
                 println!("Executing: {}", program_path.display());
             }
@@ -135,9 +128,6 @@ fn main() -> Result<(), CompilerError<'static>> {
         }
     };
 
-    let duration = start.elapsed();
-    println!("Operation completed in {:.2?}", duration);
-
     match result {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -149,20 +139,6 @@ fn main() -> Result<(), CompilerError<'static>> {
 
 fn installed_stdlib_path() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
-
-    let installed_exe = home
-        .join(".local")
-        .join("bin")
-        .join("zeta-lang")
-        .canonicalize()
-        .ok()?;
-
-    let running_exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-
-    // Only use the installed stdlib when this is the installed compiler.
-    if running_exe != installed_exe {
-        return None;
-    }
 
     let stdlib = home.join(".local").join("share").join("zeta").join("lib");
 

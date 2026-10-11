@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use codex_dependency_graph::dep_graph::{AstModule, DepGraph};
 use engraver_assembly_emit::backend::Backend;
 use engraver_assembly_emit::cranelift::cranelift_backend::CraneliftBackend;
@@ -36,6 +38,51 @@ pub mod std_file_loader;
 use crate::file_loader::FileLoader;
 use crate::main_structs::{CompilerError as BuildError, ModuleWithArena};
 
+#[derive(Default)]
+struct CompilerTimings {
+    frontend: Duration,
+    typecheck_borrowck: Duration,
+    monomorphization: Duration,
+    codegen_link: Duration,
+}
+
+impl CompilerTimings {
+    fn report(&self) {
+        let stages = [
+            ("Frontend", self.frontend),
+            ("Type checking and borrow checking", self.typecheck_borrowck),
+            ("Monomorphization", self.monomorphization),
+            ("Codegen", self.codegen_link),
+        ];
+
+        let total =
+            self.frontend + self.typecheck_borrowck + self.monomorphization + self.codegen_link;
+
+        eprintln!();
+        eprintln!("========== Zeta compiler timings ==========");
+
+        for (name, elapsed) in stages {
+            let ms = elapsed.as_secs_f64() * 1_000.0;
+            let percentage = if total.as_secs_f64() > 0.0 {
+                elapsed.as_secs_f64() / total.as_secs_f64() * 100.0
+            } else {
+                0.0
+            };
+
+            eprintln!("  {name:<34} {ms:>10.3} ms  ({percentage:>5.1}%)");
+        }
+
+        eprintln!("===========================================");
+        eprintln!(
+            "  {:<34} {:>10.3} ms",
+            "Total measured",
+            total.as_secs_f64() * 1_000.0
+        );
+        eprintln!("===========================================");
+        eprintln!();
+    }
+}
+
 pub struct Compiler<'a, 'bump> {
     pool: Arc<StringPool>,
     registry: GlobalRegistry<'a, 'bump>,
@@ -65,6 +112,7 @@ pub struct Compiler<'a, 'bump> {
     /// module_idx -> index into `deferred_lowerers`.
     deferred_lowerer_slot: FxHashMap<usize, usize>,
     dce_enabled: bool,
+    timings: CompilerTimings,
 }
 
 impl<'a, 'bump> Compiler<'a, 'bump>
@@ -125,6 +173,7 @@ where
             deferred_lowerers: Vec::new(),
             deferred_lowerer_slot: FxHashMap::default(),
             dce_enabled: true,
+            timings: CompilerTimings::default(),
         })
     }
 
@@ -145,6 +194,21 @@ where
         self.module_ids.get(&name).copied()
     }
 
+    fn register_implicit_imports(&self, module_idx: usize) {
+        let mut g = self.dep_graph.borrow_mut();
+        if self.stdlib_module_ids.contains(&module_idx) {
+            for &existing in self.module_ids.values() {
+                if existing != module_idx && !self.stdlib_module_ids.contains(&existing) {
+                    g.register_import(existing, module_idx);
+                }
+            }
+        } else {
+            for &std_idx in &self.stdlib_module_ids {
+                g.register_import(module_idx, std_idx);
+            }
+        }
+    }
+
     pub fn type_checker(&self) -> Rc<RefCell<TypeChecker<'a, 'bump>>> {
         self.type_checker.clone()
     }
@@ -163,6 +227,7 @@ where
         dir: &Path,
         is_stdlib: bool,
     ) -> Result<ErrorReporter<'a>, BuildError<'a>> {
+        let frontend_start = Instant::now();
         self.source_roots.push(dir.to_path_buf());
 
         let files = crate::file_handling::collect_zeta_files(dir)?;
@@ -223,6 +288,7 @@ where
                 &ast_module,
                 &self.pool,
             );
+            self.register_implicit_imports(*module_idx);
         }
 
         if is_stdlib {
@@ -253,6 +319,8 @@ where
             .collect();
 
         let order = self.dep_graph.borrow().get_module_compilation_order();
+
+        self.timings.frontend += frontend_start.elapsed();
 
         #[cfg(debug_assertions)]
         {
@@ -501,6 +569,8 @@ where
             groups.push(scc);
         }
 
+        let frontend_start = Instant::now();
+
         let bump = self.scratch_bump_ref();
         let mut lowerer = HirLowerer::new(
             self.pool.clone(),
@@ -520,9 +590,15 @@ where
 
         let mut lowered = lowerer.lower_all_modules(&module_stmts, order);
 
+        self.timings.frontend += frontend_start.elapsed();
+
+        let checking_start = Instant::now();
+
         self.type_checker
             .borrow_mut()
             .check_attributes(&lowerer.ctx.attrs.borrow());
+
+        self.timings.typecheck_borrowck += checking_start.elapsed();
 
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
@@ -538,6 +614,7 @@ where
             self.modules.insert(module_idx, parsed);
         }
 
+        let checking_start = Instant::now();
         for group in &groups {
             let ready: Vec<usize> = group
                 .iter()
@@ -585,6 +662,7 @@ where
                 queued_any = true;
             }
         }
+        self.timings.typecheck_borrowck += checking_start.elapsed();
 
         if queued_any {
             self.deferred_lowerers.push(lowerer);
@@ -597,15 +675,20 @@ where
         parsed: ModuleWithArena<'a, 'bump>,
     ) -> ErrorReporter<'a> {
         let mut reporter = self.make_reporter();
+        let frontend_start = Instant::now();
+
         let mut lowerer = self.make_lowerer(&parsed);
         lowerer.lower_module_prototypes(&parsed.parse_result.statements, module_idx);
 
-        let Some(lowerer) =
-            self.lower_module_bodies_phase(module_idx, lowerer, parsed, &mut reporter)
-        else {
+        let lowered = self.lower_module_bodies_phase(module_idx, lowerer, parsed, &mut reporter);
+
+        self.timings.frontend += frontend_start.elapsed();
+
+        let Some(lowerer) = lowered else {
             return reporter;
         };
 
+        let checking_start = Instant::now();
         let invalidation_set = self
             .dep_graph
             .borrow()
@@ -637,6 +720,8 @@ where
                 reporter.add_type_error(err);
             }
         }
+
+        self.timings.typecheck_borrowck += checking_start.elapsed();
 
         if reporter.has_errors() {
             return reporter;
@@ -704,8 +789,12 @@ where
         verbose: bool,
         emit_obj: bool,
     ) -> Result<PathBuf, BuildError<'a>> {
+        let monomorphization_start = Instant::now();
+
         self.run_deferred_monomorphization();
         self.finalize_monomorphization();
+
+        self.timings.monomorphization += monomorphization_start.elapsed();
         let missing: Vec<PathBuf> = self
             .hir_modules
             .keys()
@@ -756,6 +845,8 @@ where
             .filter_map(|i| self.codegen_hir_modules.get(&i).copied())
             .collect();
 
+        let codegen_start = Instant::now();
+
         let mut backend: CraneliftBackend =
             CraneliftBackend::new(self.pool.clone(), optimize, verbose);
 
@@ -769,19 +860,35 @@ where
             self.registry.clone(),
         );
 
-        let out_obj = backend
-            .finish(&out_dir.to_path_buf())
-            .map_err(|e| BuildError::FinishError(Box::new(e)))?;
+        let out_obj = match backend.finish(&out_dir.to_path_buf()) {
+            Ok(path) => path,
+            Err(e) => {
+                self.timings.codegen_link += codegen_start.elapsed();
+                self.timings.report();
+
+                return Err(BuildError::FinishError(Box::new(e)));
+            }
+        };
 
         if emit_obj {
+            self.timings.codegen_link += codegen_start.elapsed();
+            self.timings.report();
+
             Ok(out_obj)
         } else {
             let program_path = out_dir.join("program");
-            crate::link::link(
+
+            let link_result = crate::link::link(
                 &[out_obj.to_str().unwrap()],
                 program_path.to_str().unwrap(),
                 true,
-            )?;
+            );
+
+            self.timings.codegen_link += codegen_start.elapsed();
+            self.timings.report();
+
+            link_result?;
+
             Ok(program_path)
         }
     }
@@ -805,10 +912,8 @@ where
     }
 
     pub fn update_module(&mut self, path: &Path, source: String) -> ErrorReporter<'a> {
-        let canonical_name = StrId(self.pool.intern(&path.to_string_lossy()));
+        let canonical_name = self.canonical_key(path);
         let module_idx = self.module_idx_for(canonical_name);
-
-        let mut reporter = self.make_reporter();
 
         let parsed = match crate::file_handling::parse_single_file_from_source(
             self.pool.clone(),
@@ -818,16 +923,52 @@ where
             Ok(m) => m,
             Err(e) => {
                 eprintln!("error: {}", e);
-                return reporter;
+                return self.make_reporter();
             }
         };
+
+        self.loaded_sources
+            .insert(canonical_name.to_string(), parsed.source.to_string());
+        let mut reporter = self.make_reporter();
 
         for perr in &parsed.parse_result.diagnostics.errors {
             reporter.add_parser_error(perr.clone());
         }
-        reporter.add_source_file(canonical_name.to_string(), parsed.source.to_string());
         if parsed.parse_result.diagnostics.has_errors() {
             return reporter;
+        }
+
+        let is_new = !self.modules.contains_key(&module_idx);
+        let importers = self.dep_graph.borrow().get_module_importers(module_idx);
+
+        {
+            let ast_module = AstModule {
+                name: canonical_name,
+                path: parsed.path.clone(),
+                stmts: parsed.parse_result.statements.as_slice(),
+            };
+            let mut g = self.dep_graph.borrow_mut();
+            if is_new {
+                g.register_module_structure(module_idx, &ast_module, &self.pool);
+            } else {
+                g.update_module_items(module_idx, &ast_module, &self.pool);
+            }
+            g.extract_edges_for_module(module_idx, &ast_module, &self.pool);
+        }
+        self.register_implicit_imports(module_idx);
+
+        for imp_idx in importers {
+            if let Some(imp_module) = self.modules.get(&imp_idx) {
+                let imp_ast = AstModule {
+                    name: imp_module.name,
+                    path: imp_module.path.clone(), // was parsed.path
+                    stmts: imp_module.parse_result.statements.as_slice(),
+                };
+                self.dep_graph
+                    .borrow_mut()
+                    .extract_edges_for_module(imp_idx, &imp_ast, &self.pool);
+                self.register_implicit_imports(imp_idx);
+            }
         }
 
         let mut lowerer = HirLowerer::new(
@@ -837,37 +978,13 @@ where
             self.registry.clone(),
             self.auto_imports.clone(),
         );
+        lowerer.lower_module_types(&parsed.parse_result.statements, module_idx);
         let hir = lowerer.lower_module(&parsed.parse_result.statements, module_idx);
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
                 kind: TypeErrorKind::Generic(err.0.clone()),
                 span: err.1,
             });
-        }
-
-        let ast_module = AstModule {
-            name: canonical_name,
-            path: parsed.path.clone(),
-            stmts: parsed.parse_result.statements.as_slice(),
-        };
-
-        let importers = self.dep_graph.borrow().get_module_importers(module_idx);
-
-        self.dep_graph
-            .borrow_mut()
-            .update_module_items(module_idx, &ast_module, &self.pool);
-
-        for imp_idx in importers {
-            if let Some(imp_module) = self.modules.get(&imp_idx) {
-                let imp_ast = codex_dependency_graph::dep_graph::AstModule {
-                    name: imp_module.name,
-                    path: parsed.path.clone(),
-                    stmts: imp_module.parse_result.statements.as_slice(),
-                };
-                self.dep_graph
-                    .borrow_mut()
-                    .extract_edges_for_module(imp_idx, &imp_ast, &self.pool);
-            }
         }
 
         self.modules.insert(module_idx, parsed);
@@ -901,7 +1018,7 @@ where
                 }
             }
             for err in checker.take_errors() {
-                reporter.add_type_error(err.clone());
+                reporter.add_type_error(err);
             }
         }
         reporter
@@ -918,18 +1035,18 @@ where
         let mut batch: Vec<(usize, StrId, ModuleWithArena<'a, 'bump>)> = Vec::new();
 
         for path in &stdlib_files {
-            let canonical_name = path
-                .to_str()
-                .ok_or_else(|| BuildError::InvalidFileName(Vec::new()))?;
-            let name = StrId(self.pool.intern(canonical_name));
-            let module_idx = self.module_idx_for(name);
+            let canonical_name = self.canonical_key(path);
+            let module_idx = self.module_idx_for(canonical_name);
 
-            let parsed = crate::file_handling::parse_single_file(self.pool.clone(), path.clone())?;
-
-            self.loaded_sources.insert(
-                parsed.path.to_string_lossy().to_string(),
-                parsed.source.to_string(),
-            );
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| BuildError::FailedToReadFile(path.clone(), e))?;
+            let parsed = crate::file_handling::parse_single_file_from_source(
+                self.pool.clone(),
+                PathBuf::from(canonical_name.as_str()),
+                contents,
+            )?;
+            self.loaded_sources
+                .insert(canonical_name.to_string(), parsed.source.to_string());
 
             if parsed.parse_result.diagnostics.has_errors() {
                 for perr in &parsed.parse_result.diagnostics.errors {
@@ -941,7 +1058,7 @@ where
             self.stdlib_module_ids.insert(module_idx);
 
             let ast_module = codex_dependency_graph::dep_graph::AstModule {
-                name,
+                name: canonical_name,
                 path: parsed.path.clone(),
                 stmts: parsed.parse_result.statements.as_slice(),
             };
@@ -950,7 +1067,7 @@ where
                 &ast_module,
                 &self.pool,
             );
-            batch.push((module_idx, name, parsed));
+            batch.push((module_idx, canonical_name, parsed));
         }
 
         for (module_idx, name, parsed) in &batch {
@@ -1012,8 +1129,13 @@ where
         reporter
     }
 
+    fn canonical_key(&self, path: &Path) -> StrId {
+        let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        StrId(self.pool.intern(&p.to_string_lossy()))
+    }
+
     pub fn close_module(&mut self, name: &str) {
-        let canonical_name = StrId(self.pool.intern(name));
+        let canonical_name = self.canonical_key(&Path::new(name));
         if let Some(&idx) = self.module_ids.get(&canonical_name) {
             self.modules.remove(&idx);
             self.hir_modules.remove(&idx);
