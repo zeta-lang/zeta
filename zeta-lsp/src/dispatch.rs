@@ -1,7 +1,7 @@
 #![allow(unused)]
 use anyhow::{Context, Result};
-use ir::ast::Stmt;
-use ir::hir::{HirType, StrId};
+use ir::ast::{ExternModifier, FuncSafety, InlineModifier, Stmt, Visibility};
+use ir::hir::{HirEnum, HirFunc, HirGeneric, HirInterface, HirParam, HirStruct, HirType, StrId};
 use ir::span::SourceSpan;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
@@ -495,7 +495,7 @@ fn completions_at(state: &ServerState, params: &CompletionParams) -> Vec<Complet
     items
 }
 
-fn hover_at(state: &ServerState, params: &HoverParams) -> Option<Hover> {
+pub fn hover_at(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
@@ -509,52 +509,183 @@ fn hover_at(state: &ServerState, params: &HoverParams) -> Option<Hover> {
     let checker = checker_rc.borrow();
     let ctx = checker.context();
 
-    if let Some((occ_name, ty, _)) =
+    // 1. Try tightest_occurrence first
+    if let Some((occ_name, ty, symbol_id)) =
         tightest_occurrence(checker.occurrences(), module_idx, line, column)
     {
-        if occ_name.to_string() == word {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("```zeta\n{}: {}\n```", word, ty),
-                }),
-                range: None,
-            });
+        if occ_name.as_str() == word {
+            match symbol_id {
+                SymbolId::Item {
+                    module_idx: m,
+                    item_idx,
+                    tag,
+                } => {
+                    let doc = doc_for_symbol(state, &checker, symbol_id);
+                    let sig = match tag {
+                        "func_sig" | "func_body" => func_for_item(state, &ctx, m, item_idx, tag)
+                            .map(|f| format_func_signature(&f)),
+                        "type" => struct_in_module(&ctx, m, word)
+                            .map(|d| format_struct_signature(&d))
+                            .or_else(|| {
+                                enum_in_module(&ctx, m, word).map(|e| format_enum_signature(&e))
+                            }),
+                        "trait" => interface_in_module(&ctx, m, word)
+                            .map(|i| format_interface_signature(&i)),
+                        _ => None,
+                    };
+                    if let Some(sig) = sig {
+                        return Some(Hover {
+                            contents: HoverContents::Markup(format_hover_markup(
+                                &sig,
+                                doc.as_deref(),
+                            )),
+                            range: None,
+                        });
+                    }
+                }
+                SymbolId::Method {
+                    module_idx: m,
+                    item_idx,
+                    method_idx,
+                } => {
+                    let doc = doc_for_symbol(state, &checker, symbol_id);
+                    if let Some(func) = method_for_symbol(state, &ctx, m, item_idx, method_idx) {
+                        let sig = format_func_signature(&func);
+                        return Some(Hover {
+                            contents: HoverContents::Markup(format_hover_markup(
+                                &sig,
+                                doc.as_deref(),
+                            )),
+                            range: None,
+                        });
+                    }
+                }
+                SymbolId::Field {
+                    struct_name,
+                    field_name,
+                } => {
+                    let doc = doc_for_symbol(state, &checker, symbol_id);
+                    let sig = format!("{}.{}: {}", struct_name, field_name, ty);
+                    return Some(Hover {
+                        contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+                        range: None,
+                    });
+                }
+                SymbolId::Local(..) => {
+                    let doc = doc_for_symbol(state, &checker, symbol_id);
+                    let sig = format!("{}: {}", word, ty);
+                    return Some(Hover {
+                        contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+                        range: None,
+                    });
+                }
+            }
         }
     }
 
-    let value = if let Some(def) = ctx.structs.get(word) {
-        format!(
-            "```zeta\nstruct {} {{ {} field(s) }}\n```",
-            word,
-            def.fields.len()
-        )
-    } else if ctx.enums.get(word).is_some() {
-        format!("```zeta\nenum {}\n```", word)
-    } else if ctx.interfaces.get(word).is_some() {
-        format!("```zeta\ninterface {}\n```", word)
-    } else if let Some(func) = ctx
-        .module_functions
-        .get(&module_idx)
-        .and_then(|f| f.get(word))
-    {
-        let ret = func
-            .return_type
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "void".to_string());
-        let argc = func.params.map(|p| p.len()).unwrap_or(0);
-        format!("```zeta\nfn {}({} param(s)) -> {}\n```", word, argc, ret)
-    } else {
-        return None;
-    };
+    // 2. Fallback resolution for `word` (declarations, type annotations, imports, etc.)
+    if let Some((func, decl_m)) = find_func(state, &ctx, module_idx, word) {
+        let doc = state
+            .compiler
+            .source_text(decl_m)
+            .and_then(|src| crate::doc_comments::doc_comment_above(&src, func.span.line));
+        let sig = format_func_signature(&func);
+        return Some(Hover {
+            contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+            range: None,
+        });
+    }
 
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value,
-        }),
-        range: None,
-    })
+    if let Some(def) = ctx.structs.get(word) {
+        let doc = ctx
+            .struct_owner_module
+            .get(word)
+            .and_then(|&m| state.compiler.source_text(m))
+            .and_then(|src| {
+                let s_id = StrId(ctx.string_pool.intern(word));
+                let &m = ctx.struct_owner_module.get(word)?;
+                let mod_arena = state.compiler.module_with_arena(m)?;
+                let span = mod_arena.parse_result.statements.iter().find_map(|s| {
+                    let (_, s) = s.peel();
+                    if let Stmt::StructDecl(sd) = s {
+                        if sd.name == s_id {
+                            return Some(sd.span);
+                        }
+                    }
+                    None
+                })?;
+                crate::doc_comments::doc_comment_above(&src, span.line)
+            });
+        let sig = format_struct_signature(&def);
+        return Some(Hover {
+            contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+            range: None,
+        });
+    }
+
+    if let Some(def) = ctx.enums.get(word) {
+        let doc = ctx
+            .enum_owner_module
+            .get(word)
+            .and_then(|&m| state.compiler.source_text(m))
+            .and_then(|src| {
+                let e_id = StrId(ctx.string_pool.intern(word));
+                let &m = ctx.enum_owner_module.get(word)?;
+                let mod_arena = state.compiler.module_with_arena(m)?;
+                let span = mod_arena.parse_result.statements.iter().find_map(|s| {
+                    let (_, s) = s.peel();
+                    if let Stmt::EnumDecl(ed) = s {
+                        if ed.name == e_id {
+                            return Some(ed.span);
+                        }
+                    }
+                    None
+                })?;
+                crate::doc_comments::doc_comment_above(&src, span.line)
+            });
+        let sig = format_enum_signature(&def);
+        return Some(Hover {
+            contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+            range: None,
+        });
+    }
+
+    if let Some(def) = ctx.interfaces.get(word) {
+        let doc = ctx
+            .interface_owner_module
+            .get(word)
+            .and_then(|&m| state.compiler.source_text(m))
+            .and_then(|src| {
+                let i_id = StrId(ctx.string_pool.intern(word));
+                let &m = ctx.interface_owner_module.get(word)?;
+                let mod_arena = state.compiler.module_with_arena(m)?;
+                let span = mod_arena.parse_result.statements.iter().find_map(|s| {
+                    let (_, s) = s.peel();
+                    if let Stmt::InterfaceDecl(id) = s {
+                        if id.name == i_id {
+                            return Some(id.span);
+                        }
+                    }
+                    None
+                })?;
+                crate::doc_comments::doc_comment_above(&src, span.line)
+            });
+        let sig = format_interface_signature(&def);
+        return Some(Hover {
+            contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
+            range: None,
+        });
+    }
+
+    if let Some((_, ty)) = ctx.variables.get(word) {
+        let sig = format!("{}: {}", word, ty);
+        return Some(Hover {
+            contents: HoverContents::Markup(format_hover_markup(&sig, None)),
+            range: None,
+        });
+    }
+
+    None
 }
 
 fn strip_container<'a, 'b, 'bump>(ty: &'b HirType<'a, 'bump>) -> &'b HirType<'a, 'bump> {
@@ -579,6 +710,7 @@ fn document_symbols_at(
 
     let mut symbols = Vec::new();
     for stmt in &module_with_arena.parse_result.statements {
+        let (_, stmt) = stmt.peel();
         let (name, kind, span) = match stmt {
             Stmt::FuncDecl(f) => (f.name.to_string(), SymbolKind::FUNCTION, f.span),
             Stmt::StructDecl(s) => (s.name.to_string(), SymbolKind::STRUCT, s.span),
@@ -617,16 +749,316 @@ fn item_decl_span<'a, 'bump>(
     tag: &str,
 ) -> Option<SourceSpan<'a>> {
     let stmt = stmts.get(item_idx)?;
+    let (_, stmt) = stmt.peel();
     match (stmt, tag) {
         (Stmt::FuncDecl(f), "func_sig" | "func_body") => Some(f.span),
         (Stmt::StructDecl(s), "type") => Some(s.span),
         (Stmt::EnumDecl(e), "type") => Some(e.span),
         (Stmt::InterfaceDecl(i), "trait") => Some(i.span),
+        (Stmt::Const(c), "const") => Some(c.span),
+        (Stmt::TypeAliasDecl(t), "type") => Some(t.span),
+        (Stmt::ImplDecl(impl_decl), _) => Some(impl_decl.span),
         _ => None,
     }
 }
 
-fn go_to_definition(
+fn method_decl_span<'a, 'bump>(
+    stmts: &'bump [Stmt<'a, 'bump>],
+    item_idx: usize,
+    method_idx: usize,
+) -> Option<SourceSpan<'a>> {
+    let stmt = stmts.get(item_idx)?;
+    let (_, stmt) = stmt.peel();
+    if let Stmt::ImplDecl(impl_decl) = stmt {
+        let methods = impl_decl.methods.as_ref()?;
+        let method = methods.get(method_idx)?;
+        Some(method.span)
+    } else {
+        None
+    }
+}
+
+pub fn find_ident_range_on_line(
+    source: &str,
+    line_1_indexed: usize,
+    name: &str,
+    fallback_span: SourceSpan,
+) -> lsp_types::Range {
+    if let Some(line_str) = line_at(source, (line_1_indexed.saturating_sub(1)) as u32) {
+        let mut search_start = 0;
+        while let Some(idx) = line_str[search_start..].find(name) {
+            let actual_idx = search_start + idx;
+            let before = if actual_idx > 0 {
+                line_str[..actual_idx].chars().next_back()
+            } else {
+                None
+            };
+            let after = line_str[actual_idx + name.len()..].chars().next();
+            let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+            let word_boundary_before = before.map_or(true, |c| !is_ident_char(c));
+            let word_boundary_after = after.map_or(true, |c| !is_ident_char(c));
+            if word_boundary_before && word_boundary_after {
+                let start_char = crate::text_utils::utf16_offset_from_byte(line_str, actual_idx);
+                let end_char =
+                    crate::text_utils::utf16_offset_from_byte(line_str, actual_idx + name.len());
+                return lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: (line_1_indexed.saturating_sub(1)) as u32,
+                        character: start_char,
+                    },
+                    end: lsp_types::Position {
+                        line: (line_1_indexed.saturating_sub(1)) as u32,
+                        character: end_char,
+                    },
+                };
+            }
+            search_start = actual_idx + name.len();
+        }
+    }
+    span_to_range(
+        source,
+        fallback_span.line,
+        fallback_span.column,
+        fallback_span.end_line,
+        fallback_span.end_column,
+    )
+}
+
+fn format_generic(g: &HirGeneric) -> String {
+    let mut s = g.name.to_string();
+    if !g.constraints.is_empty() {
+        s.push_str(": ");
+        let c_strs: Vec<String> = g.constraints.iter().map(|c| c.to_string()).collect();
+        s.push_str(&c_strs.join(" + "));
+    }
+    if let Some(def) = &g.default_type {
+        s.push_str(&format!(" = {}", def));
+    }
+    s
+}
+
+pub fn format_func_signature(func: &HirFunc) -> String {
+    let mut sig = String::new();
+
+    if func.function_metadata.visibility == Visibility::Private {
+        sig.push_str("private ");
+    }
+
+    if func.function_metadata.func_safety == FuncSafety::Unsafe {
+        sig.push_str("unsafe ");
+    }
+
+    match func.function_metadata.extern_modifier {
+        ExternModifier::None => {}
+        ExternModifier::Abi(abi) => {
+            sig.push_str(&format!("extern \"{}\" ", abi));
+        }
+    }
+
+    match func.function_metadata.inline_modifier {
+        InlineModifier::Inline => sig.push_str("inline "),
+        InlineModifier::Noinline => sig.push_str("noinline "),
+        InlineModifier::None => {}
+    }
+
+    sig.push_str("func ");
+    sig.push_str(func.unmangled_name.as_str());
+
+    if let Some(generics) = func.generics {
+        if !generics.is_empty() {
+            sig.push('<');
+            let g_strs: Vec<String> = generics.iter().map(format_generic).collect();
+            sig.push_str(&g_strs.join(", "));
+            sig.push('>');
+        }
+    }
+
+    sig.push('(');
+    if let Some(params) = func.params {
+        let p_strs: Vec<String> = params
+            .iter()
+            .map(|p| match p {
+                HirParam::Normal {
+                    name, param_type, ..
+                } => format!("{}: {}", name, param_type),
+                HirParam::This { kind, .. } => format!("{}", kind),
+            })
+            .collect();
+        sig.push_str(&p_strs.join(", "));
+    }
+    sig.push(')');
+
+    if let Some(ret) = &func.return_type {
+        sig.push_str(&format!(": {}", ret));
+    }
+
+    sig.push(';');
+    sig
+}
+
+pub fn format_struct_signature(s: &HirStruct) -> String {
+    let mut sig = String::new();
+    if s.visibility == Visibility::Private {
+        sig.push_str("private ");
+    }
+    sig.push_str("struct ");
+    sig.push_str(s.unmangled_name.as_str());
+    if let Some(generics) = s.generics {
+        if !generics.is_empty() {
+            sig.push('<');
+            let g_strs: Vec<String> = generics.iter().map(format_generic).collect();
+            sig.push_str(&g_strs.join(", "));
+            sig.push('>');
+        }
+    }
+    if s.fields.is_empty() {
+        sig.push_str(" {}");
+    } else {
+        sig.push_str(" {\n");
+        for f in s.fields {
+            if f.visibility == Visibility::Private {
+                sig.push_str("    private ");
+            } else {
+                sig.push_str("    ");
+            }
+            sig.push_str(&format!("{}: {},\n", f.name, f.field_type));
+        }
+        sig.push('}');
+    }
+    sig
+}
+
+pub fn format_enum_signature(e: &HirEnum) -> String {
+    let mut sig = String::new();
+    if e.visibility == Visibility::Private {
+        sig.push_str("private ");
+    }
+    sig.push_str("enum ");
+    sig.push_str(e.name.as_str());
+    if let Some(generics) = e.generics {
+        if !generics.is_empty() {
+            sig.push('<');
+            let g_strs: Vec<String> = generics.iter().map(format_generic).collect();
+            sig.push_str(&g_strs.join(", "));
+            sig.push('>');
+        }
+    }
+    if e.variants.is_empty() {
+        sig.push_str(" {}");
+    } else {
+        sig.push_str(" {\n");
+        for v in e.variants {
+            sig.push_str("    ");
+            sig.push_str(v.name.as_str());
+            if !v.fields.is_empty() {
+                let f_strs: Vec<String> =
+                    v.fields.iter().map(|f| f.field_type.to_string()).collect();
+                sig.push_str(&format!("({})", f_strs.join(", ")));
+            }
+            sig.push_str(",\n");
+        }
+        sig.push('}');
+    }
+    sig
+}
+
+pub fn format_interface_signature(i: &HirInterface) -> String {
+    let mut sig = String::new();
+    if i.visibility == Visibility::Private {
+        sig.push_str("private ");
+    }
+    sig.push_str("interface ");
+    sig.push_str(i.name.as_str());
+    if let Some(generics) = i.generics {
+        if !generics.is_empty() {
+            sig.push('<');
+            let g_strs: Vec<String> = generics.iter().map(format_generic).collect();
+            sig.push_str(&g_strs.join(", "));
+            sig.push('>');
+        }
+    }
+    sig.push_str(" { ... }");
+    sig
+}
+
+pub fn format_hover_markup(code_block: &str, doc: Option<&str>) -> MarkupContent {
+    let mut value = String::new();
+    value.push_str("```zeta\n");
+    value.push_str(code_block);
+    value.push_str("\n```");
+    if let Some(d) = doc {
+        let trimmed = d.trim();
+        if !trimmed.is_empty() {
+            value.push_str("\n\n---\n\n");
+            value.push_str(trimmed);
+        }
+    }
+    MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    }
+}
+
+fn find_func<'a, 'bump>(
+    state: &ServerState<'a, 'bump>,
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    module_idx: usize,
+    name: &str,
+) -> Option<(HirFunc<'a, 'bump>, usize)> {
+    // 1. Current module
+    if let Some(func) = ctx
+        .module_functions
+        .get(&module_idx)
+        .and_then(|f| f.get(name))
+    {
+        return Some((*func, func.declaring_module_idx));
+    }
+
+    // 2. Direct imports
+    let dep_graph = state.compiler.dep_graph_ref().borrow();
+    for imp_idx in dep_graph.get_module_imports(module_idx) {
+        if let Some(func) = ctx.module_functions.get(&imp_idx).and_then(|f| f.get(name)) {
+            return Some((*func, func.declaring_module_idx));
+        }
+    }
+
+    // 3. Anywhere via dep_graph symbol lookup or find_function_by_name_anywhere
+    let name_id = StrId(ctx.string_pool.intern(name));
+    if let Some((decl_m, _, _)) = dep_graph.resolve_item_in_module(module_idx, name_id) {
+        if let Some(func) = ctx.module_functions.get(&decl_m).and_then(|f| f.get(name)) {
+            return Some((*func, func.declaring_module_idx));
+        }
+    }
+
+    // 3b. Anywhere: only if exactly one candidate
+    let mut found: Vec<HirFunc<'a, 'bump>> = Vec::new();
+    for cand_m in dep_graph.find_function_by_name_anywhere(name_id) {
+        if let Some(f) = ctx.module_functions.get(&cand_m).and_then(|f| f.get(name)) {
+            found.push(*f);
+        }
+    }
+    if found.len() == 1 {
+        let f = found[0];
+        return Some((f, f.declaring_module_idx));
+    }
+    if found.len() > 1 {
+        return None;
+    }
+
+    // 4. Any method: only if exactly one candidate
+    let mut methods: Vec<HirFunc<'a, 'bump>> = ctx
+        .type_methods
+        .values()
+        .filter_map(|t| t.methods.get(name).copied())
+        .collect();
+    if methods.len() == 1 {
+        let f = methods.remove(0);
+        return Some((f, f.declaring_module_idx));
+    }
+    None
+}
+
+pub fn go_to_definition(
     state: &mut ServerState,
     params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
@@ -637,30 +1069,235 @@ fn go_to_definition(
     let module_idx = state.compiler.module_idx_for_path(&doc.path)?;
     let source = state.compiler.source_text(module_idx)?;
     let (line, column) = to_span_coords(&source, position);
+    let word = ident_at_column(line_at(&source, position.line)?, position.character)?;
 
     let checker_rc = state.compiler.type_checker();
     let checker = checker_rc.borrow();
+    let ctx = checker.context();
 
-    let (occ_name, ty, symbol_id) =
-        tightest_occurrence(checker.occurrences(), module_idx, line, column)?;
+    // 1. Check tightest_occurrence
+    if let Some((occ_name, _ty, symbol_id)) =
+        tightest_occurrence(checker.occurrences(), module_idx, line, column)
+    {
+        if occ_name.as_str() == word {
+            match symbol_id {
+                SymbolId::Item {
+                    module_idx: m,
+                    item_idx,
+                    tag,
+                } => {
+                    let module_with_arena = state.compiler.module_with_arena(m)?;
+                    let span =
+                        item_decl_span(&module_with_arena.parse_result.statements, item_idx, tag)?;
+                    let target_path = state.compiler.path_for_module(m)?;
+                    let target_source = state.compiler.source_text(m)?;
+                    let range = find_ident_range_on_line(&target_source, span.line, word, span);
+                    let target_uri = path_to_uri(target_path).ok()?;
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: target_uri,
+                        range,
+                    }));
+                }
+                SymbolId::Method {
+                    module_idx: m,
+                    item_idx,
+                    method_idx,
+                } => {
+                    let module_with_arena = state.compiler.module_with_arena(m)?;
+                    let span = method_decl_span(
+                        &module_with_arena.parse_result.statements,
+                        item_idx,
+                        method_idx,
+                    )?;
+                    let target_path = state.compiler.path_for_module(m)?;
+                    let target_source = state.compiler.source_text(m)?;
+                    let range = find_ident_range_on_line(&target_source, span.line, word, span);
+                    let target_uri = path_to_uri(target_path).ok()?;
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: target_uri,
+                        range,
+                    }));
+                }
+                SymbolId::Field {
+                    struct_name,
+                    field_name,
+                } => {
+                    let struct_str = struct_name.to_string();
+                    let &m = ctx.struct_owner_module.get(&struct_str)?;
+                    let module_with_arena = state.compiler.module_with_arena(m)?;
+                    let span = module_with_arena
+                        .parse_result
+                        .statements
+                        .iter()
+                        .find_map(|s| {
+                            let (_, s) = s.peel();
+                            if let Stmt::StructDecl(sd) = s {
+                                if sd.name == struct_name {
+                                    if let Some(params) = sd.params {
+                                        for p in params {
+                                            if let ir::ast::Param::Normal(np) = p {
+                                                if np.name == field_name {
+                                                    return Some(np.span);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })?;
+                    let target_path = state.compiler.path_for_module(m)?;
+                    let target_source = state.compiler.source_text(m)?;
+                    let range = find_ident_range_on_line(&target_source, span.line, word, span);
+                    let target_uri = path_to_uri(target_path).ok()?;
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: target_uri,
+                        range,
+                    }));
+                }
+                SymbolId::Local(..) => {
+                    if let Some((span, _, _, occ_m, _, _)) = checker
+                        .occurrences()
+                        .iter()
+                        .find(|(_, _, _, _, sid, is_decl)| *sid == symbol_id && *is_decl)
+                    {
+                        let target_path = state.compiler.path_for_module(*occ_m)?;
+                        let target_source = state.compiler.source_text(*occ_m)?;
+                        let range =
+                            find_ident_range_on_line(&target_source, span.line, word, *span);
+                        let target_uri = path_to_uri(target_path).ok()?;
+                        return Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: target_uri,
+                            range,
+                        }));
+                    }
+                }
+            }
+        }
+    }
 
-    let span = declaration_span(checker.occurrences(), symbol_id)?;
+    // 2. Fallback resolution by `word`
+    // Function fallback
+    if let Some((func, decl_m)) = find_func(state, &ctx, module_idx, word) {
+        let span = func.span;
+        let target_path = state.compiler.path_for_module(decl_m)?;
+        let target_source = state.compiler.source_text(decl_m)?;
+        let range = find_ident_range_on_line(&target_source, span.line, word, span);
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
 
-    let target_path = state.compiler.path_for_module(module_idx)?;
-    let target_source = state.compiler.source_text(module_idx)?;
-    let range = span_to_range(
-        &target_source,
-        span.line,
-        span.column,
-        span.end_line,
-        span.end_column,
-    );
-    let target_uri = path_to_uri(target_path).ok()?;
+    // Struct fallback
+    if let Some(&m) = ctx.struct_owner_module.get(word) {
+        let s_id = StrId(ctx.string_pool.intern(word));
+        let module_with_arena = state.compiler.module_with_arena(m)?;
+        let span = module_with_arena
+            .parse_result
+            .statements
+            .iter()
+            .find_map(|s| {
+                let (_, s) = s.peel();
+                if let Stmt::StructDecl(sd) = s {
+                    if sd.name == s_id {
+                        return Some(sd.span);
+                    }
+                }
+                None
+            })?;
+        let target_path = state.compiler.path_for_module(m)?;
+        let target_source = state.compiler.source_text(m)?;
+        let range = find_ident_range_on_line(&target_source, span.line, word, span);
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
 
-    Some(GotoDefinitionResponse::Scalar(Location {
-        uri: target_uri,
-        range,
-    }))
+    // Enum fallback
+    if let Some(&m) = ctx.enum_owner_module.get(word) {
+        let e_id = StrId(ctx.string_pool.intern(word));
+        let module_with_arena = state.compiler.module_with_arena(m)?;
+        let span = module_with_arena
+            .parse_result
+            .statements
+            .iter()
+            .find_map(|s| {
+                let (_, s) = s.peel();
+                if let Stmt::EnumDecl(ed) = s {
+                    if ed.name == e_id {
+                        return Some(ed.span);
+                    }
+                }
+                None
+            })?;
+        let target_path = state.compiler.path_for_module(m)?;
+        let target_source = state.compiler.source_text(m)?;
+        let range = find_ident_range_on_line(&target_source, span.line, word, span);
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
+
+    // Interface fallback
+    if let Some(&m) = ctx.interface_owner_module.get(word) {
+        let i_id = StrId(ctx.string_pool.intern(word));
+        let module_with_arena = state.compiler.module_with_arena(m)?;
+        let span = module_with_arena
+            .parse_result
+            .statements
+            .iter()
+            .find_map(|s| {
+                let (_, s) = s.peel();
+                if let Stmt::InterfaceDecl(id) = s {
+                    if id.name == i_id {
+                        return Some(id.span);
+                    }
+                }
+                None
+            })?;
+        let target_path = state.compiler.path_for_module(m)?;
+        let target_source = state.compiler.source_text(m)?;
+        let range = find_ident_range_on_line(&target_source, span.line, word, span);
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
+
+    // Item in dep_graph
+    let word_id = StrId(ctx.string_pool.intern(word));
+    let dep_graph = state.compiler.dep_graph_ref().borrow();
+    if let Some((decl_m, item_idx, tag)) = dep_graph.resolve_item_in_module(module_idx, word_id) {
+        let module_with_arena = state.compiler.module_with_arena(decl_m)?;
+        let span = item_decl_span(&module_with_arena.parse_result.statements, item_idx, tag)?;
+        let target_path = state.compiler.path_for_module(decl_m)?;
+        let target_source = state.compiler.source_text(decl_m)?;
+        let range = find_ident_range_on_line(&target_source, span.line, word, span);
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
+
+    // Module package path fallback
+    if let Some(m) = dep_graph.resolve_module_path(&[word_id]) {
+        let target_path = state.compiler.path_for_module(m)?;
+        let target_uri = path_to_uri(target_path).ok()?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range: lsp_types::Range::default(),
+        }));
+    }
+
+    None
 }
 
 fn references_at(state: &ServerState, params: &ReferenceParams) -> Vec<Location> {
@@ -688,42 +1325,38 @@ fn references_at(state: &ServerState, params: &ReferenceParams) -> Vec<Location>
         return vec![];
     };
 
+    let mut locations = Vec::new();
+
     if let SymbolId::Item {
         module_idx: m,
         item_idx,
         tag,
     } = symbol_id
     {
-        if !include_declaration {
-            return vec![];
+        if include_declaration {
+            if let Some(module_with_arena) = state.compiler.module_with_arena(m) {
+                if let Some(span) =
+                    item_decl_span(&module_with_arena.parse_result.statements, item_idx, tag)
+                {
+                    if let Some(target_path) = state.compiler.path_for_module(m) {
+                        if let Some(target_source) = state.compiler.source_text(m) {
+                            let range = span_to_range(
+                                &target_source,
+                                span.line,
+                                span.column,
+                                span.end_line,
+                                span.end_column,
+                            );
+                            if let Ok(uri) = path_to_uri(target_path) {
+                                locations.push(Location { uri, range });
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let Some(module_with_arena) = state.compiler.module_with_arena(m) else {
-            return vec![];
-        };
-        let Some(span) = item_decl_span(&module_with_arena.parse_result.statements, item_idx, tag)
-        else {
-            return vec![];
-        };
-        let Some(target_path) = state.compiler.path_for_module(m) else {
-            return vec![];
-        };
-        let Some(target_source) = state.compiler.source_text(m) else {
-            return vec![];
-        };
-        let range = span_to_range(
-            &target_source,
-            span.line,
-            span.column,
-            span.end_line,
-            span.end_column,
-        );
-        let Ok(uri) = path_to_uri(target_path) else {
-            return vec![];
-        };
-        return vec![Location { uri, range }];
     }
 
-    let mut locations = Vec::new();
     for (span, _, _, m, sid, is_decl) in checker.occurrences() {
         if *sid != symbol_id {
             continue;
@@ -763,4 +1396,145 @@ pub fn apply_change(source: &mut String, change: TextDocumentContentChangeEvent)
         // Client sent the whole document.
         *source = change.text;
     }
+}
+
+fn doc_for_symbol(
+    state: &ServerState,
+    checker: &sentinel_typechecker::TypeChecker,
+    sid: SymbolId,
+) -> Option<String> {
+    let (m, span) = match sid {
+        SymbolId::Item {
+            module_idx,
+            item_idx,
+            tag,
+        } => {
+            let stmts = &state
+                .compiler
+                .module_with_arena(module_idx)?
+                .parse_result
+                .statements;
+            (module_idx, item_decl_span(stmts, item_idx, tag)?)
+        }
+        SymbolId::Method {
+            module_idx,
+            item_idx,
+            method_idx,
+        } => {
+            let stmts = &state
+                .compiler
+                .module_with_arena(module_idx)?
+                .parse_result
+                .statements;
+            (module_idx, method_decl_span(stmts, item_idx, method_idx)?)
+        }
+        SymbolId::Field {
+            struct_name,
+            field_name,
+        } => {
+            let struct_str = struct_name.to_string();
+            let &owner_m = checker.context().struct_owner_module.get(&struct_str)?;
+            let stmts = &state
+                .compiler
+                .module_with_arena(owner_m)?
+                .parse_result
+                .statements;
+            let span = stmts.iter().find_map(|s| {
+                let (_, s) = s.peel();
+                if let Stmt::StructDecl(sd) = s {
+                    if sd.name == struct_name {
+                        if let Some(params) = sd.params {
+                            for p in params {
+                                if let ir::ast::Param::Normal(np) = p {
+                                    if np.name == field_name {
+                                        return Some(np.span);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })?;
+            (owner_m, span)
+        }
+        _ => checker
+            .occurrences()
+            .iter()
+            .find(|(_, _, _, _, s, is_decl)| *s == sid && *is_decl)
+            .map(|(span, _, _, m, _, _)| (*m, *span))?,
+    };
+    let src = state.compiler.source_text(m)?;
+    crate::doc_comments::doc_comment_above(&src, span.line)
+}
+
+fn func_for_item<'a, 'bump>(
+    state: &ServerState<'a, 'bump>,
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    m: usize,
+    item_idx: usize,
+    tag: &str,
+) -> Option<HirFunc<'a, 'bump>> {
+    let stmts = &state.compiler.module_with_arena(m)?.parse_result.statements;
+    let span = item_decl_span(stmts, item_idx, tag)?;
+    ctx.module_functions
+        .get(&m)?
+        .values()
+        .find(|f| f.span == span)
+        .copied()
+}
+
+fn method_for_symbol<'a, 'bump>(
+    state: &ServerState<'a, 'bump>,
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    m: usize,
+    item_idx: usize,
+    method_idx: usize,
+) -> Option<HirFunc<'a, 'bump>> {
+    let stmts = &state.compiler.module_with_arena(m)?.parse_result.statements;
+    let span = method_decl_span(stmts, item_idx, method_idx)?;
+    ctx.type_methods
+        .values()
+        .flat_map(|t| t.methods.values())
+        .find(|f| f.declaring_module_idx == m && f.span == span)
+        .copied()
+}
+
+fn struct_in_module<'a, 'bump>(
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    m: usize,
+    unmangled: &str,
+) -> Option<HirStruct<'a, 'bump>> {
+    ctx.structs
+        .iter()
+        .find(|(k, s)| {
+            s.unmangled_name == unmangled && ctx.struct_owner_module.get(k.as_str()) == Some(&m)
+        })
+        .map(|(_, s)| *s)
+}
+
+fn enum_in_module<'a, 'bump>(
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    m: usize,
+    unmangled: &str,
+) -> Option<HirEnum<'a, 'bump>> {
+    ctx.enums
+        .iter()
+        .find(|(k, e)| {
+            e.unmangled_name == unmangled && ctx.enum_owner_module.get(k.as_str()) == Some(&m)
+        })
+        .map(|(_, e)| *e)
+}
+
+fn interface_in_module<'a, 'bump>(
+    ctx: &sentinel_typechecker::TypeContext<'a, 'bump>,
+    m: usize,
+    unmangled: &str,
+) -> Option<HirInterface<'a, 'bump>> {
+    ctx.interfaces
+        .iter()
+        .find(|(k, i)| {
+            i.unmangled_name == unmangled && ctx.interface_owner_module.get(k.as_str()) == Some(&m)
+        })
+        .map(|(_, i)| *i)
 }

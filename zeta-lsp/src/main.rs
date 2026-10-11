@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod doc_comments;
 pub mod docs;
 pub mod lsp_diagnostics;
 pub mod semantic_tokens;
@@ -6,6 +7,9 @@ pub mod server;
 pub mod state;
 pub mod text_utils;
 pub mod urls;
+
+#[cfg(test)]
+mod tests;
 
 use std::error::Error;
 
