@@ -40,6 +40,12 @@ pub struct ModuleSymbols {
     pub struct_methods: Vec<(StrId, StrId)>, // (struct_name, method_name)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TypeAliasEntry<'a, 'bump> {
+    pub generics: Option<&'bump [crate::ast::Generic<'a, 'bump>]>,
+    pub ty: crate::ast::Type<'a, 'bump>,
+}
+
 /// Cloning this is very cheap as every field is wrapped in Rc
 #[derive(Clone)]
 pub struct GlobalRegistry<'a, 'bump> {
@@ -71,6 +77,8 @@ pub struct GlobalRegistry<'a, 'bump> {
     owned_by_module: Rc<RefCell<FxHashMap<StrId, ModuleSymbols>>>,
     pub known: Rc<RefCell<FxHashMap<(KnownKind, StrId), AttrTarget>>>,
     pub statics: Rc<RefCell<FxHashMap<StrId, StaticDef>>>,
+    pub type_aliases: Rc<RefCell<FxHashMap<StrId, TypeAliasEntry<'a, 'bump>>>>,
+    pub module_consts: Rc<RefCell<FxHashMap<(usize, StrId), HirExpr<'a, 'bump>>>>,
 }
 
 impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
@@ -93,6 +101,8 @@ impl<'a, 'bump> GlobalRegistry<'a, 'bump> {
             instantiated_functions: Rc::new(RefCell::new(FxHashMap::default())),
             known: Rc::new(RefCell::new(FxHashMap::default())),
             statics: Rc::new(RefCell::new(FxHashMap::default())),
+            type_aliases: Rc::new(RefCell::new(FxHashMap::default())),
+            module_consts: Rc::new(RefCell::new(FxHashMap::default())),
         }
     }
 
