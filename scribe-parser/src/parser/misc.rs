@@ -440,13 +440,27 @@ where
 
                 if cursor.peek() == LBracket {
                     let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
-                    if let TypeKind::UnsafePointer { .. } = kind {
-                        todo!("Handle error when & and [*] are mixed together.")
-                    }
-
                     let nullable = cursor.consume(TokenKind::Question);
 
-                    return Ok(Type { kind, nullable });
+                    return Ok(match kind {
+                        TypeKind::UnsafePointer { .. } => {
+                            todo!("Handle error when & and [*] are mixed together.")
+                        }
+                        // `&[]T` is already a borrowed view, so keep it as the slice type.
+                        TypeKind::Slice { .. } => Type { kind, nullable },
+                        // `&[N]T` is a shared reference to an array.
+                        other => Type {
+                            kind: TypeKind::Ref {
+                                inner: bump.alloc_value_immutable(Type {
+                                    kind: other,
+                                    nullable: false,
+                                }),
+                                ref_kind: RefKind::Shared,
+                                provenance,
+                            },
+                            nullable,
+                        },
+                    });
                 } else {
                     let ref_kind = if cursor.consume(TokenKind::Mut) {
                         RefKind::Unique
