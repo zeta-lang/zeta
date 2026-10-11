@@ -7,6 +7,11 @@ use crate::borrow_checker::{
     AliasReasoner, Bound, IndexContainer, Interval, MemoryRelation, Place, PlaceId, Projection,
 };
 
+#[inline(always)]
+fn get_place(places: &[Place], id: PlaceId) -> Option<&Place> {
+    places.get(id.0 as usize)
+}
+
 impl AliasReasoner {
     pub fn new() -> Self {
         Self {
@@ -20,10 +25,10 @@ impl AliasReasoner {
         }
     }
 
-    fn ancestor_chain(&self, places: &FxHashMap<PlaceId, Place>, start: PlaceId) -> Vec<PlaceId> {
+    fn ancestor_chain(&self, places: &[Place], start: PlaceId) -> Vec<PlaceId> {
         let mut chain = vec![start];
         let mut current = start;
-        while let Some(place) = places.get(&current) {
+        while let Some(place) = get_place(places, current) {
             match place.parent {
                 Some(parent) => {
                     chain.push(parent);
@@ -37,7 +42,7 @@ impl AliasReasoner {
 
     pub fn relation(
         &self,
-        places: &FxHashMap<PlaceId, Place>,
+        places: &[Place],
         place_to_local: &FxHashMap<PlaceId, StrId>,
         lhs: PlaceId,
         rhs: PlaceId,
@@ -57,11 +62,11 @@ impl AliasReasoner {
             return MemoryRelation::Overlap;
         }
 
-        let lhs_place = match places.get(&lhs) {
+        let lhs_place = match get_place(places, lhs) {
             Some(place) => place,
             None => return MemoryRelation::Unknown,
         };
-        let rhs_place = match places.get(&rhs) {
+        let rhs_place = match get_place(places, rhs) {
             Some(place) => place,
             None => return MemoryRelation::Unknown,
         };
@@ -86,7 +91,7 @@ impl AliasReasoner {
         // just when the compared places are themselves the immediate
         // Index/Field nodes.
         if let Some((ldiv, rdiv)) = self.find_divergence(&lhs_chain, &rhs_chain) {
-            if let (Some(ld), Some(rd)) = (places.get(&ldiv), places.get(&rdiv)) {
+            if let (Some(ld), Some(rd)) = (get_place(places, ldiv), get_place(places, rdiv)) {
                 match (&ld.projection, &rd.projection) {
                     (Some(Projection::Field(a)), Some(Projection::Field(b))) => {
                         return if a == b {
@@ -109,7 +114,7 @@ impl AliasReasoner {
             }
         }
 
-        if let (Some(l), Some(r)) = (places.get(&lhs), places.get(&rhs)) {
+        if let (Some(l), Some(r)) = (get_place(places, lhs), get_place(places, rhs)) {
             if let (Some(Projection::Deref), Some(Projection::Deref)) =
                 (&l.projection, &r.projection)
             {
@@ -397,13 +402,8 @@ impl AliasReasoner {
         None
     }
 
-    fn is_ancestor(
-        &self,
-        places: &FxHashMap<PlaceId, Place>,
-        ancestor: PlaceId,
-        mut current: PlaceId,
-    ) -> bool {
-        while let Some(place) = places.get(&current) {
+    fn is_ancestor(&self, places: &[Place], ancestor: PlaceId, mut current: PlaceId) -> bool {
+        while let Some(place) = get_place(places, current) {
             if place.id == ancestor {
                 return true;
             }

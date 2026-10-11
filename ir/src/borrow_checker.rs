@@ -124,6 +124,9 @@ pub struct Place {
     pub parent: Option<PlaceId>,
 
     pub projection: Option<Projection>,
+
+    /// Child places (fields, derefs, indices).
+    pub children: Vec<PlaceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,8 +197,8 @@ pub struct BorrowChecker {
     pub(super) next_loan: LoanId,
     pub(super) next_provenance: ProvenanceId,
 
-    pub places: FxHashMap<PlaceId, Place>,
-    pub active_loans: FxHashMap<LoanId, Loan>,
+    pub places: Vec<Place>,
+    pub active_loans: Vec<Option<Loan>>,
     pub provenances: FxHashMap<ProvenanceId, Provenance>,
 
     pub local_places: FxHashMap<StrId, PlaceId>,
