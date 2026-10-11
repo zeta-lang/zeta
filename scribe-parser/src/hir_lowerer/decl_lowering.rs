@@ -628,7 +628,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     path: self.ctx.bump.alloc_slice(&hir_path),
                 });
             }
-            &*self.ctx.bump.alloc_slice(&hir_mps)
+            self.ctx.bump.alloc_slice(&hir_mps)
         })
     }
 

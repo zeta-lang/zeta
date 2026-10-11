@@ -15,10 +15,6 @@ import zeta::sync::mutex.MutexGuard;
 import zeta::thread::threads;
 import zeta::thread::threads.ThreadCtxHeader;
 
-// Scoped threads: `scope(|s| { s.spawn(...); ... })` joins every thread that is
-// still running when the closure returns, so spawned closures may borrow from
-// the enclosing function. No `Arc`, no `static` bound -- only `Send`.
-
 struct ScopedThread {
     tid: Pthread,
     joined: bool,

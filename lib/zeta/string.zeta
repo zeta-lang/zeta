@@ -83,7 +83,11 @@ impl<A: Allocator = Mallocator> String<A> {
         unsafe { return str.from_utf8_unchecked(this.as_bytes()); }
     }
 
-    func write(&mut this, bytes: &[]u8): Result<usize, IOError> {
+    func write(&mut this, string: str): Result<usize, IOError> {
+        return this.write_bytes(string.as_bytes());
+    }
+
+    func write_bytes(&mut this, bytes: &[]u8): Result<usize, IOError> {
         unsafe { return this.write_raw(bytes); };
     }
 

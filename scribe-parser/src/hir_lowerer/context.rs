@@ -5,7 +5,7 @@ use ir::errors::reporter::ErrorReporter;
 use ir::hir::{HirEnum, HirExpr, HirFuncProto, RefKind};
 use ir::hir::{HirFunc, HirInterface, HirStruct, HirType, StrId};
 use ir::ir_hasher::{FxHashBuilder, FxHashMap};
-use ir::registry::global_registry::GlobalRegistry;
+use ir::registry::global_registry::{GlobalRegistry, TypeAliasEntry};
 use ir::span::SourceSpan;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -46,15 +46,9 @@ pub struct LoweringCtx<'a, 'bump> {
     pub lowering_errors: RefCell<Vec<(String, SourceSpan<'a>)>>,
     pub type_aliases: Rc<RefCell<FxHashMap<StrId, TypeAliasEntry<'a, 'bump>>>>,
     pub(super) alias_resolution_stack: RefCell<Vec<StrId>>,
-    pub module_consts: RefCell<FxHashMap<(usize, StrId), HirExpr<'a, 'bump>>>,
+    pub module_consts: Rc<RefCell<FxHashMap<(usize, StrId), HirExpr<'a, 'bump>>>>,
     pub attrs: RefCell<AttrTable<'a, 'bump>>,
     pub registry: GlobalRegistry<'a, 'bump>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TypeAliasEntry<'a, 'bump> {
-    pub generics: Option<&'bump [ir::ast::Generic<'a, 'bump>]>,
-    pub ty: ir::ast::Type<'a, 'bump>,
 }
 
 impl<'a, 'bump> LoweringCtx<'a, 'bump> {
@@ -249,7 +243,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 bump,
                 imported_modules: RefCell::new(FxHashMap::default()),
                 alias_resolution_stack: RefCell::new(Vec::default()),
-                type_aliases: Rc::new(RefCell::new(FxHashMap::default())),
                 dep_graph,
                 module_idx: usize::MAX,
                 struct_interfaces: registry.struct_interfaces.clone(),
@@ -258,7 +251,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 instantiated_structs: registry.instantiated_structs.clone(),
                 instantiated_struct_origins: registry.instantiated_struct_origins.clone(),
                 named_imports: RefCell::new(FxHashMap::default()),
-                module_consts: RefCell::new(FxHashMap::default()),
+                type_aliases: registry.type_aliases.clone(),
+                module_consts: registry.module_consts.clone(),
                 lowering_errors: RefCell::new(Vec::default()),
                 auto_imports,
                 attrs: RefCell::new(AttrTable::default()),

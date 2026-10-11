@@ -78,7 +78,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         return unsafe {
             this.data.len -= 1;
             let ptr: [*]mut T = this.data as [*]mut T;
-            ptr[this.data.len]
+            $ptr_read(&ptr[this.data.len] as *const T)
         };
     }
 
@@ -135,7 +135,9 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
 
         unsafe {
-            this.data = this.alloc.realloc(this.data, new_cap);
+            old := $ptr_read(&this.data as *const ^this.alloc []T);
+            $ptr_write(&mut this.data as *mut ^this.alloc []T,
+                       this.alloc.realloc(old, new_cap));
         }
     }
 
@@ -149,12 +151,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         unsafe {
             let ptr: [*]mut T = this.data as [*]mut T;
 
-            let mut i: usize = this.data.len;
-            while (i > index) {
-                ptr[i] = ptr[i - 1];
-                i -= 1;
-            }
-
+            $ptr_copy(&ptr[index], &mut ptr[index + 1], this.data.len - index);
             this.data.write_uninit(index, value);
             this.data.len += 1;
         }
@@ -181,7 +178,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
 
         unsafe {
             let ptr: [*]mut T = this.data as [*]mut T;
-            let value: T = ptr[index];
+            let value: T = $ptr_read(&ptr[index] as *const T);
 
             let mut i: usize = index;
             while (i + 1 < this.data.len) {
@@ -203,14 +200,10 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
             let ptr: [*]mut T = this.data as [*]mut T;
 
             this.data.len -= 1;
-
-            if (index == this.data.len) {
-                return ptr[index];
+            let value: T = $ptr_read(&ptr[index] as *const T);
+            if (index != this.data.len) {
+                $ptr_copy(&ptr[this.data.len], &mut ptr[index], 1);
             }
-
-            let value: T = ptr[index];
-            ptr[index] = ptr[this.data.len];
-
             return value;
         }
     }
