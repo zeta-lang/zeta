@@ -232,10 +232,16 @@ where
         let let_stmt = if self.cursor.peek() == TokenKind::Semicolon {
             None
         } else {
-            // parse_let_stmt() automatically consumes Semicolon
-            let Stmt::Let(let_stmt) = self.parse_let_stmt()? else {
+            let stmt = if self.cursor.peek() == TokenKind::Let {
+                self.parse_let_stmt()?
+            } else {
+                self.parse_shorthand_let_stmt()?
+            };
+
+            let Stmt::Let(let_stmt) = stmt else {
                 unreachable!()
             };
+
             Some(let_stmt)
         };
 
