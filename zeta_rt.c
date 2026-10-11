@@ -268,3 +268,7 @@ void *__zeta_memset(void *dst, int value, unsigned long long size) {
 void *__zeta_memcpy(void *dst, void *src, unsigned long long size) {
     return __builtin_memcpy(dst, src, size);
 }
+
+void *__zeta_memmove(void *dst, void *src, unsigned long long size) {
+    return __builtin_memmove(dst, src, size);
+}
