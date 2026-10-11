@@ -513,11 +513,6 @@ where
         value: char,
         span: SourceSpan<'a>,
     },
-    FieldInit {
-        ident: StrId,
-        expr: &'bump Expr<'a, 'bump>,
-        span: SourceSpan<'a>,
-    },
     Unary {
         op: Op,
         operand: &'bump Expr<'a, 'bump>,

@@ -1410,9 +1410,6 @@ impl DepGraph {
                 self.walk_expr(expr, from_node, module_idx, pool);
                 self.walk_expr(index, from_node, module_idx, pool);
             }
-            Expr::FieldInit { expr, .. } => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-            }
             Expr::ExprList { expressions, .. } => {
                 for e in *expressions {
                     self.walk_expr(e, from_node, module_idx, pool);
