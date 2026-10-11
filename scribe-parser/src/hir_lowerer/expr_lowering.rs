@@ -42,6 +42,13 @@ const INTRINSICS: &[(&str, IntrinsicKind)] = &[
     ("atomic_fetch_or", IntrinsicKind::AtomicFetchOr),
     ("atomic_fetch_xor", IntrinsicKind::AtomicFetchXor),
     ("atomic_fence", IntrinsicKind::AtomicFence),
+    ("ptr_read", IntrinsicKind::PtrRead),
+    ("ptr_write", IntrinsicKind::PtrWrite),
+    ("ptr_copy", IntrinsicKind::PtrCopy),
+    (
+        "ptr_copy_nonoverlapping",
+        IntrinsicKind::PtrCopyNonoverlapping,
+    ),
 ];
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
@@ -493,19 +500,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             }
 
             Expr::Char { value, span } => HirExpr::Char(*value, *span),
-
-            Expr::FieldInit {
-                ident: _,
-                expr,
-                span,
-            } => {
-                // TODO: evaluate if this should be removed
-                let lowered_expr = self.lower_expr(expr);
-                HirExpr::ExprList {
-                    list: self.ctx.bump.alloc_slice(&[lowered_expr]),
-                    span: *span,
-                }
-            }
 
             Expr::If { if_stmt, span } => HirExpr::If {
                 if_stmt: self.ctx.bump.alloc_value(self.lower_if_stmt(**if_stmt)),
@@ -1164,8 +1158,97 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 .map(|e| self.infer_type(e))
                 .unwrap_or(HirType::Void),
             HirExpr::Comparison { .. } => HirType::Boolean,
+            HirExpr::Intrinsic {
+                kind,
+                type_args,
+                args,
+                ..
+            } => self.infer_intrinsic_type(*kind, type_args, args),
+            HirExpr::Cast { target_type, .. } => *target_type,
+            HirExpr::Deref { expr, .. } => {
+                Self::pointee_of(self.infer_type(expr)).unwrap_or(HirType::Unknown)
+            }
+            HirExpr::Index { object, .. } => {
+                match Self::pointee_of_or_self(self.infer_type(object)) {
+                    HirType::Array(inner, _) | HirType::Slice(inner) => *inner,
+                    _ => HirType::Unknown,
+                }
+            }
 
             _ => HirType::Unknown,
+        }
+    }
+
+    fn pointee_of(ty: HirType<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
+        match ty {
+            HirType::Ref { inner, .. }
+            | HirType::SafePointer { inner, .. }
+            | HirType::UnsafePointer { inner, .. }
+            | HirType::OwnedPointer { inner, .. } => Some(*inner),
+            _ => None,
+        }
+    }
+
+    fn pointee_of_or_self(object: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
+        Self::pointee_of(object).unwrap_or(object)
+    }
+
+    fn infer_intrinsic_type(
+        &self,
+        kind: IntrinsicKind,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+    ) -> HirType<'a, 'bump> {
+        use IntrinsicKind::*;
+        let first_ty = || type_args.first().copied();
+        match kind {
+            SizeOf | AlignOf => HirType::Usize,
+            TypeName => HirType::String,
+            Unreachable => HirType::Never,
+            Reinterpret => first_ty().unwrap_or(HirType::Unknown),
+
+            PtrRead => first_ty()
+                .or_else(|| {
+                    args.first()
+                        .and_then(|a| Self::pointee_of(self.infer_type(a)))
+                })
+                .unwrap_or(HirType::Unknown),
+
+            Replace => match args.first() {
+                Some(HirExpr::Ref { expr, .. }) => self.infer_type(expr),
+                Some(other) => self.infer_type(other),
+                None => HirType::Unknown,
+            },
+
+            Leak => match args.first().map(|a| self.infer_type(a)) {
+                Some(HirType::OwnedPointer { inner, .. }) => match *inner {
+                    HirType::Slice(elem) => HirType::Slice(elem),
+                    pointee => HirType::UnsafePointer {
+                        inner: self.ctx.bump.alloc_value(pointee),
+                        mutability_state: ir::ast::MutabilityState::Mut,
+                    },
+                },
+                _ => HirType::Unknown,
+            },
+
+            AtomicLoad | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
+            | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor => {
+                first_ty().unwrap_or(HirType::Unknown)
+            }
+
+            PtrWrite
+            | PtrCopy
+            | PtrCopyNonoverlapping
+            | DropInPlace
+            | MemForget
+            | AssumeInit
+            | AssertAlign
+            | CpuRelax
+            | AtomicStore
+            | AtomicFence => HirType::Void,
+
+            // allocator provenance / closure tables are needed for these
+            Own | FnPtr => HirType::Unknown,
         }
     }
 

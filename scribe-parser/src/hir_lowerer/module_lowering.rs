@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
-use crate::hir_lowerer::context::TypeAliasEntry;
+use ir::registry::global_registry::TypeAliasEntry;
 
 use super::context::HirLowerer;
-use ir::ast::{AttrArg, Stmt};
+use ir::ast::{AttrArg, Stmt, TypeKind};
 use ir::ast::{FuncDecl, Path};
 use ir::attributes::{AttrTarget, KnownKind};
 use ir::hir::{Hir, HirAttrArg, HirModule, HirStmt, StrId};
@@ -27,25 +27,24 @@ pub enum ImplTargetKind {
 }
 
 pub fn primitive_canonical_name(kind: &ir::ast::TypeKind) -> Option<&'static str> {
-    use ir::ast::TypeKind::*;
     Some(match kind {
-        I8 => "i8",
-        I16 => "i16",
-        I32 => "i32",
-        I64 => "i64",
-        I128 => "i128",
-        U8 => "u8",
-        U16 => "u16",
-        U32 => "u32",
-        U64 => "u64",
-        U128 => "u128",
-        Usize => "usize",
-        Isize => "isize",
-        F32 => "f32",
-        F64 => "f64",
-        Boolean => "bool",
-        String => "str",
-        Char => "char",
+        TypeKind::I8 => "i8",
+        TypeKind::I16 => "i16",
+        TypeKind::I32 => "i32",
+        TypeKind::I64 => "i64",
+        TypeKind::I128 => "i128",
+        TypeKind::U8 => "u8",
+        TypeKind::U16 => "u16",
+        TypeKind::U32 => "u32",
+        TypeKind::U64 => "u64",
+        TypeKind::U128 => "u128",
+        TypeKind::Usize => "usize",
+        TypeKind::Isize => "isize",
+        TypeKind::F32 => "f32",
+        TypeKind::F64 => "f64",
+        TypeKind::Boolean => "bool",
+        TypeKind::String => "str",
+        TypeKind::Char => "char",
         _ => return None,
     })
 }
