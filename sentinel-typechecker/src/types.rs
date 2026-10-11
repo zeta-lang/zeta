@@ -403,7 +403,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn strip_ref<'x>(ty: &'x HirType<'a, 'bump>) -> &'x HirType<'a, 'bump> {
         match ty {
             HirType::Ref { inner, .. } => inner,
-            HirType::SafePointer { inner, .. } => inner,
             HirType::OwnedPointer { inner, .. } => inner,
             _ => ty,
         }

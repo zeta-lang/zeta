@@ -190,12 +190,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn analyze_suspension(&self, point: PointId) -> SuspensionReport {
         let mut frame_locals: Vec<StrId> = self
-            .init_state
-            .keys()
-            .copied()
+            .local_table
+            .names()
             .filter(|l| self.local_used_after(point, *l))
             .collect();
-        frame_locals.sort_by_key(|l| str_id_to_string(*l));
+        frame_locals.sort_by_key(|l| l.clone());
 
         let borrows_across: Vec<LoanId> = self
             .loan_owners

@@ -1,8 +1,9 @@
 use codex_dependency_graph::DepGraph;
 use ir::{
     hir::{HirEnum, HirFunc, HirInterface, HirStruct, HirType, StrId},
-    ir_hasher::{HashMap, HashSet},
+    ir_hasher::{FxHashMap, HashMap, HashSet},
 };
+use smallvec::SmallVec;
 use std::{cell::RefCell, sync::Arc};
 use zetaruntime::{bump::GrowableBump, string_pool::StringPool};
 
@@ -43,12 +44,8 @@ pub struct TypeContext<'a, 'bump> {
     pub struct_interfaces: HashMap<String, HashSet<String>>,
     pub mutable_variables: HashSet<String>,
     pub string_pool: Arc<StringPool>,
-    pub generic_struct_instantiations: RefCell<
-        Vec<(
-            (StrId, Vec<HirType<'a, 'bump>>),
-            &'bump [HirType<'a, 'bump>],
-        )>,
-    >,
+    pub generic_struct_instantiations:
+        RefCell<FxHashMap<(StrId, SmallVec<HirType<'a, 'bump>, 4>), &'bump [HirType<'a, 'bump>]>>,
     pub generic_enum_instantiations: RefCell<
         Vec<(
             (StrId, Vec<HirType<'a, 'bump>>),
@@ -83,7 +80,7 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
             struct_owner_module: HashMap::default(),
             enum_owner_module: HashMap::default(),
             interface_owner_module: HashMap::default(),
-            generic_struct_instantiations: RefCell::new(Vec::new()),
+            generic_struct_instantiations: RefCell::new(FxHashMap::default()),
             generic_enum_instantiations: RefCell::new(Vec::new()),
             conditional_impls: HashMap::default(),
         }
@@ -142,22 +139,22 @@ impl<'a, 'bump> TypeContext<'a, 'bump> {
         name: StrId,
         args: &[HirType<'a, 'bump>],
     ) -> Option<&'bump [HirType<'a, 'bump>]> {
+        let key = (name, SmallVec::from_slice_copy(args));
         self.generic_struct_instantiations
             .borrow()
-            .iter()
-            .find(|((n, a), _)| *n == name && a.as_slice() == args)
-            .map(|(_, fields)| *fields)
+            .get(&key)
+            .copied()
     }
 
     pub fn cache_struct_instantiation(
         &self,
         name: StrId,
-        args: Vec<HirType<'a, 'bump>>,
+        args: SmallVec<HirType<'a, 'bump>, 4>,
         fields: &'bump [HirType<'a, 'bump>],
     ) {
         self.generic_struct_instantiations
             .borrow_mut()
-            .push(((name, args), fields));
+            .insert((name, args), fields);
     }
 
     pub fn add_function(&mut self, module_idx: usize, name: String, func: HirFunc<'a, 'bump>) {

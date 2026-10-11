@@ -245,6 +245,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.move_state = converged_entry;
         self.init_state = converged_init;
 
+        self.enter_loop_body(body);
         self.check_stmt(body);
 
         self.context.exit_loop();
@@ -278,6 +279,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.move_state = converged_entry;
         self.init_state = converged_init;
 
+        self.enter_loop_body(body);
         self.check_stmt(body);
 
         self.context.exit_loop();
@@ -355,7 +357,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 (f.name, InitNode::Whole(s))
             })
             .collect();
-        self.init_state.insert(root, InitNode::Struct(map));
+        self.set_init_node(root, InitNode::Struct(map));
     }
 
     pub fn check_let_stmt(
@@ -383,6 +385,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let temp_snap = self.snapshot_call_loan_keys();
         let value_type = self.check_expr_expected(value, ty);
+        let ty = if matches!(ty, HirType::Unknown) {
+            &value_type
+        } else {
+            ty
+        };
 
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
         if !is_uninit_value {
@@ -397,10 +404,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let symbol_id = self.mint_symbol_id();
+
         self.context
             .add_variable_with_mutability(var_name, *ty, *mutable, symbol_id);
         self.borrow_checker.declare_local(*name);
-        self.move_state.clear(*name);
+        let local_id = self.local_table.register(*name);
+        self.move_state.clear(local_id);
         self.occurrences.push((
             *span,
             *name,

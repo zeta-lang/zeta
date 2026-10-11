@@ -4,9 +4,16 @@ use ir::{
         AssignmentOperator, HirExpr, HirFunc, HirParam, HirStmt, HirType, Operator, RefKind, StrId,
     },
     ir_hasher::{FxHashMap, HashSet},
+    nll_cfg::PointId,
 };
 
-use crate::{TypeChecker, move_state::MoveState, str_id_to_string};
+use crate::{
+    TypeChecker,
+    dataflow::{Effect, FlowState, Solved},
+    initialization_bitset::FastInitState,
+    move_state::MoveState,
+    str_id_to_string,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingMode {
@@ -130,6 +137,23 @@ impl IntervalSet {
             result.push((new_start, new_end));
         }
         self.ranges = result;
+    }
+
+    pub fn remove(&mut self, start: i64, end: i64) {
+        let mut kept = IntervalSet::default();
+        for &(s, e) in &self.ranges {
+            if e <= start || s >= end {
+                kept.insert(s, e);
+            } else {
+                if s < start {
+                    kept.insert(s, start);
+                }
+                if end < e {
+                    kept.insert(end, e);
+                }
+            }
+        }
+        *self = kept;
     }
 
     pub fn contains_range(&self, start: i64, end: i64) -> bool {
@@ -329,10 +353,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             let Some((root, path)) = self.static_field_path(object) else {
                 continue;
             };
-            let Some(node) = self.init_state.get(&root) else {
+            let Some(node) = self.init_node(root) else {
                 continue;
             };
-            let entry = Self::node_at_path_ref(node, &path).clone();
+            let entry = Self::node_at_path_ref(&node, &path).clone();
             out.push(CountedFill {
                 root,
                 path,
@@ -357,20 +381,23 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 _ => {}
             }
-            let Some(node) = self.init_state.get_mut(&f.root) else {
+            let Some(node) = self.init_node(f.root) else {
                 continue;
             };
-            // several fills of the same array in one loop accumulate
-            if let InitNode::Array { ranges: cur, .. } = Self::node_at_path_ref(node, &f.path) {
+            if let InitNode::Array { ranges: cur, .. } = Self::node_at_path_ref(&node, &f.path) {
                 for &(s, e) in &cur.ranges {
                     ranges.insert(s, e);
                 }
             }
             ranges.insert(f.start, f.end);
-            *Self::node_at_path_mut(node, &f.path) = InitNode::Array {
-                ranges,
-                len: Some(f.len),
-            };
+            self.set_init_path(
+                f.root,
+                &f.path,
+                InitNode::Array {
+                    ranges,
+                    len: Some(f.len),
+                },
+            );
         }
     }
 
@@ -392,11 +419,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             self.mark_array_range(root, &path, *i, *i + 1, len);
                         }
                         _ => {
-                            let Some(node) = self.init_state.get_mut(&root) else {
-                                return;
-                            };
-                            *Self::node_at_path_mut(node, &path) =
-                                InitNode::Whole(InitStatus::Initialized);
+                            self.set_init_path(
+                                root,
+                                &path,
+                                InitNode::Whole(InitStatus::Initialized),
+                            );
                         }
                     }
                 }
@@ -412,12 +439,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         };
                         self.mark_array_range(root, &path, *s, *e, len);
                     } else {
-                        let node = self
-                            .init_state
-                            .entry(root)
-                            .or_insert(InitNode::Whole(InitStatus::Uninitialized));
-                        *Self::node_at_path_mut(node, &path) =
-                            InitNode::Whole(InitStatus::Initialized);
+                        self.local_table.register(root);
+                        self.set_init_path(root, &path, InitNode::Whole(InitStatus::Initialized));
                     }
                 }
             }
@@ -454,7 +477,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if let (Some((root, path)), HirExpr::Number(i, _)) =
                     (self.static_field_path(object), index)
                 {
-                    if let Some(node) = self.init_state.get(&root).cloned() {
+                    if let Some(node) = self.init_node(root) {
                         let target_node = Self::node_at_path_ref(&node, &path);
                         let covered = match target_node {
                             InitNode::Array { ranges, .. } => ranges.contains_range(*i, *i + 1),
@@ -475,22 +498,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    pub fn mark_whole_uninit(&mut self, root: StrId) {
-        self.init_state
-            .insert(root, InitNode::Whole(InitStatus::Uninitialized));
+    pub fn join_nodes(a: InitNode, b: InitNode) -> InitNode {
+        join_init_nodes(a, b)
     }
 
-    pub fn mark_whole_init(&mut self, root: StrId) {
-        self.init_state
-            .insert(root, InitNode::Whole(InitStatus::Initialized));
+    /// Snapshot of a local's init node; `None` if the name was never registered
+    /// (pattern bindings, lambda params, statics): callers skip, as before.
+    pub(crate) fn init_node(&self, name: StrId) -> Option<InitNode> {
+        let id = self.local_table.get(name)?;
+        Some(self.init_state.node(id))
     }
 
-    pub fn mark_field_init(&mut self, root: StrId, path: &[StrId]) {
-        let node = self
-            .init_state
-            .entry(root)
-            .or_insert(InitNode::Whole(InitStatus::Initialized));
-        Self::mark_field_init_node(node, path);
+    pub(crate) fn set_init_node(&mut self, name: StrId, node: InitNode) {
+        let id = self.local_table.register(name);
+        self.log_effect(Effect::SetPath(id, Vec::new(), node.clone()));
+        self.init_state.set_node(id, node);
     }
 
     pub fn mark_field_init_node(node: &mut InitNode, path: &[StrId]) {
@@ -515,20 +537,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Self::mark_field_init_node(child, rest);
     }
 
-    pub fn mark_array_range(
-        &mut self,
-        root: StrId,
-        path: &[StrId],
-        start: i64,
-        end: i64,
-        len: Option<usize>,
-    ) {
-        let Some(node) = self.init_state.get_mut(&root) else {
-            return;
-        };
-        Self::mark_array_range_node(node, path, start, end, len);
-    }
-
     pub fn mark_array_range_node(
         node: &mut InitNode,
         path: &[StrId],
@@ -537,7 +545,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         len: Option<usize>,
     ) {
         if let InitNode::Whole(InitStatus::Initialized) = node {
-            return; // was: only checked when path.is_empty()
+            return;
         }
 
         if let Some((head, rest)) = path.split_first() {
@@ -565,19 +573,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 *node = InitNode::Array { ranges, len };
             }
         }
-    }
-
-    pub fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
-        let root_ty = self
-            .context
-            .get_variable(&str_id_to_string(root))
-            .map(|(_, t)| t);
-        let mut node = self
-            .init_state
-            .remove(&root)
-            .unwrap_or(InitNode::Whole(InitStatus::Initialized));
-        self.set_uninit_at(&mut node, path, root_ty);
-        self.init_state.insert(root, node);
     }
 
     fn set_uninit_at(&self, node: &mut InitNode, path: &[StrId], ty: Option<HirType<'a, 'bump>>) {
@@ -635,10 +630,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if self.suppress_init_read {
             return;
         }
-        let Some(node) = self.init_state.get(&root) else {
+        let Some(node) = self.init_node(root) else {
             return;
         };
-        match Self::status_at_path(node, path) {
+        match Self::status_at_path(&node, path) {
             InitStatus::Initialized => {}
             InitStatus::Uninitialized => self.record(TypeErrorKind::Generic(format!(
                 "use of uninitialized value `{}{}`: not assigned since `uninit`",
@@ -673,7 +668,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if self.suppress_init_read {
             return;
         }
-        let Some(node) = self.init_state.get(&root).cloned() else {
+        let Some(node) = self.init_node(root) else {
             return;
         };
         let status = match Self::node_exact(&node, path) {
@@ -728,71 +723,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
-    pub fn join_init_states(
-        a: &FxHashMap<StrId, InitNode>,
-        b: &FxHashMap<StrId, InitNode>,
-    ) -> FxHashMap<StrId, InitNode> {
-        let mut result = FxHashMap::default();
-        for key in a.keys().chain(b.keys()).copied().collect::<HashSet<_>>() {
-            let na = a
-                .get(&key)
-                .cloned()
-                .unwrap_or(InitNode::Whole(InitStatus::Initialized));
-            let nb = b
-                .get(&key)
-                .cloned()
-                .unwrap_or(InitNode::Whole(InitStatus::Initialized));
-            result.insert(key, Self::join_nodes(na, nb));
-        }
-        result
-    }
-
-    pub fn join_nodes(a: InitNode, b: InitNode) -> InitNode {
-        match (a, b) {
-            (InitNode::Whole(sa), InitNode::Whole(sb)) => InitNode::Whole(match (sa, sb) {
-                (InitStatus::Initialized, InitStatus::Initialized) => InitStatus::Initialized,
-                (InitStatus::Uninitialized, InitStatus::Uninitialized) => InitStatus::Uninitialized,
-                _ => InitStatus::Maybe,
-            }),
-            (InitNode::Array { ranges: ra, len }, InitNode::Array { ranges: rb, .. }) => {
-                InitNode::Array {
-                    ranges: ra.intersect(&rb),
-                    len,
-                }
-            }
-            (InitNode::Array { ranges, len }, InitNode::Whole(InitStatus::Initialized))
-            | (InitNode::Whole(InitStatus::Initialized), InitNode::Array { ranges, len }) => {
-                InitNode::Array { ranges, len }
-            }
-            (InitNode::Struct(ma), InitNode::Struct(mb)) => {
-                let mut out = FxHashMap::default();
-                for key in ma.keys().chain(mb.keys()).copied().collect::<HashSet<_>>() {
-                    let fa = ma
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
-                    let fb = mb
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
-                    out.insert(key, Self::join_nodes(fa, fb));
-                }
-                InitNode::Struct(out)
-            }
-            (InitNode::Struct(ma), InitNode::Whole(InitStatus::Initialized))
-            | (InitNode::Whole(InitStatus::Initialized), InitNode::Struct(ma)) => {
-                InitNode::Struct(ma)
-            }
-            _ => InitNode::Whole(InitStatus::Maybe),
-        }
-    }
-
     pub fn converge_loop_states(
         &mut self,
         body: &HirStmt<'a, 'bump>,
         move_entry: MoveState,
-        init_entry: FxHashMap<StrId, InitNode>,
-    ) -> (MoveState, FxHashMap<StrId, InitNode>) {
+        init_entry: FastInitState,
+    ) -> (MoveState, FastInitState) {
         let saved_move_state = self.move_state.clone();
         let saved_init_state = self.init_state.clone();
         let saved_context = self.context.clone();
@@ -806,7 +742,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 this.init_state = converged_init.clone();
                 this.check_stmt(body);
                 let next_move = MoveState::join(&converged_move, &this.move_state);
-                let next_init = Self::join_init_states(&converged_init, &this.init_state);
+                let next_init = FastInitState::join(&converged_init, &this.init_state);
 
                 let stable =
                     converged_move.is_superset_of(&next_move) && converged_init == next_init;
@@ -828,7 +764,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if self.suppress_init_read {
             return;
         }
-        let Some(node) = self.init_state.get(&name).cloned() else {
+        let Some(node) = self.init_node(name) else {
             return;
         };
         let status = match ty {
@@ -860,7 +796,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let Some((root, path)) = self.static_field_path(object) else {
             return;
         };
-        let Some(node) = self.init_state.get(&root).cloned() else {
+        let Some(node) = self.init_node(root) else {
             return;
         };
         let target = Self::node_at_path_ref(&node, &path);
@@ -1168,5 +1104,301 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
             _ => node,
         }
+    }
+
+    #[inline]
+    pub(crate) fn log_effect(&mut self, e: Effect<'a, 'bump>) {
+        if self.recording_effects {
+            self.effect_log.push((self.current_point, e));
+        }
+    }
+
+    pub fn mark_whole_init(&mut self, root: StrId) {
+        let id = self.local_table.register(root);
+        self.log_effect(Effect::InitWhole(id));
+        self.init_state.mark_whole_init(id);
+    }
+
+    pub fn mark_whole_uninit(&mut self, root: StrId) {
+        let id = self.local_table.register(root);
+        self.log_effect(Effect::UninitWhole(id));
+        self.init_state.mark_whole_uninit(id);
+    }
+
+    pub fn clear_move(&mut self, name: StrId) {
+        let id = self.local_table.register(name);
+        self.log_effect(Effect::ClearMove(id));
+        self.move_state.clear(id);
+    }
+
+    pub fn mark_field_init(&mut self, root: StrId, path: &[StrId]) {
+        let id = self.local_table.register(root);
+        self.log_effect(Effect::InitField(id, path.to_vec()));
+        let mut node = self.init_state.node(id);
+        Self::mark_field_init_node(&mut node, path);
+        self.init_state.set_node(id, node);
+    }
+
+    pub fn mark_array_range(
+        &mut self,
+        root: StrId,
+        path: &[StrId],
+        start: i64,
+        end: i64,
+        len: Option<usize>,
+    ) {
+        let Some(id) = self.local_table.get(root) else {
+            return;
+        };
+        self.log_effect(Effect::ArrayRange {
+            local: id,
+            path: path.to_vec(),
+            start,
+            end,
+            len,
+        });
+        let mut node = self.init_state.node(id);
+        Self::mark_array_range_node(&mut node, path, start, end, len);
+        self.init_state.set_node(id, node);
+    }
+
+    pub fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
+        let root_ty = self
+            .context
+            .get_variable(&str_id_to_string(root))
+            .map(|(_, t)| t);
+        let id = self.local_table.register(root);
+        self.log_effect(Effect::UninitField {
+            local: id,
+            path: path.to_vec(),
+            root_ty,
+        });
+        let mut node = self.init_state.node(id);
+        self.set_uninit_at(&mut node, path, root_ty);
+        self.init_state.set_node(id, node);
+    }
+
+    /// For the sites that used `*node_at_path_mut(..) = <constant>`.
+    pub fn set_init_path(&mut self, root: StrId, path: &[StrId], value: InitNode) {
+        let Some(id) = self.local_table.get(root) else {
+            return;
+        };
+        self.log_effect(Effect::SetPath(id, path.to_vec(), value.clone()));
+        let mut node = self.init_state.node(id);
+        *Self::node_at_path_mut(&mut node, path) = value;
+        self.init_state.set_node(id, node);
+    }
+
+    pub fn punch_array_hole(&mut self, root: StrId, path: &[StrId], idx: i64) {
+        let Some(id) = self.local_table.get(root) else {
+            return;
+        };
+        self.log_effect(Effect::ArrayHole {
+            local: id,
+            path: path.to_vec(),
+            idx,
+        });
+        let mut node = self.init_state.node(id);
+        if let InitNode::Array { ranges, .. } = Self::node_at_path_mut(&mut node, path) {
+            ranges.remove(idx, idx + 1);
+        }
+        self.init_state.set_node(id, node);
+    }
+
+    fn apply_effect(&self, e: &Effect<'a, 'bump>, f: &mut FlowState) {
+        match e {
+            Effect::Move { local, field: None } => f.mv.mark_whole_moved(*local),
+            Effect::Move {
+                local,
+                field: Some(x),
+            } => f.mv.mark_field_moved(*local, *x),
+            Effect::ClearMove(l) => f.mv.clear(*l),
+            Effect::InitWhole(l) => f.init.mark_whole_init(*l),
+            Effect::UninitWhole(l) => f.init.mark_whole_uninit(*l),
+            Effect::InitField(l, p) => {
+                let mut n = f.init.node(*l);
+                Self::mark_field_init_node(&mut n, p);
+                f.init.set_node(*l, n);
+            }
+            Effect::UninitField {
+                local,
+                path,
+                root_ty,
+            } => {
+                let mut n = f.init.node(*local);
+                self.set_uninit_at(&mut n, path, *root_ty);
+                f.init.set_node(*local, n);
+            }
+            Effect::ArrayRange {
+                local,
+                path,
+                start,
+                end,
+                len,
+            } => {
+                let mut n = f.init.node(*local);
+                Self::mark_array_range_node(&mut n, path, *start, *end, *len);
+                f.init.set_node(*local, n);
+            }
+            Effect::ArrayHole { local, path, idx } => {
+                let mut n = f.init.node(*local);
+                if let InitNode::Array { ranges, .. } = Self::node_at_path_mut(&mut n, path) {
+                    ranges.remove(*idx, *idx + 1);
+                }
+                f.init.set_node(*local, n);
+            }
+            Effect::SetPath(l, p, v) => {
+                let mut n = f.init.node(*l);
+                *Self::node_at_path_mut(&mut n, p) = v.clone();
+                f.init.set_node(*l, n);
+            }
+        }
+    }
+
+    fn cfg_edges(&self) -> (usize, Vec<Vec<usize>>, Vec<Vec<usize>>, usize) {
+        let cfg = &self.cfg;
+
+        let mut max_ix: Option<usize> = None;
+        let mut bump = |p: PointId| {
+            let i = p.0 as usize;
+            max_ix = Some(max_ix.map_or(i, |m| m.max(i)));
+        };
+
+        if let Some(e) = cfg.entry {
+            bump(e);
+        }
+        for (&from, tos) in cfg.successors.iter() {
+            bump(from);
+            for &to in tos {
+                bump(to);
+            }
+        }
+        for &p in cfg.exits.iter() {
+            bump(p);
+        }
+        for &p in self.stmt_points.values() {
+            bump(p);
+        }
+
+        // At least one slot so `entry` is always a valid index, even for an empty Cfg.
+        let n = max_ix.map_or(1, |m| m + 1);
+        let entry = cfg.entry.map_or(0, |p| p.0 as usize);
+
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (&from, tos) in cfg.successors.iter() {
+            let a = from.0 as usize;
+            for &to in tos {
+                let b = to.0 as usize;
+                succs[a].push(b);
+                preds[b].push(a);
+            }
+        }
+
+        // Deterministic order and no duplicate edges, regardless of hash-map iteration order.
+        for v in succs.iter_mut().chain(preds.iter_mut()) {
+            v.sort_unstable();
+            v.dedup();
+        }
+
+        (n, preds, succs, entry)
+    }
+
+    pub(crate) fn solve_flow(&mut self, entry: FlowState) -> Solved {
+        let log = std::mem::take(&mut self.effect_log);
+
+        let (mut n, mut preds, mut succs, entry_pt) = self.cfg_edges();
+
+        // Effects can be logged at a point the Cfg and `stmt_points` never mention
+        // (e.g. an isolated dead-code point). Grow the graph so none are dropped.
+        if let Some(max) = log.iter().map(|(p, _)| p.0 as usize).max() {
+            if max >= n {
+                n = max + 1;
+                preds.resize_with(n, Vec::new);
+                succs.resize_with(n, Vec::new);
+            }
+        }
+
+        let mut by_point: Vec<Vec<Effect<'a, 'bump>>> = vec![Vec::new(); n];
+        for (p, e) in log {
+            by_point[p.0 as usize].push(e);
+        }
+
+        let this = &*self;
+        let mut solved = crate::dataflow::solve(n, &preds, &succs, entry_pt, entry, &|p, st| {
+            for e in &by_point[p] {
+                this.apply_effect(e, st);
+            }
+        });
+
+        // Identity mapping, so `entry_in(PointId)` keeps working unchanged.
+        solved.index = (0..n).map(|i| (PointId(i as u32), i)).collect();
+        solved
+    }
+
+    /// Replaces converge_loop_states at both call sites.
+    pub(crate) fn enter_loop_body(&mut self, body: &HirStmt<'a, 'bump>) {
+        if self.recording_effects {
+            self.check_stmt(body); // single pass, no convergence
+            return;
+        }
+        let solved = self
+            .stmt_points
+            .get(&Self::stmt_key(body))
+            .and_then(|&p| self.solved.as_ref()?.entry_in(p).cloned());
+        match solved {
+            Some(f) => {
+                self.move_state = f.mv;
+                self.init_state = f.init;
+            }
+            None => {
+                // fallback: no solved state (no CFG point, or solver skipped this function)
+                let (m, i) = self.converge_loop_states(
+                    body,
+                    self.move_state.clone(),
+                    self.init_state.clone(),
+                );
+                self.move_state = m;
+                self.init_state = i;
+            }
+        }
+    }
+}
+
+pub fn join_init_nodes(a: InitNode, b: InitNode) -> InitNode {
+    match (a, b) {
+        (InitNode::Whole(sa), InitNode::Whole(sb)) => InitNode::Whole(match (sa, sb) {
+            (InitStatus::Initialized, InitStatus::Initialized) => InitStatus::Initialized,
+            (InitStatus::Uninitialized, InitStatus::Uninitialized) => InitStatus::Uninitialized,
+            _ => InitStatus::Maybe,
+        }),
+        (InitNode::Array { ranges: ra, len }, InitNode::Array { ranges: rb, .. }) => {
+            InitNode::Array {
+                ranges: ra.intersect(&rb),
+                len,
+            }
+        }
+        (InitNode::Array { ranges, len }, InitNode::Whole(InitStatus::Initialized))
+        | (InitNode::Whole(InitStatus::Initialized), InitNode::Array { ranges, len }) => {
+            InitNode::Array { ranges, len }
+        }
+        (InitNode::Struct(ma), InitNode::Struct(mb)) => {
+            let mut out = FxHashMap::default();
+            for key in ma.keys().chain(mb.keys()).copied().collect::<HashSet<_>>() {
+                let fa = ma
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
+                let fb = mb
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
+                out.insert(key, join_init_nodes(fa, fb));
+            }
+            InitNode::Struct(out)
+        }
+        (InitNode::Struct(ma), InitNode::Whole(InitStatus::Initialized))
+        | (InitNode::Whole(InitStatus::Initialized), InitNode::Struct(ma)) => InitNode::Struct(ma),
+        _ => InitNode::Whole(InitStatus::Maybe),
     }
 }

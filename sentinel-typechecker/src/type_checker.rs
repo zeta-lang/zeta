@@ -4,7 +4,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::borrow_lifetime::{BorrowObligation, CalleeConcurrency};
+use crate::borrowck::hir_visit::{HirVisitor, walk_stmt};
+use crate::dataflow::FlowState;
 use crate::initialization::{BindingMode, InitNode, ModuleImports};
+use crate::initialization_bitset::FastInitState;
+use crate::local_table::FunctionLocalTable;
 use crate::move_state::MoveState;
 use crate::naming::{str_id_to_string, type_to_string};
 use crate::type_context::TypeContext;
@@ -27,6 +31,43 @@ use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 pub const SLICE_PRIMITIVES: &[&str] = &["write_uninit", "write_uninit_all", "get_unchecked"];
+
+struct LoopFinder {
+    found: bool,
+}
+
+impl<'a, 'bump> HirVisitor<'a, 'bump> for LoopFinder {
+    fn should_continue(&self) -> bool {
+        !self.found
+    }
+
+    fn visit_stmt(&mut self, stmt: &HirStmt<'a, 'bump>) {
+        if matches!(stmt, HirStmt::While { .. } | HirStmt::For { .. }) {
+            self.found = true;
+            return;
+        }
+        walk_stmt(self, stmt);
+    }
+}
+
+pub struct Liveness {
+    words: usize,
+    live: Vec<u64>, // n_points * words
+    idx: FxHashMap<StrId, u32>,
+}
+
+impl Liveness {
+    #[inline]
+    pub fn used_at_or_after(&self, p: PointId, local: StrId) -> bool {
+        let Some(&b) = self.idx.get(&local) else {
+            return false;
+        };
+        let b = b as usize;
+        self.live
+            .get(p.0 as usize * self.words + b / 64)
+            .map_or(false, |w| w & (1u64 << (b % 64)) != 0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalSymbolId(pub u32);
@@ -116,7 +157,7 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) current_point: PointId,
     pub(crate) undefined_backfill: FxHashMap<usize, HirType<'a, 'bump>>,
     pub(crate) uninit_backfill: FxHashMap<usize, HirType<'a, 'bump>>,
-    pub(crate) init_state: FxHashMap<StrId, InitNode>,
+    pub(crate) init_state: FastInitState,
     pub(crate) suppress_init_read: bool,
     pub(crate) local_ref_kind: FxHashMap<StrId, RefKind>,
     pub(crate) binding_mode_backfill: FxHashMap<usize, BindingMode>,
@@ -156,6 +197,11 @@ pub struct TypeChecker<'a, 'bump> {
     pub(crate) closure_static_uses: FxHashMap<usize, Vec<(StrId, bool)>>,
     pub(crate) tail_expr_key: Option<usize>,
     pub(crate) tail_borrows: Vec<StrId>,
+    pub(crate) local_table: FunctionLocalTable,
+    pub(crate) recording_effects: bool,
+    pub(crate) effect_log: Vec<(PointId, crate::dataflow::Effect<'a, 'bump>)>,
+    pub(crate) solved: Option<crate::dataflow::Solved>,
+    pub(crate) liveness: std::cell::OnceCell<Liveness>,
 }
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -198,7 +244,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             point_locals_used: HashMap::default(),
             current_point: PointId::default(),
             uninit_backfill: FxHashMap::default(),
-            init_state: FxHashMap::default(),
+            init_state: FastInitState::new(),
             local_ref_kind: FxHashMap::default(),
             binding_mode_backfill: FxHashMap::default(),
             non_null_state: FxHashMap::default(),
@@ -238,11 +284,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             closure_static_uses: FxHashMap::default(),
             tail_expr_key: None,
             tail_borrows: Vec::default(),
+            local_table: FunctionLocalTable::new(),
+            recording_effects: false,
+            effect_log: Vec::default(),
+            solved: None,
+            liveness: std::cell::OnceCell::new(),
         }
     }
 
-    pub fn scope_end_init_snapshot(&self, name: StrId) -> Option<&InitNode> {
-        self.init_state.get(&name)
+    pub(crate) fn contains_loop(body: &HirStmt<'a, 'bump>) -> bool {
+        let mut f = LoopFinder { found: false };
+        f.visit_stmt(body);
+        f.found
+    }
+
+    pub fn scope_end_init_snapshot(&self, name: StrId) -> Option<InitNode> {
+        self.init_node(name)
     }
 
     pub fn uninit_ty(&self, expr: &HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
@@ -571,6 +628,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         )));
                     }
 
+                    if let Some(params) = f.params
+                        && let Some(this_param) = params.first()
+                    {
+                        if matches!(this_param, HirParam::This { .. }) {
+                            self.record(TypeErrorKind::IllegalThisParam {
+                                func_name: f.unmangled_name.to_string(),
+                            });
+                        }
+                    }
+
                     self.context
                         .add_function(module_idx, unmangled_name.clone(), **f);
                     if mangled_name != unmangled_name {
@@ -714,29 +781,35 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 _ => {}
             }
         }
+        let mut name_to_func: FxHashMap<StrId, usize> = FxHashMap::default();
+        name_to_func.reserve(funcs.len());
+        for (j, (f, _)) in funcs.iter().enumerate() {
+            name_to_func.insert(f.name, j);
+            name_to_func.insert(f.unmangled_name, j);
+        }
         let used: Vec<HashSet<StrId>> = funcs.iter().map(|(f, _)| self.idents_used_in(f)).collect();
         let mut done = vec![false; funcs.len()];
         let mut order = Vec::with_capacity(funcs.len());
         fn visit(
             i: usize,
-            funcs: &[(&HirFunc<'_, '_>, Option<&[HirGeneric<'_, '_>]>)],
             used: &[HashSet<StrId>],
+            name_to_func: &FxHashMap<StrId, usize>,
             done: &mut [bool],
             order: &mut Vec<usize>,
         ) {
             if done[i] {
                 return;
             }
-            done[i] = true; // marking first makes recursion/cycles terminate
-            for (j, (g, _)) in funcs.iter().enumerate() {
-                if used[i].contains(&g.name) || used[i].contains(&g.unmangled_name) {
-                    visit(j, funcs, used, done, order);
+            done[i] = true;
+            for name in &used[i] {
+                if let Some(&j) = name_to_func.get(name) {
+                    visit(j, used, name_to_func, done, order);
                 }
             }
             order.push(i);
         }
         for i in 0..funcs.len() {
-            visit(i, &funcs, &used, &mut done, &mut order);
+            visit(i, &used, &name_to_func, &mut done, &mut order);
         }
         for i in order {
             let (f, g) = funcs[i];
@@ -812,13 +885,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.borrow_checker = BorrowChecker::new();
         self.borrow_checker.begin_scope();
 
-        // These are all keyed by StrId (globally-interned identifier text), not by
-        // any per-function or per-scope discriminator. Without resetting them here,
-        // a local named `alloc` or `slot` in one function leaks its move/init/
-        // non-null/ref-kind status into every other function with a same-named
-        // local or parameter, checked afterward in the same compilation unit.
+        // Per-function dataflow state. StrId is globally interned, so none of this
+        // may leak between functions: a local named `alloc` in one function must not
+        // inherit move/init/non-null/ref-kind status in the next.
+        // The local table is reset together with the bitsets that index into it:
+        // a stale LocalId from a previous function would alias a different variable.
+        self.local_table = FunctionLocalTable::new();
         self.move_state = MoveState::new();
-        self.init_state = FxHashMap::default();
+        self.init_state = FastInitState::new();
         self.non_null_state = FxHashMap::default();
         self.local_ref_kind = FxHashMap::default();
         self.const_locals.clear();
@@ -829,7 +903,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             for param in params.iter() {
                 match param {
                     HirParam::Normal {
-                        name, param_type, ..
+                        name,
+                        param_type,
+                        span,
+                        ..
                     } => {
                         let param_name = str_id_to_string(*name);
                         let symbol_id = self.mint_symbol_id();
@@ -840,9 +917,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         }
                         func_context.add_variable(param_name, *param_type, symbol_id);
                         self.borrow_checker.declare_local(*name);
-                        self.mark_whole_init(*name);
+
+                        // Params are initialized on entry.
+                        let local_id = self.local_table.register(*name);
+                        self.init_state.mark_whole_init(local_id);
+                        self.occurrences.push((
+                            *span,
+                            *name,
+                            *param_type,
+                            self.context.current_module_idx,
+                            symbol_id,
+                            true,
+                        ));
                     }
-                    HirParam::This { kind, .. } => {
+                    HirParam::This { kind, span, .. } => {
                         let rk = match kind {
                             ThisPassingKind::RefConst
                             | ThisPassingKind::ConstSafePtr
@@ -879,7 +967,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         let symbol_id = self.mint_symbol_id();
                         func_context.add_variable("this".to_string(), self_ty, symbol_id);
                         self.borrow_checker.declare_local(self.this_id);
-                        self.mark_whole_init(self.this_id);
+
+                        let this_local = self.local_table.register(self.this_id);
+                        self.init_state.mark_whole_init(this_local);
+                        self.occurrences.push((
+                            *span,
+                            self.this_id,
+                            self_ty,
+                            self.context.current_module_idx,
+                            symbol_id,
+                            true,
+                        ));
                     }
                 }
             }
@@ -916,16 +1014,38 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(body) = func.body {
             let (cfg, points) = CfgBuilder::new().build(&body);
             self.cfg = cfg;
+            self.liveness = std::cell::OnceCell::new();
             self.stmt_points = points.stmt_points;
             self.stmt_after_points = points.stmt_after_points;
             self.point_locals_used = FxHashMap::default();
 
             self.current_point = self.cfg.entry.unwrap_or_default();
             self.collect_locals_used_stmt(&body);
-
-            self.current_point = self.cfg.entry.unwrap_or_default();
+            let entry_point = self.cfg.entry.unwrap_or_default();
+            self.current_point = entry_point;
 
             let old_context = std::mem::replace(&mut self.context, func_context);
+
+            // Phase 1: record effects. Only worth it if the body has a loop.
+            if Self::contains_loop(&body) {
+                let entry = FlowState {
+                    mv: self.move_state.clone(),
+                    init: self.init_state.clone(),
+                };
+                let saved_ctx = self.context.clone();
+                self.recording_effects = true;
+                self.with_suppressed_errors(|t| {
+                    t.check_stmt(&body);
+                });
+                self.recording_effects = false;
+                self.context = saved_ctx;
+                self.move_state = entry.mv.clone();
+                self.init_state = entry.init.clone();
+                self.current_point = entry_point;
+                self.solved = Some(self.solve_flow(entry));
+            }
+
+            // Phase 2: the real walk. Loops now read their entry state from `self.solved`.
             self.check_stmt(&body);
             self.context = old_context;
         }
@@ -1150,6 +1270,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expr: &HirExpr<'a, 'bump>,
         expected: &HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
+        if matches!(expr, HirExpr::Ref { .. }) {
+            return self.check_expr(expr);
+        }
         match expr {
             HirExpr::Call {
                 callee,
@@ -1653,7 +1776,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::Char(_, _) => HirType::Char,
             HirExpr::UnknownIntrinsic { span, name } => {
                 self.recover(
-                    Err(TypeErrorKind::Generic(format!("Unknown intrinsic {}", name)).at(*span)),
+                    Err(TypeErrorKind::Generic(format!("Unknown intrinsic: {}", name)).at(*span)),
                     (),
                 );
                 HirType::Unknown
@@ -1679,5 +1802,44 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .for_each(|b| Self::collect_bound_names(b, out)),
             _ => {}
         }
+    }
+
+    pub(crate) fn build_liveness(&self) -> Liveness {
+        let n = self.cfg.point_count();
+        let mut idx: FxHashMap<StrId, u32> = FxHashMap::default(); // separate from local_table on purpose
+        for set in self.point_locals_used.values() {
+            for &s in set {
+                let k = idx.len() as u32;
+                idx.entry(s).or_insert(k);
+            }
+        }
+        let words = ((idx.len() + 63) / 64).max(1);
+        let mut live = vec![0u64; n * words];
+        for (p, set) in &self.point_locals_used {
+            for s in set {
+                let b = idx[s] as usize;
+                live[p.0 as usize * words + b / 64] |= 1 << (b % 64);
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for p in (0..n).rev() {
+                // reverse creation order ≈ reverse program order
+                let Some(succs) = self.cfg.successors.get(&PointId(p as u32)) else {
+                    continue;
+                };
+                for s in succs {
+                    for w in 0..words {
+                        let add = live[s.0 as usize * words + w] & !live[p * words + w];
+                        if add != 0 {
+                            live[p * words + w] |= add;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        Liveness { words, live, idx }
     }
 }

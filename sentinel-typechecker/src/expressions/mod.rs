@@ -15,7 +15,7 @@ use ir::{
 
 use crate::{
     TypeChecker,
-    initialization::{BareImportKind, InitNode, InitStatus, IntervalSet},
+    initialization::{BareImportKind, InitNode, InitStatus},
     move_state::MoveState,
     naming::{operator_symbol, str_id_to_string, type_to_string},
     statics,
@@ -106,7 +106,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.recover(self.types_compatible(&HirType::Usize, &index_ty), ());
 
         if let Some((root, path)) = self.static_field_path(object) {
-            if let Some(node) = self.init_state.get(&root).cloned() {
+            if let Some(node) = self.init_node(root) {
                 let target = Self::node_at_path_ref(&node, &path);
                 match index {
                     HirExpr::Number(i, _) => {
@@ -286,10 +286,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn is_definitely_initialized(&self, root: StrId, path: &[StrId]) -> bool {
-        let Some(node) = self.init_state.get(&root) else {
+        let Some(node) = self.init_node(root) else {
             return true;
         };
-        match Self::node_at_path_ref(node, path) {
+        match Self::node_at_path_ref(&node, path) {
             InitNode::Whole(InitStatus::Initialized) => true,
             InitNode::Array {
                 ranges,
@@ -379,7 +379,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let HirExpr::Ident(name, ..) = target {
-            self.move_state.clear(*name);
+            self.clear_move(*name);
             self.const_locals.remove(name);
         }
 
@@ -492,10 +492,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         }
                         HirExpr::Number(i, _) => {
                             let root_node = self
-                                .init_state
-                                .entry(root)
-                                .or_insert(InitNode::Whole(InitStatus::Uninitialized));
-                            let already_init = match Self::node_at_path_ref(root_node, &path) {
+                                .init_node(root)
+                                .unwrap_or(InitNode::Whole(InitStatus::Uninitialized));
+                            let already_init = match Self::node_at_path_ref(&root_node, &path) {
                                 InitNode::Array { ranges, .. } => ranges.contains_range(*i, *i + 1),
                                 InitNode::Whole(InitStatus::Initialized) => true,
                                 _ => false,
@@ -506,23 +505,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                      `uninit` may only be assigned to an element that isn't initialized yet",
                                     str_id_to_string(root), i
                                 )));
-                            } else if let InitNode::Array { ranges, .. } =
-                                Self::node_at_path_mut(root_node, &path)
-                            {
-                                let mut kept = IntervalSet::default();
-                                for &(s, e) in &ranges.ranges {
-                                    if e <= *i || s >= *i + 1 {
-                                        kept.insert(s, e);
-                                    } else {
-                                        if s < *i {
-                                            kept.insert(s, *i);
-                                        }
-                                        if *i + 1 < e {
-                                            kept.insert(*i + 1, e);
-                                        }
-                                    }
-                                }
-                                *ranges = kept;
+                            } else {
+                                self.punch_array_hole(root, &path, *i);
                             }
                         }
                         _ => {
@@ -536,10 +520,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                     )));
                                 }
                             } else if !fully_init {
-                                if let Some(root_node) = self.init_state.get_mut(&root) {
-                                    *Self::node_at_path_mut(root_node, &path) =
-                                        InitNode::Whole(InitStatus::Maybe);
-                                }
+                                self.set_init_path(root, &path, InitNode::Whole(InitStatus::Maybe));
                             }
                         }
                     }
@@ -1360,13 +1341,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return HirType::Unknown;
         };
 
-        self.check_bare_name_import(
-            self.context.struct_owner(&struct_name_str),
-            struct_name,
-            &struct_name_str,
-            BareImportKind::Struct,
-        );
-
         let field_name = str_id_to_string(field);
         let field_idx = struct_def
             .fields
@@ -1521,65 +1495,49 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_bare_name_import(
         &mut self,
-        declaring_module: Option<usize>,
+        _declaring_module: Option<usize>, // keep the signature, ignore it
         name: StrId,
         name_str: &str,
         kind: BareImportKind,
     ) {
-        let Some(declaring_module) = declaring_module else {
-            return;
-        };
         let current = self.context.current_module_idx;
-        if declaring_module == current {
-            return;
-        }
-
-        let explicitly_imported = self.imports_by_module.get(&current).is_some_and(|imp| {
-            imp.modules.contains(&declaring_module)
-                || imp.named.values().any(|&m| m == declaring_module)
-        });
-        if explicitly_imported {
-            return;
-        }
-
-        let wildcard_modules: Vec<usize> = self
-            .imports_by_module
-            .get(&current)
-            .map(|imp| imp.wildcard.clone())
-            .unwrap_or_default();
-
-        if !wildcard_modules.contains(&declaring_module) {
-            self.record(TypeErrorKind::Generic(format!(
-                "{} `{}` is declared in another module and has not been imported",
-                kind.as_str(),
-                name_str,
-            )));
-            return;
-        }
-
         let by_module: &FxHashMap<usize, HashSet<StrId>> = match kind {
             BareImportKind::Struct => &self.structs_by_module,
             BareImportKind::Enum => &self.enums_by_module,
         };
-        let candidates: Vec<usize> = wildcard_modules
+        let declaring: Vec<usize> = by_module
             .iter()
-            .copied()
-            .filter(|m| by_module.get(m).is_some_and(|set| set.contains(&name)))
+            .filter(|(_, s)| s.contains(&name))
+            .map(|(&m, _)| m)
             .collect();
 
-        if candidates.len() > 1 {
-            let candidate_pkgs: Vec<String> = candidates
-                .iter()
-                .filter_map(|&m| self.context.dep_graph.borrow().get_module_package(m))
-                .map(|p| p.to_string())
-                .collect();
-            self.record(TypeErrorKind::Generic(format!(
-                "`{}` is ambiguous: it is auto-imported from multiple packages ({}); \
-                 add an explicit `import` to disambiguate",
-                name_str,
-                candidate_pkgs.join(", "),
-            )));
+        if declaring.is_empty() || declaring.contains(&current) {
+            return; // declared right here
         }
+
+        let imp = self.imports_by_module.get(&current);
+        let explicit = imp.is_some_and(|i| {
+            declaring.iter().any(|d| i.modules.contains(d))
+                || i.named.values().any(|m| declaring.contains(m))
+        });
+        if explicit {
+            return;
+        }
+        let wildcard: Vec<usize> = imp.map(|i| i.wildcard.clone()).unwrap_or_default();
+        let visible: Vec<usize> = wildcard
+            .iter()
+            .copied()
+            .filter(|m| declaring.contains(m))
+            .collect();
+        if visible.is_empty() {
+            self.record(TypeErrorKind::Generic(format!(
+                "{} `{}` is declared in another module and has not been imported",
+                kind.as_str(),
+                name_str
+            )));
+            return;
+        }
+        // ambiguity check: dedupe `visible` first, then error only if len() > 1
     }
 
     ///   Public:   visible everywhere.

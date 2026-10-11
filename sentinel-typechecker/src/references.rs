@@ -135,7 +135,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> HirType<'a, 'bump> {
         self.set_span(span);
 
-        let inner_ty = if ref_kind != RefKind::Shared {
+        let inner_ty = if ref_kind != RefKind::Shared || self.resolve_place(expr).is_some() {
             self.check_expr_as_place(expr)
         } else {
             self.check_expr(expr)

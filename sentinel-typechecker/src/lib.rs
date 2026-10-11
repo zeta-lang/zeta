@@ -1,12 +1,16 @@
 pub mod auto_traits;
+pub mod bitset;
 pub mod borrow_lifetime;
 pub mod borrowck;
 pub mod closures;
 pub mod concurrency;
 pub mod control_flow;
+pub mod dataflow;
 pub mod expressions;
 pub mod initialization;
+pub mod initialization_bitset;
 pub mod instantiations;
+pub mod local_table;
 pub mod move_state;
 pub mod naming;
 pub mod nullables;

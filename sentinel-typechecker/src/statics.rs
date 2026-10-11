@@ -126,9 +126,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn is_whole_init(&self, name: StrId) -> bool {
-        self.init_state
-            .get(&name)
-            .map_or(true, |n| n.is_fully_init())
+        self.init_node(name).map_or(true, |n| n.is_fully_init())
     }
 
     pub(crate) fn note_static_use(&mut self, name: StrId, mutating: bool) {

@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use ir::{
     hir::{HirParam, HirType, StrId},
     ir_hasher::FxHashMap,
 };
+use smallvec::SmallVec;
 
-use crate::{str_id_to_string, TypeChecker};
+use crate::{TypeChecker, str_id_to_string};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn instantiate_struct(
@@ -14,34 +17,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(cached) = self.context.get_struct_instantiation(name, args) {
             return Some(cached);
         }
-
-        let name_str = str_id_to_string(name);
-        let def = self.context.get_struct(&name_str)?;
+        let def = self.context.get_struct(&str_id_to_string(name))?;
         let generics = def.generics?;
-        let mut full_args = args.to_vec();
-        if full_args.len() < generics.len() {
-            let mut subs = FxHashMap::default();
-            for (param, arg) in generics.iter().zip(full_args.iter()) {
-                subs.insert(param.name, *arg);
-            }
-            let start = full_args.len();
-            for param in &generics[start..] {
-                if let Some(ref def_ty) = param.default_type {
-                    let resolved = self.substitute_type_local(def_ty, &subs);
-                    subs.insert(param.name, resolved);
-                    full_args.push(resolved);
-                } else {
-                    return None;
-                }
-            }
-        }
-        if generics.len() != full_args.len() {
-            return None;
-        }
 
-        let mut subs = FxHashMap::default();
-        for (param, arg) in generics.iter().zip(full_args.iter()) {
-            subs.insert(param.name, *arg);
+        let mut subs: FxHashMap<StrId, HirType> = HashMap::default();
+        subs.reserve(generics.len());
+        for (i, param) in generics.iter().enumerate() {
+            let arg = if i < args.len() {
+                args[i]
+            } else {
+                let resolved = self.substitute_type_local(param.default_type.as_ref()?, &subs);
+                resolved
+            };
+            subs.insert(param.name, arg);
+        }
+        if subs.len() != generics.len() {
+            return None;
         }
 
         let field_types: Vec<_> = def
@@ -50,9 +41,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .map(|f| self.substitute_type_local(&f.field_type, &subs))
             .collect();
         let result = self.context.bump.alloc_slice_copy(&field_types);
-
         self.context
-            .cache_struct_instantiation(name, args.to_vec(), result);
+            .cache_struct_instantiation(name, SmallVec::from_slice_copy(args), result);
         Some(result)
     }
 
@@ -101,6 +91,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         ty: &HirType<'a, 'bump>,
         subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirType<'a, 'bump> {
+        if !type_contains_generic(ty, subs) {
+            return *ty;
+        }
         match ty {
             HirType::Generic(name) => subs.get(name).copied().unwrap_or(*ty),
             HirType::Nullable(inner) => HirType::Nullable(
@@ -386,5 +379,31 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
         subs
+    }
+}
+
+fn type_contains_generic(ty: &HirType, subs: &FxHashMap<StrId, HirType>) -> bool {
+    match ty {
+        HirType::Generic(n) => subs.contains_key(n),
+        HirType::Nullable(i)
+        | HirType::Slice(i)
+        | HirType::Array(i, _)
+        | HirType::OwnedPointer { inner: i, .. }
+        | HirType::SafePointer { inner: i, .. }
+        | HirType::UnsafePointer { inner: i, .. }
+        | HirType::Ref { inner: i, .. } => type_contains_generic(i, subs),
+        HirType::Tuple(es) => es.iter().any(|e| type_contains_generic(e, subs)),
+        HirType::Struct { type_args, .. } | HirType::Enum { type_args, .. } => {
+            type_args.iter().any(|a| type_contains_generic(a, subs))
+        }
+        HirType::Dyn { bounds } => bounds.iter().any(|b| type_contains_generic(b, subs)),
+        HirType::Lambda {
+            params,
+            return_type,
+        } => {
+            params.iter().any(|p| type_contains_generic(p, subs))
+                || type_contains_generic(return_type, subs)
+        }
+        _ => false,
     }
 }

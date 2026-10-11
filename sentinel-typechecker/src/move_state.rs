@@ -1,80 +1,95 @@
-use ir::{hir::StrId, ir_hasher::FxHashBuilder};
-use std::collections::{HashMap, HashSet};
+use super::bitset::{LocalBitSet, LocalId};
+use ir::hir::StrId;
+use smallvec::SmallVec;
 
-#[derive(Debug, Clone, Default)]
-pub struct LocalMoveState {
-    pub whole_moved: bool,
-    pub moved_fields: HashSet<StrId>,
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MoveState {
-    locals: HashMap<StrId, LocalMoveState, FxHashBuilder>,
+    /// 1 bit per local: variable is moved completely.
+    pub whole_moved: LocalBitSet,
+    /// 1 bit per local: at least one field of this local is moved.
+    pub any_field_moved: LocalBitSet,
+    /// Sparse field moves: (local, field_name). In 99% of functions, this is empty!
+    pub field_moves: SmallVec<(LocalId, StrId), 4>,
 }
 
 impl MoveState {
     pub fn new() -> Self {
-        Self {
-            locals: HashMap::default(),
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn is_whole_moved(&self, id: LocalId) -> bool {
+        self.whole_moved.test(id)
+    }
+
+    #[inline(always)]
+    pub fn blocks_whole_use(&self, id: LocalId) -> bool {
+        // A whole use is blocked if the whole value is moved OR any of its fields are moved!
+        self.whole_moved.test(id) || self.any_field_moved.test(id)
+    }
+
+    #[inline]
+    pub fn is_field_moved(&self, id: LocalId, field: StrId) -> bool {
+        if self.whole_moved.test(id) {
+            return true;
+        }
+        if !self.any_field_moved.test(id) {
+            return false;
+        }
+        self.field_moves.iter().any(|&(l, f)| l == id && f == field)
+    }
+
+    #[inline(always)]
+    pub fn mark_whole_moved(&mut self, id: LocalId) {
+        self.whole_moved.set(id);
+    }
+
+    #[inline]
+    pub fn mark_field_moved(&mut self, id: LocalId, field: StrId) {
+        self.any_field_moved.set(id);
+        if !self.field_moves.iter().any(|&(l, f)| l == id && f == field) {
+            self.field_moves.push((id, field));
         }
     }
 
-    pub fn is_whole_moved(&self, name: StrId) -> bool {
-        self.locals.get(&name).map_or(false, |l| l.whole_moved)
+    #[inline]
+    pub fn clear(&mut self, id: LocalId) {
+        self.whole_moved.clear(id);
+        self.any_field_moved.clear(id);
+        self.field_moves.retain(|&(l, _)| l != id);
     }
 
-    pub fn blocks_whole_use(&self, name: StrId) -> bool {
-        self.locals
-            .get(&name)
-            .map_or(false, |l| l.whole_moved || !l.moved_fields.is_empty())
-    }
-
-    pub fn is_field_moved(&self, name: StrId, field: StrId) -> bool {
-        self.locals
-            .get(&name)
-            .map_or(false, |l| l.whole_moved || l.moved_fields.contains(&field))
-    }
-
-    pub fn mark_whole_moved(&mut self, name: StrId) {
-        self.locals.entry(name).or_default().whole_moved = true;
-    }
-
-    pub fn mark_field_moved(&mut self, name: StrId, field: StrId) {
-        self.locals
-            .entry(name)
-            .or_default()
-            .moved_fields
-            .insert(field);
-    }
-
-    pub fn clear(&mut self, name: StrId) {
-        self.locals.remove(&name);
-    }
-
-    /// Join two states from divergent control-flow paths.
-    /// Union of everything moved on *either* path: a place moved on one
-    /// branch but not the other becomes "moved" in the merged state
+    /// O(1) Branch Join using bitwise OR!
+    #[inline]
     pub fn join(a: &MoveState, b: &MoveState) -> MoveState {
         let mut result = a.clone();
-        for (name, b_local) in &b.locals {
-            let entry = result.locals.entry(*name).or_default();
-            entry.whole_moved |= b_local.whole_moved;
-            entry
-                .moved_fields
-                .extend(b_local.moved_fields.iter().copied());
+        result.whole_moved.union_with(&b.whole_moved);
+        result.any_field_moved.union_with(&b.any_field_moved);
+
+        // Fast path: if neither branch moved fields, skip the sparse vector
+        if !b.field_moves.is_empty() {
+            for &item in &b.field_moves {
+                if !result.field_moves.contains(&item) {
+                    result.field_moves.push(item);
+                }
+            }
         }
         result
     }
 
-    /// True if `join(self, other)` would change nothing and is used to detect
-    /// fixpoint convergence around loop back-edges
+    /// O(1) Superset check for loop convergence
+    #[inline]
     pub fn is_superset_of(&self, other: &MoveState) -> bool {
-        other.locals.iter().all(|(name, o)| {
-            self.locals
-                .get(name)
-                .map_or(o.whole_moved == false && o.moved_fields.is_empty(), |s| {
-                    (s.whole_moved || !o.whole_moved) && o.moved_fields.is_subset(&s.moved_fields)
-                })
-        })
+        if !self.whole_moved.is_superset_of(&other.whole_moved) {
+            return false;
+        }
+        if !self.any_field_moved.is_superset_of(&other.any_field_moved) {
+            return false;
+        }
+        // Check sparse field moves
+        other
+            .field_moves
+            .iter()
+            .all(|item| self.field_moves.contains(item))
     }
 }
