@@ -164,6 +164,11 @@ pub enum IntrinsicKind {
     AtomicFetchOr,
     AtomicFetchXor,
     AtomicFence,
+
+    PtrRead,
+    PtrWrite,
+    PtrCopy,
+    PtrCopyNonoverlapping,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1010,6 +1015,11 @@ where
             inner,
             mutability_state,
         }
+    }
+
+    /// Returns true if this is a safe pointer type
+    pub fn is_owned_slice(&self) -> bool {
+        matches!(self, HirType::OwnedPointer { inner, .. } if matches!(*inner, HirType::Slice(_)))
     }
 
     /// Returns true if this is a safe pointer type

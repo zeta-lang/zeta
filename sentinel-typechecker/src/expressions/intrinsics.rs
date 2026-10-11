@@ -4,7 +4,7 @@ use ir::{
     hir::{HirExpr, HirType, IntrinsicKind, ProvenanceRoot, RefKind},
 };
 
-use crate::{naming::type_to_string, str_id_to_string, TypeChecker};
+use crate::{TypeChecker, naming::type_to_string, str_id_to_string};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn check_intrinsic_expr(
@@ -15,6 +15,84 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         args: &&[HirExpr<'a, 'bump>],
     ) -> HirType<'a, 'bump> {
         match kind {
+            IntrinsicKind::PtrRead => {
+                self.require_unsafe_ptr_intrinsic(
+                "$ptr_read",
+                "bitwise-copies a value out of the pointee, leaving it logically uninitialized; \
+                 the caller must not use or drop the source again",
+            );
+                if type_args.len() > 1 || args.len() != 1 {
+                    self.record(TypeErrorKind::Generic(
+                        "$ptr_read expects at most 1 type argument and exactly 1 argument".into(),
+                    ));
+                    return HirType::Unknown;
+                }
+                let Some(pointee) = self.check_ptr_intrinsic_arg("$ptr_read", &args[0], false)
+                else {
+                    return HirType::Unknown;
+                };
+                if let Some(t) = type_args.first() {
+                    self.recover(self.types_compatible(t, &pointee), ());
+                }
+                pointee // owned by the caller; goes through normal drop elaboration
+            }
+            IntrinsicKind::PtrWrite => {
+                self.require_unsafe_ptr_intrinsic(
+                "$ptr_write",
+                "writes without dropping the previous value, which leaks it if it was initialized",
+            );
+                if type_args.len() > 1 || args.len() != 2 {
+                    self.record(TypeErrorKind::Generic(
+                        "$ptr_write expects at most 1 type argument and exactly 2 arguments".into(),
+                    ));
+                    return HirType::Void;
+                }
+                let Some(pointee) = self.check_ptr_intrinsic_arg("$ptr_write", &args[0], true)
+                else {
+                    return HirType::Void;
+                };
+                if let Some(t) = type_args.first() {
+                    self.recover(self.types_compatible(t, &pointee), ());
+                }
+                let value_ty = self.check_expr_expected(&args[1], &pointee);
+                self.check_and_record_value_use(&args[1], &value_ty); // moved into the slot
+                self.recover(self.types_compatible(&pointee, &value_ty), ());
+                HirType::Void
+            }
+            IntrinsicKind::PtrCopy | IntrinsicKind::PtrCopyNonoverlapping => {
+                let name = if *kind == IntrinsicKind::PtrCopy {
+                    "$ptr_copy"
+                } else {
+                    "$ptr_copy_nonoverlapping"
+                };
+                self.require_unsafe_ptr_intrinsic(
+                name,
+                "copies bytes between pointers: both ranges must be valid, and the destination's \
+                 old contents are overwritten without being dropped",
+            );
+                if type_args.len() > 1 || args.len() != 3 {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name} expects at most 1 type argument and 3 arguments (src, dst, count)"
+                    )));
+                    return HirType::Void;
+                }
+                let src = self.check_ptr_intrinsic_arg(name, &args[0], false);
+                let dst = self.check_ptr_intrinsic_arg(name, &args[1], true);
+                if let (Some(s), Some(d)) = (&src, &dst) {
+                    self.recover(self.types_compatible(s, d), ());
+                    if let Some(t) = type_args.first() {
+                        self.recover(self.types_compatible(t, s), ());
+                    }
+                }
+                let n_ty = self.check_expr(&args[2]);
+                if !self.is_integer(&n_ty) {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name}: count must be an integer, found `{}`",
+                        type_to_string(&n_ty)
+                    )));
+                }
+                HirType::Void
+            }
             IntrinsicKind::AssumeInit => {
                 if !type_args.is_empty() {
                     self.record(TypeErrorKind::Generic(
@@ -89,7 +167,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if !self.in_unsafe() {
                     self.record(TypeErrorKind::Generic(
                         "$leak requires an unsafe block: it gives up ownership without running \
-                     drop glue or freeing, so the caller becomes responsible for the allocation"
+                        drop glue or freeing, so the caller becomes responsible for the allocation"
                             .to_string(),
                     ));
                 }
@@ -699,5 +777,68 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
         Some(t)
+    }
+
+    fn require_unsafe_ptr_intrinsic(&mut self, name: &str, why: &str) {
+        if !self.in_unsafe() {
+            self.record(TypeErrorKind::Generic(format!(
+                "{name} requires an unsafe block: it {why}"
+            )));
+        }
+    }
+
+    /// Checks a pointer-typed argument and returns its pointee type.
+    fn check_ptr_intrinsic_arg(
+        &mut self,
+        name: &str,
+        arg: &HirExpr<'a, 'bump>,
+        need_mut: bool,
+    ) -> Option<HirType<'a, 'bump>> {
+        let ty = self.check_expr(arg);
+        self.check_and_record_value_use(arg, &ty);
+        match &ty {
+            HirType::SafePointer {
+                inner,
+                mutability_state,
+            }
+            | HirType::UnsafePointer {
+                inner,
+                mutability_state,
+            } => {
+                if need_mut && *mutability_state != ir::ast::MutabilityState::Mut {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name} needs a `mut` pointer for its destination, found `{}`",
+                        type_to_string(&ty)
+                    )));
+                    return None;
+                }
+                Some(**inner)
+            }
+            HirType::Ref {
+                inner, ref_kind, ..
+            } => {
+                if need_mut && !matches!(ref_kind, RefKind::Unique | RefKind::Alias) {
+                    self.record(TypeErrorKind::Generic(format!(
+                        "{name} needs `&mut`/`&alias` for its destination, found `{}`",
+                        type_to_string(&ty)
+                    )));
+                    return None;
+                }
+                Some(**inner)
+            }
+            HirType::OwnedPointer { .. } => {
+                self.record(TypeErrorKind::Generic(format!(
+                    "{name} cannot take an owned pointer `^T`; pass a raw pointer or reference to the pointee"
+                )));
+                None
+            }
+            other => {
+                self.record(TypeErrorKind::Generic(format!(
+                    "{name} expects a pointer or reference, found `{}`",
+                    type_to_string(other)
+                )));
+                None
+            }
+        }
     }
 }

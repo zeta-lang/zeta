@@ -52,6 +52,20 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         self.emit(Instruction::Ret { value: None });
     }
 
+    /// `__zeta_memmove(dst, src, size_bytes)`. Overlap-safe.
+    pub(super) fn emit_memmove(&mut self, dst: Value, src: Value, size: Value) {
+        let f = StrId::from_static("__zeta_memmove");
+        self.emit(Instruction::Call {
+            dest: None,
+            func: Operand::FunctionRef(f),
+            args: smallvec![
+                Operand::Value(dst),
+                Operand::Value(src),
+                Operand::Value(size)
+            ],
+        });
+    }
+
     /// `__zeta_memcpy(dst, src, size_bytes)`
     pub(super) fn emit_memcpy(&mut self, dst: Value, src: Value, size: Value) {
         let f = StrId::from_static("__zeta_memcpy");

@@ -11,32 +11,14 @@ use smallvec::SmallVec;
 use crate::midend::ir::mir_lowering::{FunctionLowerer, lowerer::OrdSel};
 
 impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
-    pub(super) fn lower_replace_intrinsic(
-        &mut self,
-        place: &HirExpr<'a, 'bump>,
-        new_expr: &HirExpr<'a, 'bump>,
-        span: &SourceSpan<'a>,
-    ) -> Value {
-        self.record_move_if_any(new_expr);
+    fn load_by_value(&mut self, addr: Value, ty: &SsaType) -> Value {
+        let inline = Self::is_aggregate_ssa_type(ty)
+            && !matches!(ty, SsaType::Owned(i) if !matches!(i.as_ref(), SsaType::Slice(_)));
 
-        if let HirExpr::Ident(name, ident_span) = place {
-            let rhs = self.lower_expr(new_expr);
-            let old = self.lower_expr(place);
-            self.record_move_if_any(place);
-            self.handle_ident(AssignmentOperator::Assign, rhs, *name, *ident_span);
-            return old;
-        }
-
-        let (addr, ty) = self.lower_place_addr(place, span);
-        let init = self.lower_init_operand(new_expr, &ty);
-
-        let inline = Self::is_aggregate_ssa_type(&ty)
-            && !matches!(&ty, SsaType::Owned(i) if !matches!(i.as_ref(), SsaType::Slice(_)));
-
-        let old = if inline {
-            let size = ir::layout::sizeof_ssa(&ty, TargetInfo { ptr_bytes: 8 })
-                .expect("$replace: slot type has no known size");
-            let (alloc_ty, count) = match &ty {
+        if inline {
+            let size = ir::layout::sizeof_ssa(ty, TargetInfo { ptr_bytes: 8 })
+                .expect("by-value load: slot type has no known size");
+            let (alloc_ty, count) = match ty {
                 SsaType::Array(inner, len) => ((**inner).clone(), *len),
                 _ => (ty.clone(), 1),
             };
@@ -67,7 +49,29 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             });
             self.current_block_data.value_types.insert(v, ty.clone());
             v
-        };
+        }
+    }
+
+    pub(super) fn lower_replace_intrinsic(
+        &mut self,
+        place: &HirExpr<'a, 'bump>,
+        new_expr: &HirExpr<'a, 'bump>,
+        span: &SourceSpan<'a>,
+    ) -> Value {
+        self.record_move_if_any(new_expr);
+
+        if let HirExpr::Ident(name, ident_span) = place {
+            let rhs = self.lower_expr(new_expr);
+            let old = self.lower_expr(place);
+            self.record_move_if_any(place);
+            self.handle_ident(AssignmentOperator::Assign, rhs, *name, *ident_span);
+            return old;
+        }
+
+        let (addr, ty) = self.lower_place_addr(place, span);
+        let init = self.lower_init_operand(new_expr, &ty);
+
+        let old = self.load_by_value(addr, &ty);
 
         self.store_init(addr, 0, &ty, init);
 
@@ -103,6 +107,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         use ir::hir::IntrinsicKind;
 
         match kind {
+            IntrinsicKind::PtrRead => self.emit_ptr_read_intrinsic(type_args, args),
+            IntrinsicKind::PtrWrite => self.emit_ptr_write_intrinsic(type_args, args),
+            IntrinsicKind::PtrCopy => self.emit_ptr_copy_intrinsic(type_args, args, true),
+            IntrinsicKind::PtrCopyNonoverlapping => {
+                self.emit_ptr_copy_intrinsic(type_args, args, false)
+            }
             IntrinsicKind::DropInPlace => self.emit_drop_in_place_intrinsic(type_args, args, span),
             IntrinsicKind::FnPtr => {
                 panic!("fn_ptr intrinsic is not supported");
@@ -982,5 +992,82 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 (s, f)
             }
         }
+    }
+
+    /// Pointee type: the explicit type arg wins, otherwise taken from the pointer's SSA type.
+    fn ptr_pointee_ty(&self, who: &str, ptr: Value, type_args: &[HirType<'a, 'bump>]) -> SsaType {
+        if let Some(t) = type_args.first() {
+            return lower_type_hir(t, self.enums, self.structs);
+        }
+        match self.value_type(ptr).cloned() {
+            Some(SsaType::Pointer(_, inner)) => *inner,
+            other => panic!("{who}: expected pointer-typed argument, got {other:?}"),
+        }
+    }
+
+    fn emit_ptr_read_intrinsic(
+        &mut self,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+    ) -> Value {
+        let ptr = self.lower_expr(&args[0]);
+        let ty = self.ptr_pointee_ty("$ptr_read", ptr, type_args);
+        self.load_by_value(ptr, &ty)
+    }
+
+    fn emit_ptr_write_intrinsic(
+        &mut self,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+    ) -> Value {
+        self.record_move_if_any(&args[1]);
+        let ptr = self.lower_expr(&args[0]);
+        let ty = self.ptr_pointee_ty("$ptr_write", ptr, type_args);
+        let init = self.lower_init_operand(&args[1], &ty);
+        // No load and no drop of the old value: that is the whole point.
+        self.store_init(ptr, 0, &ty, init);
+        self.unit_value()
+    }
+
+    fn emit_ptr_copy_intrinsic(
+        &mut self,
+        type_args: &[HirType<'a, 'bump>],
+        args: &[HirExpr<'a, 'bump>],
+        overlapping: bool,
+    ) -> Value {
+        let src = self.lower_expr(&args[0]);
+        let dst = self.lower_expr(&args[1]);
+        let ty = self.ptr_pointee_ty("$ptr_copy", src, type_args);
+        let count = self.lower_expr_expected(&args[2], &SsaType::Usize);
+
+        let elem = ir::layout::sizeof_ssa(&ty, TargetInfo { ptr_bytes: 8 })
+            .expect("$ptr_copy: element type has no known size");
+        let elem_v = self.new_value();
+        self.emit(Instruction::Const {
+            dest: elem_v,
+            ty: SsaType::Usize,
+            value: Operand::ConstInt(elem as i64),
+        });
+        self.current_block_data
+            .value_types
+            .insert(elem_v, SsaType::Usize);
+
+        let bytes = self.new_value();
+        self.emit(Instruction::Binary {
+            dest: bytes,
+            op: BinOp::Mul,
+            left: Operand::Value(count),
+            right: Operand::Value(elem_v),
+        });
+        self.current_block_data
+            .value_types
+            .insert(bytes, SsaType::Usize);
+
+        if overlapping {
+            self.emit_memmove(dst, src, bytes);
+        } else {
+            self.emit_memcpy(dst, src, bytes);
+        }
+        self.unit_value()
     }
 }
