@@ -62,7 +62,15 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let mut src_ty = self.current_block_data.value_types[&src].clone();
         let dst_ty = lower_type_hir(target_type, self.enums, self.structs);
 
-        if dst_ty.is_pointer() {
+        // `x as *T` decays slices to their data pointer, but `&slot as *const ^[]T`
+        // is a pointer *to* the fat pointer and must keep the slot's address.
+        let dst_pointee_is_fat = matches!(
+            &dst_ty,
+            SsaType::Pointer(_, d)
+                if matches!(d.as_ref(), SsaType::Slice(_) | SsaType::Owned(_) | SsaType::String)
+        );
+
+        if dst_ty.is_pointer() && !dst_pointee_is_fat {
             match &src_ty {
                 SsaType::Slice(inner) => {
                     let ptr = self.current_block_data.fresh_value();
