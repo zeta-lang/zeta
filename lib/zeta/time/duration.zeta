@@ -23,7 +23,6 @@ impl Duration {
         };
     }
 
-
     public func zero(): Duration {
         return Duration {
             seconds: 0,
@@ -62,6 +61,9 @@ impl Duration {
         );
     }
 
+    public func nanoseconds(&this): i32 {
+        return this.nanosecond;
+    }
 
     public func total_seconds(&this): i64 {
         return this.seconds;

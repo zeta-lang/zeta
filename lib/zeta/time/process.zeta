@@ -11,8 +11,8 @@ public func sleep(duration: Duration): void {
     }
 
     let request: Timespec = Timespec {
-        tv_sec: duration.seconds,
-        tv_nsec: duration.nanosecond as i64,
+        tv_sec: duration.total_seconds(),
+        tv_nsec: duration.nanoseconds() as i64,
     };
 
     let mut remaining: Timespec = Timespec {

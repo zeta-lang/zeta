@@ -32,18 +32,18 @@ impl Instant {
         }
 
         return Instant {
-            seconds: ts.tv_sec,
-            nanosecond: ts.tv_nsec as i32,
+            seconds: ts.tv_sec(),
+            nanosecond: ts.tv_nsec() as i32,
         };
     }
 
     public func add(&this, duration: Duration): Instant {
         let mut seconds: i64 =
-            this.seconds + duration.seconds;
+            this.seconds + duration.total_seconds();
 
         let mut nanosecond: i64 =
             (this.nanosecond as i64) +
-            (duration.nanosecond as i64);
+            (duration.nanoseconds() as i64);
 
         if (nanosecond >= 1_000_000_000) {
             seconds += 1;

@@ -4,10 +4,30 @@ import zeta::alloc::allocator.Allocator;
 import zeta::utils::mallocator.Mallocator;
 import zeta::io;
 
-struct Node<T> {
+public struct Node<T> {
     value: T,
     prev: ?&alias Node<T>,
     next: ?^Node<T>,
+}
+
+impl<T> Node<T> {
+    public func value_ref(&this): &T {
+        return &this.value;
+    }
+
+    public func next_node(&this): ?&Node<T> {
+        match (this.next) {
+            case null -> { return null; },
+            case n -> { return &*n; },
+        }
+    }
+
+    public func prev_node(&this): ?&Node<T> {
+        match (this.prev) {
+            case null -> { return null; },
+            case p -> { return &*p; },
+        }
+    }
 }
 
 public struct LinkedList<T, A: Allocator = Mallocator> {
@@ -26,6 +46,60 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
             len: 0,
             alloc,
         };
+    }
+
+    public func len(&this): usize {
+        return this.len;
+    }
+
+    public func is_empty(&this): bool {
+        return this.len == 0;
+    }
+
+    /// Borrow the first element, or null if the list is empty.
+    public func head(&this): ?&T {
+        match (this.head) {
+            case null -> {
+                return null;
+            },
+            case node -> {
+                return &node.value;
+            },
+        }
+    }
+
+    /// Borrow the last element, or null if the list is empty.
+    public func tail(&this): ?&T {
+        match (this.tail) {
+            case null -> {
+                return null;
+            },
+            case node -> {
+                return &node.value;
+            },
+        }
+    }
+
+    public func head_mut(&mut this): ?&mut T {
+        match (this.head) {
+            case null -> {
+                return null;
+            },
+            case node -> {
+                return &mut node.value;
+            },
+        }
+    }
+
+    public func tail_mut(&mut this): ?&mut T {
+        match (this.tail) {
+            case null -> {
+                return null;
+            },
+            case node -> {
+                return &mut node.value;
+            },
+        }
     }
 
     public func push_back(&mut this, value: T) {
@@ -48,6 +122,36 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
         tail.next = node;
 
         this.tail = &alias *tail.next;
+        this.len += 1;
+    }
+
+    public func push_front(&mut this, value: T) {
+        let node: ^Node<T> = this.alloc.new<Node<T>>(Node<T> {
+            value: value,
+            prev: null,
+            next: null,
+        });
+
+        if (this.head == null) {
+            this.head = node;
+            this.tail = &alias *this.head;
+            this.len += 1;
+            return;
+        }
+
+        let old_head: ?^Node<T> = $replace(this.head, null);
+
+        match (old_head) {
+            case null -> {
+                $unreachable();
+            },
+            case old -> {
+                old.prev = &alias *node;
+                node.next = old;
+                this.head = node;
+            },
+        }
+
         this.len += 1;
     }
 
@@ -88,6 +192,39 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
                     return unwrapped_node.value;
                 }
             }
+        }
+    }
+
+    public func remove_front(&mut this): ?T {
+        let old_head: ?^Node<T> = $replace(this.head, null);
+
+        match (old_head) {
+            case null -> {
+                return null;
+            },
+            case node -> {
+                let next: ?^Node<T> = $replace(node.next, null);
+
+                match (next) {
+                    case null -> {
+                        // That was the only element.
+                        this.tail = null;
+                    },
+                    case new_head -> {
+                        new_head.prev = null;
+                        this.head = new_head;
+                    },
+                }
+
+                this.len -= 1;
+                return node.value;
+            },
+        }
+    }
+
+    public func clear(&mut this) {
+        while (this.len != 0) {
+            let removed: ?T = this.remove_back();
         }
     }
 }

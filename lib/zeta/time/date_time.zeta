@@ -341,8 +341,8 @@ impl DateTime {
         }
 
         return DateTime.from_seconds(
-            ts.tv_sec,
-            ts.tv_nsec as u32,
+            ts.tv_sec(),
+            ts.tv_nsec() as u32,
             0
         );
     }
@@ -407,8 +407,8 @@ impl DateTime {
     }
 
     public func add(&this, delta: Duration): DateTime {
-        let mut secs: i64 = this.to_seconds() + delta.seconds;
-        let mut nanos: i64 = (this.nanosecond as i64) + delta.nanosecond;
+        let mut secs: i64 = this.to_seconds() + delta.total_seconds();
+        let mut nanos: i64 = (this.nanosecond as i64) + delta.nanoseconds();
 
         if (nanos >= 1000000000) {
             nanos -= 1000000000;
@@ -422,7 +422,7 @@ impl DateTime {
     }
 
     public func subtract(&this, delta: Duration): DateTime {
-        return this.add(Duration.normalize(-delta.seconds, -(delta.nanosecond as i64)));
+        return this.add(Duration.normalize(-delta.total_seconds(), -(delta.nanoseconds() as i64)));
     }
 
     /// `this - other`
