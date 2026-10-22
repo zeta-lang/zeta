@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 use walkdir::WalkDir;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
@@ -169,21 +170,24 @@ where
 pub(crate) fn emit_all<'a, 'bump>(
     hir_modules: &[HirModule<'a, 'bump>],
     compilation_order: &[usize],
-    backend: &mut CraneliftBackend,
     pool: Arc<StringPool>,
     extern_c_names: Rc<HashSet<StrId>>,
     dep_graph: &'a RefCell<DepGraph>,
     registry: GlobalRegistry<'a, 'bump>,
-) where
+    optimize: bool,
+    verbose: bool,
+) -> (Instant, CraneliftBackend)
+where
     'bump: 'a,
 {
+    let codegen_start = Instant::now();
+
     let glue_registry = DropGlueRegistry::new(registry.clone(), pool.clone());
 
     let mir_module: Module = MirModuleLowerer::new(
         pool.clone(),
         extern_c_names.clone(),
         dep_graph,
-        0, // sentinel, it's overwritten
         glue_registry,
         registry.instantiated_functions.clone(),
         registry.struct_methods.clone(),
@@ -191,5 +195,8 @@ pub(crate) fn emit_all<'a, 'bump>(
     )
     .lower_all_modules(hir_modules, compilation_order);
 
-    CraneliftBackend::emit_module(backend, &mir_module);
+    let mut backend: CraneliftBackend = CraneliftBackend::new(pool.clone(), optimize, verbose);
+
+    CraneliftBackend::emit_module(&mut backend, &mir_module);
+    (codegen_start, backend)
 }

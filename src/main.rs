@@ -51,6 +51,9 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+
+    /// Type check and borrow check without generating code
+    Check { path: Option<PathBuf> },
 }
 
 fn main() -> Result<(), CompilerError<'static>> {
@@ -126,6 +129,15 @@ fn main() -> Result<(), CompilerError<'static>> {
 
             return Ok(());
         }
+        Commands::Check { path } => {
+            let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
+            if verbose {
+                println!("Checking: {}", source_path.display());
+            }
+
+            check_compiler(path, verbose, lib_override)?;
+            Ok(())
+        }
     };
 
     match result {
@@ -145,6 +157,50 @@ fn installed_stdlib_path() -> Option<PathBuf> {
     stdlib.is_dir().then_some(stdlib)
 }
 
+fn resolve_stdlib_path(lib_override: Option<PathBuf>) -> Result<PathBuf, CompilerError<'static>> {
+    if let Some(custom) = lib_override {
+        Ok(custom)
+    } else if let Some(installed) = installed_stdlib_path() {
+        Ok(installed)
+    } else {
+        compiler_lib_path()
+    }
+}
+
+/// Loads the stdlib and the user's sources, running parsing, lowering and
+/// type/borrow checking. Prints diagnostics and returns Err on failure.
+fn load_and_check<'a, 'bump>(
+    compiler: &mut Compiler<'a, 'bump>,
+    path: Option<PathBuf>,
+    lib_override: Option<PathBuf>,
+) -> Result<(), CompilerError<'a>>
+where
+    'bump: 'a,
+    'a: 'bump,
+{
+    let stdlib_path = resolve_stdlib_path(lib_override)?;
+    let source_path = path.unwrap_or_else(|| PathBuf::from("./src"));
+    let file_loader = choose_file_loader();
+
+    let stdlib_diags = compiler
+        .load_directory(&file_loader, &stdlib_path, true)
+        .unwrap_or_else(|e| panic!("Could not load stdlib because of {e}"));
+
+    if stdlib_diags.has_errors() {
+        stdlib_diags.report_all();
+        return Err(CompilerError::ParserError(vec![]));
+    }
+
+    let user_diags = compiler.load_directory(&file_loader, &source_path, false)?;
+
+    if user_diags.has_errors() {
+        user_diags.report_all();
+        return Err(CompilerError::TypeCheckError);
+    }
+
+    Ok(())
+}
+
 fn run_compiler<'a, 'bump>(
     path: Option<PathBuf>,
     out_dir: &PathBuf,
@@ -157,37 +213,26 @@ where
     'bump: 'a,
     'a: 'bump,
 {
-    let stdlib_path = if let Some(custom) = lib_override {
-        custom
-    } else if let Some(installed) = installed_stdlib_path() {
-        installed
-    } else {
-        compiler_lib_path()?
-    };
-
-    let source_path = path.unwrap_or_else(|| PathBuf::from("./src"));
-
-    let file_loader = choose_file_loader();
-
     let mut compiler = Compiler::new()?;
-
-    let stdlib_diags = compiler
-        .load_directory(&file_loader, &stdlib_path, true)
-        .unwrap_or_else(|e| panic!("Could not load stdlib because of {e}"));
-
-    if stdlib_diags.has_errors() {
-        stdlib_diags.report_all();
-        return Err(CompilerError::ParserError(vec![]));
-    }
-
-    let user_diags = compiler
-        .load_directory(&file_loader, &source_path, false)
-        .unwrap_or_else(|e| panic!("Could not load user directory because of {e}"));
-
-    if user_diags.has_errors() {
-        user_diags.report_all();
-        return Err(CompilerError::TypeCheckError);
-    }
-
+    load_and_check(&mut compiler, path, lib_override)?;
     compiler.emit(out_dir, optimize, verbose, emit_obj)
+}
+
+fn check_compiler<'a, 'bump>(
+    path: Option<PathBuf>,
+    verbose: bool,
+    lib_override: Option<PathBuf>,
+) -> Result<(), CompilerError<'a>>
+where
+    'bump: 'a,
+    'a: 'bump,
+{
+    let mut compiler = Compiler::new()?;
+    load_and_check(&mut compiler, path, lib_override)?;
+
+    if verbose {
+        compiler.report_check_timings();
+    }
+    println!("No errors found.");
+    Ok(())
 }
