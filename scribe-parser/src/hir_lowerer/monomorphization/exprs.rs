@@ -1,9 +1,10 @@
 use ir::{
     hir::{
         self, HirExpr, HirFieldInit, HirFunc, HirGeneric, HirMatchArm, HirModuleAccess, HirParam,
-        HirStmt, HirStruct, HirType, InterpolationPart, IntrinsicKind, StrId,
+        HirStmt, HirStruct, HirType, HirTypeKind, InterpolationPart, IntrinsicKind, StrId,
     },
-    ir_hasher::{FxHashMap, HashMap},
+    ir_hasher::{FxHashMap, HashMap, HashSet},
+    span::SourceSpan,
 };
 
 use crate::hir_lowerer::{
@@ -19,7 +20,7 @@ use crate::hir_lowerer::{
 
 impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     pub fn monomorphize_expr<'subs>(
-        &self,
+        &mut self,
         expr: &HirExpr<'a, 'bump>,
         subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirExpr<'a, 'bump> {
@@ -48,6 +49,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 args,
                 type_args,
                 span,
+                variant_span,
             } => {
                 let new_args: Vec<HirExpr> = args
                     .iter()
@@ -78,6 +80,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                 args: args_slice,
                                 type_args: None,
                                 span: *span,
+                                variant_span: *variant_span,
                             };
                         }
                     }
@@ -89,6 +92,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     args: args_slice,
                     type_args: *type_args,
                     span: *span,
+                    variant_span: *variant_span,
                 }
             }
             HirExpr::Cast {
@@ -166,21 +170,21 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                 // it binds the `F: func(..)` generic to the env struct.
                                 for (declared_ty, arg) in declared.iter().zip(args.iter()) {
                                     if let (
-                                        HirType::Generic(g),
+                                        HirTypeKind::Generic(g),
                                         HirExpr::StructInit {
                                             name,
                                             type_args: None,
                                             ..
                                         },
-                                    ) = (declared_ty, arg)
+                                    ) = (declared_ty.kind, arg)
                                     {
                                         if let HirExpr::Ident(env_name, _) = &**name {
                                             let is_closure_param = type_params
                                                 .iter()
-                                                .find(|p| p.name == *g)
+                                                .find(|p| p.name == g)
                                                 .map_or(false, |p| {
                                                     p.constraints.iter().any(|c| {
-                                                        matches!(c, HirType::Lambda { .. })
+                                                        matches!(c.kind, HirTypeKind::Lambda { .. })
                                                     })
                                                 });
 
@@ -188,7 +192,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                                 && is_closure_param
                                             {
                                                 inner_subs
-                                                    .insert(*g, self.closure_env_type(*env_name));
+                                                    .insert(g, self.closure_env_type(*env_name));
                                             }
                                         }
                                     }
@@ -257,21 +261,24 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                     // Bind closure-env generics.
                                     for (declared_ty, arg) in declared.iter().zip(args.iter()) {
                                         if let (
-                                            HirType::Generic(g),
+                                            HirTypeKind::Generic(g),
                                             HirExpr::StructInit {
                                                 name,
                                                 type_args: None,
                                                 ..
                                             },
-                                        ) = (declared_ty, arg)
+                                        ) = (declared_ty.kind, arg)
                                         {
                                             if let HirExpr::Ident(env_name, _) = &**name {
                                                 let is_closure_param = type_params
                                                     .iter()
-                                                    .find(|p| p.name == *g)
+                                                    .find(|p| p.name == g)
                                                     .map_or(false, |p| {
                                                         p.constraints.iter().any(|c| {
-                                                            matches!(c, HirType::Lambda { .. })
+                                                            matches!(
+                                                                c.kind,
+                                                                HirTypeKind::Lambda { .. }
+                                                            )
                                                         })
                                                     });
 
@@ -279,7 +286,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                                     && is_closure_param
                                                 {
                                                     inner_subs.insert(
-                                                        *g,
+                                                        g,
                                                         self.closure_env_type(*env_name),
                                                     );
                                                 }
@@ -348,8 +355,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     if let Some(concrete_recv_ty) = self.concrete_type_of(&new_object) {
                         let concrete_recv_ty = peel_to_struct_owned(concrete_recv_ty);
                         if matches!(
-                            concrete_recv_ty,
-                            HirType::Struct { .. } | HirType::Enum { .. }
+                            concrete_recv_ty.kind,
+                            HirTypeKind::Struct { .. } | HirTypeKind::Enum { .. }
                         ) {
                             if let Some(concrete_method_name) = self.resolve_method_for_type(
                                 &concrete_recv_ty,
@@ -430,25 +437,37 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             .map(|t| substitute_type(t, subs, &self.bump))
                             .collect();
 
-                        if let Some(ty_struct) = self.ctx.structs.borrow().get(&target_key) {
-                            if let Some(declared) = ty_struct.generics {
-                                HirLowerer::fill_default_type_args(
-                                    declared,
-                                    &mut resolved_targs,
-                                    &&self.bump,
-                                );
-                            }
+                        let declared = self
+                            .ctx
+                            .structs
+                            .borrow()
+                            .get(&target_key)
+                            .and_then(|s| s.generics);
+                        if let Some(declared) = declared {
+                            HirLowerer::fill_default_type_args(
+                                declared,
+                                &mut resolved_targs,
+                                &&self.bump,
+                            );
                         }
 
-                        let struct_ty = HirType::Struct {
-                            name: target_key,
-                            field_types: &[],
-                            type_args: self.bump.alloc_slice(&resolved_targs),
-                        };
+                        // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+                        let struct_ty = HirType::struct_type(
+                            target_key,
+                            target_key,
+                            &[],
+                            self.bump.alloc_slice(&resolved_targs),
+                            *span,
+                        );
 
                         let concrete_method_name = self
                         .resolve_method_for_type(&struct_ty, acc.member, None, subs)
                         .unwrap_or_else(|| {
+                            let sm = self.ctx.struct_methods.borrow();
+                            eprintln!("keys with ArrayList: {:?}",
+                                sm.keys().filter(|k| k.as_str().contains("ArrayList")).collect::<Vec<_>>());
+                            eprintln!("methods under target_key: {:?}", sm.get(&target_key).map(|m| m.keys().collect::<Vec<_>>()));
+                            eprintln!("module_idx = {}", self.ctx.module_idx);
                             panic!(
                                 "monomorphize_expr: could not resolve `{}.{}<...>` at {span}; struct key \
                                  `{}` with type args {:?} has no such method (or the struct/method \
@@ -518,12 +537,23 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 // declared field type (this is what `return S { .. }` already got).
                 if let (HirExpr::Ident(n, _), None) = (&**name, type_args) {
                     let key = self.resolve_struct_key(*n);
-                    if self.ctx.structs.borrow().contains_key(&key) {
-                        let expected = HirType::Struct {
-                            name: key,
-                            field_types: &[],
-                            type_args: &[],
-                        };
+
+                    let expected: Option<HirType<'a, 'bump>> = {
+                        let structs_binding = self.ctx.structs.borrow();
+                        structs_binding.get(&key).map(|struct_ty| {
+                            let field_types: Vec<HirType<'a, 'bump>> =
+                                struct_ty.fields.iter().map(|f| f.field_type).collect();
+                            HirType::struct_type(
+                                key,
+                                struct_ty.unmangled_name,
+                                self.ctx.bump.alloc_slice(&field_types),
+                                &[],
+                                *span,
+                            )
+                        })
+                    };
+
+                    if let Some(expected) = expected {
                         if let Some(done) = self
                             .try_monomorphize_struct_init_with_expected_type(expr, &expected, subs)
                         {
@@ -642,7 +672,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 let new_object = self.monomorphize_expr(object, subs);
                 #[cfg(debug_assertions)]
                 if let Some(recv) = self.concrete_type_of(&new_object) {
-                    if let HirType::Struct { name: rn, .. } = peel_to_struct_owned(recv) {
+                    if let HirTypeKind::Struct { name: rn, .. } = peel_to_struct_owned(recv).kind {
                         let origin = self
                             .instantiated_struct_origins
                             .borrow()
@@ -929,7 +959,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn monomorphize_expr_with_expected_type<'subs>(
-        &self,
+        &mut self,
         expr: &HirExpr<'a, 'bump>,
         expected_ty: &HirType<'a, 'bump>,
         subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
@@ -1027,38 +1057,55 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
     }
 
-    pub fn force_instantiate_drops(&self) {
+    pub fn force_instantiate_drops(&mut self) {
         let drop_iface = StrId::from_static("Drop");
         let drop_method_name = StrId::from_static("drop");
-        let origins: Vec<(StrId, Vec<HirType<'a, 'bump>>)> = self
-            .instantiated_struct_origins
-            .borrow()
-            .values()
-            .cloned()
-            .collect();
-        for (origin_name, origin_targs) in origins {
-            let implements_drop = self
-                .ctx
-                .struct_interfaces
+        let mut done: HashSet<StrId> = HashSet::default();
+        loop {
+            let batch: Vec<(StrId, StrId, Vec<HirType<'a, 'bump>>)> = self
+                .instantiated_struct_origins
                 .borrow()
-                .get(&origin_name)
-                .map(|ifaces| ifaces.contains(&drop_iface))
-                .unwrap_or(false);
-            if !implements_drop {
-                continue;
+                .iter()
+                .filter(|(inst, _)| !done.contains(*inst))
+                .map(|(inst, (origin, targs))| (*inst, *origin, targs.clone()))
+                .collect();
+            if batch.is_empty() {
+                break;
             }
-            let targs_slice = self.bump.alloc_slice(&origin_targs);
-            let generic_ty = HirType::Struct {
-                name: origin_name,
-                field_types: &[],
-                type_args: targs_slice,
-            };
-            self.resolve_method_for_type(&generic_ty, drop_method_name, None, &HashMap::default());
+            for (inst, origin_name, origin_targs) in batch {
+                done.insert(inst);
+                let implements_drop = self
+                    .ctx
+                    .struct_interfaces
+                    .borrow()
+                    .get(&origin_name)
+                    .map(|ifaces| ifaces.contains(&drop_iface))
+                    .unwrap_or(false);
+                if !implements_drop {
+                    continue;
+                }
+                let targs_slice = self.bump.alloc_slice(&origin_targs);
+
+                // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+                let generic_ty = HirType::struct_type(
+                    origin_name,
+                    origin_name,
+                    &[],
+                    targs_slice,
+                    SourceSpan::default(),
+                );
+                self.resolve_method_for_type(
+                    &generic_ty,
+                    drop_method_name,
+                    None,
+                    &HashMap::default(),
+                );
+            }
         }
     }
 
     pub(crate) fn try_monomorphize_struct_init_with_expected_type<'subs>(
-        &self,
+        &mut self,
         value: &HirExpr<'a, 'bump>,
         expected_ty: &HirType<'a, 'bump>,
         outer_subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
@@ -1075,20 +1122,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let HirExpr::Ident(struct_name, ident_span) = &**name else {
             return None;
         };
-        let HirType::Struct {
+        let HirTypeKind::Struct {
             name: expected_struct_name,
             type_args: expected_targs,
             ..
-        } = expected_ty
+        } = expected_ty.kind
         else {
             return None;
         };
 
-        let names_match = *expected_struct_name == *struct_name
+        let names_match = expected_struct_name == *struct_name
             || self
                 .instantiated_struct_origins
                 .borrow()
-                .get(expected_struct_name)
+                .get(&expected_struct_name)
                 .map(|(origin, _)| *origin == *struct_name)
                 .unwrap_or(false);
         if !names_match {
@@ -1100,14 +1147,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 .ctx
                 .structs
                 .borrow()
-                .get(expected_struct_name)
+                .get(&expected_struct_name)
                 .map_or(false, |s| s.generics.is_some())
         {
             return None; // bare template type: let the old path handle it
         }
 
         let new_struct_name = if expected_targs.is_empty() {
-            *expected_struct_name
+            expected_struct_name
         } else {
             let resolved_targs: Vec<HirType> = expected_targs
                 .iter()
@@ -1168,7 +1215,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn try_monomorphize_enum_init_with_expected_type<'subs>(
-        &self,
+        &mut self,
         value: &HirExpr<'a, 'bump>,
         expected_ty: &HirType<'a, 'bump>,
         outer_subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
@@ -1179,24 +1226,26 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             args,
             type_args: None,
             span,
+            variant_span,
         } = value
         else {
             return None;
         };
-        let HirType::Enum {
+        let HirTypeKind::Enum {
             name: expected_enum_name,
             type_args: expected_targs,
+            unmangled_name: _,
             variants: _,
-        } = expected_ty
+        } = expected_ty.kind
         else {
             return None;
         };
 
-        let names_match = *expected_enum_name == *enum_name
+        let names_match = expected_enum_name == enum_name
             || self
                 .instantiated_enum_origins
                 .borrow()
-                .get(expected_enum_name)
+                .get(&expected_enum_name)
                 .map(|(origin, _)| *origin == *enum_name)
                 .unwrap_or(false);
         if !names_match {
@@ -1204,7 +1253,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
 
         let new_enum_name = if expected_targs.is_empty() {
-            *expected_enum_name
+            expected_enum_name
         } else {
             let resolved_targs: Vec<HirType> = expected_targs
                 .iter()
@@ -1234,10 +1283,11 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             args: args_slice,
             type_args: None,
             span: *span,
+            variant_span: *variant_span,
         })
     }
 
-    pub fn force_instantiate_allocator_frees(&self) {
+    pub fn force_instantiate_allocator_frees(&mut self) {
         let free_method_name = StrId::from_static("free");
         let allocator_iface = StrId::from_static("Allocator");
 
@@ -1260,14 +1310,24 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 }
             }
 
-            let this_ty = func.impl_target.map(|name| HirType::Struct {
-                name,
-                field_types: &[],
-                type_args: &[],
-            });
+            // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+            let this_ty = func
+                .impl_target
+                .map(|name| HirType::struct_type(name, name, &[], &[], SourceSpan::default()));
 
             let prev_params = self.current_params.replace(param_map);
             let prev_this = self.current_this.replace(this_ty);
+
+            if let Some(params) = func.params {
+                for p in params.iter() {
+                    if let HirParam::Normal { param_type, .. } = p {
+                        Self::collect_owned_pointees(param_type, &mut needed);
+                    }
+                }
+            }
+            if let Some(rt) = func.return_type {
+                Self::collect_owned_pointees(&rt, &mut needed);
+            }
 
             self.collect_owned_pointer_allocs(&body, &mut needed);
 
@@ -1280,13 +1340,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
         let allocator_field_of = |name: StrId| -> Option<StrId> {
             self.ctx.structs.borrow().get(&name).and_then(|s| {
-                s.fields.iter().find_map(|f| match &f.field_type {
-                    HirType::Struct { name: fty_name, .. } => {
+                s.fields.iter().find_map(|f| match f.field_type.kind {
+                    HirTypeKind::Struct { name: fty_name, .. } => {
                         let ifaces = self.ctx.struct_interfaces.borrow();
                         ifaces
-                            .get(fty_name)
+                            .get(&fty_name)
                             .map_or(false, |v| v.contains(&allocator_iface))
-                            .then_some(*fty_name)
+                            .then_some(fty_name)
                     }
                     _ => None,
                 })
@@ -1309,29 +1369,63 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             .or_else(|| allocator_field_of(node_name)),
                     };
 
-                if let Some(allocator_name) = allocator_name {
-                    needed.push((allocator_name, node_ty));
-                }
+                needed.push((allocator_name.unwrap_or(StrId::from_static("*")), node_ty));
             }
         }
 
+        let wildcard = StrId::from_static("*");
+        let allocators: Vec<StrId> = {
+            let si = self.ctx.struct_interfaces.borrow();
+            let st = self.ctx.structs.borrow();
+            si.iter()
+                .filter(|(n, v)| {
+                    v.contains(&allocator_iface)
+                        && st.get(*n).map_or(false, |s| s.generics.is_none())
+                })
+                .map(|(n, _)| *n)
+                .collect()
+        };
+        let mut expanded = Vec::new();
+        for (a, t) in needed {
+            if a == wildcard {
+                for &al in &allocators {
+                    expanded.push((al, t));
+                }
+            } else {
+                expanded.push((a, t));
+            }
+        }
+        let needed = expanded;
         for (allocator_name, pointee_ty) in needed {
             if contains_unresolved_generic(&pointee_ty) {
-                continue; // came from a generic template; the instantiated copy covers it
+                continue;
             }
-            let allocator_ty = HirType::Struct {
-                name: allocator_name,
-                field_types: &[],
-                type_args: &[],
-            };
+
+            // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+
+            let allocator_ty = HirType::struct_type(
+                allocator_name,
+                allocator_name,
+                &[],
+                &[],
+                SourceSpan::default(),
+            );
 
             let type_args_slice = self.bump.alloc_slice(&[pointee_ty]);
-            self.resolve_method_for_type(
-                &allocator_ty,
-                free_method_name,
-                Some(type_args_slice),
-                &HashMap::default(),
-            );
+            if self
+                .resolve_method_for_type(
+                    &allocator_ty,
+                    free_method_name,
+                    Some(type_args_slice),
+                    &HashMap::default(),
+                )
+                .is_none()
+            {
+                eprintln!(
+                    "[allocfree] FAILED {} :: free<{:?}>",
+                    allocator_name, pointee_ty
+                );
+            }
         }
     }
 
@@ -1375,6 +1469,23 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
     }
 
+    fn collect_owned_pointees(ty: &HirType<'a, 'bump>, out: &mut Vec<(StrId, HirType<'a, 'bump>)>) {
+        match ty.kind {
+            HirTypeKind::OwnedPointer { inner, .. } => {
+                out.push((StrId::from_static("*"), *inner));
+                Self::collect_owned_pointees(inner, out);
+            }
+            HirTypeKind::Nullable(i)
+            | HirTypeKind::Slice(i)
+            | HirTypeKind::Array(i, _)
+            | HirTypeKind::Ref { inner: i, .. }
+            | HirTypeKind::SafePointer { inner: i, .. }
+            | HirTypeKind::UnsafePointer { inner: i, .. } => Self::collect_owned_pointees(i, out),
+            HirTypeKind::Tuple(ts) => ts.iter().for_each(|t| Self::collect_owned_pointees(t, out)),
+            _ => {}
+        }
+    }
+
     pub(crate) fn collect_owned_pointer_allocs(
         &self,
         stmt: &HirStmt<'a, 'bump>,
@@ -1388,10 +1499,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 span: _,
                 ..
             } => {
-                if let HirType::OwnedPointer { inner, .. } = ty {
+                if let HirTypeKind::OwnedPointer { inner, .. } = ty.kind {
                     if let Some(alloc_ty) = self.infer_allocator_ty_from_expr(value) {
-                        if let HirType::Struct { name, .. } = peel_to_struct_owned(alloc_ty) {
-                            needed.push((name, **inner));
+                        if let HirTypeKind::Struct { name, .. } =
+                            peel_to_struct_owned(alloc_ty).kind
+                        {
+                            needed.push((name, *inner));
                         }
                     }
                 }
@@ -1555,7 +1668,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn resolve_own_generic_method_call<'subs>(
-        &self,
+        &mut self,
         new_object: &HirExpr<'a, 'bump>,
         field: StrId,
         call_type_args: Option<&'bump [HirType<'a, 'bump>]>,
@@ -1564,20 +1677,32 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     ) -> Option<HirExpr<'a, 'bump>> {
         let concrete_recv_ty = self.concrete_type_of(new_object)?;
         let struct_ty = peel_to_struct(&concrete_recv_ty);
-        let HirType::Struct {
-            name: recv_name,
-            type_args: recv_targs,
-            ..
-        } = struct_ty
-        else {
-            return None;
+        let (recv_name, recv_targs) = match struct_ty.kind {
+            HirTypeKind::Struct {
+                name, type_args, ..
+            }
+            | HirTypeKind::Enum {
+                name, type_args, ..
+            } => (name, type_args),
+            _ => return None,
         };
 
-        let (origin, recv_targs): (StrId, Vec<HirType>) =
-            match self.instantiated_struct_origins.borrow().get(&recv_name) {
-                Some((o, t)) => (*o, t.clone()),
-                None => (*recv_name, recv_targs.to_vec()),
-            };
+        let origin_entry = self
+            .instantiated_struct_origins
+            .borrow()
+            .get(&recv_name)
+            .cloned()
+            .or_else(|| {
+                self.instantiated_enum_origins
+                    .borrow()
+                    .get(&recv_name)
+                    .cloned()
+            });
+
+        let (origin, recv_targs): (StrId, Vec<HirType>) = match origin_entry {
+            Some((o, t)) => (o, t),
+            None => (recv_name, recv_targs.to_vec()),
+        };
 
         let base_method_name = *self.ctx.struct_methods.borrow().get(&origin)?.get(&field)?;
         let base_func = self.functions.borrow().get(&base_method_name)?.clone();
@@ -1618,26 +1743,23 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             // `F: func(..)` generic to its env struct.
             for (declared_ty, arg) in declared_types.iter().zip(args.iter()) {
                 if let (
-                    HirType::Generic(g),
+                    HirTypeKind::Generic(g),
                     HirExpr::StructInit {
                         name,
                         type_args: None,
                         ..
                     },
-                ) = (declared_ty, arg)
+                ) = (declared_ty.kind, arg)
                 {
                     if let HirExpr::Ident(env_name, _) = &**name {
                         let is_closure_param =
-                            type_params
-                                .iter()
-                                .find(|p| p.name == *g)
-                                .map_or(false, |p| {
-                                    p.constraints
-                                        .iter()
-                                        .any(|c| matches!(c, HirType::Lambda { .. }))
-                                });
+                            type_params.iter().find(|p| p.name == g).map_or(false, |p| {
+                                p.constraints
+                                    .iter()
+                                    .any(|c| matches!(c.kind, HirTypeKind::Lambda { .. }))
+                            });
                         if self.env_structs.contains_key(env_name) && is_closure_param {
-                            inner_subs.insert(*g, self.closure_env_type(*env_name));
+                            inner_subs.insert(g, self.closure_env_type(*env_name));
                         }
                     }
                 }
@@ -1709,52 +1831,52 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         type_params: &[HirGeneric<'a, 'bump>],
         inner_subs: &mut FxHashMap<StrId, HirType<'a, 'bump>>,
     ) {
-        match declared {
-            HirType::Generic(name) => {
-                if type_params.iter().any(|p| p.name == *name) && !inner_subs.contains_key(name) {
-                    inner_subs.insert(*name, *concrete);
+        match declared.kind {
+            HirTypeKind::Generic(name) => {
+                if type_params.iter().any(|p| p.name == name) && !inner_subs.contains_key(&name) {
+                    inner_subs.insert(name, *concrete);
                 }
             }
-            HirType::Slice(inner) => {
-                if let HirType::Slice(c) = concrete {
+            HirTypeKind::Slice(inner) => {
+                if let HirTypeKind::Slice(c) = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::Nullable(inner) => {
-                if let HirType::Nullable(c) = concrete {
+            HirTypeKind::Nullable(inner) => {
+                if let HirTypeKind::Nullable(c) = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::OwnedPointer { inner, .. } => {
-                if let HirType::OwnedPointer { inner: c, .. } = concrete {
+            HirTypeKind::OwnedPointer { inner, .. } => {
+                if let HirTypeKind::OwnedPointer { inner: c, .. } = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::Ref { inner, .. } => {
-                if let HirType::Ref { inner: c, .. } = concrete {
+            HirTypeKind::Ref { inner, .. } => {
+                if let HirTypeKind::Ref { inner: c, .. } = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::SafePointer { inner, .. } => {
-                if let HirType::SafePointer { inner: c, .. } = concrete {
+            HirTypeKind::SafePointer { inner, .. } => {
+                if let HirTypeKind::SafePointer { inner: c, .. } = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::UnsafePointer { inner, .. } => {
-                if let HirType::UnsafePointer { inner: c, .. } = concrete {
+            HirTypeKind::UnsafePointer { inner, .. } => {
+                if let HirTypeKind::UnsafePointer { inner: c, .. } = concrete.kind {
                     Self::unify_generic(inner, c, type_params, inner_subs);
                 }
             }
-            HirType::Struct {
+            HirTypeKind::Struct {
                 name: dn,
                 type_args: da,
                 ..
             } => {
-                if let HirType::Struct {
+                if let HirTypeKind::Struct {
                     name: an,
                     type_args: aa,
                     ..
-                } = concrete
+                } = concrete.kind
                 {
                     if dn == an {
                         for (d, a) in da.iter().zip(aa.iter()) {
@@ -1763,16 +1885,61 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     }
                 }
             }
-            HirType::Enum {
+            HirTypeKind::Enum {
                 name: dn,
                 type_args: da,
                 ..
             } => {
-                if let HirType::Enum {
+                if let HirTypeKind::Enum {
                     name: an,
                     type_args: aa,
                     ..
-                } = concrete
+                } = concrete.kind
+                {
+                    if dn == an {
+                        for (d, a) in da.iter().zip(aa.iter()) {
+                            Self::unify_generic(d, a, type_params, inner_subs);
+                        }
+                    }
+                }
+            }
+            HirTypeKind::Array(inner, _) => {
+                if let HirTypeKind::Array(c, _) = concrete.kind {
+                    Self::unify_generic(inner, c, type_params, inner_subs);
+                }
+            }
+            HirTypeKind::Tuple(ds) => {
+                if let HirTypeKind::Tuple(cs) = concrete.kind {
+                    for (d, c) in ds.iter().zip(cs.iter()) {
+                        Self::unify_generic(d, c, type_params, inner_subs);
+                    }
+                }
+            }
+            HirTypeKind::Lambda {
+                params: dp,
+                return_type: dr,
+            } => {
+                if let HirTypeKind::Lambda {
+                    params: cp,
+                    return_type: cr,
+                } = concrete.kind
+                {
+                    for (d, c) in dp.iter().zip(cp.iter()) {
+                        Self::unify_generic(d, c, type_params, inner_subs);
+                    }
+                    Self::unify_generic(dr, cr, type_params, inner_subs);
+                }
+            }
+            HirTypeKind::DynInterface {
+                name: dn,
+                type_args: da,
+                ..
+            } => {
+                if let HirTypeKind::DynInterface {
+                    name: an,
+                    type_args: aa,
+                    ..
+                } = concrete.kind
                 {
                     if dn == an {
                         for (d, a) in da.iter().zip(aa.iter()) {
@@ -1814,67 +1981,56 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     /// After closure-env generics (e.g. `F -> __closure_env_0`) are bound in
     /// `inner_subs`, some generic parameters (e.g. `R` in `F: func(): R`) may
     /// only appear in the *constraint* on a closure-bound generic, not in any
-    /// parameter type. This method resolves those by looking up the `__call`
+    /// parameter type.
+    ///
+    /// This method resolves those by looking up the `__call`
     /// return type on the env struct and unifying it with the constraint's
     /// return-type position.
     pub(crate) fn infer_generics_from_closure_constraints(
         &self,
         type_params: &[HirGeneric<'a, 'bump>],
-        current_subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
+        _current_subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
         inner_subs: &mut FxHashMap<StrId, HirType<'a, 'bump>>,
     ) {
-        for param in type_params {
-            if inner_subs.contains_key(&param.name) {
-                continue; // already resolved
-            }
-            // Check if this generic appears as the return type in the
-            // constraint of some already-resolved closure-env generic.
-            for other_param in type_params {
-                let Some(bound_ty) = current_subs.get(&other_param.name) else {
+        loop {
+            let before = inner_subs.len();
+            for other in type_params {
+                let Some(bound) = inner_subs.get(&other.name).copied() else {
                     continue;
                 };
-                let HirType::Struct { name: env_name, .. } = bound_ty else {
+                let HirTypeKind::Struct { name: env_name, .. } = bound.kind else {
                     continue;
                 };
-                if !self.env_structs.contains_key(env_name) {
+                let Some(&call_name) = self.env_structs.get(&env_name) else {
                     continue;
-                }
-
-                // Look for a Lambda constraint on `other_param` whose
-                // return_type is `Generic(param.name)`.
-                for constraint in other_param.constraints {
-                    if let HirType::Lambda { return_type, .. } = constraint {
-                        if let HirType::Generic(ret_generic) = **return_type {
-                            if ret_generic == param.name {
-                                // Resolve by looking up the __call return type.
-                                let call_fn_name = self.env_structs.get(env_name).copied();
-                                if let Some(n) = call_fn_name {
-                                    let func_opt = self.functions.borrow().get(&n).cloned();
-                                    if let Some(call_fn) = func_opt {
-                                        if let Some(ret) = call_fn.return_type {
-                                            inner_subs.insert(param.name, ret);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                };
+                let call_fn = self.functions.borrow().get(&call_name).cloned();
+                let Some(ret) = call_fn.and_then(|f| f.return_type) else {
+                    continue;
+                };
+                for c in other.constraints {
+                    if let HirTypeKind::Lambda { return_type, .. } = c.kind {
+                        Self::unify_generic(return_type, &ret, type_params, inner_subs);
                     }
                 }
+            }
+            if inner_subs.len() == before {
+                break;
             }
         }
     }
 }
 
 fn owned_link_parts<'a, 'bump>(ty: &HirType<'a, 'bump>) -> Option<(HirType<'a, 'bump>, StrId)> {
-    let owned: HirType<'a, 'bump> = match ty {
-        HirType::Nullable(inner) => **inner,
-        other => *other,
+    let owned: HirType<'a, 'bump> = match ty.kind {
+        HirTypeKind::Nullable(inner) => *inner,
+        _ => *ty,
     };
-    let HirType::OwnedPointer { inner, .. } = owned else {
+    let HirTypeKind::OwnedPointer { inner, .. } = owned.kind else {
         return None;
     };
     let pointee: HirType<'a, 'bump> = *inner;
-    let HirType::Struct { name, .. } = pointee else {
+    let HirTypeKind::Struct { name, .. } = pointee.kind else {
         return None;
     };
     Some((pointee, name))
@@ -1885,14 +2041,14 @@ fn field_allocator_annotation<'a, 'bump>(
     hir_struct: &HirStruct<'a, 'bump>,
     ty: &HirType<'a, 'bump>,
 ) -> Option<StrId> {
-    let owned = match ty {
-        HirType::Nullable(inner) => **inner,
-        other => *other,
+    let owned = match ty.kind {
+        HirTypeKind::Nullable(inner) => *inner,
+        _ => *ty,
     };
-    let HirType::OwnedPointer {
+    let HirTypeKind::OwnedPointer {
         allocator: Some(ann),
         ..
-    } = owned
+    } = owned.kind
     else {
         return None;
     };
@@ -1913,7 +2069,7 @@ fn field_allocator_annotation<'a, 'bump>(
     let field = hir_struct
         .fields
         .iter()
-        .find(|f| f.name == *field_name)
+        .find(|f| f.name == field_name)
         .unwrap_or_else(|| {
             panic!(
                 "field_allocator_annotation: struct `{}`'s allocator annotation points to \
@@ -1922,8 +2078,8 @@ fn field_allocator_annotation<'a, 'bump>(
             )
         });
 
-    match field.field_type {
-        HirType::Struct { name, .. } => Some(name),
+    match field.field_type.kind {
+        HirTypeKind::Struct { name, .. } => Some(name),
         other => panic!(
             "field_allocator_annotation: struct `{}` field `{}` (named by an allocator \
              annotation) isn't itself a struct type -- found `{:?}`",

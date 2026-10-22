@@ -6,6 +6,7 @@ use super::context::HirLowerer;
 use ir::ast::{AttrArg, Stmt, TypeKind};
 use ir::ast::{FuncDecl, Path};
 use ir::attributes::{AttrTarget, KnownKind};
+use ir::hir::JoinStr;
 use ir::hir::{Hir, HirAttrArg, HirModule, HirStmt, StrId};
 use ir::hir::{HirAttribute, HirFuncProto};
 use ir::hir::{HirEnum, HirEnumVariant, HirField, HirFunc, HirInterface, HirStruct};
@@ -49,25 +50,29 @@ pub fn primitive_canonical_name(kind: &ir::ast::TypeKind) -> Option<&'static str
     })
 }
 
-pub fn primitive_hir_type<'a, 'bump>(name: StrId, pool: &StringPool) -> Option<HirType<'a, 'bump>> {
+pub fn primitive_hir_type<'a, 'bump>(
+    name: StrId,
+    pool: &StringPool,
+    span: SourceSpan<'a>,
+) -> Option<HirType<'a, 'bump>> {
     Some(match pool.resolve_string(&name) {
-        "i8" => HirType::I8,
-        "i16" => HirType::I16,
-        "i32" => HirType::I32,
-        "i64" => HirType::I64,
-        "i128" => HirType::I128,
-        "u8" => HirType::U8,
-        "u16" => HirType::U16,
-        "u32" => HirType::U32,
-        "u64" => HirType::U64,
-        "u128" => HirType::U128,
-        "usize" => HirType::Usize,
-        "isize" => HirType::Isize,
-        "f32" => HirType::F32,
-        "f64" => HirType::F64,
-        "bool" => HirType::Boolean,
-        "str" => HirType::String,
-        "char" => HirType::Char,
+        "i8" => HirType::i8(span),
+        "i16" => HirType::i16(span),
+        "i32" => HirType::i32(span),
+        "i64" => HirType::i64(span),
+        "i128" => HirType::i128(span),
+        "u8" => HirType::u8(span),
+        "u16" => HirType::u16(span),
+        "u32" => HirType::u32(span),
+        "u64" => HirType::u64(span),
+        "u128" => HirType::u128(span),
+        "usize" => HirType::usize(span),
+        "isize" => HirType::isize(span),
+        "f32" => HirType::f32(span),
+        "f64" => HirType::f64(span),
+        "bool" => HirType::boolean(span),
+        "str" => HirType::string(span),
+        "char" => HirType::char(span),
         _ => return None,
     })
 }
@@ -104,15 +109,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         }
                     },
                     None => {
-                        let path_str = segments
-                            .iter()
-                            .map(|s| self.ctx.context.resolve_string(s).to_string())
-                            .collect::<Vec<_>>()
-                            .join("::");
+                        let path_str = segments.join("::");
                         let member_str = import_stmt
                             .path
                             .member
-                            .map(|m| format!(".{}", self.ctx.context.resolve_string(&m)))
+                            .map(|m| format!(".{}", m))
                             .unwrap_or_default();
                         self.ctx.record_error(
                             format!(
@@ -373,6 +374,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             generics: None,
                             fields: self.ctx.bump.alloc_slice::<HirField>(&[]),
                             unmangled_name: s.name,
+                            span: s.span,
+                            name_span: s.name_span,
                         });
                     self.ctx
                         .struct_owner_module
@@ -391,6 +394,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             generics: None,
                             variants: self.ctx.bump.alloc_slice::<HirEnumVariant>(&[]),
                             unmangled_name: e.name,
+                            span: e.span,
+                            name_span: e.name_span,
                         });
                     self.ctx
                         .enum_owner_module
@@ -418,6 +423,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             methods: None,
                             generics: None,
                             unmangled_name: i.name,
+                            span: i.span,
+                            name_span: i.name_span,
+                            declaring_module_idx: self.ctx.module_idx,
                         });
                 }
                 Stmt::Module(module_decl) => self.pre_register_type_names(module_decl.body),
@@ -565,6 +573,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             declaring_module_idx: self.ctx.module_idx,
             impl_target: struct_name,
             span: proto.span,
+            name_span: proto.name_span,
+            ensures: &[],
+            return_binders: &[],
         };
 
         self.ctx.functions.borrow_mut().insert(proto.name, hir_func);
@@ -718,7 +729,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         });
         let return_type = match f.return_type {
             Some(ty) => self.lower_type(&ty, f.span),
-            None => HirType::Void,
+            None => HirType::void(f.span),
         };
 
         if let Some(gs) = generics {
@@ -734,6 +745,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             function_metadata: f.function_metadata,
             generics,
             unmangled_name: f.name,
+            name_span: f.name_span,
             span: f.span,
         }
     }

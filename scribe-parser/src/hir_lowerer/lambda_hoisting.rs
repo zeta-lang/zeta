@@ -4,9 +4,10 @@ use ir::ast::{ExternModifier, FuncSafety, InlineModifier, Visibility};
 use ir::hir::{
     CaptureMode, ClosureKind, ClosureLowering, EffectIndexKey, FuncModifiers, Hir,
     HirEffectSegment, HirExpr, HirField, HirFieldInit, HirFunc, HirLambdaParam, HirModule,
-    HirParam, HirStmt, HirStruct, HirType, RefKind, StrId, static_effect_path,
+    HirParam, HirStmt, HirStruct, HirType, HirTypeKind, RefKind, StrId, static_effect_path,
 };
 use ir::ir_hasher::FxHashMap;
+use ir::span::SourceSpan;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
@@ -125,6 +126,8 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 catch_pattern,
                 span,
                 manual,
+                visibility,
+                inferred_ty,
             } => {
                 let new_value = self.rewrite_expr(value);
                 HirStmt::Let {
@@ -136,6 +139,8 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     catch_pattern,
                     span,
                     manual,
+                    visibility,
+                    inferred_ty,
                 }
             }
             HirStmt::Return(Some(expr), span) => {
@@ -405,6 +410,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 args,
                 type_args,
                 span,
+                variant_span,
             } => {
                 let new_args: Vec<HirExpr<'a, 'bump>> =
                     args.iter().map(|a| self.rewrite_expr(*a)).collect();
@@ -414,6 +420,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                     args: self.bump.alloc_slice(&new_args),
                     type_args,
                     span,
+                    variant_span,
                 }
             }
             HirExpr::InterpolatedString(parts) => {
@@ -709,15 +716,21 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
 
         let env_param_ty = match closure.kind {
             ClosureKind::FnOnce => closure.env_ty,
-            ClosureKind::FnMut => HirType::Ref {
-                inner: self.bump.alloc_value(closure.env_ty),
-                ref_kind: RefKind::Unique,
-                provenance: None,
+            ClosureKind::FnMut => HirType {
+                kind: HirTypeKind::Ref {
+                    inner: self.bump.alloc_value(closure.env_ty),
+                    ref_kind: RefKind::Unique,
+                    provenance: None,
+                },
+                span,
             },
-            _ => HirType::Ref {
-                inner: self.bump.alloc_value(closure.env_ty),
-                ref_kind: RefKind::Shared,
-                provenance: None,
+            _ => HirType {
+                kind: HirTypeKind::Ref {
+                    inner: self.bump.alloc_value(closure.env_ty),
+                    ref_kind: RefKind::Shared,
+                    provenance: None,
+                },
+                span,
             },
         };
         let mut hir_params: Vec<HirParam<'a, 'bump>> = Vec::with_capacity(params.len() + 1);
@@ -737,12 +750,13 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         }
         let params_slice = self.bump.alloc_slice(&hir_params);
 
-        let ret_ty =
-            if matches!(closure.ret_ty, HirType::Void) && !matches!(return_type, HirType::Void) {
-                return_type
-            } else {
-                closure.ret_ty
-            };
+        let ret_ty = if matches!(closure.ret_ty.kind, HirTypeKind::Void)
+            && !matches!(return_type.kind, HirTypeKind::Void)
+        {
+            return_type
+        } else {
+            closure.ret_ty
+        };
 
         let synthetic_func = HirFunc {
             name: closure.fn_name,
@@ -760,12 +774,15 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             declaring_module_idx: self.module_idx,
             impl_target: None,
             span,
+            name_span: span,
+            ensures: &[],
+            return_binders: &[],
         };
         self.hoisted
             .push(Hir::Func(self.bump.alloc_value(synthetic_func)));
 
-        let field_types: &[HirType<'a, 'bump>] = match closure.env_ty {
-            HirType::Struct { field_types, .. } => field_types,
+        let field_types: &[HirType<'a, 'bump>] = match closure.env_ty.kind {
+            HirTypeKind::Struct { field_types, .. } => field_types,
             _ => unreachable!("ClosureLowering::env_ty is always a Struct"),
         };
         let env_fields: Vec<HirField<'a, 'bump>> = closure
@@ -777,14 +794,17 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 field_type: *ty,
                 visibility: Visibility::Private,
                 manual: false,
+                span: SourceSpan::default(),
             })
             .collect();
         let env_struct = HirStruct {
             name: closure.env_name,
             visibility: Visibility::Private,
             generics: None,
+            name_span: SourceSpan::default(),
             fields: self.bump.alloc_slice(&env_fields),
             unmangled_name: closure.env_name,
+            span: SourceSpan::default(),
         };
         self.hoisted
             .push(Hir::Struct(self.bump.alloc_value(env_struct)));
@@ -865,7 +885,10 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
             unmangled_name: synthetic_name,
             declaring_module_idx: self.module_idx,
             impl_target: None,
+            ensures: &[],
+            return_binders: &[],
             span,
+            name_span: span,
         };
 
         self.hoisted

@@ -1,6 +1,6 @@
-use ir::hir::HirType;
 #[cfg(debug_assertions)]
 use ir::hir::{Hir, HirExpr, HirStmt, StrId};
+use ir::hir::{HirType, HirTypeKind};
 
 use crate::hir_lowerer::monomorphization::Monomorphizer;
 
@@ -193,6 +193,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 args,
                 type_args,
                 span,
+                variant_span: _,
             } => {
                 let still_generic = self
                     .ctx
@@ -304,15 +305,17 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 }
 
 pub fn contains_unresolved_generic(ty: &HirType) -> bool {
-    match ty {
-        HirType::Generic(_) => true,
-        HirType::Slice(inner) | HirType::Array(inner, _) => contains_unresolved_generic(inner),
-        HirType::Nullable(inner) => contains_unresolved_generic(inner),
-        HirType::Ref { inner, .. }
-        | HirType::SafePointer { inner, .. }
-        | HirType::UnsafePointer { inner, .. }
-        | HirType::OwnedPointer { inner, .. } => contains_unresolved_generic(inner),
-        HirType::Struct {
+    match ty.kind {
+        HirTypeKind::Generic(_) => true,
+        HirTypeKind::Slice(inner) | HirTypeKind::Array(inner, _) => {
+            contains_unresolved_generic(inner)
+        }
+        HirTypeKind::Nullable(inner) => contains_unresolved_generic(inner),
+        HirTypeKind::Ref { inner, .. }
+        | HirTypeKind::SafePointer { inner, .. }
+        | HirTypeKind::UnsafePointer { inner, .. }
+        | HirTypeKind::OwnedPointer { inner, .. } => contains_unresolved_generic(inner),
+        HirTypeKind::Struct {
             field_types,
             type_args,
             ..
@@ -320,39 +323,41 @@ pub fn contains_unresolved_generic(ty: &HirType) -> bool {
             field_types.iter().any(contains_unresolved_generic)
                 || type_args.iter().any(contains_unresolved_generic)
         }
-        HirType::DynInterface(_, args)
-        | HirType::Enum {
+        HirTypeKind::DynInterface {
+            type_args: args, ..
+        }
+        | HirTypeKind::Enum {
             type_args: args, ..
         } => args.iter().any(contains_unresolved_generic),
-        HirType::Lambda {
+        HirTypeKind::Lambda {
             params,
             return_type,
         } => {
             params.iter().any(contains_unresolved_generic)
                 || contains_unresolved_generic(return_type)
         }
-        HirType::Tuple(elems) => elems.iter().any(contains_unresolved_generic),
-        HirType::Dyn { bounds } => bounds.iter().any(contains_unresolved_generic),
+        HirTypeKind::Tuple(elems) => elems.iter().any(contains_unresolved_generic),
+        HirTypeKind::Dyn { bounds } => bounds.iter().any(contains_unresolved_generic),
         _ => false,
     }
 }
 
 pub(super) fn peel_to_struct_owned<'a, 'bump>(ty: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
-    match ty {
-        HirType::Ref { inner, .. }
-        | HirType::SafePointer { inner, .. }
-        | HirType::OwnedPointer { inner, .. }
-        | HirType::UnsafePointer { inner, .. } => peel_to_struct_owned(*inner),
+    match ty.kind {
+        HirTypeKind::Ref { inner, .. }
+        | HirTypeKind::SafePointer { inner, .. }
+        | HirTypeKind::OwnedPointer { inner, .. }
+        | HirTypeKind::UnsafePointer { inner, .. } => peel_to_struct_owned(*inner),
         _ => ty,
     }
 }
 
 pub(super) fn peel_to_struct<'b, 'a, 'bump>(ty: &'b HirType<'a, 'bump>) -> &'b HirType<'a, 'bump> {
-    match ty {
-        HirType::Ref { inner, .. }
-        | HirType::SafePointer { inner, .. }
-        | HirType::OwnedPointer { inner, .. }
-        | HirType::UnsafePointer { inner, .. } => peel_to_struct(inner),
+    match ty.kind {
+        HirTypeKind::Ref { inner, .. }
+        | HirTypeKind::SafePointer { inner, .. }
+        | HirTypeKind::OwnedPointer { inner, .. }
+        | HirTypeKind::UnsafePointer { inner, .. } => peel_to_struct(inner),
         _ => ty,
     }
 }
