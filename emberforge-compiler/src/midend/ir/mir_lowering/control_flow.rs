@@ -1646,8 +1646,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     ) -> SsaType {
         let mut types = self.phi_incoming_types(incoming);
 
-        // Two passes with different notion of "real type". Both are kept from the original code;
-        // see `promote_null_types`.
         Self::promote_null_types(&mut types, false);
         Self::promote_null_types(&mut types, true);
 
