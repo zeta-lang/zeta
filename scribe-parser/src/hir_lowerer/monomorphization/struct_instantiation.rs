@@ -4,7 +4,7 @@ use crate::hir_lowerer::context::LoweringCtx;
 use crate::hir_lowerer::monomorphization::assertions::contains_unresolved_generic;
 use crate::hir_lowerer::monomorphization::naming::instantiate_enum_name;
 use crate::hir_lowerer::monomorphization::suffix_for_subs;
-use ir::hir::{HirEnum, HirEnumVariant, HirField, HirStruct, HirType, StrId};
+use ir::hir::{HirEnum, HirEnumVariant, HirField, HirStruct, HirType, HirTypeKind, StrId};
 use ir::hir_utils::hir_contains_this;
 use ir::ir_hasher::FxHashMap;
 use std::cell::RefCell;
@@ -21,7 +21,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
 ) -> Option<&'bump HirEnum<'a, 'bump>> {
     if concrete_args
         .iter()
-        .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+        .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
     {
         return None;
     }
@@ -36,7 +36,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
 
     if concrete_args
         .iter()
-        .any(|t| matches!(t, HirType::Generic(_)))
+        .any(|t| matches!(t.kind, HirTypeKind::Generic(_)))
     {
         return None;
     }
@@ -93,11 +93,13 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
                     visibility: field.visibility,
                     field_type: new_field_type,
                     manual: field.manual,
+                    span: field.span,
                 });
             }
             new_variants.push(HirEnumVariant {
                 name: variant.name,
                 fields: bump.alloc_slice(&new_fields),
+                span: variant.span,
             });
         }
         new_enum.variants = bump.alloc_slice(&new_variants);
@@ -142,7 +144,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
 ) -> Option<&'bump HirStruct<'a, 'bump>> {
     if concrete_args
         .iter()
-        .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+        .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
     {
         return None;
     }
@@ -157,7 +159,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
 
     if concrete_args
         .iter()
-        .any(|t| matches!(t, HirType::Generic(_)))
+        .any(|t| matches!(t.kind, HirTypeKind::Generic(_)))
     {
         return None;
     }
@@ -257,6 +259,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
                 visibility: field.visibility,
                 field_type: new_field_type,
                 manual: field.manual,
+                span: field.span,
             });
         }
         new_struct.fields = bump.alloc_slice(&new_fields);
@@ -309,14 +312,15 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
     ty: HirType<'a, 'bump>,
     bump: &'bump GrowableBump<'bump>,
 ) -> HirType<'a, 'bump> {
-    match ty {
-        HirType::Struct {
+    let span = ty.span;
+    match ty.kind {
+        HirTypeKind::Struct {
             name, type_args, ..
         } => {
             if !type_args.is_empty()
                 && !type_args
                     .iter()
-                    .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+                    .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
             {
                 let rec_args: Vec<_> = type_args
                     .iter()
@@ -353,11 +357,13 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                             nested_inst.fields.iter().map(|f| f.field_type).collect();
                         bump.alloc_slice(&nested_fields)
                     };
-                    HirType::Struct {
-                        name: nested_inst.name,
+                    HirType::struct_type(
+                        nested_inst.name,
+                        nested_inst.unmangled_name,
                         field_types,
-                        type_args: &[],
-                    }
+                        &[],
+                        span,
+                    )
                 } else {
                     ty
                 }
@@ -365,15 +371,16 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 ty
             }
         }
-        HirType::Enum {
+        HirTypeKind::Enum {
             name,
+            unmangled_name: _,
             type_args,
             variants: _,
         } => {
             if !type_args.is_empty()
                 && !type_args
                     .iter()
-                    .any(|t| matches!(t, HirType::Generic(_)) || hir_contains_this(t))
+                    .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
             {
                 let rec_args: Vec<_> = type_args
                     .iter()
@@ -397,10 +404,14 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                     &rec_args,
                     bump,
                 ) {
-                    HirType::Enum {
-                        name: nested_inst.name,
-                        variants: nested_inst.variants,
-                        type_args: &[],
+                    HirType {
+                        kind: HirTypeKind::Enum {
+                            name: nested_inst.name,
+                            unmangled_name: nested_inst.unmangled_name,
+                            variants: nested_inst.variants,
+                            type_args: &[],
+                        },
+                        span,
                     }
                 } else {
                     ty
@@ -409,8 +420,8 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 ty
             }
         }
-        HirType::Slice(inner) => {
-            HirType::Slice(bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+        HirTypeKind::Slice(inner) => HirType::slice(
+            bump.alloc_value_immutable(instantiate_type_recursively_ctx(
                 ctx,
                 instantiated_structs,
                 instantiated_struct_origins,
@@ -418,9 +429,10 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 instantiated_enum_origins,
                 *inner,
                 bump,
-            )))
-        }
-        HirType::Array(inner, len) => HirType::Array(
+            )),
+            span,
+        ),
+        HirTypeKind::Array(inner, len) => HirType::array(
             bump.alloc_value_immutable(instantiate_type_recursively_ctx(
                 ctx,
                 instantiated_structs,
@@ -431,44 +443,81 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 bump,
             )),
             len,
+            span,
         ),
-        HirType::Ref {
+        HirTypeKind::Ref {
             inner,
             ref_kind,
             provenance,
-        } => HirType::Ref {
-            inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
-                ctx,
-                instantiated_structs,
-                instantiated_struct_origins,
-                instantiated_enums,
-                instantiated_enum_origins,
-                *inner,
-                bump,
-            )),
-            ref_kind,
-            provenance,
+        } => HirType {
+            kind: HirTypeKind::Ref {
+                inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+                    ctx,
+                    instantiated_structs,
+                    instantiated_struct_origins,
+                    instantiated_enums,
+                    instantiated_enum_origins,
+                    *inner,
+                    bump,
+                )),
+                ref_kind,
+                provenance,
+            },
+            span,
         },
-        HirType::SafePointer {
+        HirTypeKind::SafePointer {
             inner,
             mutability_state,
-        } => HirType::SafePointer {
-            inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
-                ctx,
-                instantiated_structs,
-                instantiated_struct_origins,
-                instantiated_enums,
-                instantiated_enum_origins,
-                *inner,
-                bump,
-            )),
-            mutability_state,
+        } => HirType {
+            kind: HirTypeKind::SafePointer {
+                inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+                    ctx,
+                    instantiated_structs,
+                    instantiated_struct_origins,
+                    instantiated_enums,
+                    instantiated_enum_origins,
+                    *inner,
+                    bump,
+                )),
+                mutability_state,
+            },
+            span,
         },
-        HirType::UnsafePointer {
+        HirTypeKind::UnsafePointer {
             inner,
             mutability_state,
-        } => HirType::UnsafePointer {
-            inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+        } => HirType {
+            kind: HirTypeKind::UnsafePointer {
+                inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+                    ctx,
+                    instantiated_structs,
+                    instantiated_struct_origins,
+                    instantiated_enums,
+                    instantiated_enum_origins,
+                    *inner,
+                    bump,
+                )),
+                mutability_state,
+            },
+            span,
+        },
+        HirTypeKind::OwnedPointer { inner, allocator } => HirType {
+            kind: HirTypeKind::OwnedPointer {
+                inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
+                    ctx,
+                    instantiated_structs,
+                    instantiated_struct_origins,
+                    instantiated_enums,
+                    instantiated_enum_origins,
+                    *inner,
+                    bump,
+                )),
+                allocator,
+            },
+            span,
+        },
+        HirTypeKind::Nullable(inner) => HirType::nullable(
+            bump.alloc_value_immutable(instantiate_type_recursively_ctx(
                 ctx,
                 instantiated_structs,
                 instantiated_struct_origins,
@@ -477,32 +526,9 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                 *inner,
                 bump,
             )),
-            mutability_state,
-        },
-        HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
-            inner: bump.alloc_value_immutable(instantiate_type_recursively_ctx(
-                ctx,
-                instantiated_structs,
-                instantiated_struct_origins,
-                instantiated_enums,
-                instantiated_enum_origins,
-                *inner,
-                bump,
-            )),
-            allocator,
-        },
-        HirType::Nullable(inner) => {
-            HirType::Nullable(bump.alloc_value_immutable(instantiate_type_recursively_ctx(
-                ctx,
-                instantiated_structs,
-                instantiated_struct_origins,
-                instantiated_enums,
-                instantiated_enum_origins,
-                *inner,
-                bump,
-            )))
-        }
-        HirType::Tuple(hir_types) => {
+            span,
+        ),
+        HirTypeKind::Tuple(hir_types) => {
             let types: Vec<HirType<'a, 'bump>> = hir_types
                 .iter()
                 .map(|inner| {
@@ -517,8 +543,8 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
                     )
                 })
                 .collect::<Vec<_>>();
-            HirType::Tuple(bump.alloc_slice(types.as_slice()))
+            HirType::tuple(bump.alloc_slice(types.as_slice()), span)
         }
-        other => other,
+        _ => ty,
     }
 }

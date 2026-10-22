@@ -1,4 +1,5 @@
 use ir::hir_utils::hir_contains_this;
+use ir::span::SourceSpan;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -6,13 +7,14 @@ use std::sync::Arc;
 use zetaruntime::bump::GrowableBump;
 
 use crate::hir_lowerer::LoweringCtx;
-use crate::hir_lowerer::monomorphization::assertions::{
-    contains_unresolved_generic, peel_to_struct,
-};
+use crate::hir_lowerer::monomorphization::assertions::peel_to_struct;
+
+#[cfg(debug_assertions)]
+use crate::hir_lowerer::monomorphization::assertions::contains_unresolved_generic;
 
 use super::naming::suffix_for_subs;
 use super::type_substitution::substitute_type;
-use ir::hir::{Hir, HirField, HirFunc, HirModule, HirParam, HirType, StrId};
+use ir::hir::{Hir, HirField, HirFunc, HirModule, HirParam, HirType, HirTypeKind, StrId};
 use ir::ir_hasher::FxHashMap;
 use zetaruntime::string_pool::StringPool;
 
@@ -113,26 +115,6 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         functions.insert(f.name, (**f).clone());
                     }
                 }
-                Hir::Struct(s) if self.env_structs.contains_key(&s.name) => {
-                    let new_fields: Vec<HirField<'a, 'bump>> = s
-                        .fields
-                        .iter()
-                        .map(|f| {
-                            let sub = substitute_type(&f.field_type, &empty_subs, &self.bump);
-                            HirField {
-                                name: f.name,
-                                field_type: self
-                                    .instantiate_type_recursively(sub, Default::default()),
-                                visibility: f.visibility,
-                                manual: f.manual,
-                            }
-                        })
-                        .collect();
-                    let mut ns = (**s).clone();
-                    ns.fields = self.bump.alloc_slice(&new_fields);
-                    self.ctx.structs.borrow_mut().insert(ns.name, ns.clone());
-                    new_items.push(Hir::Struct(self.bump.alloc_value_immutable(ns)));
-                }
                 _ => {}
             }
         }
@@ -140,6 +122,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         for item in module.items {
             match item {
                 Hir::Func(f) => {
+                    let prev_module_idx =
+                        std::mem::replace(&mut self.ctx.module_idx, f.declaring_module_idx);
+
                     let mut new_func = (*f).clone();
                     if new_func.generics.is_none() {
                         if let Some(params) = new_func.params {
@@ -183,10 +168,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             let prev_module_idx = self.ctx.module_idx;
                             self.ctx.module_idx = f.declaring_module_idx;
 
-                            let this_ty = f.impl_target.map(|name| HirType::Struct {
-                                name,
-                                field_types: &[],
-                                type_args: &[],
+                            // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+                            let this_ty = f.impl_target.map(|name| HirType {
+                                kind: HirTypeKind::Struct {
+                                    name,
+                                    unmangled_name: name,
+                                    field_types: &[],
+                                    type_args: &[],
+                                },
+                                span: new_func
+                                    .params
+                                    .map(|params| params.first())
+                                    .flatten()
+                                    .map(|p| p.get_span())
+                                    .unwrap_or(SourceSpan::default()),
                             });
                             let prev_this = self.current_this.replace(this_ty);
                             let scope = self.enter_fn_scope(new_func.params, new_func.return_type);
@@ -200,8 +195,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         }
                     }
                     new_items.push(Hir::Func(self.bump.alloc_value_immutable(new_func)));
+                    self.ctx.module_idx = prev_module_idx;
                 }
                 Hir::Interface(iface) => {
+                    let prev_module_idx =
+                        std::mem::replace(&mut self.ctx.module_idx, iface.declaring_module_idx);
+
                     let mut new_iface = (*iface).clone();
                     if new_iface.generics.is_none() {
                         if let Some(methods) = new_iface.methods {
@@ -248,10 +247,19 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                             substitute_type(&ret_ty, &empty_subs, &self.bump)
                                         });
 
-                                        let this_ty = HirType::Struct {
-                                            name: new_iface.name,
-                                            field_types: &[],
-                                            type_args: &[],
+                                        let this_ty = HirType {
+                                            kind: HirTypeKind::Struct {
+                                                name: new_iface.name,
+                                                unmangled_name: new_iface.unmangled_name,
+                                                field_types: &[],
+                                                type_args: &[],
+                                            },
+                                            span: nm
+                                                .params
+                                                .map(|params| params.first())
+                                                .flatten()
+                                                .map(|p| p.get_span())
+                                                .unwrap_or(SourceSpan::default()),
                                         };
                                         let prev_this = self.current_this.replace(Some(this_ty));
                                         let scope =
@@ -278,7 +286,10 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         }
                     }
                     new_items.push(Hir::Interface(self.bump.alloc_value_immutable(new_iface)));
+
+                    self.ctx.module_idx = prev_module_idx;
                 }
+
                 Hir::Struct(s) if self.env_structs.contains_key(&s.name) => {
                     let new_fields: Vec<HirField<'a, 'bump>> = s
                         .fields
@@ -291,6 +302,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                     .instantiate_type_recursively(sub, Default::default()),
                                 visibility: f.visibility,
                                 manual: f.manual,
+                                span: f.span,
                             }
                         })
                         .collect();
@@ -299,7 +311,11 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     self.ctx.structs.borrow_mut().insert(ns.name, ns.clone());
                     new_items.push(Hir::Struct(self.bump.alloc_value_immutable(ns)));
                 }
+
                 Hir::Impl(i) => {
+                    let prev_module_idx =
+                        std::mem::replace(&mut self.ctx.module_idx, i.declaring_module_idx);
+
                     let mut new_impl = (*i).clone();
                     if new_impl.generics.is_none() {
                         if let Some(methods) = new_impl.methods {
@@ -360,10 +376,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                                             substitute_type(&ret_ty, &empty_subs, &self.bump)
                                         });
 
-                                        let this_ty = HirType::Struct {
-                                            name: new_impl.target,
-                                            field_types: &[],
-                                            type_args: &[],
+                                        // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+                                        let this_ty = HirType {
+                                            kind: HirTypeKind::Struct {
+                                                name: new_impl.target,
+                                                unmangled_name: new_impl.target,
+                                                field_types: &[],
+                                                type_args: &[],
+                                            },
+                                            span: nm
+                                                .params
+                                                .map(|params| params.first())
+                                                .flatten()
+                                                .map(|p| p.get_span())
+                                                .unwrap_or(SourceSpan::default()),
                                         };
                                         let prev_this = self.current_this.replace(Some(this_ty));
                                         let scope =
@@ -386,6 +412,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         }
                     }
                     new_items.push(Hir::Impl(self.bump.alloc_value_immutable(new_impl)));
+
+                    self.ctx.module_idx = prev_module_idx;
                 }
                 other => new_items.push(*other),
             }
@@ -414,7 +442,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub fn monomorphize_function<'subs>(
-        &self,
+        &mut self,
         func: &HirFunc<'a, 'bump>,
         substitutions: &'subs FxHashMap<StrId, HirType<'a, 'bump>>,
     ) -> Option<StrId> {
@@ -451,20 +479,52 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .collect();
         let substitutions = &normalized;
 
+        let is_method = func.impl_target.is_some()
+            || func
+                .params
+                .is_some_and(|ps| matches!(ps.first(), Some(HirParam::This { .. })));
+        // Free functions never see a `this`, even when instantiated from inside a method.
+        let this_for_key: Option<HirType<'a, 'bump>> = if is_method {
+            *self.current_this.borrow()
+        } else {
+            None
+        };
+
         let orig_name = func.name.clone();
-        let suffix = suffix_for_subs(self.context.clone(), substitutions);
-        let key = (orig_name.clone(), suffix.clone());
-        {
-            let instantiated_functions = self.instantiated_functions.borrow();
-            if let Some(existing) = instantiated_functions.get(&key) {
-                return Some(*existing);
+        let self_is_redundant = this_for_key.map_or(false, |t| match peel_to_struct(&t).kind {
+            HirTypeKind::Struct {
+                name, type_args, ..
             }
-        }
+            | HirTypeKind::Enum {
+                name, type_args, ..
+            } => {
+                type_args.is_empty()
+                    && !self
+                        .instantiated_struct_origins
+                        .borrow()
+                        .contains_key(&name)
+                    && !self.instantiated_enum_origins.borrow().contains_key(&name)
+            }
+            _ => false,
+        });
+
+        let suffix = match this_for_key {
+            Some(this_ty) if !self_is_redundant => {
+                let mut keyed = substitutions.clone();
+                keyed.insert(StrId::from_static("Self"), this_ty);
+                suffix_for_subs(self.context.clone(), &keyed)
+            }
+            _ => suffix_for_subs(self.context.clone(), substitutions),
+        };
+        let key = (orig_name.clone(), suffix.clone());
+
+        let prev_module_idx =
+            std::mem::replace(&mut self.ctx.module_idx, func.declaring_module_idx);
 
         let mut new_func = func.clone();
         self.apply_substitutions_to_func(&mut new_func, substitutions, func.span);
 
-        if let Some(self_ty) = *self.current_this.borrow() {
+        if let Some(self_ty) = this_for_key {
             if let Some(params) = new_func.params {
                 let p: Vec<HirParam> = params
                     .iter()
@@ -476,7 +536,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             span,
                         } => HirParam::Normal {
                             name: *name,
-                            param_type: replace_this(param_type, &self_ty, self.bump),
+                            param_type: replace_this(param_type, &self_ty, self.bump, *span),
                             multi_place: *multi_place,
                             span: *span,
                         },
@@ -487,16 +547,15 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             }
             new_func.return_type = new_func
                 .return_type
-                .map(|t| replace_this(&t, &self_ty, self.bump));
+                .map(|t| replace_this(&t, &self_ty, self.bump, t.span));
         }
 
         if new_func.impl_target.is_some() {
-            let cur_self = *self.current_this.borrow();
-            if let Some(ref self_ty) = cur_self {
-                if let HirType::Struct { name, .. } | HirType::Enum { name, .. } =
-                    peel_to_struct(self_ty)
+            if let Some(ref self_ty) = this_for_key {
+                if let HirTypeKind::Struct { name, .. } | HirTypeKind::Enum { name, .. } =
+                    peel_to_struct(self_ty).kind
                 {
-                    new_func.impl_target = Some(*name);
+                    new_func.impl_target = Some(name);
                 }
             }
         }
@@ -513,6 +572,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
         new_func.name = new_name;
 
+        self.instantiated_functions
+            .borrow_mut()
+            .insert(key, new_name);
+        self.functions
+            .borrow_mut()
+            .insert(new_name, new_func.clone());
+
         let mut param_map: FxHashMap<StrId, HirType> = FxHashMap::default();
         if let Some(params) = new_func.params {
             for p in params.iter() {
@@ -525,6 +591,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             }
         }
         let prev_params = self.current_params.replace(param_map);
+        let prev_this = self.current_this.replace(this_for_key);
         let prev_return_type = self.current_return_type.replace(new_func.return_type);
         let prev_variable_types = std::mem::take(&mut *self.ctx.variable_types.borrow_mut());
 
@@ -534,16 +601,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
 
         self.current_params.replace(prev_params);
+        self.current_this.replace(prev_this);
         self.current_return_type.replace(prev_return_type);
         *self.ctx.variable_types.borrow_mut() = prev_variable_types;
 
-        self.functions
-            .borrow_mut()
-            .insert(new_func.name.clone(), new_func);
-
-        self.instantiated_functions
-            .borrow_mut()
-            .insert(key, new_name);
+        self.functions.borrow_mut().insert(new_name, new_func);
+        self.ctx.module_idx = prev_module_idx;
 
         Some(new_name)
     }
@@ -584,91 +647,128 @@ pub fn replace_this<'a, 'bump>(
     ty: &HirType<'a, 'bump>,
     self_ty: &HirType<'a, 'bump>,
     bump: &'bump GrowableBump<'bump>,
+    span: SourceSpan<'a>,
 ) -> HirType<'a, 'bump> {
     if !hir_contains_this(ty) {
         return *ty;
     }
-    let r = |t: &HirType<'a, 'bump>| replace_this(t, self_ty, bump);
-    match ty {
-        HirType::This => *self_ty,
-        HirType::Nullable(i) => HirType::Nullable(bump.alloc_value(r(i))),
-        HirType::Slice(i) => HirType::Slice(bump.alloc_value(r(i))),
-        HirType::Array(i, n) => HirType::Array(bump.alloc_value(r(i)), *n),
-        HirType::Ref {
+    let r = |t: &HirType<'a, 'bump>| replace_this(t, self_ty, bump, span);
+    match ty.kind {
+        HirTypeKind::This => *self_ty,
+        HirTypeKind::Nullable(i) => HirType::nullable(bump.alloc_value(r(i)), span),
+        HirTypeKind::Slice(i) => HirType::slice(bump.alloc_value(r(i)), span),
+        HirTypeKind::Array(i, n) => HirType::array(bump.alloc_value(r(i)), n, span),
+        HirTypeKind::Ref {
             inner,
             ref_kind,
             provenance,
-        } => HirType::Ref {
-            inner: bump.alloc_value(r(inner)),
-            ref_kind: *ref_kind,
-            provenance: *provenance,
+        } => HirType {
+            kind: HirTypeKind::Ref {
+                inner: bump.alloc_value(r(inner)),
+                ref_kind,
+                provenance,
+            },
+            span,
         },
-        HirType::SafePointer {
+        HirTypeKind::SafePointer {
             inner,
             mutability_state,
-        } => HirType::SafePointer {
-            inner: bump.alloc_value(r(inner)),
-            mutability_state: *mutability_state,
+        } => HirType {
+            kind: HirTypeKind::SafePointer {
+                inner: bump.alloc_value(r(inner)),
+                mutability_state,
+            },
+            span,
         },
-        HirType::UnsafePointer {
+        HirTypeKind::UnsafePointer {
             inner,
             mutability_state,
-        } => HirType::UnsafePointer {
-            inner: bump.alloc_value(r(inner)),
-            mutability_state: *mutability_state,
+        } => HirType {
+            kind: HirTypeKind::UnsafePointer {
+                inner: bump.alloc_value(r(inner)),
+                mutability_state,
+            },
+            span,
         },
-        HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
-            inner: bump.alloc_value(r(inner)),
-            allocator: *allocator,
+        HirTypeKind::OwnedPointer { inner, allocator } => HirType {
+            kind: HirTypeKind::OwnedPointer {
+                inner: bump.alloc_value(r(inner)),
+                allocator,
+            },
+            span,
         },
-        HirType::Tuple(ts) => {
+        HirTypeKind::Tuple(ts) => {
             let v: Vec<_> = ts.iter().map(r).collect();
-            HirType::Tuple(bump.alloc_slice(&v))
+            HirType {
+                kind: HirTypeKind::Tuple(bump.alloc_slice(&v)),
+                span,
+            }
         }
-        HirType::Struct {
+        HirTypeKind::Struct {
             name,
             field_types,
+            unmangled_name,
             type_args,
         } => {
             let a: Vec<_> = type_args.iter().map(r).collect();
-            HirType::Struct {
-                name: *name,
-                field_types,
-                type_args: bump.alloc_slice(&a),
+            HirType {
+                kind: HirTypeKind::Struct {
+                    name,
+                    unmangled_name,
+                    field_types,
+                    type_args: bump.alloc_slice(&a),
+                },
+                span,
             }
         }
-        HirType::Enum {
+        HirTypeKind::Enum {
             name,
+            unmangled_name,
             variants,
             type_args,
         } => {
             let a: Vec<_> = type_args.iter().map(r).collect();
-            HirType::Enum {
-                name: *name,
-                variants,
-                type_args: bump.alloc_slice(&a),
+            HirType {
+                kind: HirTypeKind::Enum {
+                    name,
+                    unmangled_name,
+                    variants,
+                    type_args: bump.alloc_slice(&a),
+                },
+                span,
             }
         }
-        HirType::DynInterface(n, args) => {
-            let a: Vec<_> = args.iter().map(r).collect();
-            HirType::DynInterface(*n, bump.alloc_slice(&a))
+        HirTypeKind::DynInterface {
+            name,
+            unmangled_name,
+            type_args,
+        } => {
+            let a: Vec<_> = type_args.iter().map(r).collect();
+            HirType {
+                kind: HirTypeKind::DynInterface {
+                    name,
+                    unmangled_name,
+                    type_args: bump.alloc_slice(&a),
+                },
+                span,
+            }
         }
-        HirType::Dyn { bounds } => {
+        HirTypeKind::Dyn { bounds } => {
             let b: Vec<_> = bounds.iter().map(r).collect();
-            HirType::Dyn {
-                bounds: bump.alloc_slice(&b),
+            HirType {
+                kind: HirTypeKind::Dyn {
+                    bounds: bump.alloc_slice(&b),
+                },
+                span,
             }
         }
-        HirType::Lambda {
+        HirTypeKind::Lambda {
             params,
             return_type,
         } => {
             let p: Vec<_> = params.iter().map(r).collect();
-            HirType::Lambda {
-                params: bump.alloc_slice(&p),
-                return_type: bump.alloc_value(r(return_type)),
-            }
+            HirType::lambda(bump.alloc_slice(&p), bump.alloc_value(r(return_type)), span)
         }
-        other => *other,
+        _ => *ty,
     }
 }

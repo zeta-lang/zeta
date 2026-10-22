@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirExpr, HirMatchArm, HirModuleAccess, HirParam, HirStmt, HirType, StrId},
+    hir::{HirExpr, HirMatchArm, HirModuleAccess, HirParam, HirStmt, HirType, HirTypeKind, StrId},
     ir_hasher::{FxHashMap, HashMap},
 };
 
@@ -10,7 +10,7 @@ use crate::hir_lowerer::monomorphization::{
 
 impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     pub fn monomorphize_stmt<'subs>(
-        &self,
+        &mut self,
         stmt: &HirStmt<'a, 'bump>,
         substitutions: &'subs HashMap<StrId, HirType<'a, 'bump>>,
     ) -> HirStmt<'a, 'bump> {
@@ -81,6 +81,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 catch_pattern,
                 span,
                 manual,
+                visibility,
+                inferred_ty,
             } => {
                 let subd_ty = substitute_type(ty, substitutions, &self.bump);
 
@@ -99,6 +101,8 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     catch_pattern: *catch_pattern,
                     span: *span,
                     manual: *manual,
+                    visibility: *visibility,
+                    inferred_ty: *inferred_ty,
                 }
             }
             HirStmt::Return(opt, span) => {
@@ -185,7 +189,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn try_monomorphize_assoc_call<'subs>(
-        &self,
+        &mut self,
         value: &HirExpr<'a, 'bump>,
         expected_ty: &HirType<'a, 'bump>,
         outer_subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
@@ -205,18 +209,22 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         if acc.member.is_empty() {
             return None;
         }
-        let HirType::Struct {
+        let HirTypeKind::Struct {
             name: expected_name,
             type_args: declared_targs,
             ..
-        } = expected_ty
+        } = expected_ty.kind
         else {
             return None;
         };
 
         let recovered: Vec<HirType<'a, 'bump>>;
         let expected_targs: &[HirType<'a, 'bump>] = if declared_targs.is_empty() {
-            match self.instantiated_struct_origins.borrow().get(expected_name) {
+            match self
+                .instantiated_struct_origins
+                .borrow()
+                .get(&expected_name)
+            {
                 Some((_, targs)) => {
                     recovered = targs.clone();
                     &recovered
@@ -272,21 +280,16 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             struct_name,
             acc.member,
             struct_methods_binding
-                .keys()
-                .map(|k| self.context.resolve_string(k).to_string())
-                .collect::<Vec<_>>(),
+                .keys(),
         )
     });
         let base_method_name = *method_map.get(&acc.member).unwrap_or_else(|| {
             panic!(
                 "try_monomorphize_assoc_call: struct `{}` has no method `{}` (static call at \
              {span}). Known methods on this struct: {:?}",
-                self.context.resolve_string(&target_key),
-                self.context.resolve_string(&acc.member),
-                method_map
-                    .keys()
-                    .map(|k| self.context.resolve_string(k).to_string())
-                    .collect::<Vec<_>>(),
+                target_key,
+                acc.member,
+                method_map.keys(),
             )
         });
         drop(struct_methods_binding);
@@ -362,7 +365,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                     p.name,
                     struct_name,
                     acc.member,
-                    outer_subs.keys().collect::<Vec<_>>(),
+                    outer_subs.keys(),
                 );
             }
             inner_subs.insert(p.name, resolved);
@@ -418,10 +421,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .iter()
             .map(|f| f.field_type)
             .collect();
-        let concrete_recv_ty = HirType::Struct {
-            name: concrete_recv_ty.name,
-            field_types: self.bump.alloc_slice(&field_types),
-            type_args: &[],
+        let concrete_recv_ty = HirType {
+            kind: HirTypeKind::Struct {
+                name: concrete_recv_ty.name,
+                unmangled_name: concrete_recv_ty.unmangled_name,
+                field_types: self.bump.alloc_slice(&field_types),
+                type_args: &[],
+            },
+            span: *span,
         };
 
         let prev_self = self.current_this.replace(Some(concrete_recv_ty));
@@ -447,7 +454,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn monomorphize_stmt_with_expected_type<'subs>(
-        &self,
+        &mut self,
         stmt: &HirStmt<'a, 'bump>,
         expected_ty: &HirType<'a, 'bump>,
         substitutions: &'subs HashMap<StrId, HirType<'a, 'bump>>,
