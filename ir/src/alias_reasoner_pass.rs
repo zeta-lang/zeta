@@ -1,8 +1,5 @@
 use std::collections::HashMap;
 
-use crate::hir::StrId;
-use crate::ir_hasher::FxHashMap;
-
 use crate::borrow_checker::{
     AliasReasoner, Bound, IndexContainer, Interval, MemoryRelation, Place, PlaceId, Projection,
 };
@@ -25,80 +22,69 @@ impl AliasReasoner {
         }
     }
 
-    fn ancestor_chain(&self, places: &[Place], start: PlaceId) -> Vec<PlaceId> {
-        let mut chain = vec![start];
-        let mut current = start;
-        while let Some(place) = get_place(places, current) {
-            match place.parent {
-                Some(parent) => {
-                    chain.push(parent);
-                    current = parent;
-                }
-                None => break,
-            }
-        }
-        chain
+    pub(super) fn reset(&mut self) {
+        self.disjoint_indexable.clear();
+        self.equal.clear();
+        self.not_equal.clear();
+        self.less_than.clear();
+        self.ranges.clear();
+        self.disjoint_intervals.clear();
+        self.place_not_equal.clear();
     }
 
-    pub fn relation(
-        &self,
-        places: &[Place],
-        place_to_local: &FxHashMap<PlaceId, StrId>,
-        lhs: PlaceId,
-        rhs: PlaceId,
-    ) -> MemoryRelation {
-        let lhs_chain = self.ancestor_chain(places, lhs);
-        let rhs_chain = self.ancestor_chain(places, rhs);
-
-        for &l in &lhs_chain {
-            for &r in &rhs_chain {
-                if self.place_not_equal.get(&l).is_some_and(|s| s.contains(&r)) {
-                    return MemoryRelation::Disjoint;
+    /// True if some ancestor-or-self of `lhs` is recorded as not-equal to some
+    /// ancestor-or-self of `rhs`.
+    #[inline]
+    fn check_not_equal_chains(&self, places: &[Place], lhs: PlaceId, rhs: PlaceId) -> bool {
+        let mut l = Some(lhs);
+        while let Some(lid) = l {
+            if let Some(set) = self.place_not_equal.get(&lid) {
+                if !set.is_empty() {
+                    let mut r = Some(rhs);
+                    while let Some(rid) = r {
+                        if set.contains(&rid) {
+                            return true;
+                        }
+                        r = get_place(places, rid).and_then(|p| p.parent);
+                    }
                 }
             }
+            l = get_place(places, lid).and_then(|p| p.parent);
         }
+        false
+    }
 
+    #[inline(always)]
+    pub fn relation(&self, places: &[Place], lhs: PlaceId, rhs: PlaceId) -> MemoryRelation {
         if lhs == rhs {
             return MemoryRelation::Overlap;
         }
 
-        let lhs_place = match get_place(places, lhs) {
-            Some(place) => place,
-            None => return MemoryRelation::Unknown,
-        };
-        let rhs_place = match get_place(places, rhs) {
-            Some(place) => place,
-            None => return MemoryRelation::Unknown,
-        };
+        let l_place = &places[lhs.0 as usize];
+        let r_place = &places[rhs.0 as usize];
 
-        // Completely different locals.
-        if lhs_place.parent.is_none() && rhs_place.parent.is_none() {
+        if l_place.root != r_place.root {
             return MemoryRelation::Disjoint;
         }
 
-        // Parent/child always overlap.
-        if self.is_ancestor(places, lhs_place.id, rhs_place.id)
-            || self.is_ancestor(places, rhs_place.id, lhs_place.id)
-        {
-            return MemoryRelation::Overlap;
+        if !self.place_not_equal.is_empty() {
+            if self.check_not_equal_chains(places, lhs, rhs) {
+                return MemoryRelation::Disjoint;
+            }
         }
 
-        // General field/index disjointness: find where the two ancestor
-        // chains diverge (their lowest common ancestor's two children) and
-        // compare THOSE, rather than requiring lhs/rhs to be direct siblings.
-        // This is what makes `second.inner.tag` correctly compare against
-        // `third`'s loan through several layers of field projection, not
-        // just when the compared places are themselves the immediate
-        // Index/Field nodes.
-        if let Some((ldiv, rdiv)) = self.find_divergence(&lhs_chain, &rhs_chain) {
-            if let (Some(ld), Some(rd)) = (get_place(places, ldiv), get_place(places, rdiv)) {
+        match self.find_divergence_fast(places, lhs, rhs) {
+            Divergence::AncestorDescendant => MemoryRelation::Overlap,
+            Divergence::Diverged(ldiv, rdiv) => {
+                let ld = &places[ldiv.0 as usize];
+                let rd = &places[rdiv.0 as usize];
                 match (&ld.projection, &rd.projection) {
                     (Some(Projection::Field(a)), Some(Projection::Field(b))) => {
-                        return if a == b {
+                        if a == b {
                             MemoryRelation::Overlap
                         } else {
                             MemoryRelation::Disjoint
-                        };
+                        }
                     }
                     (
                         Some(Projection::Index {
@@ -106,66 +92,63 @@ impl AliasReasoner {
                             container,
                         }),
                         Some(Projection::Index { index: ri, .. }),
-                    ) => {
-                        return self.reason_about_indices(li, ri, *container);
-                    }
-                    _ => {}
+                    ) => self.reason_about_indices(li, ri, *container),
+                    _ => MemoryRelation::Unknown,
                 }
             }
+            Divergence::Disjoint => MemoryRelation::Disjoint,
         }
-
-        if let (Some(l), Some(r)) = (get_place(places, lhs), get_place(places, rhs)) {
-            if let (Some(Projection::Deref), Some(Projection::Deref)) =
-                (&l.projection, &r.projection)
-            {
-                if l.parent != r.parent {
-                    if let (Some(lb), Some(rb)) = (
-                        l.parent
-                            .and_then(|p| place_to_local.get(&p))
-                            .map(|&s| Bound::Symbol(s)),
-                        r.parent
-                            .and_then(|p| place_to_local.get(&p))
-                            .map(|&s| Bound::Symbol(s)),
-                    ) {
-                        if self.not_equal.get(&lb).is_some_and(|s| s.contains(&rb)) {
-                            return MemoryRelation::Disjoint;
-                        }
-                        if self.equal.get(&lb).is_some_and(|s| s.contains(&rb)) {
-                            return MemoryRelation::Overlap;
-                        }
-                    }
-                }
-            }
-        }
-
-        MemoryRelation::Unknown
     }
 
-    /// Given two ancestor chains (each ordered [place, parent, grandparent,
-    /// ..., root]), find their lowest common ancestor and return the pair of
-    /// children, one from each chain that sit immediately below it. These
-    /// are the two projections that actually need comparing (both Field or
-    /// both Index) to determine disjointness. Returns None if the chains
-    /// share no common ancestor, or if one chain is a prefix of the other
-    /// (already handled by the ancestor/descendant check before this runs).
-    fn find_divergence(
-        &self,
-        lhs_chain: &[PlaceId],
-        rhs_chain: &[PlaceId],
-    ) -> Option<(PlaceId, PlaceId)> {
-        let lhs_rev: Vec<PlaceId> = lhs_chain.iter().rev().copied().collect();
-        let rhs_rev: Vec<PlaceId> = rhs_chain.iter().rev().copied().collect();
+    #[inline]
+    fn find_divergence_fast(&self, places: &[Place], mut a: PlaceId, mut b: PlaceId) -> Divergence {
+        let mut depth_a = places[a.0 as usize].depth;
+        let mut depth_b = places[b.0 as usize].depth;
 
-        let mut i = 0;
-        while i < lhs_rev.len() && i < rhs_rev.len() && lhs_rev[i] == rhs_rev[i] {
-            i += 1;
+        // Equalize depths
+        while depth_a > depth_b {
+            let parent = match places[a.0 as usize].parent {
+                Some(p) => p,
+                None => return Divergence::Disjoint,
+            };
+            if parent == b {
+                return Divergence::AncestorDescendant;
+            }
+            a = parent;
+            depth_a -= 1;
         }
 
-        if i == 0 || i >= lhs_rev.len() || i >= rhs_rev.len() {
-            return None;
+        while depth_b > depth_a {
+            let parent = match places[b.0 as usize].parent {
+                Some(p) => p,
+                None => return Divergence::Disjoint,
+            };
+            if parent == a {
+                return Divergence::AncestorDescendant;
+            }
+            b = parent;
+            depth_b -= 1;
         }
 
-        Some((lhs_rev[i], rhs_rev[i]))
+        // Walk up together until divergence point right under common ancestor
+        while a != b {
+            let pa = match places[a.0 as usize].parent {
+                Some(p) => p,
+                None => return Divergence::Disjoint,
+            };
+            let pb = match places[b.0 as usize].parent {
+                Some(p) => p,
+                None => return Divergence::Disjoint,
+            };
+
+            if pa == pb {
+                return Divergence::Diverged(a, b);
+            }
+            a = pa;
+            b = pb;
+        }
+
+        Divergence::AncestorDescendant
     }
 
     pub fn retract_place_not_equal(&mut self, lhs: &PlaceId, rhs: &PlaceId) {
@@ -401,19 +384,10 @@ impl AliasReasoner {
 
         None
     }
+}
 
-    fn is_ancestor(&self, places: &[Place], ancestor: PlaceId, mut current: PlaceId) -> bool {
-        while let Some(place) = get_place(places, current) {
-            if place.id == ancestor {
-                return true;
-            }
-
-            match place.parent {
-                Some(parent) => current = parent,
-                None => return false,
-            }
-        }
-
-        false
-    }
+pub enum Divergence {
+    AncestorDescendant,
+    Diverged(PlaceId, PlaceId),
+    Disjoint,
 }
