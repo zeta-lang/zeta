@@ -1,4 +1,4 @@
-use ir::ast::{AttrArg, Attribute, AttributedStmt, Stmt, Visibility};
+use ir::ast::{AttrArg, Attribute, AttributedStmt, ReturnBinder, Stmt, Visibility};
 use ir::diagnostics_context::{DiagnosticWarning, ParserDiagnosticsContext};
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::span::SourceSpan;
@@ -8,6 +8,11 @@ use zetaruntime::string_pool::StringPool;
 
 use crate::tokenizer::lexer::Lexer;
 use ir::tokens::{Cursor, TokenKind, Tokens};
+
+pub(crate) struct BinderCtx<'a, 'bump> {
+    pub(crate) path: Vec<usize>, // current generic-arg index path
+    pub(crate) found: Vec<ReturnBinder<'a, 'bump>>,
+}
 
 pub struct DescentParser<'a, 'bump>
 where
@@ -19,6 +24,7 @@ where
     pub(crate) diag: ParserDiagnosticsContext<'a, 'bump>,
     pub(crate) pending_attrs: &'bump [Attribute<'a, 'bump>],
     pub(crate) pending_close_angle: u8, // To prevent mismatches when closing generics between `>`, `>>`, `>>>`, etc. So that they don't get confused with bitwise/comparison operators or fail entirely.
+    pub(crate) binder_ctx: Option<BinderCtx<'a, 'bump>>,
 }
 
 impl<'a, 'bump> DescentParser<'a, 'bump>
@@ -37,6 +43,7 @@ where
             diag: ParserDiagnosticsContext::new(true),
             pending_close_angle: 0,
             pending_attrs: &[],
+            binder_ctx: None,
         };
 
         parser.parse_toplevel()
@@ -46,7 +53,7 @@ where
         let mut stmts = Vec::new();
 
         while self.cursor.peek() != TokenKind::EOF {
-            match self.parse_stmt(Visibility::Public) {
+            match self.parse_stmt(Visibility::Private) {
                 Ok(s) => stmts.push(s),
                 Err(e) => {
                     self.diag.record(e);
@@ -67,15 +74,15 @@ where
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let kind = self.cursor.peek();
         match kind {
-            TokenKind::Let => self.parse_let_stmt(),
+            TokenKind::Let => self.parse_let_stmt(visibility),
             TokenKind::Import => self.parse_import(),
             TokenKind::Package => self.parse_package(),
-            TokenKind::Const => self.parse_const_stmt(),
+            TokenKind::Const => self.parse_const_stmt(visibility),
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Defer => self.parse_defer_stmt(),
             TokenKind::Static => {
                 self.cursor.advance(); // consume 'static'
-                self.parse_static_let_stmt()
+                self.parse_static_let_stmt(visibility)
             }
             TokenKind::Func => self.parse_function_with_visibility(visibility),
             TokenKind::If => self.parse_if_stmt(),
@@ -116,7 +123,7 @@ where
                 // `module Name { ... }` is a module *declaration*.
                 // `module fn foo()` / `module struct Bar {}` is a visibility modifier.
                 if self.cursor.peek() == TokenKind::Ident
-                    && self.cursor.peek_n(1) == TokenKind::LBrace
+                    && self.cursor.peek_n_kind(1) == TokenKind::LBrace
                 {
                     self.parse_module_decl(visibility)
                 } else {
@@ -132,9 +139,9 @@ where
             TokenKind::Unsafe => {
                 // `unsafe { ... }` is a statement-level unsafe block.
                 // `unsafe func` / `unsafe extern` are function modifiers.
-                if self.cursor.peek_n(1) == TokenKind::LBrace {
+                if self.cursor.peek_n_kind(1) == TokenKind::LBrace {
                     self.parse_unsafe_block_stmt()
-                } else if self.cursor.peek_n(1) == TokenKind::Impl {
+                } else if self.cursor.peek_n_kind(1) == TokenKind::Impl {
                     self.parse_impl_decl(visibility)
                 } else {
                     self.parse_function_with_visibility(visibility)
@@ -161,8 +168,8 @@ where
 
             TokenKind::Ident => {
                 // Check for shorthand let (ident := expr)
-                if self.cursor.peek_n(1) == TokenKind::ColonAssign {
-                    self.parse_shorthand_let_stmt()
+                if self.cursor.peek_n_kind(1) == TokenKind::ColonAssign {
+                    self.parse_shorthand_let_stmt(visibility)
                 } else {
                     self.parse_expr_stmt()
                 }
@@ -172,10 +179,10 @@ where
 
             TokenKind::Mut => {
                 // Check for shorthand let (ident := expr)
-                if self.cursor.peek_n(1) == TokenKind::Ident
-                    && self.cursor.peek_n(2) == TokenKind::ColonAssign
+                if self.cursor.peek_n_kind(1) == TokenKind::Ident
+                    && self.cursor.peek_n_kind(2) == TokenKind::ColonAssign
                 {
-                    self.parse_shorthand_let_stmt()
+                    self.parse_shorthand_let_stmt(visibility)
                 } else {
                     self.parse_expr_stmt()
                 }
@@ -349,6 +356,7 @@ pub fn parse_program<'a, 'bump>(
         diag: ParserDiagnosticsContext::new(false),
         pending_close_angle: 0,
         pending_attrs: &[],
+        binder_ctx: None,
     };
 
     let stmts: Vec<Stmt<'_, '_>> = match parser.parse_toplevel() {

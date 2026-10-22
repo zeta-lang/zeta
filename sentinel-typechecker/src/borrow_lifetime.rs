@@ -1,6 +1,6 @@
 use ir::{borrow_checker::LoanId, errors::type_error::TypeErrorKind, hir::StrId};
 
-use crate::{TypeChecker, auto_traits::AutoTrait, str_id_to_string};
+use crate::{TypeChecker, auto_traits::AutoTrait};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holder {
@@ -19,7 +19,6 @@ pub struct BorrowObligation {
     pub holder: Holder,
     pub methods: Vec<StrId>,
     pub on_move: bool,
-    /// Discharged on the *current path*. The loans may still be held back (see `discharge`).
     pub discharged: bool,
 }
 
@@ -113,21 +112,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn outstanding_message(&self, idx: usize, scope: &str) -> String {
         let ob = &self.borrow_obligations[idx];
-        let callee = str_id_to_string(ob.callee);
         match ob.holder {
             Holder::Local(h) => format!(
                 "`{}` goes out of scope {scope} with an outstanding `borrow_until` obligation \
-                     from `{callee}`; call one of its discharging operations first, \
+                     from `{}`; call one of its discharging operations first, \
                      because dropping the handle does not stop the computation",
-                str_id_to_string(h)
+                ob.callee, h
             ),
             Holder::Pending => format!(
-                "the value returned by `{callee}` carries a `borrow_until` obligation and must be \
-                     bound to a variable; dropping it would detach the computation from the borrows it holds"
+                "the value returned by `{}` carries a `borrow_until` obligation and must be \
+                     bound to a variable; dropping it would detach the computation from the borrows it holds",
+                ob.callee
             ),
             Holder::InFlight(_) => format!(
-                "the handle from `{callee}` was moved somewhere that cannot discharge its \
-                     `borrow_until` obligation; only moving it into another local transfers the obligation"
+                "the handle from `{}` was moved somewhere that cannot discharge its \
+                     `borrow_until` obligation; only moving it into another local transfers the obligation",
+                ob.callee
             ),
         }
     }

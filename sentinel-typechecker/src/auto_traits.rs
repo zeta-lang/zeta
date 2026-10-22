@@ -1,6 +1,6 @@
 use ir::{
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirType, RefKind, StrId},
+    hir::{HirExpr, HirType, HirTypeKind, RefKind, StrId},
     ir_hasher::{FxHashMap, HashSet},
 };
 
@@ -8,7 +8,6 @@ use crate::{
     TypeChecker,
     closures::{capture_mode_text, required_for_capture},
     naming::type_to_string,
-    str_id_to_string,
     type_checker::ImplCondition,
 };
 
@@ -65,8 +64,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         env: &FxHashMap<StrId, HirType<'a, 'bump>>,
         visiting: &mut HashSet<(StrId, AutoTrait)>,
     ) -> bool {
-        match ty {
-            HirType::Ref {
+        match &ty.kind {
+            HirTypeKind::Ref {
                 inner, ref_kind, ..
             } => match ref_kind {
                 // &T: Send <-> T: Sync, and &T: Sync <-> T: Sync
@@ -81,16 +80,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             },
 
             // Raw pointers opt in through `unsafe impl` on the wrapping type.
-            HirType::SafePointer { .. } | HirType::UnsafePointer { .. } => false,
+            HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. } => false,
 
             // ^T: Send <-> T: Send, ^T: Sync <-> T: Sync.
-            HirType::OwnedPointer { inner, .. } => self.auto_in(inner, tr, env, visiting),
+            HirTypeKind::OwnedPointer { inner, .. } => self.auto_in(inner, tr, env, visiting),
 
-            HirType::Nullable(inner) | HirType::Array(inner, _) | HirType::Slice(inner) => {
-                self.auto_in(inner, tr, env, visiting)
-            }
+            HirTypeKind::Nullable(inner)
+            | HirTypeKind::Array(inner, _)
+            | HirTypeKind::Slice(inner) => self.auto_in(inner, tr, env, visiting),
 
-            HirType::Tuple(elems) => {
+            HirTypeKind::Tuple(elems) => {
                 for e in elems.iter() {
                     if !self.auto_in(e, tr, env, visiting) {
                         return false;
@@ -99,42 +98,43 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 true
             }
 
-            HirType::Struct {
+            HirTypeKind::Struct {
                 name, type_args, ..
             } => self.auto_adt(*name, type_args, tr, env, visiting),
 
-            HirType::Enum {
+            HirTypeKind::Enum {
                 name, type_args, ..
             } => self.auto_adt(*name, type_args, tr, env, visiting),
 
-            HirType::Generic(name) => match env.get(name).copied() {
+            HirTypeKind::Generic(name) => match env.get(name).copied() {
                 Some(t) => self.auto_in(&t, tr, &FxHashMap::default(), visiting),
                 None => self.generic_has_bound(*name, tr),
             },
 
-            HirType::Dyn { .. } => {
-                let s = type_to_string(ty);
-                s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            HirTypeKind::Dyn { .. } => {
+                let s = type_to_string(ty, &self.context.string_pool);
+                s.as_str()
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                     .any(|w| w == tr.name())
             }
-            HirType::DynInterface(name, _) => str_id_to_string(*name) == tr.name(),
+            HirTypeKind::DynInterface { name, .. } => name == tr.name(),
 
-            HirType::I8
-            | HirType::I16
-            | HirType::I32
-            | HirType::I64
-            | HirType::I128
-            | HirType::U8
-            | HirType::U16
-            | HirType::U32
-            | HirType::U64
-            | HirType::U128
-            | HirType::Usize
-            | HirType::Isize
-            | HirType::F32
-            | HirType::F64
-            | HirType::Boolean
-            | HirType::Char => tr == AutoTrait::Send,
+            HirTypeKind::I8
+            | HirTypeKind::I16
+            | HirTypeKind::I32
+            | HirTypeKind::I64
+            | HirTypeKind::I128
+            | HirTypeKind::U8
+            | HirTypeKind::U16
+            | HirTypeKind::U32
+            | HirTypeKind::U64
+            | HirTypeKind::U128
+            | HirTypeKind::Usize
+            | HirTypeKind::Isize
+            | HirTypeKind::F32
+            | HirTypeKind::F64
+            | HirTypeKind::Boolean
+            | HirTypeKind::Char => tr == AutoTrait::Send,
 
             _ => true,
         }
@@ -148,17 +148,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         env: &FxHashMap<StrId, HirType<'a, 'bump>>,
         visiting: &mut HashSet<(StrId, AutoTrait)>,
     ) -> bool {
-        let name_str = str_id_to_string(name);
-
         // Explicit `unsafe impl X by Send/Sync` replaces structural derivation (as in Rust):
         // if its bounds don't hold the type is simply not Send/Sync.
         if self
             .context
             .struct_interfaces
-            .get(&name_str)
+            .get(name)
             .is_some_and(|s| s.contains(tr.name()))
         {
-            return self.explicit_impl_holds(name, &name_str, type_args, tr, env, visiting);
+            return self.explicit_impl_holds(name, name.as_str(), type_args, tr, env, visiting);
         }
 
         // Coinductive: a recursive type (`struct Node { next: ^Node }`) is Send if its
@@ -168,12 +166,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let (generic_names, fields): (Vec<StrId>, Vec<HirType<'a, 'bump>>) =
-            if let Some(def) = self.context.get_struct(&name_str) {
+            if let Some(def) = self.context.get_struct(name) {
                 (
                     def.generics.unwrap_or(&[]).iter().map(|g| g.name).collect(),
                     def.fields.iter().map(|f| f.field_type).collect(),
                 )
-            } else if let Some(def) = self.context.get_enum(&name_str) {
+            } else if let Some(def) = self.context.get_enum(name) {
                 (
                     def.generics.unwrap_or(&[]).iter().map(|g| g.name).collect(),
                     def.variants
@@ -189,9 +187,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let mut new_env: FxHashMap<StrId, HirType<'a, 'bump>> = FxHashMap::default();
         for (g, a) in generic_names.iter().zip(type_args.iter()) {
-            let resolved = match a {
-                HirType::Generic(n) => env.get(n).copied().unwrap_or(*a),
-                other => *other,
+            let resolved = match &a.kind {
+                HirTypeKind::Generic(n) => env.get(n).copied().unwrap_or(*a),
+                _ => *a,
             };
             new_env.insert(*g, resolved);
         }
@@ -227,9 +225,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let actual: Vec<HirType<'a, 'bump>> = type_args
             .iter()
-            .map(|a| match a {
-                HirType::Generic(n) => env.get(n).copied().unwrap_or(*a),
-                other => *other,
+            .map(|a| match &a.kind {
+                HirTypeKind::Generic(n) => env.get(n).copied().unwrap_or(*a),
+                _ => *a,
             })
             .collect();
 
@@ -263,14 +261,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         } else {
             for (i, formal) in c.target_args.iter().enumerate() {
                 let Some(act) = actual.get(i) else { continue };
-                match formal {
-                    HirType::Generic(g) if c.generics.iter().any(|(n, _)| n == g) => {
+                match &formal.kind {
+                    HirTypeKind::Generic(g) if c.generics.iter().any(|(n, _)| n == g) => {
                         binding.entry(*g).or_insert(*act);
                     }
                     // Specialised impl (`unsafe impl Wrapper<i32> by Send`): must match exactly.
-                    other => {
-                        if !matches!(act, HirType::Unknown)
-                            && !self.types_structurally_equal(other, act)
+                    _ => {
+                        if !matches!(act.kind, HirTypeKind::Unknown)
+                            && !self.types_structurally_equal(formal, act)
                         {
                             return false;
                         }
@@ -285,9 +283,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 continue;
             };
             for b in bounds {
-                let ok = match AutoTrait::from_interface_name(b) {
+                let ok = match AutoTrait::from_interface_name(b.as_str()) {
                     Some(t) => self.auto_in(&act, t, &FxHashMap::default(), visiting),
-                    None => self.satisfies_interface_bound(&act, b),
+                    None => self.satisfies_interface_bound(&act, b.as_str()),
                 };
                 if !ok {
                     return false;
@@ -301,13 +299,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// only nominal types and bounded generics are checked.
     fn satisfies_interface_bound(&self, ty: &HirType<'a, 'bump>, bound: &str) -> bool {
         let short = last_segment(bound);
-        match ty {
-            HirType::Struct { name, .. } | HirType::Enum { name, .. } => {
-                let n = str_id_to_string(*name);
-                self.context.struct_implements(&n, bound)
-                    || self.context.struct_implements(&n, short)
+        match &ty.kind {
+            HirTypeKind::Struct { name, .. } | HirTypeKind::Enum { name, .. } => {
+                self.context.struct_implements(name, bound)
+                    || self.context.struct_implements(name, short)
             }
-            HirType::Generic(n) => self
+            HirTypeKind::Generic(n) => self
                 .current_fn_bounds
                 .get(n)
                 .is_some_and(|bs| bs.iter().any(|b| last_segment(b) == short)),
@@ -347,10 +344,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         target: &str,
         interface: &str,
         is_unsafe: bool,
-        generics: impl Iterator<Item = (StrId, Vec<String>)>,
+        generics: Vec<(StrId, Vec<StrId>)>,
         target_args: &[HirType<'a, 'bump>],
     ) {
         self.check_unsafe_marker_impl(target, interface, is_unsafe);
+        for a in target_args {
+            self.record_type_occurrences(a);
+        }
+
         self.context
             .add_struct_interface(target, interface.to_string());
         if is_unsafe_marker_interface(interface) {
@@ -358,7 +359,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 target,
                 interface,
                 ImplCondition {
-                    generics: generics.collect(),
+                    generics: generics,
                     target_args: target_args.to_vec(),
                 },
             );
@@ -374,9 +375,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         self.record(TypeErrorKind::Generic(format!(
                             "closure must be `{}`, but it captures `{}` {} and `{}` is not `{}`",
                             tr.name(),
-                            str_id_to_string(cap.name),
+                            cap.name,
                             capture_mode_text(cap.mode),
-                            type_to_string(&cap.ty),
+                            cap.ty,
                             need.name(),
                         )));
                     }
@@ -400,14 +401,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
         let ty = self.peek_type(arg);
         // A closure stored in a variable can't be re-analysed here.
-        if matches!(ty, HirType::Lambda { .. }) {
+        if matches!(ty.kind, HirTypeKind::Lambda { .. }) {
             return;
         }
         for &tr in traits {
             if !self.implements_auto(&ty, tr) {
                 self.record(TypeErrorKind::Generic(format!(
                     "`{}` cannot be used here: it is not `{}`",
-                    type_to_string(&ty),
+                    type_to_string(&ty, &self.context.string_pool),
                     tr.name()
                 )));
             }

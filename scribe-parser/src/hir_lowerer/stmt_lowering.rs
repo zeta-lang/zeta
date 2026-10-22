@@ -3,6 +3,7 @@ use ir::ast::{self, Block, ElseBranch, ErrorHandlerPattern, LetStmt, MatchArm, S
 use ir::hir::{
     HirErrorHandlerBranch, HirErrorHandlerPattern, HirMatchArm, HirStmt, HirType, StrId,
 };
+use ir::hir_utils::lower_visibility;
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub(super) fn lower_stmt(&self, stmt: Stmt<'a, 'bump>) -> HirStmt<'a, 'bump> {
@@ -290,18 +291,19 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     }
 
     fn lower_let_stmt(&self, l: &LetStmt<'a, 'bump>) -> HirStmt<'a, 'bump> {
+        let inferred_ty = l.type_annotation == Type::infer(l.type_annotation.span);
         let value = self.lower_expr_expected(
             l.value,
-            if l.type_annotation != Type::infer() {
-                self.lower_type(&l.type_annotation, l.span)
+            if inferred_ty {
+                HirType::unknown(l.span)
             } else {
-                HirType::Unknown
+                self.lower_type(&l.type_annotation, l.span)
             },
         );
-        let final_type: HirType<'a, 'bump> = if l.type_annotation != Type::infer() {
-            self.lower_type(&l.type_annotation, l.span)
-        } else {
+        let final_type: HirType<'a, 'bump> = if inferred_ty {
             self.infer_type(&value)
+        } else {
+            self.lower_type(&l.type_annotation, l.span)
         };
 
         let catch_pattern = l.catch_pattern.as_ref().map(|pat| {
@@ -410,6 +412,8 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             catch_pattern,
             span: l.span,
             manual: l.manual,
+            visibility: lower_visibility(&l.visibility),
+            inferred_ty,
         }
     }
 }

@@ -1,8 +1,8 @@
-use crate::parser::descent_parser::DescentParser;
+use crate::parser::descent_parser::{BinderCtx, DescentParser};
 use ir::ast::{
     Block, EffectAccess, EffectSegment, Generic, MatchArm, MutabilityState, NormalParam, Param,
     ParamPassingKind, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, RefKind,
-    ThisParam, Type, TypeKind, Visibility,
+    ReturnBinder, ThisParam, Type, TypeKind, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 
@@ -248,7 +248,7 @@ where
                     span: token.span,
                 }))
             } else if self.cursor.peek() == TokenKind::Mut
-                && self.cursor.peek_n(1) == TokenKind::This
+                && self.cursor.peek_n_kind(1) == TokenKind::This
             {
                 self.cursor.advance(); // consume 'mut'
                 let token = self.cursor.expect(TokenKind::This)?;
@@ -417,21 +417,85 @@ where
         }
     }
 
-    pub(crate) fn parse_type(&mut self) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
-        Self::parse_type_impl(self.bump, &mut self.cursor, &mut self.pending_close_angle)
-    }
-
     pub fn parse_type_impl(
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
+        Self::parse_type_in(bump, cursor, pending, &mut None)
+    }
+
+    pub(crate) fn parse_type(&mut self) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
+        Self::parse_type_in(
+            self.bump,
+            &mut self.cursor,
+            &mut self.pending_close_angle,
+            &mut self.binder_ctx,
+        )
+    }
+
+    pub(crate) fn try_binder_in(
+        bump: &'bump GrowableBump<'bump>,
+        cursor: &mut Cursor<'a, 'bump>,
+        binders: &mut Option<BinderCtx<'a, 'bump>>,
+    ) -> Result<(), DiagnosticError<'a>> {
+        let Some(ctx) = binders.as_mut() else {
+            return Ok(());
+        };
+        if cursor.peek() != TokenKind::Ident {
+            return Ok(());
+        }
+        let lt = cursor.peek_n(1);
+        let minus = cursor.peek_n(2);
+        let touching = lt.kind == TokenKind::Lt
+            && minus.kind == TokenKind::Sub
+            && lt.span.line == minus.span.line
+            && minus.span.column == lt.span.column + 1;
+        if !touching {
+            return Ok(());
+        }
+
+        let name_tok = cursor.bump();
+        cursor.advance(); // `<`
+        cursor.advance(); // `-`
+        let Some(name) = name_tok.text else {
+            return Err(DiagnosticError::new(
+                ParseErrorKind::EmptyIdent,
+                name_tok.span,
+            ));
+        };
+        if ctx.found.iter().any(|b| b.name == name) {
+            return Err(DiagnosticError::new(
+                ParseErrorKind::DuplicateReturnBinder { name },
+                name_tok.span,
+            ));
+        }
+        ctx.found.push(ReturnBinder {
+            name,
+            arg_path: bump.alloc_slice(&ctx.path),
+            span: name_tok.span,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn parse_type_in(
+        bump: &'bump GrowableBump<'bump>,
+        cursor: &mut Cursor<'a, 'bump>,
+        pending: &mut u8,
+        binders: &mut Option<BinderCtx<'a, 'bump>>,
+    ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
         let nullable = cursor.consume(TokenKind::Question);
+        let start = cursor.peek_token().span;
+
         match cursor.peek() {
             TokenKind::LBracket => {
-                let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
+                let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending, binders)?;
                 let nullable = cursor.consume(TokenKind::Question);
-                return Ok(Type { kind, nullable });
+                return Ok(Type {
+                    kind,
+                    nullable,
+                    span: start,
+                });
             }
             TokenKind::BitAnd => {
                 cursor.advance();
@@ -439,7 +503,8 @@ where
                 let provenance = Self::parse_optional_provenance_impl(bump, cursor)?;
 
                 if cursor.peek() == LBracket {
-                    let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
+                    let bracket_span = cursor.peek_token().span;
+                    let kind = Self::parse_bracket_type_kind_impl(bump, cursor, pending, binders)?;
                     let nullable = cursor.consume(TokenKind::Question);
 
                     return Ok(match kind {
@@ -447,18 +512,24 @@ where
                             todo!("Handle error when & and [*] are mixed together.")
                         }
                         // `&[]T` is already a borrowed view, so keep it as the slice type.
-                        TypeKind::Slice { .. } => Type { kind, nullable },
+                        TypeKind::Slice { .. } => Type {
+                            kind,
+                            nullable,
+                            span: start,
+                        },
                         // `&[N]T` is a shared reference to an array.
                         other => Type {
                             kind: TypeKind::Ref {
                                 inner: bump.alloc_value_immutable(Type {
                                     kind: other,
                                     nullable: false,
+                                    span: bracket_span,
                                 }),
                                 ref_kind: RefKind::Shared,
                                 provenance,
                             },
                             nullable,
+                            span: start,
                         },
                     });
                 } else {
@@ -470,13 +541,15 @@ where
                         RefKind::Shared
                     };
 
+                    let dyn_span = cursor.peek_token().span;
                     let is_dyn = cursor.consume(TokenKind::Dyn);
 
                     if is_dyn {
                         let mut bounds = Vec::new();
-                        bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
+                        bounds.push(Self::parse_core_type_impl(bump, cursor, pending, binders)?);
                         while cursor.consume(TokenKind::Add) {
-                            bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
+                            bounds
+                                .push(Self::parse_core_type_impl(bump, cursor, pending, binders)?);
                         }
                         return Ok(Type {
                             kind: TypeKind::Ref {
@@ -485,15 +558,17 @@ where
                                         bounds: bump.alloc_slice(&bounds),
                                     },
                                     nullable: false,
+                                    span: dyn_span,
                                 }),
                                 ref_kind: RefKind::Shared,
                                 provenance,
                             },
                             nullable: false,
+                            span: start,
                         });
                     }
 
-                    let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
+                    let inner = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
 
                     return Ok(Type {
                         kind: TypeKind::Ref {
@@ -502,6 +577,7 @@ where
                             provenance,
                         },
                         nullable,
+                        span: start,
                     });
                 }
             }
@@ -511,13 +587,16 @@ where
                 let allocator = Self::parse_optional_provenance_impl(bump, cursor)?;
 
                 if cursor.peek() == TokenKind::LBracket {
-                    let bracket = Self::parse_bracket_type_kind_impl(bump, cursor, pending)?;
+                    let bracket_span = cursor.peek_token().span;
+                    let bracket =
+                        Self::parse_bracket_type_kind_impl(bump, cursor, pending, binders)?;
 
                     let kind = match bracket {
                         TypeKind::Slice { inner } => TypeKind::OwnedPointer {
                             inner: bump.alloc_value_immutable(Type {
                                 kind: TypeKind::Slice { inner },
                                 nullable: false,
+                                span: bracket_span,
                             }),
                             allocator,
                         },
@@ -529,10 +608,14 @@ where
                         other => other,
                     };
 
-                    return Ok(Type { kind, nullable });
+                    return Ok(Type {
+                        kind,
+                        nullable,
+                        span: start,
+                    });
                 }
 
-                let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
+                let inner = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
 
                 return Ok(Type {
                     kind: TypeKind::OwnedPointer {
@@ -540,6 +623,7 @@ where
                         allocator,
                     },
                     nullable,
+                    span: start,
                 });
             }
             _ => {}
@@ -550,10 +634,10 @@ where
         if is_dyn {
             let mut bounds = Vec::new();
 
-            bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
+            bounds.push(Self::parse_core_type_impl(bump, cursor, pending, binders)?);
 
             while cursor.consume(TokenKind::Add) {
-                bounds.push(Self::parse_core_type_impl(bump, cursor, pending)?);
+                bounds.push(Self::parse_core_type_impl(bump, cursor, pending, binders)?);
             }
 
             return Ok(Type {
@@ -561,10 +645,11 @@ where
                     bounds: bump.alloc_slice(&bounds),
                 },
                 nullable: false,
+                span: start,
             });
         }
 
-        let mut ty = Self::parse_core_type_impl(bump, cursor, pending)?;
+        let mut ty = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
 
         ty.nullable = nullable;
 
@@ -576,6 +661,7 @@ where
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
+        binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
         let token = cursor.peek_token();
 
@@ -600,7 +686,7 @@ where
                 )
             })?;
 
-            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
+            let inner = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::Array {
                 inner: inner_ref,
@@ -616,7 +702,7 @@ where
                 _ => MutabilityState::Const,
             };
 
-            let inner = Self::parse_core_type_impl(bump, cursor, pending)?;
+            let inner = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::UnsafePointer {
                 inner: inner_ref,
@@ -788,42 +874,48 @@ where
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
+        binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
         cursor.expect(TokenKind::LBracket)?;
-        Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending)
+        Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending, binders)
     }
 
     fn parse_core_type_impl(
         bump: &'bump GrowableBump<'bump>,
         cursor: &mut Cursor<'a, 'bump>,
         pending: &mut u8,
+        binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
         let tok = cursor.bump();
+        // Span of the first token of this type (identifier, keyword, `func`, `[`, ...).
+        let sp = tok.span;
 
         let kind = match tok.kind {
-            TokenKind::U8 => return Ok(Type::u8()),
-            TokenKind::U16 => return Ok(Type::u16()),
-            TokenKind::U32 => return Ok(Type::u32()),
-            TokenKind::U64 => return Ok(Type::u64()),
-            TokenKind::U128 => return Ok(Type::u128()),
-            TokenKind::I8 => return Ok(Type::i8()),
-            TokenKind::I16 => return Ok(Type::i16()),
-            TokenKind::I32 => return Ok(Type::i32()),
-            TokenKind::I64 => return Ok(Type::i64()),
-            TokenKind::I128 => return Ok(Type::i128()),
-            TokenKind::Usize => return Ok(Type::usize()),
-            TokenKind::Isize => return Ok(Type::isize()),
-            TokenKind::F32 => return Ok(Type::f32()),
-            TokenKind::F64 => return Ok(Type::f64()),
-            TokenKind::Boolean => return Ok(Type::boolean()),
-            TokenKind::CharLiteral => return Ok(Type::char()),
-            TokenKind::Str => return Ok(Type::string()),
-            TokenKind::Void => return Ok(Type::void()),
-            TokenKind::Never => return Ok(Type::never()),
+            TokenKind::U8 => return Ok(Type::u8(sp)),
+            TokenKind::U16 => return Ok(Type::u16(sp)),
+            TokenKind::U32 => return Ok(Type::u32(sp)),
+            TokenKind::U64 => return Ok(Type::u64(sp)),
+            TokenKind::U128 => return Ok(Type::u128(sp)),
+            TokenKind::I8 => return Ok(Type::i8(sp)),
+            TokenKind::I16 => return Ok(Type::i16(sp)),
+            TokenKind::I32 => return Ok(Type::i32(sp)),
+            TokenKind::I64 => return Ok(Type::i64(sp)),
+            TokenKind::I128 => return Ok(Type::i128(sp)),
+            TokenKind::Usize => return Ok(Type::usize(sp)),
+            TokenKind::Isize => return Ok(Type::isize(sp)),
+            TokenKind::F32 => return Ok(Type::f32(sp)),
+            TokenKind::F64 => return Ok(Type::f64(sp)),
+            TokenKind::Boolean => return Ok(Type::boolean(sp)),
+            TokenKind::CharLiteral => return Ok(Type::char(sp)),
+            TokenKind::Str => return Ok(Type::string(sp)),
+            TokenKind::Void => return Ok(Type::void(sp)),
+            TokenKind::Never => return Ok(Type::never(sp)),
 
-            TokenKind::Underscore => return Ok(Type::infer()),
+            TokenKind::Underscore => return Ok(Type::infer(sp)),
 
-            TokenKind::LBracket => Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending)?,
+            TokenKind::LBracket => {
+                Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending, binders)?
+            }
 
             TokenKind::Mul => {
                 let mutability_token = cursor.expect_or(TokenKind::Mut, TokenKind::Const)?;
@@ -850,13 +942,16 @@ where
                 }
             }
 
+            // Lambda type: spanned at the `func` keyword (`sp`).
             TokenKind::Func => {
                 cursor.expect(TokenKind::LParen)?;
                 let mut params: Vec<Type<'a, 'bump>> = Vec::new();
                 while cursor.peek() != TokenKind::RParen {
                     // Named parameters are allowed for readability/documentation,
                     // e.g. `func(arg: [*]mut void): void`, they serve no other purpose.
-                    if cursor.peek() == TokenKind::Ident && cursor.peek_n(1) == TokenKind::Colon {
+                    if cursor.peek() == TokenKind::Ident
+                        && cursor.peek_n_kind(1) == TokenKind::Colon
+                    {
                         cursor.advance(); // consume the parameter name
                         cursor.advance(); // consume ':'
                     }
@@ -871,7 +966,7 @@ where
                     cursor.advance();
                     Self::parse_type_impl(bump, cursor, pending)?
                 } else {
-                    Type::void()
+                    Type::void(sp)
                 };
 
                 let params_bump = bump.alloc_slice(&params);
@@ -900,6 +995,7 @@ where
                 }
                 cursor.expect(TokenKind::RParen)?;
                 if types.len() == 1 && !trailing_comma {
+                    // `(T)` is plain grouping: keep T's own span.
                     return Ok(types.pop().unwrap());
                 }
                 TypeKind::Tuple {
@@ -937,44 +1033,54 @@ where
                 let path = bump.alloc_slice(&path);
 
                 if path.is_empty() && name.as_str() == "This" {
-                    return Ok(Type::this());
+                    return Ok(Type::this(sp));
                 }
 
                 match name.as_str() {
-                    "void" => return Ok(Type::void()),
-                    "bool" => return Ok(Type::boolean()),
-                    "str" => return Ok(Type::string()),
-                    "char" => return Ok(Type::char()),
-                    "u8" => return Ok(Type::u8()),
-                    "u16" => return Ok(Type::u16()),
-                    "u32" => return Ok(Type::u32()),
-                    "u64" => return Ok(Type::u64()),
-                    "u128" => return Ok(Type::u128()),
-                    "i8" => return Ok(Type::i8()),
-                    "i16" => return Ok(Type::i16()),
-                    "i32" => return Ok(Type::i32()),
-                    "i64" => return Ok(Type::i64()),
-                    "i128" => return Ok(Type::i128()),
-                    "f32" => return Ok(Type::f32()),
-                    "f64" => return Ok(Type::f64()),
-                    "never" => return Ok(Type::never()),
-                    "This" => return Ok(Type::this()),
+                    "void" => return Ok(Type::void(sp)),
+                    "bool" => return Ok(Type::boolean(sp)),
+                    "str" => return Ok(Type::string(sp)),
+                    "char" => return Ok(Type::char(sp)),
+                    "u8" => return Ok(Type::u8(sp)),
+                    "u16" => return Ok(Type::u16(sp)),
+                    "u32" => return Ok(Type::u32(sp)),
+                    "u64" => return Ok(Type::u64(sp)),
+                    "u128" => return Ok(Type::u128(sp)),
+                    "i8" => return Ok(Type::i8(sp)),
+                    "i16" => return Ok(Type::i16(sp)),
+                    "i32" => return Ok(Type::i32(sp)),
+                    "i64" => return Ok(Type::i64(sp)),
+                    "i128" => return Ok(Type::i128(sp)),
+                    "f32" => return Ok(Type::f32(sp)),
+                    "f64" => return Ok(Type::f64(sp)),
+                    "never" => return Ok(Type::never(sp)),
+                    "This" => return Ok(Type::this(sp)),
                     _ => {}
                 }
 
                 let generics = if cursor.peek() == TokenKind::Lt {
                     cursor.advance();
                     let mut args: Vec<Type<'a, 'bump>> = Vec::new();
+                    let mut idx = 0usize;
                     loop {
-                        args.push(Self::parse_type_impl(bump, cursor, pending)?);
+                        if let Some(c) = binders.as_mut() {
+                            c.path.push(idx);
+                        }
+                        let bound = Self::try_binder_in(bump, cursor, binders);
+                        let arg = match bound {
+                            Ok(()) => Self::parse_type_in(bump, cursor, pending, binders),
+                            Err(e) => Err(e),
+                        };
+                        if let Some(c) = binders.as_mut() {
+                            c.path.pop();
+                        }
+                        args.push(arg?);
+                        idx += 1;
 
-                        // A split `>>` left a pending `>` for us: this list ends here,
-                        // whatever token (`,`, `+`, `=`) follows in the source.
                         if *pending > 0 {
                             *pending -= 1;
                             break;
                         }
-
                         if cursor.peek() == TokenKind::Comma {
                             cursor.advance();
                             continue;
@@ -1017,6 +1123,7 @@ where
         Ok(Type {
             kind,
             nullable: false,
+            span: sp,
         })
     }
 
@@ -1045,6 +1152,7 @@ where
     pub fn parse_impl_target(&mut self) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
         if self.cursor.peek() == TokenKind::LBracket {
             let checkpoint = self.cursor.pos();
+            let bracket_span = self.cursor.peek_token().span;
             self.cursor.advance(); // consume `[`
             if self.cursor.peek() == TokenKind::RBracket {
                 self.cursor.advance(); // consume `]`
@@ -1053,6 +1161,7 @@ where
                         return Ok(Type {
                             kind: TypeKind::AnySlice,
                             nullable: false,
+                            span: bracket_span,
                         });
                     }
                     _ => {}

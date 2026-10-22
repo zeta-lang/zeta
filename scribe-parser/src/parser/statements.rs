@@ -1,8 +1,8 @@
-use crate::parser::descent_parser::DescentParser;
+use crate::parser::descent_parser::{DescentParser, token_to_visibility};
 use ir::ast::{
     Block, DeferAction, DeferStmt, ElseBranch, Expr, ForKind, ForStmt, IfStmt, ImportStmt,
-    InternalExprStmt, LetStmt, MatchStmt, ModuleDecl, PackageStmt, Pattern, ReturnStmt, Stmt, Type,
-    UnsafeBlock, Visibility, WhileStmt,
+    InternalExprStmt, LetStmt, MatchStmt, ModuleDecl, PackageStmt, Pattern, PatternKind,
+    ReturnStmt, Stmt, Type, UnsafeBlock, Visibility, WhileStmt,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::hir::StrId;
@@ -27,23 +27,30 @@ where
         }
     }
 
-    pub fn parse_let_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
-        self.parse_let_stmt_inner(false)
+    pub fn parse_let_stmt(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+        self.parse_let_stmt_inner(false, visibility)
     }
 
-    pub fn parse_static_let_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
-        self.parse_let_stmt_inner(true)
+    pub fn parse_static_let_stmt(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+        self.parse_let_stmt_inner(true, visibility)
     }
 
     fn parse_let_stmt_inner(
         &mut self,
         is_static: bool,
+        visibility: Visibility,
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let token = self.cursor.expect(TokenKind::Let)?;
 
         let is_mut = self.cursor.consume(TokenKind::Mut);
         let is_manual = self.eat_manual_modifier();
-        let (name, _span) = self.expect_binding_name()?;
+        let (name, name_span) = self.expect_binding_name()?;
 
         let type_annotation = if self.cursor.consume(TokenKind::Colon) {
             self.parse_type()?
@@ -60,7 +67,7 @@ where
                 ));
             }
 
-            Type::infer()
+            Type::infer(name_span)
         };
 
         self.cursor.expect(TokenKind::Assign)?;
@@ -100,12 +107,16 @@ where
             catch_pattern,
             span: token.span,
             manual: is_manual,
+            visibility,
         };
 
         Ok(Stmt::Let(self.bump.alloc_value_immutable(let_stmt)))
     }
 
-    pub fn parse_shorthand_let_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+    pub fn parse_shorthand_let_stmt(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let mutable = self.cursor.consume(TokenKind::Mut);
         let is_manual = self.eat_manual_modifier();
         let (name, span) = self.expect_binding_name()?;
@@ -122,13 +133,14 @@ where
 
         let let_stmt = LetStmt {
             ident: name,
-            type_annotation: Type::infer(),
+            type_annotation: Type::infer(span),
             value: self.bump.alloc_value_immutable(value),
             mutable,
             is_static: false,
             catch_pattern,
             span,
             manual: is_manual,
+            visibility,
         };
 
         Ok(Stmt::Let(self.bump.alloc_value_immutable(let_stmt)))
@@ -232,10 +244,21 @@ where
         let let_stmt = if self.cursor.peek() == TokenKind::Semicolon {
             None
         } else {
-            let stmt = if self.cursor.peek() == TokenKind::Let {
-                self.parse_let_stmt()?
+            let inner_visibility = if self.cursor.peek() == TokenKind::Private
+                || self.cursor.peek() == TokenKind::Module
+                || self.cursor.peek() == TokenKind::Package
+            {
+                let vis = token_to_visibility(self.cursor.peek());
+                self.cursor.advance();
+                vis
             } else {
-                self.parse_shorthand_let_stmt()?
+                Visibility::Public
+            };
+
+            let stmt = if self.cursor.peek() == TokenKind::Let {
+                self.parse_let_stmt(inner_visibility)?
+            } else {
+                self.parse_shorthand_let_stmt(inner_visibility)?
             };
 
             let Stmt::Let(let_stmt) = stmt else {
@@ -355,57 +378,67 @@ where
         Ok(Stmt::Match(self.bump.alloc_value_immutable(match_stmt)))
     }
 
-    pub fn parse_pattern(&mut self) -> Result<Pattern<'bump>, DiagnosticError<'a>> {
+    pub fn parse_pattern(&mut self) -> Result<Pattern<'a, 'bump>, DiagnosticError<'a>> {
         match self.cursor.peek() {
             TokenKind::Underscore => {
-                self.cursor.advance();
-                Ok(Pattern::Wildcard)
+                let span = self.cursor.bump().span;
+                Ok(Pattern::wildcard(span))
             }
 
             TokenKind::Null => {
-                self.cursor.advance();
-                Ok(Pattern::Null)
+                let span = self.cursor.bump().span;
+                Ok(Pattern::null(span))
             }
 
             TokenKind::Number => {
                 let tok = self.cursor.bump();
+                let span = tok.span;
                 let text = tok.text.unwrap_or_default();
                 let n = text.as_str().parse::<i64>().unwrap_or(0);
-                Ok(Pattern::Number(n))
+                Ok(Pattern::number(span, n))
             }
 
             TokenKind::String => {
                 let tok = self.cursor.bump();
                 let s = tok.text.unwrap_or_default();
-                Ok(Pattern::String(s))
+                Ok(Pattern::string(tok.span, s))
             }
 
             TokenKind::BooleanTrue => {
-                self.cursor.advance();
-                Ok(Pattern::Boolean(true))
+                let tok = self.cursor.bump();
+                Ok(Pattern::boolean(tok.span, true))
             }
             TokenKind::BooleanFalse => {
-                self.cursor.advance();
-                Ok(Pattern::Boolean(false))
+                let tok = self.cursor.bump();
+                Ok(Pattern::boolean(tok.span, false))
             }
 
             TokenKind::Mut => {
                 self.cursor.advance(); // consume 'mut'
-                let (name, _) = self.cursor.expect_ident()?;
-                Ok(Pattern::Ident(name, true))
+
+                let pat = self.parse_pattern()?;
+                match &pat.kind {
+                    // `mut name`: keep the binding mutable instead of dropping the keyword
+                    PatternKind::Ident(name, _) => Ok(Pattern::ident(pat.span, *name, true)),
+                    _ => Ok(pat),
+                }
             }
 
             TokenKind::Ident => {
                 let tok = self.cursor.bump();
+                let span = tok.span;
                 let mut name = tok.text.unwrap_or_default();
+
+                let mut variant_span = tok.span;
 
                 let mut qualified = false;
                 while matches!(self.cursor.peek(), TokenKind::Dot | TokenKind::ColonColon)
-                    && matches!(self.cursor.peek_n(1), TokenKind::Ident)
+                    && matches!(self.cursor.peek_n_kind(1), TokenKind::Ident)
                 {
                     self.cursor.advance(); // consume '.' or '::'
-                    let (seg, _) = self.cursor.expect_ident()?;
+                    let (seg, inner_span) = self.cursor.expect_ident()?;
                     name = seg;
+                    variant_span = inner_span;
                     qualified = true;
                 }
 
@@ -422,21 +455,23 @@ where
                         }
                     }
                     self.cursor.expect(TokenKind::RParen)?;
-                    Ok(Pattern::EnumVariant {
+                    Ok(Pattern::enum_variant(
+                        span,
                         name,
-                        bindings: self.bump.alloc_slice(&bindings),
-                    })
+                        self.bump.alloc_slice(&bindings),
+                        variant_span,
+                    ))
                 } else if self.cursor.peek() == TokenKind::LBrace {
                     self.cursor.advance(); // consume '{'
                     let mut fields = Vec::new();
                     while self.cursor.peek() != TokenKind::RBrace
                         && self.cursor.peek() != TokenKind::EOF
                     {
-                        let (field_name, _span) = self.cursor.expect_ident()?;
+                        let (field_name, span) = self.cursor.expect_ident()?;
                         let pattern = if self.cursor.consume(TokenKind::Colon) {
                             self.parse_pattern()?
                         } else {
-                            Pattern::Ident(field_name, false) // shorthand: `{ value }` == `{ value: value }`
+                            Pattern::ident(span, field_name, false) // shorthand: `{ value }` == `{ value: value }`
                         };
                         fields.push((field_name, pattern));
                         if !self.cursor.consume(TokenKind::Comma) {
@@ -444,23 +479,22 @@ where
                         }
                     }
                     self.cursor.expect(TokenKind::RBrace)?;
-                    Ok(Pattern::Struct {
+                    Ok(Pattern::struct_pattern(
+                        span,
                         name,
-                        fields: self.bump.alloc_slice(&fields),
-                    })
+                        self.bump.alloc_slice(&fields),
+                        variant_span,
+                    ))
                 } else if qualified {
-                    Ok(Pattern::EnumVariant {
-                        name,
-                        bindings: &[],
-                    })
+                    Ok(Pattern::enum_variant(span, name, &[], variant_span))
                 } else {
-                    Ok(Pattern::Ident(name, false))
+                    Ok(Pattern::ident(span, name, false))
                 }
             }
 
             // Tuple pattern: (a, b, c)
             TokenKind::LParen => {
-                self.cursor.advance();
+                let span = self.cursor.bump().span;
                 let mut pats = Vec::new();
                 while self.cursor.peek() != TokenKind::RParen
                     && self.cursor.peek() != TokenKind::EOF
@@ -471,12 +505,12 @@ where
                     }
                 }
                 self.cursor.expect(TokenKind::RParen)?;
-                Ok(Pattern::Tuple(self.bump.alloc_slice(&pats)))
+                Ok(Pattern::tuple(span, self.bump.alloc_slice(&pats)))
             }
 
             // Array pattern: [a, b, c]
             TokenKind::LBracket => {
-                self.cursor.advance();
+                let span = self.cursor.bump().span;
                 let mut pats = Vec::new();
                 while self.cursor.peek() != TokenKind::RBracket
                     && self.cursor.peek() != TokenKind::EOF
@@ -487,7 +521,7 @@ where
                     }
                 }
                 self.cursor.expect(TokenKind::RBracket)?;
-                Ok(Pattern::Array(self.bump.alloc_slice(&pats)))
+                Ok(Pattern::array(span, self.bump.alloc_slice(&pats)))
             }
 
             other => {
@@ -544,7 +578,7 @@ where
         segments.push(first);
 
         while self.cursor.peek() == TokenKind::ColonColon
-            && matches!(self.cursor.peek_n(1), TokenKind::Ident)
+            && matches!(self.cursor.peek_n_kind(1), TokenKind::Ident)
         {
             self.cursor.advance(); // ::
             let (seg, _) = self.cursor.expect_ident()?;
@@ -552,7 +586,7 @@ where
         }
 
         let member = if self.cursor.peek() == TokenKind::Dot
-            && matches!(self.cursor.peek_n(1), TokenKind::Ident)
+            && matches!(self.cursor.peek_n_kind(1), TokenKind::Ident)
         {
             self.cursor.advance(); // .
             let (m, _) = self.cursor.expect_ident()?;

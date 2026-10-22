@@ -135,9 +135,14 @@ where
                                 }
                             }
                         } else {
-                            todo!(
-                                "Handle error when trying to call like `hello<>()` because you cannot have an empty generic list"
-                            )
+                            let t = self.cursor.peek_token();
+                            return Err(DiagnosticError::new(
+                                ParseErrorKind::UnexpectedToken {
+                                    expected: TokenKind::Ident,
+                                    found: t.kind,
+                                },
+                                t.span,
+                            ));
                         }
 
                         if !Self::try_consume_close_angle(
@@ -434,7 +439,7 @@ where
                 }
             }
         } else {
-            todo!("Handle error when trying to call like `hello<>()` ...")
+            return false;
         }
         if !Self::try_consume_close_angle(&mut cursor, &mut pending) {
             return false;
@@ -512,13 +517,25 @@ where
                             if !self.cursor.consume(TokenKind::Comma) {
                                 break;
                             }
-
-                            if self.cursor.peek() == TokenKind::RParen {
+                            // trailing comma: `$f<T,>()`
+                            if self.cursor.peek() == TokenKind::Gt {
                                 break;
                             }
                         }
                     }
-                    self.cursor.expect(TokenKind::Gt)?;
+                    if !Self::try_consume_close_angle(
+                        &mut self.cursor,
+                        &mut self.pending_close_angle,
+                    ) {
+                        let token = self.cursor.peek_token();
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Gt,
+                                found: token.kind,
+                            },
+                            token.span,
+                        ));
+                    }
                 }
 
                 self.cursor.expect(TokenKind::LParen)?;
@@ -893,6 +910,8 @@ where
             None
         };
 
+        let ensures = self.parse_ensures_clauses()?;
+
         let block = self.parse_block()?;
         let body = self.bump.alloc_value_immutable(block);
 
@@ -903,6 +922,7 @@ where
             modifiers,
             params: self.bump.alloc_slice(&params),
             return_type,
+            ensures,
             body,
             span,
         })

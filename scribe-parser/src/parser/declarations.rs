@@ -25,7 +25,7 @@ where
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let token = self.cursor.expect(TokenKind::Struct)?;
 
-        let (name, _span) = self.cursor.expect_ident()?;
+        let (name, name_span) = self.cursor.expect_ident()?;
 
         // Parse optional generics: <T, U: Display>
         let generics = if self.cursor.peek() == TokenKind::Lt {
@@ -55,7 +55,7 @@ where
                     self.cursor.advance();
                     vis
                 } else {
-                    Visibility::Public
+                    Visibility::Private
                 };
 
                 let manual = self.eat_manual_modifier();
@@ -138,6 +138,7 @@ where
             name,
             generics,
             params,
+            name_span,
             span: token.span,
         };
 
@@ -206,15 +207,7 @@ where
         while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
             let attrs = self.parse_attributes()?; // empty slice if there's no `#`
 
-            if self.cursor.peek() == TokenKind::Const {
-                let Stmt::Const(const_stmt) = self.parse_const_stmt()? else {
-                    unreachable!()
-                };
-                constants.push(*const_stmt);
-                continue;
-            }
-
-            let method_vis = if self.cursor.peek() == TokenKind::Private
+            let inner_visibility = if self.cursor.peek() == TokenKind::Public
                 || self.cursor.peek() == TokenKind::Module
                 || self.cursor.peek() == TokenKind::Package
             {
@@ -225,8 +218,16 @@ where
                 Visibility::Public
             };
 
+            if self.cursor.peek() == TokenKind::Const {
+                let Stmt::Const(const_stmt) = self.parse_const_stmt(inner_visibility)? else {
+                    unreachable!()
+                };
+                constants.push(*const_stmt);
+                continue;
+            }
+
             self.pending_attrs = attrs;
-            match self.parse_function_with_visibility(method_vis) {
+            match self.parse_function_with_visibility(inner_visibility) {
                 Ok(func) => {
                     if let ir::ast::Stmt::FuncDecl(func) = func {
                         methods.push(*func);
@@ -283,7 +284,7 @@ where
                 self.cursor.advance();
                 vis
             } else {
-                Visibility::Public
+                Visibility::Private
             };
 
             let peeked_token = self.cursor.peek_token();
@@ -347,14 +348,17 @@ where
         Ok(self.bump.alloc_slice(&fields))
     }
 
-    pub fn parse_const_stmt(&mut self) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
-        let token = self.cursor.expect(TokenKind::Const)?;
-        let (name, _span) = self.expect_binding_name()?;
+    pub fn parse_const_stmt(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
+        let _ = self.cursor.expect(TokenKind::Const)?;
+        let (name, name_span) = self.expect_binding_name()?;
 
         let type_annotation = if self.cursor.consume(TokenKind::Colon) {
             self.parse_type()?
         } else {
-            ir::ast::Type::infer()
+            ir::ast::Type::infer(name_span)
         };
 
         self.cursor.expect(TokenKind::Assign)?;
@@ -365,7 +369,8 @@ where
             ident: name,
             type_annotation,
             value: self.bump.alloc_value_immutable(value),
-            span: token.span,
+            span: name_span,
+            visibility,
         })))
     }
 
@@ -386,7 +391,7 @@ where
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let token = self.cursor.expect(TokenKind::Interface)?;
 
-        let (name, _span) = self.cursor.expect_ident()?;
+        let (name, name_span) = self.cursor.expect_ident()?;
 
         // Parse optional generics: <T, U: Display>
         let generics = if self.cursor.peek() == TokenKind::Lt {
@@ -448,6 +453,7 @@ where
                 Some(self.bump.alloc_slice(&methods))
             },
             generics,
+            name_span,
             span: token.span,
         };
 
@@ -481,7 +487,7 @@ where
         visibility: Visibility,
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let token = self.cursor.expect(TokenKind::Enum)?;
-        let (name, _span) = self.cursor.expect_ident()?;
+        let (name, name_span) = self.cursor.expect_ident()?;
         let generics = self.parse_generics()?;
 
         let mut variants = Vec::new();
@@ -499,6 +505,7 @@ where
             visibility,
             generics,
             variants: self.bump.alloc_slice(&variants),
+            name_span,
             span: token.span,
         })))
     }
@@ -590,7 +597,7 @@ where
         visibility: Visibility,
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
         let token = self.cursor.expect(TokenKind::Type)?;
-        let (name, _span) = self.cursor.expect_ident()?;
+        let (name, name_span) = self.cursor.expect_ident()?;
 
         let generics = if self.cursor.peek() == TokenKind::Lt {
             self.parse_generics()?
@@ -608,6 +615,7 @@ where
                 name,
                 generics,
                 ty,
+                name_span,
                 span: token.span,
             },
         )))
@@ -616,9 +624,9 @@ where
 
 fn token_to_visibility(token_kind: TokenKind) -> Visibility {
     match token_kind {
-        TokenKind::Private => Visibility::Private,
+        TokenKind::Public => Visibility::Public,
         TokenKind::Module => Visibility::Module,
         TokenKind::Package => Visibility::Internal,
-        _ => Visibility::Public,
+        _ => Visibility::Private,
     }
 }

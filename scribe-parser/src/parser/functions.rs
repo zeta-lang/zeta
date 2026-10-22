@@ -1,6 +1,7 @@
-use crate::parser::descent_parser::DescentParser;
+use crate::parser::descent_parser::{BinderCtx, DescentParser};
 use ir::ast::{
-    ExternModifier, FuncDecl, FuncModifiers, FuncSafety, InlineModifier, Stmt, Type, Visibility,
+    EnsuresClause, ExternModifier, FuncDecl, FuncModifiers, FuncSafety, InlineModifier,
+    ReturnBinder, Stmt, Type, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 use ir::tokens::{Cursor, TokenKind};
@@ -18,6 +19,7 @@ where
         let fn_token = self.cursor.expect(TokenKind::Func)?;
 
         let name_token = self.cursor.bump();
+        let name_span = name_token.span;
         let name = match name_token.kind {
             TokenKind::Ident => match name_token.text {
                 Some(text) if text.is_empty() => {
@@ -48,11 +50,13 @@ where
 
         let params = self.parse_params()?;
 
-        let return_type = if self.cursor.consume(TokenKind::Colon) {
+        let (return_type, return_binders) = if self.cursor.consume(TokenKind::Colon) {
             self.parse_return_type()?
         } else {
-            None
+            (None, &[][..])
         };
+
+        let ensures = self.parse_ensures_clauses()?;
 
         let body = if self.cursor.consume(TokenKind::Semicolon) {
             None
@@ -67,7 +71,10 @@ where
             generics,
             params,
             return_type,
+            return_binders,
+            ensures,
             body,
+            name_span,
             span: fn_token.span,
             attrs,
         };
@@ -75,10 +82,54 @@ where
         Ok(func_decl)
     }
 
-    fn parse_return_type(&mut self) -> Result<Option<Type<'a, 'bump>>, DiagnosticError<'a>> {
+    pub fn parse_ensures_clauses(
+        &mut self,
+    ) -> Result<&'bump [EnsuresClause<'a, 'bump>], DiagnosticError<'a>> {
+        let mut clauses = Vec::new();
+        while self.cursor.peek() == TokenKind::Ensures {
+            let kw = self.cursor.bump();
+            let pattern = if self.cursor.consume(TokenKind::Case) {
+                let p = self.parse_pattern()?;
+                self.cursor.expect(TokenKind::Arrow)?;
+                Some(self.bump.alloc_value_immutable(p))
+            } else {
+                None
+            };
+            let cond = self.parse_expr(0)?;
+            clauses.push(EnsuresClause {
+                pattern,
+                condition: self.bump.alloc_value_immutable(cond),
+                span: kw.span,
+            });
+        }
+        Ok(self.bump.alloc_slice(&clauses))
+    }
+
+    /// Consumes `name <-` if present and records it. Does nothing outside a return type,
+    /// so speculative generic parsing in expressions (`a < b<-1`) is unaffected.
+    fn try_parse_binder(&mut self) -> Result<(), DiagnosticError<'a>> {
+        Self::try_binder_in(self.bump, &mut self.cursor, &mut self.binder_ctx)
+    }
+
+    fn parse_return_type(
+        &mut self,
+    ) -> Result<(Option<Type<'a, 'bump>>, &'bump [ReturnBinder<'a, 'bump>]), DiagnosticError<'a>>
+    {
         match self.cursor.peek() {
-            TokenKind::Semicolon | TokenKind::LBrace | TokenKind::EOF => Ok(None),
-            _ => self.parse_type().map(|ty| Some(ty)),
+            TokenKind::Semicolon | TokenKind::LBrace | TokenKind::Ensures | TokenKind::EOF => {
+                Ok((None, &[]))
+            }
+            _ => {
+                let prev = self.binder_ctx.replace(BinderCtx {
+                    path: Vec::new(),
+                    found: Vec::new(),
+                });
+                let parsed = self.try_parse_binder().and_then(|_| self.parse_type()); // root binder
+                let ctx = std::mem::replace(&mut self.binder_ctx, prev);
+                let ty = parsed?;
+                let found = ctx.map(|c| c.found).unwrap_or_default();
+                Ok((Some(ty), self.bump.alloc_slice(&found)))
+            }
         }
     }
 
@@ -112,20 +163,44 @@ where
             match cursor.peek() {
                 TokenKind::Inline => {
                     if let InlineModifier::Noinline = inline_modifier {
-                        todo!("Handle error at inline modifier.")
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Func,
+                                found: cursor.peek(),
+                            },
+                            cursor.peek_token().span,
+                        ));
                     }
                     if let InlineModifier::Inline = inline_modifier {
-                        todo!("Handle error at inline modifier.")
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Func,
+                                found: cursor.peek(),
+                            },
+                            cursor.peek_token().span,
+                        ));
                     }
                     inline_modifier = InlineModifier::Inline;
                     cursor.advance();
                 }
                 TokenKind::Noinline => {
                     if let InlineModifier::Inline = inline_modifier {
-                        todo!("Handle error at noinline modifier.")
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Func,
+                                found: cursor.peek(),
+                            },
+                            cursor.peek_token().span,
+                        ));
                     }
                     if let InlineModifier::Noinline = inline_modifier {
-                        todo!("Handle error at noinline modifier.")
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Func,
+                                found: cursor.peek(),
+                            },
+                            cursor.peek_token().span,
+                        ));
                     }
                     inline_modifier = InlineModifier::Noinline;
                     cursor.advance();
@@ -138,7 +213,13 @@ where
                 }
                 TokenKind::Unsafe => {
                     if func_safety == FuncSafety::Unsafe {
-                        todo!("Handle error at duplicate unsafe modifier.")
+                        return Err(DiagnosticError::new(
+                            ParseErrorKind::UnexpectedToken {
+                                expected: TokenKind::Func,
+                                found: cursor.peek(),
+                            },
+                            cursor.peek_token().span,
+                        ));
                     }
                     func_safety = FuncSafety::Unsafe;
                     cursor.advance();
