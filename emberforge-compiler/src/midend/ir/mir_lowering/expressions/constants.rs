@@ -205,8 +205,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             } else {
                 v
             }
-        } else if let Some(const_expr) = self.constants.get(name) {
-            self.lower_expr(const_expr)
+        } else if let Some((m, value)) = self
+            .constants
+            .resolve_bare(self.module_idx, *name)
+            .map(|(m, v)| (m, *v))
+        {
+            self.lower_const_value(m, &value, None)
         } else if let Some((addr, ty)) = self.lower_static_addr(*name) {
             if Self::is_aggregate_ssa_type(&ty) || matches!(ty, SsaType::Array(..)) {
                 addr // aggregates are carried by address
