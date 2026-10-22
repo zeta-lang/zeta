@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirErrorHandlerPattern, HirExpr, HirStmt, HirType, StrId},
+    hir::{HirErrorHandlerPattern, HirExpr, HirStmt, HirType, HirTypeKind, StrId},
     ir_conversion::lower_type_hir,
     ir_hasher::{HashMap, HashSet},
     layout::TargetInfo,
@@ -924,6 +924,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 entries.push((*bb, *v));
             }
         }
+        if entries.len() != branches.len() {
+            // declared in only some of the live branches => out of scope at the merge
+            return None;
+        }
         let (_, first_val) = entries.first().copied()?;
         if entries.iter().all(|(_, v)| *v == first_val) {
             return Some(first_val);
@@ -1250,8 +1254,8 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .get(&throws_enum)
             .expect("__throws enum missing from enum_variant_tags");
 
-        let error_name = match error_type {
-            HirType::Struct { name, .. } | HirType::Enum { name, .. } => *name,
+        let error_name = match error_type.kind {
+            HirTypeKind::Struct { name, .. } | HirTypeKind::Enum { name, .. } => name,
             other => panic!("catch branch type {:?} is not a nominal error type", other),
         };
         let tag = *tags.get(&error_name).unwrap_or_else(|| {
@@ -1339,7 +1343,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             left: Operand::Value(left),
             right: Operand::ConstInt(right),
         });
-        let bool_ty = lower_type_hir(&HirType::Boolean, self.enums, self.structs);
+        let bool_ty = lower_type_hir(
+            &HirType::boolean(SourceSpan::default()),
+            self.enums,
+            self.structs,
+        );
         self.current_block_data.value_types.insert(dest, bool_ty);
         dest
     }

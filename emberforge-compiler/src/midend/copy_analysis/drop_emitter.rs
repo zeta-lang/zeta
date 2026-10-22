@@ -3,7 +3,9 @@ use crate::midend::copy_analysis::drop_tracking::DropMoveState;
 use crate::midend::ir::block_data::CurrentBlockData;
 use crate::midend::ir::mir_lowering::lowerer::fun_name;
 use codex_dependency_graph::DepGraph;
-use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
+use ir::hir::{
+    self, DropKind, HirEnum, HirStruct, HirType, HirTypeKind, ProvenanceAnnotation, StrId,
+};
 use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap};
@@ -134,18 +136,17 @@ pub fn owned_link_parts<'a, 'bump>(
     StrId,
     Option<ProvenanceAnnotation<'bump>>,
 )> {
-    let owned: HirType<'a, 'bump> = match ty {
-        HirType::Nullable(inner) => **inner,
-        other => *other,
+    let owned: HirType<'a, 'bump> = match ty.kind {
+        HirTypeKind::Nullable(inner) => *inner,
+        _ => *ty,
     };
-    let HirType::OwnedPointer { inner, allocator } = owned else {
+    let HirTypeKind::OwnedPointer { inner, allocator } = owned.kind else {
         return None;
     };
-    let pointee: HirType<'a, 'bump> = *inner;
-    let HirType::Struct { name, .. } = pointee else {
+    let HirTypeKind::Struct { name, .. } = inner.kind else {
         return None;
     };
-    Some((pointee, name, allocator))
+    Some((*inner, name, allocator))
 }
 
 /// The single field of `node` that owns another `node` (`next: ?^Node<T>`).
@@ -179,8 +180,8 @@ pub fn find_allocator_field<'a, 'bump>(
         .get(&struct_name)?
         .fields
         .iter()
-        .find_map(|f| match &f.field_type {
-            HirType::Struct { name, .. } if allocator_kind.contains_key(name) => Some(f.name),
+        .find_map(|f| match &f.field_type.kind {
+            HirTypeKind::Struct { name, .. } if allocator_kind.contains_key(name) => Some(f.name),
             _ => None,
         })
 }
@@ -480,7 +481,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 )
             });
 
-        if let HirType::Generic(param) = hir_field.field_type {
+        if let HirTypeKind::Generic(param) = hir_field.field_type.kind {
             panic!(
                 "[field_addr_on_value] field `{}` on struct `{}` has unresolved generic type \
                  parameter `{}`.",
@@ -488,10 +489,10 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             );
         }
 
-        let known_name = match &hir_field.field_type {
-            HirType::Struct { name, .. }
-            | HirType::Enum { name, .. }
-            | HirType::DynInterface(name, _) => Some(*name),
+        let known_name = match &hir_field.field_type.kind {
+            HirTypeKind::Struct { name, .. }
+            | HirTypeKind::Enum { name, .. }
+            | HirTypeKind::DynInterface { name, .. } => Some(*name),
             _ => None,
         };
 
@@ -593,7 +594,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         pointee_ty: &HirType,
         ptr_val: Value,
     ) {
-        let (data_ptr, size_v, align_v) = if let HirType::Slice(inner) = pointee_ty {
+        let (data_ptr, size_v, align_v) = if let HirTypeKind::Slice(inner) = pointee_ty.kind {
             let elem_ssa = lower_type_hir(inner, self.enums, self.structs);
             let Layout {
                 size: elem_size,
@@ -849,7 +850,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 pointee_ty: inner_pointee_ty,
                 allocator: inner_allocator,
             } => {
-                let inner_val = if matches!(inner_pointee_ty, HirType::Slice(_)) {
+                let inner_val = if matches!(inner_pointee_ty.kind, HirTypeKind::Slice(_)) {
                     ptr_val
                 } else {
                     let loaded = self.current_block_data.fresh_value();
@@ -993,7 +994,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 pointee_ty: inner_pointee_ty,
                 allocator: inner_allocator,
             } => {
-                let inner_val = if matches!(inner_pointee_ty, HirType::Slice(_)) {
+                let inner_val = if matches!(inner_pointee_ty.kind, HirTypeKind::Slice(_)) {
                     ptr_val
                 } else {
                     let loaded = self.current_block_data.fresh_value();
@@ -1048,7 +1049,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
             .get(&field)
             .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name));
 
-        if let HirType::Generic(param) = known_field_ty {
+        if let HirTypeKind::Generic(param) = known_field_ty.kind {
             panic!(
                 "[field_addr_typed] field `{}` on struct `{}` has unresolved generic type \
                  parameter `{}`.",
@@ -1294,7 +1295,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
                 pointee_ty,
                 allocator,
             } => {
-                let ptr_val = if matches!(pointee_ty, HirType::Slice(_)) {
+                let ptr_val = if matches!(pointee_ty.kind, HirTypeKind::Slice(_)) {
                     elem_addr
                 } else {
                     let pointee_ssa = lower_type_hir(pointee_ty, self.enums, self.structs);
@@ -1732,11 +1733,11 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         struct_name: StrId,
         field: &hir::HirField<'a, 'bump>,
     ) -> Option<ProvenanceAnnotation<'bump>> {
-        let (owned, nullable) = match field.field_type {
-            HirType::Nullable(i) => (*i, true),
-            t => (t, false),
+        let (owned, nullable) = match field.field_type.kind {
+            HirTypeKind::Nullable(i) => (*i, true),
+            _ => (field.field_type, false),
         };
-        let HirType::OwnedPointer { inner, .. } = owned else {
+        let HirTypeKind::OwnedPointer { inner, .. } = owned.kind else {
             return None;
         };
         if let Some(af) = find_allocator_field(self.structs, self.allocator_kind, struct_name) {
@@ -1750,7 +1751,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         if nullable {
             return None; // the Deref hop below can't walk a nullable slot
         }
-        let HirType::Struct { name, .. } = *inner else {
+        let HirTypeKind::Struct { name, .. } = inner.kind else {
             return None;
         };
         let af = find_allocator_field(self.structs, self.allocator_kind, name)?;

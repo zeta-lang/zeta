@@ -2,7 +2,9 @@ use crate::midend::copy_analysis::drop_emitter::{
     AllocatorResolver, DropEmitter, find_allocator_field,
 };
 use crate::midend::ir::block_data::CurrentBlockData;
-use ir::hir::{self, DropKind, HirEnum, HirStruct, HirType, ProvenanceAnnotation, StrId};
+use ir::hir::{
+    self, DropKind, HirEnum, HirStruct, HirType, HirTypeKind, ProvenanceAnnotation, StrId,
+};
 use ir::hir_utils::type_suffix_with_pool;
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap};
@@ -163,14 +165,14 @@ impl DropGlueRegistry {
         is_droppable: &HashMap<StrId, bool>,
         context: &Arc<StringPool>,
     ) -> bool {
-        match ty {
-            HirType::Struct { name, .. } => {
-                Self::resolve_struct_key(*name, ty, is_droppable, context)
+        match ty.kind {
+            HirTypeKind::Struct { name, .. } => {
+                Self::resolve_struct_key(name, ty, is_droppable, context)
                     .and_then(|k| is_droppable.get(&k).copied())
                     .unwrap_or(false)
             }
-            HirType::Nullable(inner) => Self::type_is_droppable(inner, is_droppable, context),
-            HirType::OwnedPointer { .. } => true,
+            HirTypeKind::Nullable(inner) => Self::type_is_droppable(inner, is_droppable, context),
+            HirTypeKind::OwnedPointer { .. } => true,
             _ => false,
         }
     }
@@ -319,8 +321,8 @@ impl DropGlueBuilder {
                     )
                 });
 
-            match &field.field_type {
-                HirType::Struct {
+            match &field.field_type.kind {
+                HirTypeKind::Struct {
                     name: field_struct_name,
                     ..
                 } => {
@@ -334,7 +336,7 @@ impl DropGlueBuilder {
                         });
                     }
                 }
-                HirType::OwnedPointer { inner, allocator } => {
+                HirTypeKind::OwnedPointer { inner, allocator } => {
                     let resolved: Option<ProvenanceAnnotation<'bump>> =
                         (*allocator).or_else(|| {
                             find_allocator_field(structs, allocator_kind, struct_name)
@@ -345,8 +347,8 @@ impl DropGlueBuilder {
                                     )]),
                                 })
                                 .or_else(|| {
-                                    let pointee_name = match **inner {
-                                        HirType::Struct { name, .. } => Some(name),
+                                    let pointee_name = match inner.kind {
+                                        HirTypeKind::Struct { name, .. } => Some(name),
                                         _ => None,
                                     }?;
                                     let alloc_field = find_allocator_field(
@@ -441,7 +443,7 @@ impl DropGlueBuilder {
                         offset,
                     });
 
-                    let ptr_val = if matches!(pointee_ty, HirType::Slice(_)) {
+                    let ptr_val = if matches!(pointee_ty.kind, HirTypeKind::Slice(_)) {
                         field_addr
                     } else {
                         let loaded = emitter.current_block_data.fresh_value();
