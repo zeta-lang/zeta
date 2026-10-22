@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use anyhow::Result;
 use lsp_server::{Connection, Message};
 use lsp_types::{
@@ -7,7 +9,10 @@ use lsp_types::{
     TextDocumentSyncSaveOptions,
 };
 
-use crate::{dispatch, state::ServerState};
+use crate::{
+    dispatch,
+    state::{CompletionCache, ServerState},
+};
 
 pub struct Server<'a, 'bump> {
     connection: Connection,
@@ -28,6 +33,7 @@ where
                 workspace_root: None,
                 documents: Default::default(),
                 should_exit: false,
+                completion_cache: CompletionCache::default(),
             },
         })
     }
@@ -43,6 +49,9 @@ where
                     })),
                     ..Default::default()
                 },
+            )),
+            implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(
+                true,
             )),
             document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
             definition_provider: Some(lsp_types::OneOf::Left(true)),
@@ -71,25 +80,59 @@ where
         let initialize_params = self.connection.initialize(capabilities)?;
         dispatch::initialize(&mut self.state, initialize_params)?;
 
-        for message in &self.connection.receiver {
+        let mut queue: VecDeque<Message> = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                match self.connection.receiver.recv() {
+                    Ok(m) => queue.push_back(m),
+                    Err(_) => break,
+                }
+            }
+            while let Ok(m) = self.connection.receiver.try_recv() {
+                queue.push_back(m);
+            }
+            let Some(message) = queue.pop_front() else {
+                continue;
+            };
             match message {
                 Message::Request(req) => {
                     if self.connection.handle_shutdown(&req)? {
                         break;
                     }
-                    dispatch::request(&self.connection, &mut self.state, &req)?;
+                    if let Err(e) = dispatch::request(&self.connection, &mut self.state, &req) {
+                        eprintln!("[zeta-lsp] {} failed: {e}", req.method);
+                        let _ = self.connection.sender.send(Message::Response(
+                            lsp_server::Response::new_err(
+                                req.id.clone(),
+                                lsp_server::ErrorCode::InternalError as i32,
+                                e.to_string(),
+                            ),
+                        ));
+                    }
                 }
-                Message::Notification(notification) => {
-                    dispatch::notification(&self.connection, &mut self.state, &notification)?;
+                Message::Notification(n) => {
+                    let superseded = n.method == "textDocument/didChange"
+                        && matches!(queue.front(), Some(Message::Notification(next))
+                            if next.method == "textDocument/didChange" && uri_of(next) == uri_of(&n));
+                    if let Err(e) =
+                        dispatch::notification(&self.connection, &mut self.state, &n, !superseded)
+                    {
+                        eprintln!("[zeta-lsp] {} failed: {e}", n.method);
+                    }
                     if self.state.should_exit {
                         break;
                     }
                 }
-                Message::Response(response) => {
-                    dispatch::response(&mut self.state, &response)?;
-                }
+                Message::Response(_) => {}
             }
         }
         Ok(())
     }
+}
+
+fn uri_of(n: &lsp_server::Notification) -> Option<String> {
+    n.params
+        .pointer("/textDocument/uri")?
+        .as_str()
+        .map(str::to_owned)
 }

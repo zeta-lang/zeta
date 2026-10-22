@@ -31,6 +31,23 @@ pub fn doc_comment_above(source: &str, decl_line: usize) -> Option<String> {
     Some(docs.join("\n"))
 }
 
+pub fn first_doc_block(source: &str) -> Option<String> {
+    let mut docs: Vec<&str> = Vec::new();
+    for line in source.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("///") {
+            docs.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if !docs.is_empty() {
+            break;
+        }
+    }
+    if docs.is_empty() {
+        None
+    } else {
+        Some(docs.join("\n"))
+    }
+}
+
 pub fn format_as_zeta_comments(docs: &str) -> String {
     let mut out = String::new();
     for line in docs.lines() {
@@ -44,4 +61,3 @@ pub fn format_as_zeta_comments(docs: &str) -> String {
     }
     out
 }
-

@@ -1,8 +1,5 @@
-use ir::{
-    hir::{HirType, StrId},
-    span::SourceSpan,
-};
-use sentinel_typechecker::type_checker::SymbolId;
+use ir::{hir::HirType, span::SourceSpan};
+use sentinel_typechecker::type_checker::{Occurrence, SymbolId};
 
 /// Byte offset within `line` corresponding to a UTF-16 code-unit offset
 /// (LSP's `Position.character`). Clamped to `line`'s length if `utf16_offset`
@@ -104,7 +101,7 @@ pub fn span_to_range(
     }
 }
 
-fn contains(span: &SourceSpan, line: usize, column: usize) -> bool {
+pub fn span_contains(span: &SourceSpan, line: usize, column: usize) -> bool {
     if line < span.line || line > span.end_line {
         return false;
     }
@@ -125,52 +122,30 @@ fn span_width(span: &SourceSpan) -> usize {
     }
 }
 
-pub fn tightest_occurrence<'a, 'bump>(
-    occurrences: &[(
-        SourceSpan<'a>,
-        StrId,
-        HirType<'a, 'bump>,
-        usize,
-        SymbolId,
-        bool,
-    )],
+pub fn tightest_occurrence<'o, 'a, 'bump>(
+    occurrences: &'o [Occurrence<'a, 'bump>],
     module_idx: usize,
     line: usize,
     column: usize,
-) -> Option<(StrId, HirType<'a, 'bump>, SymbolId)> {
+) -> Option<&'o Occurrence<'a, 'bump>> {
     occurrences
         .iter()
-        .filter(|(span, _, _, m, _, _)| *m == module_idx && contains(span, line, column))
-        .min_by_key(|(span, _, _, _, _, _)| span_width(span))
-        .map(|(_, name, ty, _, sid, _)| (*name, *ty, *sid))
+        .filter(|o| o.module_idx == module_idx && span_contains(&o.span, line, column))
+        .min_by_key(|o| span_width(&o.span))
 }
 
 pub fn declaration_span<'a, 'bump>(
-    occurrences: &[(
-        SourceSpan<'a>,
-        StrId,
-        HirType<'a, 'bump>,
-        usize,
-        SymbolId,
-        bool,
-    )],
+    occurrences: &[Occurrence<'a, 'bump>],
     symbol_id: SymbolId,
 ) -> Option<SourceSpan<'a>> {
     occurrences
         .iter()
-        .find(|(_, _, _, _, sid, is_decl)| *sid == symbol_id && *is_decl)
-        .map(|(span, ..)| *span)
+        .find(|o| o.symbol == symbol_id && o.is_decl)
+        .map(|o| o.span)
 }
 
 pub fn nearest_prior_occurrence<'a, 'bump>(
-    occurrences: &[(
-        SourceSpan<'a>,
-        StrId,
-        HirType<'a, 'bump>,
-        usize,
-        SymbolId,
-        bool,
-    )],
+    occurrences: &[Occurrence<'a, 'bump>],
     module_idx: usize,
     name: &str,
     line: usize,
@@ -178,13 +153,13 @@ pub fn nearest_prior_occurrence<'a, 'bump>(
 ) -> Option<HirType<'a, 'bump>> {
     occurrences
         .iter()
-        .filter(|(span, occ_name, _, m, _, _)| {
-            *m == module_idx
-                && occ_name.to_string() == name
-                && (span.line < line || (span.line == line && span.column <= column))
+        .filter(|o| {
+            o.module_idx == module_idx
+                && o.name == name
+                && (o.span.line < line || (o.span.line == line && o.span.column <= column))
         })
-        .max_by_key(|(span, _, _, _, _, _)| (span.line, span.column))
-        .map(|(_, _, ty, _, _, _)| *ty)
+        .max_by_key(|o| (o.span.line, o.span.column))
+        .map(|o| o.ty)
 }
 
 pub fn span_text(source: &str, span: &SourceSpan) -> Option<String> {
@@ -218,4 +193,11 @@ pub fn byte_offset_in_source(source: &str, position: lsp_types::Position) -> usi
     }
 
     source.len()
+}
+
+/// Is the 0-indexed LSP `position` inside `range`? End-inclusive, so a cursor sitting right
+/// after the last character of an identifier still counts.
+pub fn range_contains(range: &lsp_types::Range, position: lsp_types::Position) -> bool {
+    let p = (position.line, position.character);
+    (range.start.line, range.start.character) <= p && p <= (range.end.line, range.end.character)
 }
