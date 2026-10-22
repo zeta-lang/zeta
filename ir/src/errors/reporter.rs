@@ -1,5 +1,5 @@
 use crate::errors::error::DiagnosticError;
-use crate::errors::type_error::{TypeError, TypeErrorKind};
+use crate::errors::type_error::{TypeError, TypeErrorKind, TypeWarning};
 use crate::span::SourceSpan;
 use is_terminal::IsTerminal;
 use owo_colors::OwoColorize;
@@ -33,15 +33,21 @@ pub struct ErrorReporter<'a> {
     pub errors: Vec<CompilerError<'a>>,
     pub source_files: HashMap<String, String>,
     pub use_colors: bool,
+    pub warnings: Vec<TypeWarning<'a>>,
 }
 
 impl<'a> ErrorReporter<'a> {
     pub fn new() -> Self {
         Self {
             errors: Vec::new(),
+            warnings: Vec::new(),
             source_files: HashMap::new(),
             use_colors: std::io::stderr().is_terminal(),
         }
+    }
+
+    pub fn add_type_warning(&mut self, w: TypeWarning<'a>) {
+        self.warnings.push(w);
     }
 
     pub fn with_colors(mut self, use_colors: bool) -> Self {
@@ -65,6 +71,7 @@ impl<'a> ErrorReporter<'a> {
     /// Used when a call spans multiple files (load_directory, bootstrap_stdlib).
     pub fn merge(&mut self, mut other: Self) {
         self.errors.append(&mut other.errors);
+        self.warnings.append(&mut other.warnings);
         self.source_files.extend(other.source_files);
     }
 
@@ -77,6 +84,18 @@ impl<'a> ErrorReporter<'a> {
     }
 
     pub fn report_all(&self) {
+        for w in &self.warnings {
+            let diagnostic = Diagnostic {
+                level: DiagnosticLevel::Warning,
+                message: w.kind.to_string(),
+                span: (w.span != SourceSpan::default()).then_some(w.span),
+                notes: vec![],
+                suggestions: vec![
+                    "Raise the type's visibility or lower the function's".to_string(),
+                ],
+            };
+            self.print_diagnostic(&diagnostic);
+        }
         for error in &self.errors {
             self.report_error(error);
         }
