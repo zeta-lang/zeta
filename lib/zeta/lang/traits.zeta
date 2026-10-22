@@ -1,55 +1,60 @@
 package zeta::lang::traits;
 
-// Marker interface: types that implement `Copy` may be duplicated bitwise
-// (a plain memory copy) instead of being moved. No method is required
-// because the compiler performs the copy itself; implementing `Copy` is
-// just a promise that doing so is always safe and cheap.
+/// Marker interface: types that implement `Copy` may be duplicated bitwise
+/// (a plain memory copy) instead of being moved.
+///
+/// because the compiler performs the copy itself; implementing `Copy` is
+/// just a promise that doing so is always safe and cheap.
 public interface Copy {
 }
 
-// Types that support making an explicit, possibly expensive duplicate of
-// themselves (allocations, refcount bumps, deep copies of owned data...).
-// Unlike `Copy`, cloning is never implicit and must be spelled out with a
-// call to `.clone()`.
+/// Types that support making an explicit, possibly expensive duplicate of
+/// themselves (allocations, refcount bumps, deep copies of owned data...).
+///
+/// Unlike `Copy`, cloning is never implicit and must be spelled out with a
+/// call to `.clone()`.
 public interface Clone {
     func clone(&this): This;
 }
 
-// Types that need to run cleanup logic before their storage is reclaimed,
-// e.g. freeing memory, closing file handles, releasing locks, etc.
-// `drop` takes `this` by value (moved, mutably) so it consumes the value
-// exactly once and may still mutate its own fields while tearing down.
+/// Types that need to run cleanup logic before their storage is reclaimed,
+/// e.g. freeing memory, closing file handles, releasing locks, etc.
+///
+/// `drop` takes `this` by value (moved, mutably) so it consumes the value
+/// exactly once and may still mutate its own fields while tearing down.
+///
+/// This is incompatible with `Copy`.
 public interface Drop {
-    func drop(mut this): void;
+    public func drop(mut this): void;
 }
 
-// Explicit equality. There is intentionally no operator-overload mechanism
-// here; callers use `.eq()` / `.ne()`.
-//
-// For example:
-//     a.eq(b)
-//     a.ne(b)
+/// Explicit equality. There is intentionally no operator-overload mechanism
+/// here; callers use `.eq()` / `.ne()`.
+///
+/// For example:
+///     a.eq(b)
+///     a.ne(b)
 public interface PartialEq {
-    func eq(&this, other: &This): bool;
-    func ne(&this, other: &This): bool;
+    public func eq(&this, other: &This): bool;
+    public func ne(&this, other: &This): bool;
 }
 
-// Marker meaning equality is an equivalence relation for this type.
-//
-// A type implementing Eq should also implement PartialEq.
+/// Marker meaning equality is an equivalence relation for this type.
+///
+/// A type implementing Eq should also implement PartialEq.
 public interface Eq {
 }
 
-// Auto marker: a value of this type can be moved to another thread.
-// Derived structurally by the compiler (see `auto_traits.rs`). Raw pointers
-// opt out, so wrappers over them need `unsafe impl X by Send`.
+/// Auto marker: a value of this type can be moved to another thread.
+/// Derived structurally by the compiler. Raw pointers
+/// opt out, so wrappers over them need `unsafe impl X by Send`.
 public interface Send {
 }
 
-// Auto marker: `&T` can be shared between threads (so `&T: Send` if `T: Sync`).
+/// Auto marker: `&T` can be shared between threads (so `&T: Send` if `T: Sync`).
 public interface Sync {
 }
 
 public interface Hash {
-    func hash(&this): usize;
+    public func hash(&this): usize;
 }

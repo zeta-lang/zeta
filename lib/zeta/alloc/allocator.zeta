@@ -1,36 +1,36 @@
 package zeta::alloc::allocator;
 
-interface Allocator {
-    func alloc<T>(&this): ^T;
+public interface Allocator {
+    public func alloc<T>(&this): ^T;
 
-    func calloc<T>(&this, count: usize): ^[]T;
+    public func calloc<T>(&this, count: usize): ^[]T;
 
-    func realloc<T>(
+    public func realloc<T>(
         &this,
         value: ^[]T,
         new_len: usize
     ): ^[]T;
 
-    func new<T>(&this, value: T): ^T;
+    public func new<T>(&this, value: T): ^T;
 
-    func free<T>(&this, value: ^T);
+    public func free<T>(&this, value: ^T);
 
-    func free_slice<T>(&this, value: ^[]T);
+    public func free_slice<T>(&this, value: ^[]T);
 
-    unsafe func alloc_raw(
+    public unsafe func alloc_raw(
         &this,
         size: usize,
         align: usize
     ): [*]mut u8;
 
-    unsafe func calloc_raw(
+    public unsafe func calloc_raw(
         &this,
         count: usize,
         size: usize,
         align: usize
     ): [*]mut u8;
 
-    unsafe func realloc_raw(
+    public unsafe func realloc_raw(
         &this,
         ptr: [*]mut u8,
         old_size: usize,
@@ -38,7 +38,7 @@ interface Allocator {
         align: usize
     ): [*]mut u8;
 
-    unsafe func free_raw(
+    public unsafe func free_raw(
         &this,
         ptr: [*]mut u8,
         size: usize,
@@ -46,21 +46,21 @@ interface Allocator {
     );
 }
 
-interface RawAllocator {
-    unsafe func alloc_raw(
+public interface RawAllocator {
+    public unsafe func alloc_raw(
         &this,
         size: usize,
         align: usize
     ): [*]mut u8;
 
-    unsafe func calloc_raw(
+    public unsafe func calloc_raw(
         &this,
         count: usize,
         size: usize,
         align: usize
     ): [*]mut u8;
 
-    unsafe func realloc_raw(
+    public unsafe func realloc_raw(
         &this,
         ptr: [*]mut u8,
         old_size: usize,
@@ -68,7 +68,7 @@ interface RawAllocator {
         align: usize
     ): [*]mut u8;
 
-    unsafe func free_raw(
+    public unsafe func free_raw(
         &this,
         ptr: [*]mut u8,
         size: usize,

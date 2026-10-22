@@ -12,7 +12,9 @@ import zeta::to_string.ToString;
 import zeta::string.String;
 import zeta::utils::mallocator.Mallocator;
 
-struct DateTime {
+public const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+public struct DateTime {
     year: i32,
     month: u8,
     day: u8,
@@ -27,12 +29,12 @@ struct DateTime {
 }
 
 
-func is_leap_year(year: i32): bool {
+public func is_leap_year(year: i32): bool {
     return (year % 4 == 0 && year % 100 != 0) ||
            (year % 400 == 0);
 }
 
-func days_in_month(year: i32, month: u8): u8 {
+public func days_in_month(year: i32, month: u8): u8 {
     match (month) {
         case 1 -> return 31;
         case 2 -> {
@@ -55,7 +57,7 @@ func days_in_month(year: i32, month: u8): u8 {
     }
 }
 
-func fixed_digits(bytes: &[]u8, start: usize, count: usize):
+public func fixed_digits(bytes: &[]u8, start: usize, count: usize):
     Result<u32, ParseError> {
 
     if (start + count > bytes.len) {
@@ -318,8 +320,10 @@ impl DateTime by Parse {
             },
         };
     }
+}
 
-    func now(): DateTime {
+impl DateTime {
+    public func now(): DateTime {
         let mut ts: Timespec = Timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -343,19 +347,19 @@ impl DateTime by Parse {
         );
     }
 
-    func from_minutes(minutes: i64): DateTime {
+    public func from_minutes(minutes: i64): DateTime {
         return DateTime.normalize(minutes * 60, 0);
     }
 
-    func from_hours(hours: i64): DateTime {
+    public func from_hours(hours: i64): DateTime {
         return DateTime.normalize(hours * 3600, 0);
     }
 
-    func from_days(days: i64): DateTime {
+    public func from_days(days: i64): DateTime {
         return DateTime.normalize(days * 86400, 0);
     }
 
-    func normalize(seconds: i64, nanosecond: i64): DateTime {
+    public func normalize(seconds: i64, nanosecond: i64): DateTime {
         let mut sec: i64 = seconds + nanosecond / 1000000000;
         let mut nano: i64 = nanosecond % 1000000000;
 
@@ -371,7 +375,7 @@ impl DateTime by Parse {
         );
     }
 
-    func from_seconds(seconds: i64, nanosecond: u32, offset_minutes: i32): DateTime {
+    public func from_seconds(seconds: i64, nanosecond: u32, offset_minutes: i32): DateTime {
         let local_seconds: i64 = seconds + (offset_minutes as i64) * 60;
 
         let mut days: i64 = local_seconds / 86400;
@@ -393,7 +397,7 @@ impl DateTime by Parse {
     }
 
     /// Unix timestamp (UTC seconds).
-    func to_seconds(&this): i64 {
+    public func to_seconds(&this): i64 {
         let days: i64 = days_from_civil(this.year, this.month, this.day);
         let seconds_of_day: i64 =
             (this.hour as i64) * 3600 +
@@ -402,16 +406,7 @@ impl DateTime by Parse {
         return days * 86400 + seconds_of_day - (this.offset_minutes as i64) * 60;
     }
 
-    func now(): DateTime {
-        let mut ts: Timespec = Timespec { tv_sec: 0, tv_nsec: 0 };
-        let result: i32 = unsafe { libc_time.clock_gettime(CLOCK_REALTIME, &mut ts) };
-        if (result != 0) {
-            debug.debug_panic("clock_gettime(CLOCK_REALTIME) failed");
-        }
-        return DateTime.from_seconds(ts.tv_sec, ts.tv_nsec as u32, 0);
-    }
-
-    func add(&this, delta: Duration): DateTime {
+    public func add(&this, delta: Duration): DateTime {
         let mut secs: i64 = this.to_seconds() + delta.seconds;
         let mut nanos: i64 = (this.nanosecond as i64) + delta.nanosecond;
 
@@ -426,12 +421,12 @@ impl DateTime by Parse {
         return DateTime.from_seconds(secs, nanos as u32, this.offset_minutes);
     }
 
-    func subtract(&this, delta: Duration): DateTime {
+    public func subtract(&this, delta: Duration): DateTime {
         return this.add(Duration.normalize(-delta.seconds, -(delta.nanosecond as i64)));
     }
 
     /// `this - other`
-    func difference(&this, other: DateTime): Duration {
+    public func difference(&this, other: DateTime): Duration {
         return Duration.normalize(
             this.to_seconds() - other.to_seconds(),
             (this.nanosecond as i64) - (other.nanosecond as i64)
@@ -439,7 +434,7 @@ impl DateTime by Parse {
     }
 }
 
-func days_from_civil(
+public func days_from_civil(
     year: i32,
     month: u8,
     day: u8
@@ -483,7 +478,7 @@ func days_from_civil(
     return era * 146097 + doe - 719468;
 }
 
-func civil_from_days(days: i64):
+public func civil_from_days(days: i64):
     DateTime {
 
     let z: i64 = days + 719468;

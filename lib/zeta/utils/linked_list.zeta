@@ -10,7 +10,7 @@ struct Node<T> {
     next: ?^Node<T>,
 }
 
-struct LinkedList<T, A: Allocator = Mallocator> {
+public struct LinkedList<T, A: Allocator = Mallocator> {
     head: ?^Node<T>,
     tail: ?&alias Node<T>,
     len: usize,
@@ -18,7 +18,7 @@ struct LinkedList<T, A: Allocator = Mallocator> {
 }
 
 impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
-    func new(): LinkedList<T, Mallocator> {
+    public func new(): LinkedList<T, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return LinkedList<T, Mallocator> {
             head: null,
@@ -28,7 +28,7 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
         };
     }
 
-    func push_back(&mut this, value: T) {
+    public func push_back(&mut this, value: T) {
         let node: ^Node<T> = this.alloc.new<Node<T>>(Node<T> {
             value: value,
             prev: null,
@@ -51,7 +51,7 @@ impl<T, A: Allocator = Mallocator> LinkedList<T, A> {
         this.len += 1;
     }
 
-    func remove_back(&mut this): ?T {
+    public func remove_back(&mut this): ?T {
         let tail: ?&alias Node<T> = this.tail;
 
         if (tail == null) {

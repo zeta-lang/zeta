@@ -2,7 +2,7 @@ package zeta::io_error;
 
 import zeta::libc;
 
-enum IOError {
+public enum IOError {
     NotFound,
     PermissionDenied,
     AlreadyExists,
@@ -14,15 +14,15 @@ enum IOError {
     Other { err_no: i32 },
 }
 
-const ENOENT: i32 = 2;
-const EINTR:  i32 = 4;
-const EAGAIN: i32 = 11;
-const EACCES: i32 = 13;
-const EEXIST: i32 = 17;
-const EINVAL: i32 = 22;
+public const ENOENT: i32 = 2;
+public const EINTR:  i32 = 4;
+public const EAGAIN: i32 = 11;
+public const EACCES: i32 = 13;
+public const EEXIST: i32 = 17;
+public const EINVAL: i32 = 22;
 
 impl IOError {
-    func from_errno(): IOError {
+    public func from_errno(): IOError {
         let code: i32 = unsafe { *libc.__errno_location() };
         return match (code) {
             case 2 -> IOError.NotFound,

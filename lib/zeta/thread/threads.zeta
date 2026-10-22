@@ -30,7 +30,7 @@ struct JoinHandleInner<R, A: Allocator> {
     slot: ^ResultSlot<R, A>,
 }
 
-struct JoinHandle<R, A: Allocator> {
+public struct JoinHandle<R, A: Allocator> {
     manual inner: JoinHandleInner<R, A>,
 }
 
@@ -61,8 +61,8 @@ func reclaim_ctx<F: func(): R, R>(raw: [*]mut void, alloc: Mallocator): void {
         unsafe { $own(raw as [*]mut ThreadCtx<F, R, Mallocator>, alloc) };
 }
 
-func start_raw(ctx: [*]mut void): Pthread {
-    let mut tid: Pthread = uninit;
+public func start_raw(ctx: [*]mut void): Pthread {
+    let mut tid: Pthread = 0;
     let ret: i32 = unsafe {
         libc.pthread_create(&mut tid, null, thread_entry as [*]const void, ctx)
     };
@@ -72,7 +72,7 @@ func start_raw(ctx: [*]mut void): Pthread {
     return tid;
 }
 
-func spawn<F: Send + &static + func(): R, R: Send>(f: F): JoinHandle<R, Mallocator> {
+public func spawn<F: Send + &static + func(): R, R: Send>(f: F): JoinHandle<R, Mallocator> {
     let alloc: Mallocator = Mallocator {};
 
     let slot: ^ResultSlot<R, Mallocator> =
@@ -87,7 +87,7 @@ func spawn<F: Send + &static + func(): R, R: Send>(f: F): JoinHandle<R, Mallocat
         alloc,
     });
 
-    let mut tid: Pthread = uninit;
+    let mut tid: Pthread = 0;
     let raw_ctx: [*]mut void = unsafe { $leak(ctx) } as [*]mut void;
 
     let ret: i32 = unsafe {

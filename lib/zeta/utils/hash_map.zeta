@@ -11,13 +11,13 @@ struct Entry<K, V> {
     next: ?^Entry<K, V>,
 }
 
-struct HashMap<K: Hash + PartialEq, V, A: Allocator = Mallocator> {
+public struct HashMap<K: Hash + PartialEq, V, A: Allocator = Mallocator> {
     buckets: ^this.alloc []?^Entry<K, V>,
     alloc: A,
 }
 
 impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
-    func new(): HashMap<K, V, Mallocator> {
+    public func new(): HashMap<K, V, Mallocator> {
         let alloc: Mallocator = Mallocator {};
 
         return HashMap<K, V, Mallocator> {
@@ -26,7 +26,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         };
     }
 
-    func with_capacity(capacity: usize): HashMap<K, V, Mallocator> {
+    public func with_capacity(capacity: usize): HashMap<K, V, Mallocator> {
         let alloc: Mallocator = Mallocator {};
 
         let bucket_count: usize =
@@ -42,14 +42,14 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         };
     }
 
-    func new_in(alloc: A): HashMap<K, V, A> {
+    public func new_in(alloc: A): HashMap<K, V, A> {
         return HashMap<K, V, A> {
             buckets: alloc.calloc<?^Entry<K, V>>(16),
             alloc,
         };
     }
 
-    func with_capacity_in(capacity: usize, alloc: A): HashMap<K, V, A> {
+    public func with_capacity_in(capacity: usize, alloc: A): HashMap<K, V, A> {
         let bucket_count: usize =
             if (capacity < 1) {
                 1
@@ -63,19 +63,19 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         };
     }
 
-    func len(&this): usize {
+    public func len(&this): usize {
         return this.buckets.len;
     }
 
-    func cap(&this): usize {
+    public func cap(&this): usize {
         return this.buckets.cap;
     }
 
-    func is_empty(&this): bool {
+    public func is_empty(&this): bool {
         return this.buckets.len == 0;
     }
 
-    func insert(&mut this, key: K, value: V): ?V {
+    public func insert(&mut this, key: K, value: V): ?V {
         let bucket_count: usize = this.buckets.cap;
         let index: usize = key.hash() % bucket_count;
 
@@ -133,7 +133,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         return null;
     }
 
-    func get(&this, key: &K): ?&V {
+    public func get(&this, key: &K): ?&V {
         let index: usize = key.hash() % this.buckets.cap;
         let current: ?&Entry<K, V> = unsafe { &this.buckets[index] };
 
@@ -160,7 +160,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         }
     }
 
-    func get_mut(&mut this, key: &K): ?&mut V {
+    public func get_mut(&mut this, key: &K): ?&mut V {
         let index: usize = key.hash() % this.buckets.cap;
         let current: ?&mut Entry<K, V> = &mut this.buckets[index];
 
@@ -187,11 +187,11 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         }
     }
 
-    func contains_key(&this, key: &K): bool {
+    public func contains_key(&this, key: &K): bool {
         return this.get(key) != null;
     }
 
-    func remove(&mut this, key: &K): ?V {
+    public func remove(&mut this, key: &K): ?V {
         let index: usize = key.hash() % this.buckets.cap;
 
         let current: ?^Entry<K, V> = $replace(this.buckets[index], null);
@@ -237,7 +237,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         }
     }
 
-    func clear(&mut this) {
+    public func clear(&mut this) {
         let bucket_count: usize = this.buckets.cap;
 
         for (let mut i: usize = 0; i < bucket_count; i += 1) {
@@ -268,7 +268,7 @@ impl<K: Hash + PartialEq, V, A: Allocator = Mallocator> HashMap<K, V, A> {
         }
     }
 
-    func grow(&mut this) {
+    public func grow(&mut this) {
         let old_bucket_count: usize = this.buckets.cap;
 
         let new_bucket_count: usize =

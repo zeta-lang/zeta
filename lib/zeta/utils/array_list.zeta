@@ -13,13 +13,13 @@ public struct ArrayList<T, A: Allocator + Clone = Mallocator> {
     alloc: A,
 }
 
-struct ArrayListDrain<T, A: Allocator + Clone = Mallocator> {
+public struct ArrayListDrain<T, A: Allocator + Clone = Mallocator> {
     data: ArrayList<T, A>,
     index: usize,
 }
 
 impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
-    func new(): ArrayList<T, Mallocator> {
+    public func new(): ArrayList<T, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return ArrayList<T, Mallocator> {
             data: alloc.calloc<T>(16),
@@ -27,7 +27,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    func with_capacity(capacity: usize): ArrayList<T, Mallocator> {
+    public func with_capacity(capacity: usize): ArrayList<T, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return ArrayList<T, Mallocator> {
             data: alloc.calloc<T>(capacity),
@@ -35,33 +35,33 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    func new_in(alloc: A): ArrayList<T, A> {
+    public func new_in(alloc: A): ArrayList<T, A> {
         return ArrayList<T, A> {
             data: alloc.calloc<T>(16),
             alloc,
         };
     }
 
-    func with_capacity_in(capacity: usize, alloc: A): ArrayList<T, A> {
+    public func with_capacity_in(capacity: usize, alloc: A): ArrayList<T, A> {
         return ArrayList<T, A> {
             data: alloc.calloc<T>(capacity),
             alloc,
         };
     }
 
-    func len(&this): usize {
+    public func len(&this): usize {
         return this.data.len;
     }
 
-    func cap(&this): usize {
+    public func cap(&this): usize {
         return this.data.cap;
     }
 
-    func is_empty(&this): bool {
+    public func is_empty(&this): bool {
         return this.data.len == 0;
     }
 
-    func push(&mut this, value: T) {
+    public func push(&mut this, value: T) {
         this.reserve(1);
 
         unsafe {
@@ -70,7 +70,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
     }
 
-    func pop(&mut this): ?T {
+    public func pop(&mut this): ?T {
         if (this.data.len == 0) {
             return null;
         }
@@ -82,15 +82,15 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    func get(&this, index: usize): &T {
+    public func get(&this, index: usize): &T {
         return unsafe { &this.data[index] };
     }
 
-    func get_mut(&mut this, index: usize): &mut T {
+    public func get_mut(&mut this, index: usize): &mut T {
         return &mut this.data[index];
     }
 
-    func try_get(&this, index: usize): ?&T {
+    public func try_get(&this, index: usize): ?&T {
         return if (index >= this.data.len) {
             null
         } else {
@@ -98,7 +98,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    func try_get_mut(&mut this, index: usize): ?&mut T {
+    public func try_get_mut(&mut this, index: usize): ?&mut T {
         return if (index >= this.data.len) {
             null
         } else {
@@ -106,17 +106,17 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    unsafe func get_unchecked(&this, index: usize): &T {
+    public unsafe func get_unchecked(&this, index: usize): &T {
         let ptr: *const T = this.data as *const T;
         unsafe { return &ptr[index] };
     }
 
-    unsafe func get_unchecked_mut(&mut this, index: usize): &mut T {
+    public unsafe func get_unchecked_mut(&mut this, index: usize): &mut T {
         let ptr: *mut T = this.data as *mut T;
         unsafe { return &mut ptr[index] };
     }
 
-    func reserve(&mut this, additional: usize) {
+    public func reserve(&mut this, additional: usize) {
         let required: usize = this.data.len + additional;
 
         if (required <= this.data.cap) {
@@ -141,7 +141,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
     }
 
-    func insert(&mut this, index: usize, value: T) {
+    public func insert(&mut this, index: usize, value: T) {
         if (index > this.data.len) {
             debug.debug_panic("ArrayList::insert index out of bounds");
         }
@@ -157,7 +157,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
     }
 
-    func contains(&this, value: &T): bool {
+    public func contains(&this, value: &T): bool {
         let mut i: usize = 0;
 
         while (i < this.data.len) {
@@ -171,7 +171,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         return false;
     }
 
-    func remove(&mut this, index: usize): T {
+    public func remove(&mut this, index: usize): T {
         if (index >= this.data.len) {
             debug.debug_panic("ArrayList::remove index out of bounds");
         }
@@ -191,7 +191,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
     }
 
-    func swap_remove(&mut this, index: usize): T {
+    public func swap_remove(&mut this, index: usize): T {
         if (index >= this.data.len) {
             debug.debug_panic("ArrayList::swap_remove index out of bounds");
         }
@@ -208,7 +208,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         }
     }
 
-    func drain(&mut this): ArrayListDrain<T, A> {
+    public func drain(&mut this): ArrayListDrain<T, A> {
         let mut drained: ArrayList<T, A> =
             ArrayList.with_capacity_in<T, A>(this.data.len, this.alloc.clone());
 
@@ -224,11 +224,11 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
         };
     }
 
-    func as_slice(&this): &[]T {
+    public func as_slice(&this): &[]T {
         return unsafe { this.data[0..<this.data.len] };
     }
 
-    func clear(&mut this) {
+    public func clear(&mut this) {
         let ptr: [*]mut T = this.data as [*]mut T;
 
         while (this.data.len > 0) {
@@ -245,7 +245,7 @@ impl<T, A: Allocator + Clone = Mallocator> ArrayList<T, A> {
 }
 
 impl<T, A: Allocator> ArrayListDrain<T, A> {
-    func next(&mut this): ?T {
+    public func next(&mut this): ?T {
         if (this.index >= this.data.len()) {
             return null;
         }
@@ -256,7 +256,7 @@ impl<T, A: Allocator> ArrayListDrain<T, A> {
         return value;
     }
 
-    func len(&this): usize {
+    public func len(&this): usize {
         if (this.index >= this.data.len()) {
             return 0;
         }

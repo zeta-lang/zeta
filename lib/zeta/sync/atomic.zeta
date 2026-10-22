@@ -14,7 +14,7 @@ type AtomicI64 = Atomic<i64>;
 type AtomicIsize = Atomic<isize>;
 
 #[known]
-enum Ordering {
+public enum Ordering {
     Relaxed,
     Acquire,
     Release,
@@ -22,25 +22,25 @@ enum Ordering {
     SeqCst,
 }
 
-struct Atomic<T> {
+public struct Atomic<T> {
     value: T,
 }
 
 impl<T> Atomic<T> {
-    func new(value: T): Atomic<T> {
+    public func new(value: T): Atomic<T> {
         return Atomic<T> {
             value: value,
         };
     }
 
-    func load(&this, ordering: Ordering): T {
+    public func load(&this, ordering: Ordering): T {
         return $atomic_load<T>(
             &this.value,
             ordering,
         );
     }
 
-    func store(
+    public func store(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -52,7 +52,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func swap(
+    public func swap(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -64,7 +64,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func compare_exchange(
+    public func compare_exchange(
         &mut this,
         expected: T,
         desired: T,
@@ -80,7 +80,7 @@ impl<T> Atomic<T> {
         ) == expected;
     }
 
-    func fetch_add(
+    public func fetch_add(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -92,7 +92,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func fetch_sub(
+    public func fetch_sub(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -104,7 +104,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func fetch_and(
+    public func fetch_and(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -116,7 +116,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func fetch_or(
+    public func fetch_or(
         &mut this,
         value: T,
         ordering: Ordering,
@@ -128,7 +128,7 @@ impl<T> Atomic<T> {
         );
     }
 
-    func fetch_xor(
+    public func fetch_xor(
         &mut this,
         value: T,
         ordering: Ordering,

@@ -5,7 +5,7 @@ import zeta::time::libc_time.Timespec;
 import zeta::time::libc_time;
 import zeta::debug;
 
-func sleep(duration: Duration): void {
+public func sleep(duration: Duration): void {
     if (duration.is_negative() || duration.is_zero()) {
         return;
     }

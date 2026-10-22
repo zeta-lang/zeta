@@ -7,13 +7,13 @@ import zeta::time::libc_time;
 import zeta::debug;
 
 
-struct Instant {
+public struct Instant {
     seconds: i64,
     nanosecond: i32,
 }
 
 impl Instant {
-    func now(): Instant {
+    public func now(): Instant {
         let mut ts: Timespec = Timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -37,8 +37,7 @@ impl Instant {
         };
     }
 
-
-    func add(&this, duration: Duration): Instant {
+    public func add(&this, duration: Duration): Instant {
         let mut seconds: i64 =
             this.seconds + duration.seconds;
 
@@ -62,18 +61,15 @@ impl Instant {
         };
     }
 
-
-    func subtract(&this, duration: Duration): Instant {
+    public func subtract(&this, duration: Duration): Instant {
         return this.add(duration.negate());
     }
 
-
-    func elapsed(&this): Duration {
+    public func elapsed(&this): Duration {
         return Instant.now().difference(*this);
     }
 
-
-    func difference(&this, earlier: Instant): Duration {
+    public func difference(&this, earlier: Instant): Duration {
         return Duration.normalize(
             this.seconds - earlier.seconds,
             (this.nanosecond as i64) -

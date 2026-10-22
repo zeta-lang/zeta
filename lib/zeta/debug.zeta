@@ -9,7 +9,8 @@ import zeta::result.Result;
 import zeta::strings;
 import zeta::libc;
 
-func debug_panic(msg: str): never {
+/// Debug panics
+public func debug_panic(msg: str): never {
     let fd: i32 = 2;
     let prefix: &[]u8 = "panic: ".as_bytes();
     let body: &[]u8 = msg.as_bytes();
@@ -23,7 +24,7 @@ func debug_panic(msg: str): never {
     $unreachable();
 }
 
-func assert(cond: bool, msg: str) {
+public func assert(cond: bool, msg: str) {
     if (!cond) {
         debug_panic(msg);
     }

@@ -7,14 +7,14 @@ import zeta::io_channel.ReadChannel;
 import zeta::io_channel.WriteChannel;
 import zeta::utils::array_list.ArrayList;
 
-const O_RDONLY: i32 = 0o0;
-const O_WRONLY: i32 = 0o1;
-const O_RDWR:   i32 = 0o2;
-const O_CREAT:  i32 = 0o100;
-const O_TRUNC:  i32 = 0o1000;
-const O_APPEND: i32 = 0o2000;
+public const O_RDONLY: i32 = 0o0;
+public const O_WRONLY: i32 = 0o1;
+public const O_RDWR:   i32 = 0o2;
+public const O_CREAT:  i32 = 0o100;
+public const O_TRUNC:  i32 = 0o1000;
+public const O_APPEND: i32 = 0o2000;
 
-const DEFAULT_MODE: i32 = 0o644;
+public const DEFAULT_MODE: i32 = 0o644;
 
 struct CPathBuf {
     buf: [4096]u8,
@@ -22,7 +22,8 @@ struct CPathBuf {
 }
 
 impl CPathBuf {
-    func from_str(path: str): CPathBuf {
+    unsafe func from_str(path: str): cbuf <- CPathBuf
+    ensures cbuf.buf[0..<path.len() + 1] != uninit {
         let bytes: &[]u8 = path.as_bytes();
         if (bytes.len >= 4096) {
             debug.debug_panic("path exceeds max length");
@@ -32,11 +33,6 @@ impl CPathBuf {
             cbuf.buf[i] = bytes[i];
         }
         cbuf.buf[bytes.len] = 0;
-        // SAFETY: Even if there are no bytes, the null terminator is still needed.
-        // By contract, when it reaches `open_with_flags` and goes through `libc.open`,
-        // the null terminator is used to determine the end of the path.
-        // Therefore, this is safe to call even if the rest of the buffer is uninitialized.
-        unsafe { $assume_init(cbuf.buf); }
         return cbuf;
     }
     unsafe func ptr(&this): [*]const u8 {
@@ -44,29 +40,29 @@ impl CPathBuf {
     }
 }
 
-struct File {
+public struct File {
     fd: i32,
 }
 
 impl File {
-    unsafe func from_raw_fd(fd: i32): File {
+    public unsafe func from_raw_fd(fd: i32): File {
         return File { fd };
     }
 
-    func open(path: str): Result<File, IOError> {
+    public func open(path: str): Result<File, IOError> {
         return File.open_with_flags(path, O_RDONLY, 0);
     }
 
-    func create(path: str): Result<File, IOError> {
+    public func create(path: str): Result<File, IOError> {
         return File.open_with_flags(path, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_MODE);
     }
 
-    func append(path: str): Result<File, IOError> {
+    public func append(path: str): Result<File, IOError> {
         return File.open_with_flags(path, O_WRONLY | O_CREAT | O_APPEND, DEFAULT_MODE);
     }
 
-    func open_with_flags(path: str, flags: i32, mode: i32): Result<File, IOError> {
-        let cpath: CPathBuf = CPathBuf.from_str(path);
+    public func open_with_flags(path: str, flags: i32, mode: i32): Result<File, IOError> {
+        let cpath: CPathBuf = unsafe { CPathBuf.from_str(path) };
         let fd: i32 = unsafe { libc.open(cpath.ptr(), flags, mode) };
         if (fd < 0) {
             return Result.Err { error: IOError.from_errno() };
@@ -74,18 +70,21 @@ impl File {
         return Result.Ok { value: File { fd } };
     }
 
-    func stdin(): File  { return File { fd: 0 }; }
-    func stdout(): File { return File { fd: 1 }; }
-    func stderr(): File { return File { fd: 2 }; }
+    public func stdin(): File  { return File { fd: 0 }; }
 
-    func reader(&this): FileReader {
+    public func stdout(): File { return File { fd: 1 }; }
+
+    public func stderr(): File { return File { fd: 2 }; }
+
+    public func reader(&this): FileReader {
         return FileReader { fd: this.fd };
     }
-    func writer(&this): FileWriter {
+
+    public func writer(&this): FileWriter {
         return FileWriter { fd: this.fd };
     }
 
-    func close(mut this): Result<void, IOError> {
+    public func close(mut this): Result<void, IOError> {
         let ret: i32 = unsafe { libc.close(this.fd) };
         if (ret < 0) {
             return Result.Err { error: IOError.from_errno() };
@@ -96,7 +95,8 @@ impl File {
 
 struct FileReader { fd: i32 }
 impl FileReader by ReadChannel {
-    unsafe func read_raw(&mut this, buffer: &mut []u8): Result<usize, IOError> {
+    unsafe func read_raw(&mut this, buffer: &mut []u8): Result<n <- usize, IOError>
+    ensures buffer[0..<n] != uninit {
         let n: isize = libc.read(this.fd, buffer as [*]mut void, buffer.len);
         if (n < 0) {
             return Result.Err { error: IOError.from_errno() };
@@ -143,6 +143,9 @@ impl FileReader by ReadChannel {
                 case Result.Err { error } -> return Result.Err { error },
             };
             if (n == 0) { break; }
+
+            // SAFETY: We never read more than needed
+            unsafe { $assume_init(chunk); }
             for (let mut i: usize = 0; i < n; i += 1) {
                 out.push(chunk[i]);
             }
@@ -161,6 +164,9 @@ impl FileReader by ReadChannel {
             };
             if (n == 0) { break; }
             total += 1;
+
+            // SAFETY: We never read more than needed
+            unsafe { $assume_init(byte); }
             if (byte[0] == '\n' as u8) { break; }
             out.push_byte(byte[0]);
         }
@@ -170,11 +176,11 @@ impl FileReader by ReadChannel {
 
 struct FileWriter { fd: i32 }
 impl FileWriter {
-    func write(&mut this, bytes: &[]u8): Result<usize, IOError> {
+    public func write(&mut this, bytes: &[]u8): Result<usize, IOError> {
         unsafe { return this.write_raw(bytes); };
     }
 
-    func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
+    public func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
         let mut written: usize = 0;
         while (written < bytes.len) {
             let n: usize = match (unsafe { this.write_raw(bytes[written..<bytes.len]) }) {
@@ -189,7 +195,7 @@ impl FileWriter {
         return Result.Ok { value: written };
     }
 
-    func writeln(&mut this, s: str): Result<usize, IOError> {
+    public func writeln(&mut this, s: str): Result<usize, IOError> {
         return match (this.write_all(s.as_bytes())) {
             case Result.Err { error } -> Result.Err { error },
             case Result.Ok { value } -> {
@@ -201,7 +207,7 @@ impl FileWriter {
         }
     }
 
-    func flush(&mut this): Result<bool, IOError> {
+    public func flush(&mut this): Result<bool, IOError> {
         return Result.Ok { value: false };
     }
 }

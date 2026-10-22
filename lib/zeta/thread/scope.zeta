@@ -24,7 +24,7 @@ struct ScopeState {
     threads: ArrayList<ScopedThread, Mallocator>,
 }
 
-struct Scope {
+public struct Scope {
     state: Mutex<ScopeState>,
 }
 
@@ -40,13 +40,13 @@ struct ScopedCtx<F, R> {
     slot: Arc<ScopedSlot<R>>,
 }
 
-struct ScopedJoinHandle<R> {
+public struct ScopedJoinHandle<R> {
     scope: &alias Scope,
     index: usize,
     slot: Arc<ScopedSlot<R>>,
 }
 
-func invoke_scoped<F: func(): R, R>(arg: [*]mut void): void {
+public func invoke_scoped<F: func(): R, R>(arg: [*]mut void): void {
     let raw: [*]mut ScopedCtx<F, R> = arg as [*]mut ScopedCtx<F, R>;
     let alloc: Mallocator = Mallocator {};
 
@@ -63,13 +63,13 @@ func invoke_scoped<F: func(): R, R>(arg: [*]mut void): void {
 }
 
 impl Scope {
-    func new(): Scope {
+    public func new(): Scope {
         return Scope {
             state: Mutex.new(ScopeState { threads: ArrayList.new() }),
         };
     }
 
-    func spawn<F: Send + func(): R, R: Send>(&alias this, f: F): ScopedJoinHandle<R> {
+    public func spawn<F: Send + func(): R, R: Send>(&alias this, f: F): ScopedJoinHandle<R> {
         let alloc: Mallocator = Mallocator {};
 
         let slot: Arc<ScopedSlot<R>> = Arc.new(ScopedSlot<R> { result: null });
@@ -97,7 +97,7 @@ impl Scope {
         };
     }
 
-    func join_all(&alias this) {
+    public func join_all(&alias this) {
         let mut i: usize = 0;
 
         while (true) {
@@ -128,7 +128,7 @@ impl Scope {
 }
 
 impl<R> ScopedJoinHandle<R> {
-    func join(mut this): Result<R, i32> {
+    public func join(mut this): Result<R, i32> {
         let mut tid: Pthread = uninit;
         let mut pending: bool = false;
 
@@ -165,7 +165,7 @@ impl<R> ScopedJoinHandle<R> {
     }
 }
 
-func scope<F: func(&alias Scope): R, R>(body: F): R {
+public func scope<F: func(&alias Scope): R, R>(body: F): R {
     let mut s: Scope = Scope.new();
 
     let result: R = body(&alias s);

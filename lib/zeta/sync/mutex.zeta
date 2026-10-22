@@ -3,7 +3,7 @@ package zeta::sync::mutex;
 import zeta::libc;
 import zeta::libc.PthreadMutex;
 
-struct Mutex<T> {
+public struct Mutex<T> {
     raw: libc.PthreadMutex,
     value: T,
 }
@@ -12,13 +12,13 @@ struct Mutex<T> {
 unsafe impl<T: Send> Mutex<T> by Send {}
 unsafe impl<T: Send> Mutex<T> by Sync {}
 
-struct MutexGuard<T> {
+public struct MutexGuard<T> {
     mutex: &alias Mutex<T>,
     ptr: [*]mut T,
 }
 
 impl<T> Mutex<T> {
-    func new(value: T): Mutex<T> {
+    public func new(value: T): Mutex<T> {
         let mut m: Mutex<T> = Mutex<T> {
             raw: libc.PthreadMutex { opaque: undefined },
             value: value,
@@ -29,7 +29,7 @@ impl<T> Mutex<T> {
         return m;
     }
 
-    func lock(&alias this): MutexGuard<T> {
+    public func lock(&alias this): MutexGuard<T> {
         if (libc.pthread_mutex_lock(&alias this.raw as [*]mut libc.PthreadMutex) != 0) {
             libc.abort();
         }
@@ -39,7 +39,7 @@ impl<T> Mutex<T> {
     }
 
     /// Returns null if the lock is already held.
-    func try_lock(&alias this): ?MutexGuard<T> {
+    public func try_lock(&alias this): ?MutexGuard<T> {
         if (libc.pthread_mutex_trylock(&alias this.raw as [*]mut libc.PthreadMutex) == 0) {
             let ptr: [*]mut T = &alias this.value as [*]mut T;
             return MutexGuard<T> { mutex: this, ptr: ptr };
@@ -55,15 +55,15 @@ impl<T> Mutex<T> by Drop {
 }
 
 impl<T> MutexGuard<T> {
-    func get(&this): &T {
+    public func get(&this): &T {
         return unsafe { &(*this.ptr) };
     }
 
-    func get_mut(&mut this): &mut T {
+    public func get_mut(&mut this): &mut T {
         return unsafe { &mut (*this.ptr) };
     }
 
-    func set(&mut this, value: T) {
+    public func set(&mut this, value: T) {
         *this.get_mut() = value;
     }
 }

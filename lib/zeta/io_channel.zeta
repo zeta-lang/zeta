@@ -7,14 +7,15 @@ import zeta::utils::array_list.ArrayList;
 import zeta::result.Result;
 import zeta::string.String;
 
-interface ReadChannel {
-    unsafe func read_raw(&mut this, buffer: &[]u8): Result<usize, IOError>;
+public interface ReadChannel {
+    unsafe func read_raw(&mut this, buffer: &mut []u8): Result<n <- usize, IOError>
+    ensures buffer[0..<n] != uninit;
 }
 
-interface WriteChannel {
-    unsafe func write_raw(&mut this, bytes: &[]u8): Result<usize, IOError>;
+public interface WriteChannel {
+    public unsafe func write_raw(&mut this, bytes: &[]u8): Result<usize, IOError>;
 
-    func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
+    public func write_all(&mut this, bytes: &[]u8): Result<usize, IOError> {
         let mut written: usize = 0;
         while (written < bytes.len) {
             let n: usize = match (unsafe { this.write_raw(bytes[written..<bytes.len]) }) {
@@ -26,6 +27,7 @@ interface WriteChannel {
             }
             written += n;
         }
+        
         return Result.Ok { value: written };
     }
 }

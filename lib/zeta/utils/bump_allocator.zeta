@@ -6,7 +6,7 @@ import zeta::libc;
 import zeta::alloc::allocator.Allocator;
 import zeta::utils::mallocator.Mallocator;
 
-struct BumpAllocator<A: Allocator> {
+public struct BumpAllocator<A: Allocator> {
     memory: ^this []u8,
     offset: usize,
     backing: A,
@@ -21,19 +21,19 @@ impl<A: Allocator = Mallocator> BumpAllocator<A> {
         };
     }
 
-    func capacity(&this): usize {
+    public func capacity(&this): usize {
         return this.memory.cap;
     }
 
-    func used(&this): usize {
+    public func used(&this): usize {
         return this.memory.len;
     }
 
-    func remaining(&this): usize {
+    public func remaining(&this): usize {
         return this.memory.cap - this.memory.len;
     }
 
-    func reset(&mut this) {
+    public func reset(&mut this) {
         unsafe {
             this.memory.len = 0;
         }
@@ -42,7 +42,7 @@ impl<A: Allocator = Mallocator> BumpAllocator<A> {
 }
 
 impl<A: Allocator = Mallocator> BumpAllocator<A> by Allocator {
-    func alloc<T>(&mut this): ^this T {
+    public func alloc<T>(&mut this): ^this T {
         let start: usize = align_up(this.memory.len, $alignof<T>());
         let end: usize = start + $sizeof<T>();
 
@@ -59,7 +59,7 @@ impl<A: Allocator = Mallocator> BumpAllocator<A> by Allocator {
         return $own(ptr as [*]mut T, this);
     }
 
-    func calloc<T>(&mut this, count: usize): ^this []T {
+    public func calloc<T>(&mut this, count: usize): ^this []T {
         let align: usize = $alignof<T>();
         let size: usize = count * $sizeof<T>();
 
@@ -86,22 +86,22 @@ impl<A: Allocator = Mallocator> BumpAllocator<A> by Allocator {
         );
     }
 
-    func new<T>(&mut this, value: T): ^this T {
+    public func new<T>(&mut this, value: T): ^this T {
         let ptr: ^this T = this.alloc<T>();
         *ptr = value;
         return ptr;
     }
 
-    func free<T>(&this, value: ^this T) {
+    public func free<T>(&this, value: ^this T) {
         // no-op
     }
 
-    func free_slice<T>(&this, value: ^this []T) {
+    public func free_slice<T>(&this, value: ^this []T) {
         // no-op
     }
 }
 
-func align_up(
+public func align_up(
     value: usize,
     align: usize
 ): usize {

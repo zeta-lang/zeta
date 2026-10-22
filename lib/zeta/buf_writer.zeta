@@ -12,28 +12,29 @@ import zeta::utils::array_list.ArrayList;
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 4096;
 
-struct BufWriter<W: WriteChannel, A: Allocator = Mallocator> {
+public struct BufWriter<W: WriteChannel, A: Allocator = Mallocator> {
     inner: W,
     buffer: ArrayList<u8, A>,
     lock: SpinLock,
     threshold: usize,
 }
+
 impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
-    func new(inner: W): BufWriter<W, Mallocator> {
+    public func new(inner: W): BufWriter<W, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return BufWriter.new_with_threshold_in(inner, alloc, DEFAULT_FLUSH_THRESHOLD);
     }
 
-    func new_in(inner: W, alloc: A): BufWriter<W, A> {
+    public func new_in(inner: W, alloc: A): BufWriter<W, A> {
         return BufWriter.new_with_threshold_in(inner, alloc, DEFAULT_FLUSH_THRESHOLD);
     }
 
-    func new_with_threshold(inner: W, threshold: usize): BufWriter<W, Mallocator> {
+    public func new_with_threshold(inner: W, threshold: usize): BufWriter<W, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return BufWriter.new_with_threshold_in(inner, alloc, threshold);
     }
 
-    func new_with_threshold_in(inner: W, alloc: A, threshold: usize): BufWriter<W, A> {
+    public func new_with_threshold_in(inner: W, alloc: A, threshold: usize): BufWriter<W, A> {
         return BufWriter<W, A> {
             inner,
             buffer: ArrayList.with_capacity_in<u8, A>(threshold, alloc),
@@ -42,7 +43,7 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
         };
     }
 
-    func flush(&mut this): Result<bool, IOError> {
+    public func flush(&mut this): Result<bool, IOError> {
         this.lock.lock();
         let result: Result<usize, IOError> = this.flush_locked();
         this.lock.unlock();
@@ -52,7 +53,7 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
         };
     }
 
-    func flush_locked(&mut this): Result<usize, IOError> {
+    public func flush_locked(&mut this): Result<usize, IOError> {
         if (this.buffer.len() == 0) {
             return Result.Ok { value: 0 };
         }
@@ -63,15 +64,15 @@ impl<W: WriteChannel, A: Allocator = Mallocator> BufWriter<W, A> {
         return result;
     }
 
-    func write(&mut this, string: str): Result<usize, IOError> {
+    public func write(&mut this, string: str): Result<usize, IOError> {
         return this.write_bytes(string.as_bytes());
     }
 
-    func write_bytes(&mut this, bytes: &[]u8): Result<usize, IOError> {
+    public func write_bytes(&mut this, bytes: &[]u8): Result<usize, IOError> {
         unsafe { return this.write_raw(bytes); };
     }
 
-    func writeln(&mut this, s: str): Result<usize, IOError> {
+    public func writeln(&mut this, s: str): Result<usize, IOError> {
         return match (this.write_all(s.as_bytes())) {
             case Result.Err { error } -> Result.Err { error },
             case Result.Ok { value } -> this.write_all("\n".as_bytes()),
@@ -108,18 +109,19 @@ impl<W: WriteChannel, A: Allocator> BufWriter<W, A> by Drop {
     }
 }
 
-struct BufReader<R: ReadChannel, A: Allocator = Mallocator> {
+public struct BufReader<R: ReadChannel, A: Allocator = Mallocator> {
     inner: R,
     buffer: ArrayList<u8, A>,
     pos: usize,
 }
+
 impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
-    func new(inner: R): BufReader<R, Mallocator> {
+    public func new(inner: R): BufReader<R, Mallocator> {
         let alloc: Mallocator = Mallocator {};
         return BufReader.new_in(inner, alloc);
     }
 
-    func new_in(inner: R, alloc: A): BufReader<R, A> {
+    public func new_in(inner: R, alloc: A): BufReader<R, A> {
         return BufReader<R, A> {
             inner,
             buffer: ArrayList.with_capacity_in<u8, A>(DEFAULT_FLUSH_THRESHOLD, alloc),
@@ -127,7 +129,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         };
     }
 
-    func fill_buffer(&mut this): Result<usize, IOError> {
+    public func fill_buffer(&mut this): Result<usize, IOError> {
         this.buffer.clear();
         this.pos = 0;
         let mut chunk: [4096]u8 = undefined;
@@ -141,7 +143,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: n };
     }
 
-    func read_exact(&mut this, buffer: &[]u8): Result<usize, IOError> {
+    public func read_exact(&mut this, buffer: &[]u8): Result<usize, IOError> {
         let mut filled: usize = 0;
         while (filled < buffer.len) {
             let n: usize = match (unsafe { this.read_raw(buffer[filled..<buffer.len]) }) {
@@ -156,7 +158,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: filled };
     }
 
-    func skip(&mut this, count: usize): Result<usize, IOError> {
+    public func skip(&mut this, count: usize): Result<usize, IOError> {
         let mut remaining: usize = count;
         let mut chunk: [4096]u8 = undefined;
         while (remaining > 0) {
@@ -171,7 +173,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: count - remaining };
     }
 
-    func read_to_end<A: Allocator>(&mut this, out: &mut ArrayList<u8, A>): Result<usize, IOError> {
+    public func read_to_end<A: Allocator>(&mut this, out: &mut ArrayList<u8, A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut chunk: [4096]u8 = undefined;
         while (true) {
@@ -188,7 +190,7 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
         return Result.Ok { value: total };
     }
 
-    func read_line<A: Allocator>(&mut this, out: &mut String<A>): Result<usize, IOError> {
+    public func read_line<A: Allocator>(&mut this, out: &mut String<A>): Result<usize, IOError> {
         let mut total: usize = 0;
         let mut byte: [1]u8 = undefined;
         while (true) {
@@ -206,7 +208,8 @@ impl<R: ReadChannel, A: Allocator = Mallocator> BufReader<R, A> {
 }
 
 impl<R: ReadChannel, A: Allocator> BufReader<R, A> by ReadChannel {
-    unsafe func read_raw(&mut this, out: &mut []u8): Result<usize, IOError> {
+    unsafe func read_raw(&mut this, out: &mut []u8): Result<n <- usize, IOError>
+    ensures out[0..<n] != uninit {
         if (this.pos >= this.buffer.len()) {
             let n: usize = match (this.fill_buffer()) {
                 case Result.Ok { value } -> value,

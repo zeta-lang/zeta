@@ -3,18 +3,18 @@ package zeta::sync::spinlock;
 import zeta::sync::atomic.Atomic;
 import zeta::sync::atomic.Ordering;
 
-struct SpinLock {
+public struct SpinLock {
     state: Atomic<u32>,
 }
 
 impl SpinLock {
-    func new(): SpinLock {
+    public func new(): SpinLock {
         return SpinLock {
             state: Atomic.new(0),
         };
     }
 
-    func lock(&mut this) {
+    public func lock(&mut this) {
         while (true) {
             if (this.state.compare_exchange(
                 0,
@@ -31,7 +31,7 @@ impl SpinLock {
         }
     }
 
-    func try_lock(&mut this): bool {
+    public func try_lock(&mut this): bool {
         return this.state.compare_exchange(
             0,
             1,
@@ -40,7 +40,7 @@ impl SpinLock {
         );
     }
 
-    func unlock(&mut this) {
+    public func unlock(&mut this) {
         this.state.store(
             0,
             Ordering.Release,

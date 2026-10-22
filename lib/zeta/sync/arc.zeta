@@ -8,12 +8,12 @@ import zeta::sync::atomic.Ordering;
 import zeta::libc;
 import zeta::io;
 
-struct ArcInner<T> {
+public struct ArcInner<T> {
     strong: Atomic<usize>,
     value: T,
 }
 
-struct Arc<T, A: Allocator = Mallocator> {
+public struct Arc<T, A: Allocator = Mallocator> {
     manual inner: [*]mut ArcInner<T>,
     alloc: A
 }
@@ -23,12 +23,12 @@ unsafe impl<T: Send + Sync, A: Allocator + Clone + Send> Arc<T, A> by Send {}
 unsafe impl<T: Send + Sync, A: Allocator + Clone + Sync> Arc<T, A> by Sync {}
 
 impl<T, A: Allocator + Clone = Mallocator> Arc<T, A> {
-    func new(value: T): Arc<T> {
+    public func new(value: T): Arc<T> {
         let alloc: Mallocator = Mallocator {};
         return Arc.new_in(value, alloc);
     }
 
-    func new_in(value: T, alloc: A): Arc<T, A> {
+    public func new_in(value: T, alloc: A): Arc<T, A> {
         let inner: ^ArcInner<T> = alloc.new(ArcInner<T> {
             strong: Atomic.new(1),
             value: value,
@@ -39,7 +39,7 @@ impl<T, A: Allocator + Clone = Mallocator> Arc<T, A> {
         return Arc<T, A> { inner: raw, alloc };
     }
 
-    func clone(&this): Arc<T, A> {
+    public func clone(&this): Arc<T, A> {
         let prev: usize = unsafe { (*this.inner).strong.fetch_add(1, Ordering.Relaxed) };
 
         if (prev > 2147483647) {
@@ -49,21 +49,21 @@ impl<T, A: Allocator + Clone = Mallocator> Arc<T, A> {
         return Arc<T, A> { inner: this.inner, alloc: this.alloc.clone() };
     }
 
-    func get(&this): &T {
+    public func get(&this): &T {
         let r: &T = unsafe { &(*this.inner).value };
         return r;
     }
 
-    func get_alias(&alias this): &alias T {
+    public func get_alias(&alias this): &alias T {
         let r: &alias T = unsafe { &alias (*this.inner).value };
         return r;
     }
 
-    func as_ptr(&this): [*]mut T {
+    public func as_ptr(&this): [*]mut T {
         return unsafe { &mut (*this.inner).value as [*]mut T };
     }
 
-    func strong_count(&this): usize {
+    public func strong_count(&this): usize {
         return unsafe { (*this.inner).strong.load(Ordering.SeqCst) };
     }
 }
@@ -75,9 +75,13 @@ impl<T, A: Allocator + Clone> Arc<T, A> by Drop {
         let prev: usize = unsafe { (*raw).strong.fetch_sub(1, Ordering.Release) };
 
         if (prev == 1) {
+            defer {
+                unsafe {
+                    this.alloc.free_raw(raw as [*]mut u8, $sizeof<ArcInner<T>>(), $alignof<ArcInner<T>>());
+                }
+            }
             let _seen: usize = unsafe { (*raw).strong.load(Ordering.Acquire) };
 
-            let owned: ^ArcInner<T> = unsafe { $own(raw, this.alloc) };
         }
     }
 }

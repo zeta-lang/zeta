@@ -1,81 +1,81 @@
 package zeta::libc;
 
-type Pthread = usize;
+public type Pthread = usize;
 
-struct PthreadAttr {
+public struct PthreadAttr {
     opaque: [128]u8,
 }
 
 // 8-byte aligned and 64 bytes, big enough for pthread_mutex_t on glibc (40)
 // and Darwin (64). Using u64 words gives the alignment that [N]u8 would not.
-struct PthreadMutex {
+public struct PthreadMutex {
     opaque: [8]u64,
 }
 
-struct PthreadMutexAttr {
+public struct PthreadMutexAttr {
     opaque: [8]u64,
 }
 
-extern "C" func pthread_mutex_init(
+public unsafe extern "C" func pthread_mutex_init(
     mutex: [*]mut PthreadMutex,
     attr: [*]const PthreadMutexAttr,
 ): i32;
 
-extern "C" func pthread_mutex_destroy(mutex: [*]mut PthreadMutex): i32;
+public unsafe extern "C" func pthread_mutex_destroy(mutex: [*]mut PthreadMutex): i32;
 
-extern "C" func pthread_mutex_lock(mutex: [*]mut PthreadMutex): i32;
+public unsafe extern "C" func pthread_mutex_lock(mutex: [*]mut PthreadMutex): i32;
 
-extern "C" func pthread_mutex_trylock(mutex: [*]mut PthreadMutex): i32;
+public unsafe extern "C" func pthread_mutex_trylock(mutex: [*]mut PthreadMutex): i32;
 
-extern "C" func pthread_mutex_unlock(mutex: [*]mut PthreadMutex): i32;
+public unsafe extern "C" func pthread_mutex_unlock(mutex: [*]mut PthreadMutex): i32;
 
-extern "C" func pthread_create(
+public unsafe extern "C" func pthread_create(
     thread: [*]mut Pthread,
     attr: [*]const PthreadAttr,
     start_routine: [*]const void,
     arg: [*]mut void,
 ): i32;
 
-extern "C" func pthread_join(
+public unsafe extern "C" func pthread_join(
     thread: Pthread,
     retval: [*]mut [*]mut void
 ): i32;
 
-extern "C" func pthread_detach(thread: Pthread): i32;
+public unsafe extern "C" func pthread_detach(thread: Pthread): i32;
 
-extern "C" func pthread_self(): Pthread;
+public unsafe extern "C" func pthread_self(): Pthread;
 
-extern "C" func pthread_equal(lhs: Pthread, rhs: Pthread): i32;
+public unsafe extern "C" func pthread_equal(lhs: Pthread, rhs: Pthread): i32;
 
-extern "C" func sched_yield(): i32;
+public unsafe extern "C" func sched_yield(): i32;
 
-extern "C" func malloc(size: usize): [*]mut void;
-extern "C" func free(ptr: [*]mut void);
-extern "C" func calloc(count: usize, size: usize): [*]mut void;
-extern "C" func realloc(ptr: [*]mut void, size: usize): [*]mut void;
-extern "C" func memset(
+public unsafe extern "C" func malloc(size: usize): [*]mut void;
+public unsafe extern "C" func free(ptr: [*]mut void);
+public unsafe extern "C" func calloc(count: usize, size: usize): [*]mut void;
+public unsafe extern "C" func realloc(ptr: [*]mut void, size: usize): [*]mut void;
+public unsafe extern "C" func memset(
     ptr: [*]mut void,
     value: i32,
     size: usize
 ): [*]mut void;
 
-extern "C" func open(path: [*]const u8, flags: i32, mode: i32): i32;
-extern "C" func close(fd: i32): i32;
-extern "C" func read(fd: i32, buf: [*]mut void, count: usize): isize;
-extern "C" func write(fd: i32, buf: [*]const void, count: usize): isize;
-extern "C" func abort(): never;
+public unsafe extern "C" func open(path: [*]const u8, flags: i32, mode: i32): i32;
+public unsafe extern "C" func close(fd: i32): i32;
+public unsafe extern "C" func read(fd: i32, buf: [*]mut void, count: usize): isize;
+public unsafe extern "C" func write(fd: i32, buf: [*]const void, count: usize): isize;
+public unsafe extern "C" func abort(): never;
 
 // glibc/musl expose errno through this on Linux; per-platform __error() on
 // Darwin/BSD would need a separate extern name behind a platform cfg later.
-extern "C" func __errno_location(): [*]mut i32;
+public unsafe extern "C" func __errno_location(): [*]mut i32;
 
-extern "C" func getrandom(
+public unsafe extern "C" func getrandom(
     buf: [*]mut void,
     buflen: usize,
     flags: u32
 ): isize;
 
-extern "C" func strlen(s: [*]const u8): usize;
+public unsafe extern "C" func strlen(s: [*]const u8): usize;
 
 // Returns null if the variable is not set.
-extern "C" func getenv(name: [*]const u8): ?[*]const u8;
+public unsafe extern "C" func getenv(name: [*]const u8): ?[*]const u8;
