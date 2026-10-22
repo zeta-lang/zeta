@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirExpr, HirFunc, HirParam, HirType, StrId},
+    hir::{HirExpr, HirFunc, HirParam, HirType, HirTypeKind, StrId},
     hir_utils::hir_contains_this,
     ir_hasher::FxHashMap,
     span::SourceSpan,
@@ -23,7 +23,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let substituted = substitute_type(ty, subs, &self.bump);
         match *self.current_this.borrow() {
             Some(self_ty) if hir_contains_this(&substituted) => {
-                replace_this(&substituted, &self_ty, self.bump)
+                replace_this(&substituted, &self_ty, self.bump, ty.span)
             }
             _ => substituted,
         }
@@ -39,63 +39,78 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
         let ty = self.instantiate_struct_ty_if_needed(ty, span);
         let ty = self.instantiate_enum_ty_if_needed(ty);
-        match ty {
-            HirType::Ref {
+        match ty.kind {
+            HirTypeKind::Ref {
                 inner,
                 ref_kind: mutability_state,
                 provenance,
-            } => HirType::Ref {
-                inner: self
-                    .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
-                ref_kind: mutability_state,
-                provenance,
+            } => HirType {
+                kind: HirTypeKind::Ref {
+                    inner: self
+                        .bump
+                        .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                    ref_kind: mutability_state,
+                    provenance,
+                },
+                span: ty.span,
             },
-            HirType::SafePointer {
+            HirTypeKind::SafePointer {
                 inner,
                 mutability_state,
-            } => HirType::SafePointer {
-                inner: self
-                    .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
-                mutability_state,
+            } => HirType {
+                kind: HirTypeKind::SafePointer {
+                    inner: self
+                        .bump
+                        .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                    mutability_state,
+                },
+                span: ty.span,
             },
-            HirType::UnsafePointer {
+            HirTypeKind::UnsafePointer {
                 inner,
                 mutability_state,
-            } => HirType::UnsafePointer {
-                inner: self
-                    .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
-                mutability_state,
+            } => HirType {
+                kind: HirTypeKind::UnsafePointer {
+                    inner: self
+                        .bump
+                        .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                    mutability_state,
+                },
+                span: ty.span,
             },
-            HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
-                inner: self
-                    .bump
-                    .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
-                allocator,
+            HirTypeKind::OwnedPointer { inner, allocator } => HirType {
+                kind: HirTypeKind::OwnedPointer {
+                    inner: self
+                        .bump
+                        .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                    allocator,
+                },
+                span: ty.span,
             },
-            HirType::Slice(inner) => HirType::Slice(
+            HirTypeKind::Slice(inner) => HirType::slice(
                 self.bump
                     .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                span,
             ),
-            HirType::Array(inner, len) => HirType::Array(
+            HirTypeKind::Array(inner, len) => HirType::array(
                 self.bump
                     .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
                 len,
+                span,
             ),
-            HirType::Nullable(inner) => HirType::Nullable(
+            HirTypeKind::Nullable(inner) => HirType::nullable(
                 self.bump
                     .alloc_value_immutable(self.instantiate_type_recursively(*inner, span)),
+                span,
             ),
-            HirType::Tuple(elems) => {
+            HirTypeKind::Tuple(elems) => {
                 let new_elems: Vec<HirType> = elems
                     .iter()
                     .map(|e| self.instantiate_type_recursively(*e, span))
                     .collect();
-                HirType::Tuple(self.bump.alloc_slice(&new_elems))
+                HirType::tuple(self.bump.alloc_slice(&new_elems), span)
             }
-            other => other,
+            _ => ty,
         }
     }
 
@@ -163,9 +178,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         ty: HirType<'a, 'bump>,
         span: SourceSpan<'a>,
     ) -> HirType<'a, 'bump> {
-        let HirType::Struct {
+        let HirTypeKind::Struct {
             name, type_args, ..
-        } = &ty
+        } = ty.kind
         else {
             return ty;
         };
@@ -185,18 +200,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             &self.instantiated_struct_origins,
             &self.instantiated_enums,
             &self.instantiated_enum_origins,
-            *name,
+            name,
             normalized_args,
             &self.bump,
         ) {
             Some(new_struct) => {
                 let field_types: Vec<HirType> =
                     new_struct.fields.iter().map(|f| f.field_type).collect();
-                HirType::Struct {
-                    name: new_struct.name,
-                    field_types: self.bump.alloc_slice(&field_types),
-                    type_args: &[],
-                }
+                HirType::struct_type(
+                    new_struct.name,
+                    new_struct.unmangled_name,
+                    self.bump.alloc_slice(&field_types),
+                    &[],
+                    span,
+                )
             }
             None => panic!(
                 "instantiate_struct_ty_if_needed: failed to instantiate `{}` with type args {:?} at {span}; \
@@ -208,7 +225,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     fn resolve_method_for_enum(
-        &self,
+        &mut self,
         name: StrId,
         type_args: &[HirType<'a, 'bump>],
         method_name: StrId,
@@ -258,10 +275,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
 
         let this_ty = self.instantiate_type_recursively(
-            HirType::Enum {
-                name: origin,
-                variants: &[],
-                type_args: self.bump.alloc_slice(&targs),
+            HirType {
+                kind: HirTypeKind::Enum {
+                    name: origin,
+                    unmangled_name: self.ctx.structs.borrow().get(&origin)?.unmangled_name,
+                    variants: &[],
+                    type_args: self.bump.alloc_slice(&targs),
+                },
+                span: SourceSpan::default(),
             },
             SourceSpan::default(),
         );
@@ -272,41 +293,50 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     }
 
     pub(crate) fn resolve_method_for_type(
-        &self,
+        &mut self,
         struct_ty: &HirType<'a, 'bump>,
         method_name: StrId,
         call_type_args: Option<&[HirType<'a, 'bump>]>,
         outer_subs: &FxHashMap<StrId, HirType<'a, 'bump>>,
     ) -> Option<StrId> {
         let struct_ty = peel_to_struct(struct_ty);
-        if let HirType::Enum {
+        if let HirTypeKind::Enum {
             name, type_args, ..
-        } = struct_ty
+        } = struct_ty.kind
         {
             return self.resolve_method_for_enum(
-                *name,
+                name,
                 type_args,
                 method_name,
                 call_type_args,
                 outer_subs,
             );
         }
-        let HirType::Struct {
-            name, type_args, ..
-        } = struct_ty
+        let HirTypeKind::Struct {
+            name,
+            unmangled_name,
+            type_args,
+            ..
+        } = struct_ty.kind
         else {
             return None;
         };
 
         if type_args.is_empty() {
-            let origin = self.instantiated_struct_origins.borrow().get(name).cloned();
+            let origin = self
+                .instantiated_struct_origins
+                .borrow()
+                .get(&name)
+                .cloned();
             if let Some((origin_name, origin_targs)) = origin {
                 let targs_slice = self.bump.alloc_slice(&origin_targs);
-                let generic_ty = HirType::Struct {
-                    name: origin_name,
-                    field_types: &[],
-                    type_args: targs_slice,
-                };
+                let generic_ty = HirType::struct_type(
+                    origin_name,
+                    unmangled_name,
+                    &[],
+                    targs_slice,
+                    SourceSpan::default(),
+                );
                 return self.resolve_method_for_type(
                     &generic_ty,
                     method_name,
@@ -319,7 +349,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 .ctx
                 .struct_methods
                 .borrow()
-                .get(name)?
+                .get(&name)?
                 .get(&method_name)?;
             let base_func = self.functions.borrow().get(&base_method_name)?.clone();
 
@@ -391,7 +421,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             &self.instantiated_struct_origins,
             &self.instantiated_enums,
             &self.instantiated_enum_origins,
-            *name,
+            name,
             type_args,
             &self.bump,
         )?;
@@ -401,14 +431,14 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .ctx
             .struct_methods
             .borrow()
-            .get(name)?
+            .get(&name)?
             .get(&method_name)?;
         let base_func = self.functions.borrow().get(&base_method_name)?.clone();
         let struct_generics = self
             .ctx
             .structs
             .borrow()
-            .get(name)
+            .get(&name)
             .and_then(|s| s.generics.clone());
         let type_params = base_func.generics.as_ref().or(struct_generics.as_ref());
         let mut inner_subs: FxHashMap<StrId, HirType> = FxHashMap::default();
@@ -422,11 +452,13 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         }
 
         let field_types: Vec<HirType> = instantiated.fields.iter().map(|f| f.field_type).collect();
-        let concrete_recv_ty = HirType::Struct {
-            name: concrete_name,
-            field_types: self.bump.alloc_slice(&field_types),
-            type_args: &[],
-        };
+        let concrete_recv_ty = HirType::struct_type(
+            concrete_name,
+            instantiated.unmangled_name,
+            self.bump.alloc_slice(&field_types),
+            &[],
+            SourceSpan::default(),
+        );
 
         let prev_self = self.current_this.replace(Some(concrete_recv_ty));
         let result = self.monomorphize_function(&base_func, &inner_subs);
@@ -450,11 +482,15 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 let HirExpr::Ident(n, _) = &**name else {
                     return None;
                 };
-                Some(HirType::Struct {
-                    name: self.resolve_struct_key(*n),
-                    field_types: &[],
-                    type_args: type_args.unwrap_or(&[]),
-                })
+                // TODO: this should give field types, and unmangled names. This is a bug that affects `sizeof` and `type_name`
+                let s_key = self.resolve_struct_key(*n);
+                Some(HirType::struct_type(
+                    s_key,
+                    s_key,
+                    &[],
+                    type_args.unwrap_or(&[]),
+                    expr.get_span(),
+                ))
             }
             HirExpr::Call { callee, .. } => match &**callee {
                 HirExpr::Ident(name, _) => self
@@ -477,12 +513,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 
                     if let Some(self_ty) = *self.current_this.borrow() {
                         let struct_ty = peel_to_struct(&self_ty);
-                        if let HirType::Struct {
+                        if let HirTypeKind::Struct {
                             name: cur_struct_name,
                             ..
-                        } = struct_ty
+                        } = struct_ty.kind
                         {
-                            if *cur_struct_name == resolved_name {
+                            if cur_struct_name == resolved_name {
                                 return Some(self_ty);
                             }
                             let origin = self
@@ -497,23 +533,31 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                             }
                         }
                     }
-                    if self.ctx.structs.borrow().contains_key(&resolved_name) {
-                        return Some(HirType::Struct {
-                            name: resolved_name,
-                            field_types: &[],
-                            type_args: &[],
-                        });
+                    if let Some(s_ty) = self.ctx.structs.borrow().get(&resolved_name) {
+                        return Some(HirType::struct_type(
+                            resolved_name,
+                            s_ty.unmangled_name,
+                            self.ctx.bump.alloc_slice(
+                                s_ty.fields
+                                    .iter()
+                                    .map(|f| f.field_type)
+                                    .collect::<Vec<_>>()
+                                    .as_slice(),
+                            ),
+                            &[],
+                            expr.get_span(),
+                        ));
                     }
                     None
                 }),
             HirExpr::Deref { expr, .. } => {
                 let inner = self.concrete_type_of(expr)?;
-                match inner {
-                    HirType::Ref { inner, .. }
-                    | HirType::SafePointer { inner, .. }
-                    | HirType::UnsafePointer { inner, .. }
-                    | HirType::OwnedPointer { inner, .. } => Some(*inner),
-                    other => Some(other),
+                match inner.kind {
+                    HirTypeKind::Ref { inner, .. }
+                    | HirTypeKind::SafePointer { inner, .. }
+                    | HirTypeKind::UnsafePointer { inner, .. }
+                    | HirTypeKind::OwnedPointer { inner, .. } => Some(*inner),
+                    _ => Some(inner),
                 }
             }
             HirExpr::Ref { expr, .. } => self.concrete_type_of(expr),
@@ -528,12 +572,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                 };
                 if let Some(self_ty) = *self.current_this.borrow() {
                     let struct_ty = peel_to_struct(&self_ty);
-                    if let HirType::Struct {
+                    if let HirTypeKind::Struct {
                         name: cur_struct_name,
                         ..
-                    } = struct_ty
+                    } = struct_ty.kind
                     {
-                        if *cur_struct_name == target_key {
+                        if cur_struct_name == target_key {
                             return Some(self_ty);
                         }
                         if let Some((origin, _)) = self
@@ -548,12 +592,20 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         }
                     }
                 }
-                if self.ctx.structs.borrow().contains_key(&target_key) {
-                    return Some(HirType::Struct {
-                        name: target_key,
-                        field_types: &[],
-                        type_args: &[],
-                    });
+                if let Some(s_ty) = self.ctx.structs.borrow().get(&target_key) {
+                    return Some(HirType::struct_type(
+                        target_key,
+                        s_ty.unmangled_name,
+                        self.ctx.bump.alloc_slice(
+                            s_ty.fields
+                                .iter()
+                                .map(|f| f.field_type)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                        ),
+                        &[],
+                        expr.get_span(),
+                    ));
                 }
                 None
             }
@@ -570,12 +622,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         ty: &HirType<'a, 'bump>,
         field: StrId,
     ) -> Option<HirType<'a, 'bump>> {
-        let struct_name = match ty {
-            HirType::Struct { name, .. } => *name,
-            HirType::Ref { inner, .. }
-            | HirType::SafePointer { inner, .. }
-            | HirType::OwnedPointer { inner, .. }
-            | HirType::UnsafePointer { inner, .. } => return self.field_type_of(inner, field),
+        let struct_name = match ty.kind {
+            HirTypeKind::Struct { name, .. } => name,
+            HirTypeKind::Ref { inner, .. }
+            | HirTypeKind::SafePointer { inner, .. }
+            | HirTypeKind::OwnedPointer { inner, .. }
+            | HirTypeKind::UnsafePointer { inner, .. } => return self.field_type_of(inner, field),
             _ => return None,
         };
 
@@ -589,9 +641,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         &self,
         ty: HirType<'a, 'bump>,
     ) -> HirType<'a, 'bump> {
-        let HirType::Enum {
+        let HirTypeKind::Enum {
             name, type_args, ..
-        } = &ty
+        } = ty.kind
         else {
             return ty;
         };
@@ -609,16 +661,21 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             self.ctx,
             &self.instantiated_enums,
             &self.instantiated_enum_origins,
-            *name,
+            name,
             normalized,
             &self.bump,
         ) else {
             return ty;
         };
-        HirType::Enum {
-            name: new_enum.name,
-            type_args: &[],
-            variants: new_enum.variants,
+        // TODO: this should give type_args. This is a bug that affects `type_name`
+        HirType {
+            kind: HirTypeKind::Enum {
+                name: new_enum.name,
+                unmangled_name: new_enum.unmangled_name,
+                type_args: &[],
+                variants: new_enum.variants,
+            },
+            span: ty.span,
         }
     }
 
@@ -630,10 +687,12 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
             .get(&env_name)
             .map(|s| s.fields.iter().map(|f| f.field_type).collect())
             .unwrap_or_default();
-        HirType::Struct {
-            name: env_name,
-            field_types: self.bump.alloc_slice(&field_types),
-            type_args: &[],
-        }
+        HirType::struct_type(
+            env_name,
+            env_name, // closure
+            self.bump.alloc_slice(&field_types),
+            &[], // closure
+            SourceSpan::default(),
+        )
     }
 }
