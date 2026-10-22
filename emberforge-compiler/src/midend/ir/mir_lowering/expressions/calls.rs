@@ -194,6 +194,21 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
     }
 
+    fn lookup_method_mangled(&self, cls: StrId, method: StrId) -> Option<StrId> {
+        if let Some(&m) = self
+            .struct_mangled_map
+            .get(&cls)
+            .and_then(|mm| mm.get(&method))
+        {
+            return Some(m);
+        }
+        self.instantiated_struct_methods
+            .borrow()
+            .get(&cls)
+            .and_then(|mm| mm.get(&method))
+            .copied()
+    }
+
     pub(crate) fn lower_method_call_expr(
         &mut self,
         object: &HirExpr<'a, 'bump>,
@@ -204,7 +219,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         if let HirExpr::Ident(scope_name, _) = object {
             if !self.var_map.contains_key(scope_name)
                 && !self.is_static_name(scope_name)
-                && !self.constants.contains_key(scope_name)
+                && !self.constants.contains_bare(self.module_idx, *scope_name)
             {
                 let mangled_struct_name = self
                     .resolve_static_receiver_struct_name(*scope_name, field)
@@ -322,13 +337,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                             .is_some_and(|m| m.contains_key(&call_name));
                         if is_closure_env {
                             let field_val = self.field_access_from_value(obj_val, field, *span);
-                            let param_types: Vec<SsaType> = env_cls
-                                .and_then(|cls| self.struct_mangled_map.get(&cls))
-                                .and_then(|mmap| mmap.get(&call_name))
-                                .and_then(|mangled| self.funcs.get(mangled))
-                                .map(|f| {
-                                    f.params.iter().skip(1).map(|(_, ty)| ty.clone()).collect()
-                                })
+                            let param_types: Vec<SsaType> = cls_name_id
+                                .and_then(|cls| self.lookup_method_mangled(cls, field))
+                                .and_then(|mangled| self.funcs.get(&mangled))
+                                .map(|f| f.params.iter().map(|(_, ty)| ty.clone()).collect())
                                 .unwrap_or_default();
                             let mut operands: SmallVec<Operand, 8> = SmallVec::new();
                             operands.push(Operand::Value(field_val));
@@ -396,7 +408,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         panic!(
             "[lower_method_call] no mangled mapping or vtable slot found for method `{}` on struct `{:?}` at span {}.",
             self.context.resolve_string(&field),
-            cls_name_id.map(|id| self.context.resolve_string(&id).to_string()),
+            cls_name_id,
             span
         );
     }
@@ -529,52 +541,39 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             return None;
         };
 
-        let mmap = self.struct_mangled_map.get(&cls_name).or_else(|| {
-            self.struct_mangled_map.iter().find_map(
-                |(k, v)| {
-                    if *k == cls_name { Some(v) } else { None }
-                },
-            )
+        let mangled_name = self.lookup_method_mangled(cls_name, field).or_else(|| {
+            let field_str = self.context.resolve_string(&field);
+            self.struct_mangled_map.get(&cls_name).and_then(|mmap| {
+                mmap.iter()
+                    .find_map(|(k, v)| (self.context.resolve_string(k) == field_str).then_some(*v))
+            })
         });
 
-        if let Some(mmap) = mmap {
-            let field_str = self.context.resolve_string(&field);
-            let mangled_name = mmap.get(&field).copied().or_else(|| {
-                mmap.iter().find_map(|(k, v)| {
-                    if self.context.resolve_string(k) == field_str {
-                        Some(*v)
-                    } else {
-                        None
-                    }
-                })
+        if let Some(mangled_name) = mangled_name {
+            let actual_func_name = if self.funcs.contains_key(&mangled_name) {
+                mangled_name
+            } else {
+                panic!(
+                    "uh oh. failed with {mangled_name} \n\n{:?}",
+                    self.funcs.keys()
+                )
+            };
+
+            let dest = self.current_block_data.fresh_value();
+            self.emit(Instruction::Call {
+                dest: Some(dest),
+                func: Operand::FunctionRef(actual_func_name),
+                args: operands.clone(),
             });
 
-            if let Some(mangled_name) = mangled_name {
-                let actual_func_name = if self.funcs.contains_key(&mangled_name) {
-                    mangled_name
-                } else {
-                    panic!(
-                        "uh oh. failed with {mangled_name} \n\n{:?}",
-                        self.funcs.keys()
-                    )
-                };
-
-                let dest = self.current_block_data.fresh_value();
-                self.emit(Instruction::Call {
-                    dest: Some(dest),
-                    func: Operand::FunctionRef(actual_func_name),
-                    args: operands.clone(),
-                });
-
-                let ret_ty = self
-                    .funcs
-                    .get(&actual_func_name)
-                    .map(|f| f.ret_type.clone())
-                    .unwrap_or(SsaType::I64);
-                self.note_call_result(dest, &ret_ty, actual_func_name);
-                self.current_block_data.value_types.insert(dest, ret_ty);
-                return Some(dest);
-            }
+            let ret_ty = self
+                .funcs
+                .get(&actual_func_name)
+                .map(|f| f.ret_type.clone())
+                .unwrap_or(SsaType::I64);
+            self.note_call_result(dest, &ret_ty, actual_func_name);
+            self.current_block_data.value_types.insert(dest, ret_ty);
+            return Some(dest);
         }
 
         let struct_slots = self.struct_method_slots.get(&cls_name).or_else(|| {
