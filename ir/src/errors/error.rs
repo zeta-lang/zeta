@@ -178,6 +178,10 @@ pub enum ParseErrorKind {
     UnsupportedDisjointBorrow,
     GenericWithoutDefaultAfterDefault,
     DuplicateProvenanceBound,
+
+    DuplicateReturnBinder {
+        name: StrId,
+    },
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -256,6 +260,9 @@ impl fmt::Display for ParseErrorKind {
                 "generic parameter without a default cannot follow a parameter with a default"
             ),
             ParseErrorKind::DuplicateProvenanceBound => todo!(),
+            ParseErrorKind::DuplicateReturnBinder { name } => {
+                write!(f, "duplicate return binder found: {name}")
+            }
         }
     }
 }
