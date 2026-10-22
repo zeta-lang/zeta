@@ -1,6 +1,6 @@
 use ir::{
     errors::type_error::TypeErrorKind,
-    hir::{AssignmentOperator, HirExpr, HirFunc, HirType, RefKind, StrId},
+    hir::{AssignmentOperator, HirExpr, HirFunc, HirType, HirTypeKind, RefKind, StrId, Visibility},
     ir_hasher::{FxHashMap, HashSet},
     nll_cfg::CfgBuilder,
     span::SourceSpan,
@@ -14,6 +14,9 @@ use super::*;
 pub struct StaticDecl<'a, 'bump> {
     pub ty: HirType<'a, 'bump>,
     pub const_init: bool,
+    pub visibility: Visibility,
+    pub name: StrId,
+    pub declaring_module_idx: usize,
 }
 
 #[derive(Default, Clone)]
@@ -30,10 +33,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         name: StrId,
         ty: HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
+        visibility: Visibility,
         span: SourceSpan<'a>,
     ) {
         self.set_span(span);
-        if matches!(ty, HirType::Unknown) {
+        if matches!(ty.kind, HirTypeKind::Unknown) {
             self.record(TypeErrorKind::Generic(format!(
                 "static `{}` needs an explicit type",
                 name
@@ -52,10 +56,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 false
             }
         };
-        self.module_statics
-            .entry(module_idx)
-            .or_default()
-            .insert(name, StaticDecl { ty, const_init });
+        self.module_statics.entry(module_idx).or_default().insert(
+            name,
+            StaticDecl {
+                ty,
+                const_init,
+                visibility,
+                name,
+                declaring_module_idx: self.context.current_module_idx,
+            },
+        );
     }
 
     fn is_const_initializer(&self, module_idx: usize, e: &HirExpr<'a, 'bump>) -> bool {
@@ -110,7 +120,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.cur_statics.clear();
         for (name, d) in visible {
             let sym = self.mint_symbol_id();
-            ctx.add_variable(str_id_to_string(name), d.ty, sym);
+            ctx.add_variable(name, d.ty, sym);
             self.static_symbols.insert(sym, name);
             self.cur_statics.push(name);
             self.mark_whole_init(name); // entry assumption
@@ -121,7 +131,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub(crate) fn is_static_ident(&self, name: StrId) -> bool {
         self.context
-            .get_variable(&str_id_to_string(name))
+            .get_variable(name)
             .is_some_and(|(sym, _)| self.static_symbols.contains_key(&sym))
     }
 
@@ -133,6 +143,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if !self.is_static_ident(name) {
             return;
         }
+
         self.fn_static_accessed.insert(name);
         for f in self.closure_frames.borrow_mut().iter_mut() {
             match f.static_uses.iter_mut().find(|(n, _)| *n == name) {
@@ -221,10 +232,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.note_static_use(root, true);
         }
         let inner = self.check_expr_as_place(expr); // requires INITIALIZED
-        Some(HirType::Ref {
-            inner: self.context.bump.alloc_value(inner),
-            ref_kind: kind,
-            provenance: None,
+        Some(HirType {
+            kind: HirTypeKind::Ref {
+                inner: self.context.bump.alloc_value(inner),
+                ref_kind: kind,
+                provenance: None,
+            },
+            span,
         })
     }
 
@@ -236,14 +250,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) {
         self.set_span(span);
         for &(name, mutated) in uses {
-            let Some((_, ty)) = self.context.get_variable(&str_id_to_string(name)) else {
+            let Some((_, ty)) = self.context.get_variable(name) else {
                 continue;
             };
             if !self.implements_auto(&ty, AutoTrait::Send) {
                 self.record(TypeErrorKind::Generic(format!(
                     "static `{}` of type `{}` is used across a thread boundary but is not `Send`",
                     name,
-                    type_to_string(&ty)
+                    type_to_string(&ty, &self.context.string_pool)
                 )));
             }
             if mutated && !self.implements_auto(&ty, AutoTrait::Sync) {
@@ -251,7 +265,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     "static `{}` of type `{}` is mutated or aliased across a thread boundary \
                      but is not `Sync`",
                     name,
-                    type_to_string(&ty)
+                    type_to_string(&ty, &self.context.string_pool)
                 )));
             }
         }

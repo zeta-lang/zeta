@@ -1,13 +1,12 @@
 use ir::{
     ast::MutabilityState,
     errors::type_error::{TypeCheckResult, TypeErrorKind},
-    hir::{HirExpr, HirType, RefKind},
+    hir::{HirExpr, HirType, HirTypeKind, RefKind},
 };
 
 use crate::{
     TypeChecker,
     naming::type_to_string,
-    str_id_to_string,
     type_checker::{LocalSymbolId, SymbolId},
 };
 
@@ -17,8 +16,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         left: &HirType<'a, 'bump>,
         right: &HirType<'a, 'bump>,
     ) -> bool {
-        let unwrap_nullable = |t: &HirType<'a, 'bump>| match t {
-            HirType::Nullable(inner) => Some(**inner),
+        let unwrap_nullable = |t: &HirType<'a, 'bump>| match &t.kind {
+            HirTypeKind::Nullable(inner) => Some(**inner),
             _ => None,
         };
 
@@ -31,21 +30,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         match (unwrap_nullable(left), unwrap_nullable(right)) {
             (Some(li), Some(ri)) => payload_compatible(&li, &ri),
-            (Some(li), None) => payload_compatible(&li, right) || matches!(right, HirType::Null),
-            (None, Some(ri)) => payload_compatible(left, &ri) || matches!(left, HirType::Null),
+            (Some(li), None) => {
+                payload_compatible(&li, right) || matches!(right.kind, HirTypeKind::Null)
+            }
+            (None, Some(ri)) => {
+                payload_compatible(left, &ri) || matches!(left.kind, HirTypeKind::Null)
+            }
             (None, None) => false,
         }
     }
 
     pub fn types_structurally_equal(&self, a: &HirType<'a, 'bump>, b: &HirType<'a, 'bump>) -> bool {
-        use HirType::*;
-        if matches!(a, Generic(_)) || matches!(b, Generic(_)) {
+        use HirTypeKind::*;
+        if matches!(a.kind, Generic(_)) || matches!(b.kind, Generic(_)) {
             return true;
         }
 
-        match (a, b) {
-            (Nullable(inner), n_b) => self.types_structurally_equal(inner, n_b),
-            (n_a, Nullable(inner)) => self.types_structurally_equal(n_a, inner),
+        match (&a.kind, &b.kind) {
+            (Nullable(inner), _) => self.types_structurally_equal(inner, b),
+            (_, Nullable(inner)) => self.types_structurally_equal(a, inner),
             (
                 Struct {
                     name: na,
@@ -105,6 +108,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     mutability_state: mb,
                 },
             ) => ma == mb && self.types_structurally_equal(ia, ib),
+
             (
                 OwnedPointer {
                     inner: ia,
@@ -176,39 +180,43 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expected: &HirType<'a, 'bump>,
         found: &HirType<'a, 'bump>,
     ) -> bool {
-        let HirType::Ref {
+        let HirTypeKind::Ref {
             inner: f_inner,
             ref_kind: fk,
             ..
-        } = found
+        } = &found.kind
         else {
             return false;
         };
 
-        match (expected, *f_inner) {
+        match (&expected.kind, &f_inner.kind) {
             // &^T  ->  &T
             (
-                HirType::Ref {
+                HirTypeKind::Ref {
                     inner: e_inner,
                     ref_kind: ek,
                     ..
                 },
-                HirType::OwnedPointer { inner: pointee, .. },
-            ) if !matches!(pointee, HirType::Slice(_)) => {
+                HirTypeKind::OwnedPointer { inner: pointee, .. },
+            ) if !matches!(pointee.kind, HirTypeKind::Slice(_)) => {
                 fk.coerces_to(*ek) && self.types_compatible(e_inner, pointee).is_ok()
             }
             // &?^T  ->  ?&T
-            (
-                HirType::Nullable(e),
-                HirType::Nullable(HirType::OwnedPointer { inner: pointee, .. }),
-            ) if !matches!(pointee, HirType::Slice(_)) => match e {
-                HirType::Ref {
-                    inner: e_inner,
-                    ref_kind: ek,
-                    ..
-                } => fk.coerces_to(*ek) && self.types_compatible(e_inner, pointee).is_ok(),
-                _ => false,
-            },
+            (HirTypeKind::Nullable(e), HirTypeKind::Nullable(f_nullable_inner)) => {
+                match (&e.kind, &f_nullable_inner.kind) {
+                    (
+                        HirTypeKind::Ref {
+                            inner: e_inner,
+                            ref_kind: ek,
+                            ..
+                        },
+                        HirTypeKind::OwnedPointer { inner: pointee, .. },
+                    ) if !matches!(pointee.kind, HirTypeKind::Slice(_)) => {
+                        fk.coerces_to(*ek) && self.types_compatible(e_inner, pointee).is_ok()
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -218,19 +226,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         expected: &HirType<'a, 'bump>,
         found: &HirType<'a, 'bump>,
     ) -> TypeCheckResult<'a, ()> {
-        if matches!(found, HirType::Never) {
+        if matches!(found.kind, HirTypeKind::Never) {
             return Ok(());
         }
 
-        if let HirType::Ref { inner, .. } = expected {
-            if matches!(**inner, HirType::String) && matches!(found, HirType::String) {
+        if let HirTypeKind::Ref { inner, .. } = &expected.kind {
+            if matches!(inner.kind, HirTypeKind::String)
+                && matches!(found.kind, HirTypeKind::String)
+            {
                 return Ok(());
             }
         }
 
-        if matches!(expected, HirType::String) {
-            if let HirType::Ref { inner, .. } = found {
-                if matches!(**inner, HirType::String) {
+        if matches!(expected.kind, HirTypeKind::String) {
+            if let HirTypeKind::Ref { inner, .. } = &found.kind {
+                if matches!(inner.kind, HirTypeKind::String) {
                     return Ok(());
                 }
             }
@@ -240,21 +250,23 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
-        if let HirType::Ref {
+        if let HirTypeKind::Ref {
             inner: ei,
             ref_kind: erk,
             ..
-        } = expected
+        } = &expected.kind
         {
-            if let HirType::Slice(es) = &**ei {
-                match found {
-                    HirType::Slice(fs) if self.types_structurally_equal(es, fs) => return Ok(()),
-                    HirType::Ref {
+            if let HirTypeKind::Slice(es) = &ei.kind {
+                match &found.kind {
+                    HirTypeKind::Slice(fs) if self.types_structurally_equal(es, fs) => {
+                        return Ok(());
+                    }
+                    HirTypeKind::Ref {
                         inner: fi,
                         ref_kind: frk,
                         ..
                     } => {
-                        if let HirType::Array(fe, _) | HirType::Slice(fe) = &**fi {
+                        if let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind {
                             if self.types_structurally_equal(es, fe) && frk.coerces_to(*erk) {
                                 return Ok(());
                             }
@@ -265,9 +277,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        if let HirType::Slice(es) = expected {
-            if let HirType::Ref { inner: fi, .. } = found {
-                if let HirType::Array(fe, _) | HirType::Slice(fe) = &**fi {
+        if let HirTypeKind::Slice(es) = &expected.kind {
+            if let HirTypeKind::Ref { inner: fi, .. } = &found.kind {
+                if let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind {
                     if self.types_structurally_equal(es, fe) {
                         return Ok(());
                     }
@@ -275,8 +287,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        if let (HirType::OwnedPointer { inner: ei, .. }, HirType::OwnedPointer { inner: fi, .. }) =
-            (expected, found)
+        if let (
+            HirTypeKind::OwnedPointer { inner: ei, .. },
+            HirTypeKind::OwnedPointer { inner: fi, .. },
+        ) = (&expected.kind, &found.kind)
         {
             if self.types_structurally_equal(ei, fi) {
                 return Ok(());
@@ -284,24 +298,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let (
-            HirType::Ref {
+            HirTypeKind::Ref {
                 inner: ri,
                 ref_kind,
                 ..
             },
-            HirType::SafePointer {
+            HirTypeKind::SafePointer {
                 inner: pi,
                 mutability_state,
             }
-            | HirType::UnsafePointer {
+            | HirTypeKind::UnsafePointer {
                 inner: pi,
                 mutability_state,
             },
-        ) = (found, expected)
+        ) = (&found.kind, &expected.kind)
         {
-            let elem: &HirType<'a, 'bump> = match &**ri {
-                HirType::Array(e, _) | HirType::Slice(e) => e,
-                other => other,
+            let elem: &HirType<'a, 'bump> = match &ri.kind {
+                HirTypeKind::Array(e, _) | HirTypeKind::Slice(e) => e,
+                _ => ri,
             };
             // `&` may only become a const pointer; otherwise a shared borrow could be written through.
             let mut_ok =
@@ -315,17 +329,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let (
-            HirType::Ref {
+            HirTypeKind::Ref {
                 inner: ei,
                 ref_kind: erk,
                 ..
             },
-            HirType::Ref {
+            HirTypeKind::Ref {
                 inner: fi,
                 ref_kind: frk,
                 ..
             },
-        ) = (expected, found)
+        ) = (&expected.kind, &found.kind)
         {
             if self.types_structurally_equal(ei, fi) && frk.coerces_to(*erk) {
                 return Ok(());
@@ -336,7 +350,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
-        if *expected == HirType::Unknown || *found == HirType::Unknown {
+        if expected.kind == HirTypeKind::Unknown || found.kind == HirTypeKind::Unknown {
             return Ok(());
         }
 
@@ -346,9 +360,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
-        match expected {
-            HirType::UnsafePointer { .. } | HirType::Nullable(_) => {
-                if found == &HirType::Null {
+        match expected.kind {
+            HirTypeKind::UnsafePointer { .. } | HirTypeKind::Nullable(_) => {
+                if found.kind == HirTypeKind::Null {
                     return Ok(());
                 }
             }
@@ -356,8 +370,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         Err(TypeErrorKind::TypeMismatch {
-            expected: type_to_string(expected),
-            found: type_to_string(found),
+            expected: type_to_string(expected, &self.context.string_pool).to_string(),
+            found: type_to_string(found, &self.context.string_pool).to_string(),
         }
         .at(self.current_span))
     }
@@ -370,14 +384,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let expected_inner = Self::strip_ref(expected);
         let found_inner = Self::strip_ref(found);
 
-        let interface_name = match expected_inner {
-            HirType::DynInterface(name, _) => Some(name.to_string()),
-            HirType::Dyn { bounds } => bounds.iter().find_map(|b| match b {
-                HirType::DynInterface(name, _) => Some(name.to_string()),
-                HirType::Struct { name, .. } => {
-                    let name_str = name.to_string();
-                    if self.context.get_interface(&name_str).is_some() {
-                        Some(name_str)
+        let interface_name = match &expected_inner.kind {
+            HirTypeKind::DynInterface { name, .. } => Some(name),
+            HirTypeKind::Dyn { bounds } => bounds.iter().find_map(|b| match &b.kind {
+                HirTypeKind::DynInterface { name, .. } => Some(name),
+                HirTypeKind::Struct { name, .. } => {
+                    if self.context.get_interface(name).is_some() {
+                        Some(name)
                     } else {
                         None
                     }
@@ -391,98 +404,98 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return false;
         };
 
-        let struct_name = match found_inner {
-            HirType::Struct { name, .. } => name.to_string(),
+        let struct_name = match &found_inner.kind {
+            HirTypeKind::Struct { name, .. } => name,
             _ => return false,
         };
 
-        self.context
-            .struct_implements(&struct_name, &interface_name)
+        self.context.struct_implements(struct_name, interface_name)
     }
 
     pub fn strip_ref<'x>(ty: &'x HirType<'a, 'bump>) -> &'x HirType<'a, 'bump> {
-        match ty {
-            HirType::Ref { inner, .. } => inner,
-            HirType::OwnedPointer { inner, .. } => inner,
+        match &ty.kind {
+            HirTypeKind::Ref { inner, .. } => inner,
+            HirTypeKind::OwnedPointer { inner, .. } => inner,
             _ => ty,
         }
     }
 
     pub fn is_numeric(&self, ty: &HirType<'a, 'bump>) -> bool {
         matches!(
-            ty,
-            HirType::I8
-                | HirType::I16
-                | HirType::I32
-                | HirType::I64
-                | HirType::U8
-                | HirType::U16
-                | HirType::U32
-                | HirType::U64
-                | HirType::F32
-                | HirType::F64
-                | HirType::I128
-                | HirType::U128
-                | HirType::Usize
-                | HirType::Isize
+            ty.kind,
+            HirTypeKind::I8
+                | HirTypeKind::I16
+                | HirTypeKind::I32
+                | HirTypeKind::I64
+                | HirTypeKind::U8
+                | HirTypeKind::U16
+                | HirTypeKind::U32
+                | HirTypeKind::U64
+                | HirTypeKind::F32
+                | HirTypeKind::F64
+                | HirTypeKind::I128
+                | HirTypeKind::U128
+                | HirTypeKind::Usize
+                | HirTypeKind::Isize
         )
     }
 
     pub fn is_integer(&self, ty: &HirType<'a, 'bump>) -> bool {
         matches!(
-            ty,
-            HirType::I8
-                | HirType::I16
-                | HirType::I32
-                | HirType::I64
-                | HirType::U8
-                | HirType::U16
-                | HirType::U32
-                | HirType::U64
-                | HirType::I128
-                | HirType::U128
-                | HirType::Usize
-                | HirType::Isize
+            ty.kind,
+            HirTypeKind::I8
+                | HirTypeKind::I16
+                | HirTypeKind::I32
+                | HirTypeKind::I64
+                | HirTypeKind::U8
+                | HirTypeKind::U16
+                | HirTypeKind::U32
+                | HirTypeKind::U64
+                | HirTypeKind::I128
+                | HirTypeKind::U128
+                | HirTypeKind::Usize
+                | HirTypeKind::Isize
         )
     }
 
     pub fn is_comparable(&self, ty: &HirType<'a, 'bump>) -> bool {
-        self.is_numeric(ty) || matches!(ty, HirType::Boolean | HirType::String)
+        self.is_numeric(ty) || matches!(ty.kind, HirTypeKind::Boolean | HirTypeKind::String)
     }
 
     pub fn peek_type(&self, expr: &HirExpr<'a, 'bump>) -> HirType<'a, 'bump> {
         match expr {
             HirExpr::Ident(name, _) => {
-                let var_name = str_id_to_string(*name);
                 self.context
-                    .get_variable(&var_name)
-                    .unwrap_or((SymbolId::Local(LocalSymbolId(u32::MAX)), HirType::Unknown))
+                    .get_variable(name)
+                    .unwrap_or((
+                        SymbolId::Local(LocalSymbolId(u32::MAX)),
+                        HirType::synthetic(HirTypeKind::Unknown),
+                    ))
                     .1
             }
             HirExpr::This { .. } => {
                 self.context
                     .get_variable("this")
-                    .unwrap_or((SymbolId::Local(LocalSymbolId(u32::MAX)), HirType::This))
+                    .unwrap_or((
+                        SymbolId::Local(LocalSymbolId(u32::MAX)),
+                        HirType::synthetic(HirTypeKind::This),
+                    ))
                     .1
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
-                match Self::peel_indirections(self.peek_type(object)) {
-                    HirType::Struct {
+                match Self::peel_indirections(self.peek_type(object)).kind {
+                    HirTypeKind::Struct {
                         name: struct_name,
                         type_args,
                         ..
                     } => {
-                        let struct_name_str = str_id_to_string(struct_name);
-                        let field_name = str_id_to_string(*field);
-                        let Some(struct_def) = self.context.get_struct(&struct_name_str) else {
-                            return HirType::Unknown;
+                        let Some(struct_def) = self.context.get_struct(struct_name) else {
+                            return HirType::synthetic(HirTypeKind::Unknown);
                         };
-                        let Some(field_idx) = struct_def
-                            .fields
-                            .iter()
-                            .position(|f| str_id_to_string(f.name) == field_name)
+                        let Some(field_idx) =
+                            struct_def.fields.iter().position(|f| f.name == field)
                         else {
-                            return HirType::Unknown;
+                            return HirType::synthetic(HirTypeKind::Unknown);
                         };
                         if type_args.is_empty() {
                             struct_def.fields[field_idx].field_type
@@ -492,59 +505,56 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                                 .unwrap_or(struct_def.fields[field_idx].field_type)
                         }
                     }
-                    _ => HirType::Unknown,
+                    _ => HirType::synthetic(HirTypeKind::Unknown),
                 }
             }
-            HirExpr::Deref { expr, .. } => match self.peek_type(expr) {
-                HirType::Ref { inner, .. } => *inner,
-                HirType::SafePointer { inner, .. } => *inner,
-                HirType::UnsafePointer { inner, .. } => *inner,
-                HirType::OwnedPointer { inner, .. } => *inner,
-                _ => HirType::Unknown,
+            HirExpr::Deref { expr, .. } => match self.peek_type(expr).kind {
+                HirTypeKind::Ref { inner, .. } => *inner,
+                HirTypeKind::SafePointer { inner, .. } => *inner,
+                HirTypeKind::UnsafePointer { inner, .. } => *inner,
+                HirTypeKind::OwnedPointer { inner, .. } => *inner,
+                _ => HirType::synthetic(HirTypeKind::Unknown),
             },
-            HirExpr::Index { object, .. } => match self.peek_type(object) {
-                HirType::Array(inner, _) => *inner,
-                HirType::Slice(inner) => *inner,
-                _ => HirType::Unknown,
+            HirExpr::Index { object, .. } => match self.peek_type(object).kind {
+                HirTypeKind::Array(inner, _) => *inner,
+                HirTypeKind::Slice(inner) => *inner,
+                _ => HirType::synthetic(HirTypeKind::Unknown),
             },
             HirExpr::Cast { target_type, .. } => *target_type,
-            _ => HirType::Unknown,
+            _ => HirType::synthetic(HirTypeKind::Unknown),
         }
     }
 
     pub fn is_zeroable(&self, ty: &HirType<'a, 'bump>) -> bool {
-        match ty {
-            HirType::I8
-            | HirType::I16
-            | HirType::I32
-            | HirType::I64
-            | HirType::I128
-            | HirType::U8
-            | HirType::U16
-            | HirType::U32
-            | HirType::U64
-            | HirType::U128
-            | HirType::F32
-            | HirType::F64 => true,
+        match &ty.kind {
+            HirTypeKind::I8
+            | HirTypeKind::I16
+            | HirTypeKind::I32
+            | HirTypeKind::I64
+            | HirTypeKind::I128
+            | HirTypeKind::U8
+            | HirTypeKind::U16
+            | HirTypeKind::U32
+            | HirTypeKind::U64
+            | HirTypeKind::U128
+            | HirTypeKind::F32
+            | HirTypeKind::F64 => true,
 
-            HirType::Array(inner, _) => self.is_zeroable(inner),
+            HirTypeKind::Array(inner, _) => self.is_zeroable(inner),
 
-            HirType::Tuple(elems) => elems.iter().all(|e| self.is_zeroable(e)),
+            HirTypeKind::Tuple(elems) => elems.iter().all(|e| self.is_zeroable(e)),
 
-            HirType::Struct { name, .. } => {
-                let name_str = str_id_to_string(*name);
-                match self.context.get_struct(&name_str) {
-                    Some(def) => def.fields.iter().all(|f| self.is_zeroable(&f.field_type)),
-                    None => false,
-                }
-            }
+            HirTypeKind::Struct { name, .. } => match self.context.get_struct(name) {
+                Some(def) => def.fields.iter().all(|f| self.is_zeroable(&f.field_type)),
+                None => false,
+            },
 
-            HirType::Nullable(inner) => match **inner {
+            HirTypeKind::Nullable(inner) => match inner.kind {
                 // Pointer-shaped: all-zero bits legitimately means "null". Safe to zero-init.
-                HirType::SafePointer { .. }
-                | HirType::UnsafePointer { .. }
-                | HirType::OwnedPointer { .. }
-                | HirType::Ref { .. } => true,
+                HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
+                | HirTypeKind::OwnedPointer { .. }
+                | HirTypeKind::Ref { .. } => true,
                 // Non-pointer nullable (e.g. i32?) needs a discriminant/tag, not just zero
                 // bits
                 // We could probably add some optimizations like `NonZero<u32>` like in Rust, but for now, this is good enough.

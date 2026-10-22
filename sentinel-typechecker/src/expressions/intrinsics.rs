@@ -1,10 +1,10 @@
 use ir::{
     borrow_checker::BorrowKind,
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirType, IntrinsicKind, ProvenanceRoot, RefKind},
+    hir::{HirExpr, HirType, HirTypeKind, IntrinsicKind, ProvenanceRoot, RefKind},
 };
 
-use crate::{TypeChecker, naming::type_to_string, str_id_to_string};
+use crate::{TypeChecker, naming::type_to_string};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn check_intrinsic_expr(
@@ -25,11 +25,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.record(TypeErrorKind::Generic(
                         "$ptr_read expects at most 1 type argument and exactly 1 argument".into(),
                     ));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
                 let Some(pointee) = self.check_ptr_intrinsic_arg("$ptr_read", &args[0], false)
                 else {
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 };
                 if let Some(t) = type_args.first() {
                     self.recover(self.types_compatible(t, &pointee), ());
@@ -45,11 +45,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.record(TypeErrorKind::Generic(
                         "$ptr_write expects at most 1 type argument and exactly 2 arguments".into(),
                     ));
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
                 let Some(pointee) = self.check_ptr_intrinsic_arg("$ptr_write", &args[0], true)
                 else {
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 };
                 if let Some(t) = type_args.first() {
                     self.recover(self.types_compatible(t, &pointee), ());
@@ -57,7 +57,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 let value_ty = self.check_expr_expected(&args[1], &pointee);
                 self.check_and_record_value_use(&args[1], &value_ty); // moved into the slot
                 self.recover(self.types_compatible(&pointee, &value_ty), ());
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::PtrCopy | IntrinsicKind::PtrCopyNonoverlapping => {
                 let name = if *kind == IntrinsicKind::PtrCopy {
@@ -74,7 +74,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.record(TypeErrorKind::Generic(format!(
                         "{name} expects at most 1 type argument and 3 arguments (src, dst, count)"
                     )));
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
                 let src = self.check_ptr_intrinsic_arg(name, &args[0], false);
                 let dst = self.check_ptr_intrinsic_arg(name, &args[1], true);
@@ -88,10 +88,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if !self.is_integer(&n_ty) {
                     self.record(TypeErrorKind::Generic(format!(
                         "{name}: count must be an integer, found `{}`",
-                        type_to_string(&n_ty)
+                        type_to_string(&n_ty, &self.context.string_pool)
                     )));
                 }
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::AssumeInit => {
                 if !type_args.is_empty() {
@@ -111,7 +111,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected_args: 1,
                         found_args: args.len(),
                     });
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
                 if !matches!(
                     &args[0],
@@ -124,23 +124,23 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.record(TypeErrorKind::Generic(
                     "$assume_init's argument must be a place (variable, field, index, or slice)".into(),
                 ));
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
                 // Suppressed so naming the uninit place isn't itself an error. Not a move: no value-use.
                 let _ = self.check_expr_suppressed(&args[0]);
                 self.optimistically_mark_mut_target_init(&args[0]);
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::FnPtr => {
                 let t = self.check_expr(&args[0]);
-                let HirType::Struct { name, .. } = t else {
+                let HirTypeKind::Struct { name, .. } = t.kind else {
                     self.record(TypeErrorKind::Generic("$fn_ptr expects a closure".into()));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 };
                 let Some(lowering) = self.closure_table.values().find(|c| c.env_name == name)
                 else {
                     self.record(TypeErrorKind::Generic("$fn_ptr expects a closure".into()));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 };
                 if !lowering.captures.is_empty() {
                     let desc = self.describe_path(
@@ -151,12 +151,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "`$fn_ptr` requires a non-capturing closure, but it captures `{}`",
                         desc
                     )));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
-                HirType::Lambda {
+                HirType::synthetic(HirTypeKind::Lambda {
                     params: self.context.bump.alloc_slice(&lowering.param_tys),
                     return_type: self.context.bump.alloc_value(lowering.ret_ty),
-                }
+                })
             }
             IntrinsicKind::Leak => {
                 if !type_args.is_empty() {
@@ -176,29 +176,31 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected_args: 1,
                         found_args: args.len(),
                     });
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
 
                 let arg_ty = self.check_expr(&args[0]);
                 // Records the move, so the source local is not dropped at scope exit.
                 self.check_and_record_value_use(&args[0], &arg_ty);
 
-                match &arg_ty {
-                    HirType::OwnedPointer { inner, .. } => match **inner {
+                match &arg_ty.kind {
+                    HirTypeKind::OwnedPointer { inner, .. } => match inner.kind {
                         // ^[T] -> [T]
-                        HirType::Slice(elem) => HirType::Slice(elem),
+                        HirTypeKind::Slice(elem) => {
+                            HirType::new(HirTypeKind::Slice(elem), inner.span)
+                        }
                         // ^T -> [*]mut T
-                        pointee => HirType::UnsafePointer {
-                            inner: self.context.bump.alloc_value(pointee),
+                        _ => HirType::synthetic(HirTypeKind::UnsafePointer {
+                            inner: self.context.bump.alloc_value(**inner),
                             mutability_state: ir::ast::MutabilityState::Mut,
-                        },
+                        }),
                     },
                     other => {
                         self.record(TypeErrorKind::Generic(format!(
                             "$leak expects an owned pointer `^T`, found `{}` type {other:?}",
-                            type_to_string(&arg_ty)
+                            type_to_string(&arg_ty, &self.context.string_pool)
                         )));
-                        HirType::Unknown
+                        HirType::synthetic(HirTypeKind::Unknown)
                     }
                 }
             }
@@ -213,12 +215,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected_args: 1,
                         found_args: args.len(),
                     });
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
                 let ty = self.check_expr(&args[0]);
                 // Records the move, so the source is neither used again nor dropped at scope exit.
                 self.check_and_record_value_use(&args[0], &ty);
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::Replace => {
                 if !type_args.is_empty() {
@@ -231,7 +233,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected_args: 2,
                         found_args: args.len(),
                     });
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
 
                 let place_expr: &HirExpr<'a, 'bump> = match &args[0] {
@@ -250,14 +252,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "$replace's first argument must be a place (variable, field, deref, or index)"
                             .to_string(),
                     ));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
                 if matches!(&args[1], HirExpr::Uninit { .. }) {
                     self.record(TypeErrorKind::Generic(
                         "$replace cannot write `uninit`: the slot must always hold a valid value"
                             .to_string(),
                     ));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
                 if let HirExpr::FieldAccess { object, field, .. }
                 | HirExpr::Get { object, field, .. } = place_expr
@@ -269,7 +271,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         self.record(TypeErrorKind::Generic(
                             "$replace cannot target a slice's `.len`/`.cap`".to_string(),
                         ));
-                        return HirType::Unknown;
+                        return HirType::synthetic(HirTypeKind::Unknown);
                     }
                 }
 
@@ -282,13 +284,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.recover(self.types_compatible(&target_ty, &value_ty), ());
 
                 if let HirExpr::Ident(name, _) = place_expr {
-                    let var_name = str_id_to_string(*name);
-                    if self.context.is_local_binding(&var_name)
-                        && !self.context.is_mutable(&var_name)
-                    {
+                    if self.context.is_local_binding(name) && !self.context.is_mutable(name) {
                         self.record(TypeErrorKind::Generic(format!(
                             "cannot $replace `{}`: it is not declared `mut`",
-                            var_name
+                            name
                         )));
                     }
                 }
@@ -297,7 +296,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
 
                 if let Some((root, path)) = self.static_field_path(place_expr) {
-                    if matches!(value_ty, HirType::Nullable(_) | HirType::Null) {
+                    if matches!(value_ty.kind, HirTypeKind::Nullable(_) | HirTypeKind::Null) {
                         self.clear_non_null(root, &path);
                     } else {
                         self.mark_non_null(root, &path);
@@ -313,14 +312,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "$reinterpret expects exactly 1 type argument, found {}",
                         type_args.len()
                     )));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
                 if args.len() != 1 {
                     self.record(TypeErrorKind::InvalidFunctionCall {
                         expected_args: 1,
                         found_args: args.len(),
                     });
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
                 let target_ty = type_args[0];
                 let source_ty = self.check_expr(&args[0]);
@@ -345,7 +344,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "$unreachable takes no value arguments".to_string(),
                     ));
                 }
-                HirType::Never
+                HirType::synthetic(HirTypeKind::Never)
             }
             IntrinsicKind::SizeOf | IntrinsicKind::AlignOf | IntrinsicKind::TypeName => {
                 if type_args.len() != 1 {
@@ -360,8 +359,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     ));
                 }
                 match kind {
-                    IntrinsicKind::SizeOf | IntrinsicKind::AlignOf => HirType::Usize,
-                    IntrinsicKind::TypeName => HirType::String,
+                    IntrinsicKind::SizeOf | IntrinsicKind::AlignOf => {
+                        HirType::synthetic(HirTypeKind::Usize)
+                    }
+                    IntrinsicKind::TypeName => HirType::synthetic(HirTypeKind::String),
                     _ => unreachable!(),
                 }
             }
@@ -377,21 +378,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                          or 4 (ptr, allocator, len, cap) for owned slices, found {}",
                          args.len()
                     )));
-                    return HirType::Unknown;
+                    return HirType::synthetic(HirTypeKind::Unknown);
                 }
 
                 let ptr_ty = self.check_expr(&args[0]);
                 self.check_and_record_value_use(&args[0], &ptr_ty);
-                let pointee = match Self::strip_ref(&ptr_ty) {
-                    HirType::SafePointer { inner, .. } | HirType::UnsafePointer { inner, .. } => {
-                        *inner
-                    }
+                let pointee = match &Self::strip_ref(&ptr_ty).kind {
+                    HirTypeKind::SafePointer { inner, .. }
+                    | HirTypeKind::UnsafePointer { inner, .. } => *inner,
                     _ => {
                         self.record(TypeErrorKind::Generic(format!(
                             "$own expects a `*T` or `[*]T`, found `{}`",
-                            type_to_string(&ptr_ty)
+                            type_to_string(&ptr_ty, &self.context.string_pool)
                         )));
-                        return HirType::Unknown;
+                        return HirType::synthetic(HirTypeKind::Unknown);
                     }
                 };
 
@@ -416,16 +416,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         self.record(TypeErrorKind::Generic(
                             "$own's allocator argument must be a place with stable provenance (a global, `this`, a param, or a projection through them)".to_string(),
                         ));
-                        return HirType::Unknown;
+                        return HirType::synthetic(HirTypeKind::Unknown);
                     };
 
-                    let satisfies_allocator = match Self::strip_ref(&alloc_ty) {
-                        HirType::Struct { name, .. } => {
-                            let struct_name = str_id_to_string(*name);
-                            self.context.struct_implements(&struct_name, "RawAllocator")
-                                || self.context.struct_implements(&struct_name, "Allocator")
+                    let satisfies_allocator = match &Self::strip_ref(&alloc_ty).kind {
+                        HirTypeKind::Struct { name, .. } => {
+                            self.context.struct_implements(name, "RawAllocator")
+                                || self.context.struct_implements(name, "Allocator")
                         }
-                        HirType::Generic(p) => self
+                        HirTypeKind::Generic(p) => self
                             .generic_bounds
                             .get(p)
                             .is_some_and(|names| names.iter().any(|n| n.ends_with("Allocator"))),
@@ -436,9 +435,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         self.record(TypeErrorKind::Generic(format!(
                             "$own's allocator argument must be a struct or generic type parameter implementing \
                              `RawAllocator` or `Allocator`, found `{}`",
-                            type_to_string(&alloc_ty)
+                            type_to_string(&alloc_ty, &self.context.string_pool)
                         )));
-                        return HirType::Unknown;
+                        return HirType::synthetic(HirTypeKind::Unknown);
                     }
 
                     if !matches!(allocator.root, ProvenanceRoot::Global { .. }) {
@@ -464,7 +463,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             "$own without explicit allocator requires a `this` allocator in scope"
                                 .to_string(),
                         ));
-                        return HirType::Unknown;
+                        return HirType::synthetic(HirTypeKind::Unknown);
                     };
                     allocator
                 };
@@ -477,7 +476,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     if !self.is_integer(&len_ty) {
                         self.record(TypeErrorKind::Generic(format!(
                             "$own's len argument must be an integer, found `{}`",
-                            type_to_string(&len_ty)
+                            type_to_string(&len_ty, &self.context.string_pool)
                         )));
                     }
                     let cap_ty = self.check_expr(cap_expr);
@@ -485,17 +484,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     if !self.is_integer(&cap_ty) {
                         self.record(TypeErrorKind::Generic(format!(
                             "$own's cap argument must be an integer, found `{}`",
-                            type_to_string(&cap_ty)
+                            type_to_string(&cap_ty, &self.context.string_pool)
                         )));
                     }
-                    HirType::Slice(self.context.bump.alloc_value(pointee))
+                    HirType::synthetic(HirTypeKind::Slice(self.context.bump.alloc_value(pointee)))
                 } else if let Some(len_expr) = len_arg {
                     let len_ty = self.check_expr(len_expr);
                     self.check_and_record_value_use(len_expr, &len_ty);
                     if !self.is_integer(&len_ty) {
                         self.record(TypeErrorKind::Generic(format!(
                             "$own's argument must be an integer, found `{}`",
-                            type_to_string(&len_ty)
+                            type_to_string(&len_ty, &self.context.string_pool)
                         )));
                     }
                     self.record(TypeErrorKind::Generic(
@@ -503,15 +502,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                          `$own(ptr, allocator, len, cap)`"
                             .to_string(),
                     ));
-                    HirType::Slice(self.context.bump.alloc_value(pointee))
+                    HirType::synthetic(HirTypeKind::Slice(self.context.bump.alloc_value(pointee)))
                 } else {
                     *pointee
                 };
 
-                HirType::OwnedPointer {
+                HirType::synthetic(HirTypeKind::OwnedPointer {
                     inner: self.context.bump.alloc_value(result_inner),
                     allocator: Some(allocator),
-                }
+                })
             }
             IntrinsicKind::AssertAlign => {
                 if !type_args.is_empty() {
@@ -528,14 +527,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     let ptr_ty = self.check_expr(&args[0]);
                     self.check_and_record_value_use(&args[0], &ptr_ty);
                     if !matches!(
-                        Self::strip_ref(&ptr_ty),
-                        HirType::SafePointer { .. }
-                            | HirType::UnsafePointer { .. }
-                            | HirType::OwnedPointer { .. }
+                        Self::strip_ref(&ptr_ty).kind,
+                        HirTypeKind::SafePointer { .. }
+                            | HirTypeKind::UnsafePointer { .. }
+                            | HirTypeKind::OwnedPointer { .. }
                     ) {
                         self.record(TypeErrorKind::Generic(format!(
                             "$assert_align expects a pointer, found `{}`",
-                            type_to_string(&ptr_ty)
+                            type_to_string(&ptr_ty, &self.context.string_pool)
                         )));
                     }
 
@@ -543,7 +542,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     if !self.is_integer(&align_ty) {
                         self.record(TypeErrorKind::Generic(format!(
                             "$assert_align expects an integer alignment, found `{}`",
-                            type_to_string(&align_ty)
+                            type_to_string(&align_ty, &self.context.string_pool)
                         )));
                     }
                     if let HirExpr::Number(n, _) = &args[1] {
@@ -555,7 +554,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         }
                     }
                 }
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::DropInPlace => {
                 if type_args.len() > 1 {
@@ -576,7 +575,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         expected_args: 1,
                         found_args: args.len(),
                     });
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
 
                 let ptr_ty = self.check_expr(&args[0]);
@@ -584,50 +583,50 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     &args[0],
                     HirExpr::Index { .. } | HirExpr::FieldAccess { .. } | HirExpr::Get { .. }
                 ) && !matches!(
-                    Self::strip_ref(&ptr_ty),
-                    HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                    Self::strip_ref(&ptr_ty).kind,
+                    HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. }
                 ) {
                     self.record(TypeErrorKind::Generic(
                         "$drop_in_place needs an address: write `&mut place`, not the place itself"
                             .into(),
                     ));
-                    return HirType::Void;
+                    return HirType::synthetic(HirTypeKind::Void);
                 }
 
-                let pointee = match &ptr_ty {
-                    HirType::UnsafePointer {
+                let pointee = match &ptr_ty.kind {
+                    HirTypeKind::UnsafePointer {
                         inner,
                         mutability_state,
                     }
-                    | HirType::SafePointer {
+                    | HirTypeKind::SafePointer {
                         inner,
                         mutability_state,
                     } if matches!(mutability_state, ir::ast::MutabilityState::Mut) => **inner,
-                    HirType::Ref {
+                    HirTypeKind::Ref {
                         inner,
                         ref_kind: RefKind::Unique | RefKind::Alias,
                         ..
                     } => **inner,
-                    HirType::OwnedPointer { .. } => {
+                    HirTypeKind::OwnedPointer { .. } => {
                         self.record(TypeErrorKind::Generic(
                             "$drop_in_place cannot take an owned pointer `^T`: its scope would free it \
                              again. Pass `&mut` / `[*]mut` to the pointee"
                                 .to_string(),
                         ));
-                        return HirType::Void;
+                        return HirType::synthetic(HirTypeKind::Void);
                     }
-                    other => {
+                    _ => {
                         self.record(TypeErrorKind::Generic(format!(
                             "$drop_in_place expects a `[*]mut T` or `&mut T`, found `{}`",
-                            type_to_string(other)
+                            type_to_string(&ptr_ty, &self.context.string_pool)
                         )));
-                        return HirType::Void;
+                        return HirType::synthetic(HirTypeKind::Void);
                     }
                 };
                 if let Some(t) = type_args.first() {
                     self.recover(self.types_compatible(t, &pointee), ());
                 }
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
 
             IntrinsicKind::CpuRelax => {
@@ -636,44 +635,44 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         "$cpu_relax takes no arguments".to_string(),
                     ));
                 }
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
 
             IntrinsicKind::AtomicLoad => self
                 .check_atomic_intrinsic("$atomic_load", type_args, args, 0, 1, false)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicStore => {
                 self.check_atomic_intrinsic("$atomic_store", type_args, args, 1, 1, false);
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
             IntrinsicKind::AtomicSwap => self
                 .check_atomic_intrinsic("$atomic_swap", type_args, args, 1, 1, false)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicCas => self
                 .check_atomic_intrinsic("$atomic_cas", type_args, args, 2, 2, false)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFetchAdd => self
                 .check_atomic_intrinsic("$atomic_fetch_add", type_args, args, 1, 1, true)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFetchSub => self
                 .check_atomic_intrinsic("$atomic_fetch_sub", type_args, args, 1, 1, true)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFetchAnd => self
                 .check_atomic_intrinsic("$atomic_fetch_and", type_args, args, 1, 1, true)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFetchOr => self
                 .check_atomic_intrinsic("$atomic_fetch_or", type_args, args, 1, 1, true)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFetchXor => self
                 .check_atomic_intrinsic("$atomic_fetch_xor", type_args, args, 1, 1, true)
-                .unwrap_or(HirType::Unknown),
+                .unwrap_or(HirType::synthetic(HirTypeKind::Unknown)),
             IntrinsicKind::AtomicFence => {
                 if !type_args.is_empty() || !args.is_empty() {
                     self.record(TypeErrorKind::Generic(
                         "$atomic_fence takes no arguments".to_string(),
                     ));
                 }
-                HirType::Void
+                HirType::synthetic(HirTypeKind::Void)
             }
         }
     }
@@ -703,12 +702,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let t = type_args[0];
-        let ok = matches!(t, HirType::Generic(_))
+        let ok = matches!(t.kind, HirTypeKind::Generic(_))
             || self.is_integer(&t)
             || (!integer_only
                 && matches!(
-                    t,
-                    HirType::Boolean | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                    t.kind,
+                    HirTypeKind::Boolean
+                        | HirTypeKind::SafePointer { .. }
+                        | HirTypeKind::UnsafePointer { .. }
                 ));
         if !ok {
             self.record(TypeErrorKind::Generic(format!(
@@ -718,7 +719,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 } else {
                     "an integer, `bool` or pointer type"
                 },
-                type_to_string(&t)
+                type_to_string(&t, &self.context.string_pool)
             )));
             return None;
         }
@@ -726,8 +727,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mutates = value_args > 0;
         let ptr_ty = self.check_expr(&args[0]);
         self.check_and_record_value_use(&args[0], &ptr_ty);
-        let pointee = match &ptr_ty {
-            HirType::Ref {
+        let pointee = match &ptr_ty.kind {
+            HirTypeKind::Ref {
                 inner, ref_kind, ..
             } => {
                 if mutates && *ref_kind != RefKind::Alias {
@@ -739,11 +740,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 **inner
             }
-            HirType::SafePointer {
+            HirTypeKind::SafePointer {
                 inner,
                 mutability_state,
             }
-            | HirType::UnsafePointer {
+            | HirTypeKind::UnsafePointer {
                 inner,
                 mutability_state,
             } => {
@@ -758,7 +759,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             _ => {
                 self.record(TypeErrorKind::Generic(format!(
                     "{name} expects `&alias`, `&`, or a raw pointer, found `{}`",
-                    type_to_string(&ptr_ty)
+                    type_to_string(&ptr_ty, &self.context.string_pool)
                 )));
                 return Some(t);
             }
@@ -767,12 +768,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         for a in &args[1 + value_args..] {
             let ot = self.check_expr(a);
-            let ok = matches!(Self::strip_ref(&ot), HirType::Enum { name, .. } if name.as_str().ends_with("Ordering"))
-                || matches!(ot, HirType::Unknown);
+            let ok = matches!(Self::strip_ref(&ot).kind, HirTypeKind::Enum { name, .. } if name.as_str().ends_with("Ordering"))
+                || matches!(ot.kind, HirTypeKind::Unknown);
             if !ok {
                 self.record(TypeErrorKind::Generic(format!(
                     "{name}: expected an `Ordering`, found `{}`",
-                    type_to_string(&ot)
+                    type_to_string(&ot, &self.context.string_pool)
                 )));
             }
         }
@@ -796,46 +797,46 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> Option<HirType<'a, 'bump>> {
         let ty = self.check_expr(arg);
         self.check_and_record_value_use(arg, &ty);
-        match &ty {
-            HirType::SafePointer {
+        match &ty.kind {
+            HirTypeKind::SafePointer {
                 inner,
                 mutability_state,
             }
-            | HirType::UnsafePointer {
+            | HirTypeKind::UnsafePointer {
                 inner,
                 mutability_state,
             } => {
                 if need_mut && *mutability_state != ir::ast::MutabilityState::Mut {
                     self.record(TypeErrorKind::Generic(format!(
                         "{name} needs a `mut` pointer for its destination, found `{}`",
-                        type_to_string(&ty)
+                        type_to_string(&ty, &self.context.string_pool)
                     )));
                     return None;
                 }
                 Some(**inner)
             }
-            HirType::Ref {
+            HirTypeKind::Ref {
                 inner, ref_kind, ..
             } => {
                 if need_mut && !matches!(ref_kind, RefKind::Unique | RefKind::Alias) {
                     self.record(TypeErrorKind::Generic(format!(
                         "{name} needs `&mut`/`&alias` for its destination, found `{}`",
-                        type_to_string(&ty)
+                        type_to_string(&ty, &self.context.string_pool)
                     )));
                     return None;
                 }
                 Some(**inner)
             }
-            HirType::OwnedPointer { .. } => {
+            HirTypeKind::OwnedPointer { .. } => {
                 self.record(TypeErrorKind::Generic(format!(
                     "{name} cannot take an owned pointer `^T`; pass a raw pointer or reference to the pointee"
                 )));
                 None
             }
-            other => {
+            _ => {
                 self.record(TypeErrorKind::Generic(format!(
                     "{name} expects a pointer or reference, found `{}`",
-                    type_to_string(other)
+                    type_to_string(&ty, &self.context.string_pool)
                 )));
                 None
             }

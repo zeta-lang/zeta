@@ -6,13 +6,13 @@ use ir::{
     },
     errors::type_error::TypeErrorKind,
     hir::{
-        AssignmentOperator, HirErrorHandlerPattern, HirExpr, HirFunc, HirParam, HirStmt, HirType,
-        InterpolationPart, StrId,
+        AssignmentOperator, HirErrorHandlerPattern, HirExpr, HirFunc, HirParam, HirStmt,
+        HirTypeKind, InterpolationPart, StrId, Visibility,
     },
     ir_hasher::FxHashMap,
 };
 
-use crate::{TypeChecker, str_id_to_string};
+use crate::TypeChecker;
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// Cached read templates for `func`, one per normal parameter.
@@ -26,6 +26,39 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let templates = self.build_read_templates(func);
         self.read_templates.insert(func.name, templates.clone());
         templates
+    }
+
+    /// Public (and `Module`) functions are borrow-checked coarsely.
+    ///
+    /// This is to prevent issues like API depending on implementation details, and harder multi-threading of the compiler
+    /// (A cool optimization is that a dependency can type check signatures, then all dependents of that
+    /// dependency can start being type checked immediately instead of waiting for the signatures to be
+    /// "precised" by the borrow checker, if this didn't exist, then that feature is impossible to implement)
+    fn has_precise_param_effects(func: &HirFunc<'a, 'bump>) -> bool {
+        matches!(
+            func.function_metadata.visibility,
+            Visibility::Private | Visibility::Internal
+        )
+    }
+
+    /// Templates for borrow/alias checking (`check_call_arg_read_effects`).
+    /// Functions that don't qualify for precise effects are reported as `Opaque`.
+    pub fn analyze_read_templates_for_borrows(
+        &mut self,
+        func: &HirFunc<'a, 'bump>,
+    ) -> Vec<ReadTemplate> {
+        if Self::has_precise_param_effects(func) {
+            return self.analyze_read_templates(func);
+        }
+        let normal_count = func
+            .params
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| matches!(p, HirParam::Normal { .. }))
+                    .count()
+            })
+            .unwrap_or(0);
+        vec![ReadTemplate::Opaque; normal_count]
     }
 
     /// Walks the body, recording every read that goes through a parameter.
@@ -118,13 +151,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         else {
             return None;
         };
-        match target_type {
-            HirType::UnsafePointer {
+        match target_type.kind {
+            HirTypeKind::UnsafePointer {
                 mutability_state, ..
             }
-            | HirType::SafePointer {
+            | HirTypeKind::SafePointer {
                 mutability_state, ..
-            } if *mutability_state == MutabilityState::Mut => Some(inner),
+            } if mutability_state == MutabilityState::Mut => Some(inner),
             _ => None,
         }
     }
@@ -135,9 +168,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn resolve_callee_for_template(
         &self,
         callee: &HirExpr<'a, 'bump>,
-    ) -> Option<HirFunc<'a, 'bump>> {
+    ) -> Option<(HirFunc<'a, 'bump>, bool)> {
         match callee {
-            HirExpr::Ident(name, _) => self.context.get_function(&str_id_to_string(*name)),
+            HirExpr::Ident(name, _) => self.context.get_function(name).map(|f| (f, false)),
             HirExpr::ModuleAccess(access) => {
                 let cur = self.context.current_module_idx;
                 let aliased: Option<usize> = if access.path.len() == 1 {
@@ -160,6 +193,20 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 };
                 self.context
                     .get_module_function(midx, &access.member.to_string())
+                    .map(|f| (f, false))
+            }
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                let HirExpr::Ident(modname, _) = &**object else {
+                    return None;
+                };
+                let cur = self.context.current_module_idx;
+                let midx = self
+                    .imports_by_module
+                    .get(&cur)
+                    .and_then(|imp| imp.module_aliases.get(modname).copied())?;
+                self.context
+                    .get_module_function(midx, field.as_str())
+                    .map(|f| (f, false))
             }
             // Methods, interface calls, lambdas: no receiver type here.
             _ => None,
@@ -173,14 +220,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// Used so that `callee(x as *mut T)` where the callee never reads `x` is treated as a *write*
     /// target rather than a read.
     pub fn callee_may_read_arg(&mut self, callee: &HirExpr<'a, 'bump>, arg_idx: usize) -> bool {
-        let Some(func) = self.resolve_callee_for_template(callee) else {
+        let Some((func, is_method)) = self.resolve_callee_for_template(callee) else {
             return true;
         };
         let Some(params) = func.params else {
             return true;
         };
-        // Template indices count only `Normal` params, so bail out if `this` shifts them.
-        if arg_idx >= params.len() || params.iter().any(|p| matches!(p, HirParam::This { .. })) {
+        let has_this = params.iter().any(|p| matches!(p, HirParam::This { .. }));
+        if has_this && !is_method {
+            return true;
+        }
+        let normal_count = params
+            .iter()
+            .filter(|p| matches!(p, HirParam::Normal { .. }))
+            .count();
+        if arg_idx >= normal_count {
             return true;
         }
         if func.body.is_none() {

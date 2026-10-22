@@ -4,13 +4,12 @@ use ir::{
     },
     errors::type_error::TypeErrorKind,
     hir::{
-        HirEffectAccess, HirEffectSegment, HirExpr, HirType, Operator, ProvenanceAnnotation,
+        HirEffectAccess, HirEffectSegment, HirExpr, HirTypeKind, Operator, ProvenanceAnnotation,
         RefKind,
     },
-    ir_hasher::HashSet,
 };
 
-use crate::{TypeChecker, closures, naming::provenance_to_string, str_id_to_string};
+use crate::{TypeChecker, closures, naming::provenance_to_string, type_checker::LoanWatermark};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// The provenance of the reference that reading through `expr` goes via.
@@ -53,11 +52,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 let base = self.resolve_place(object)?;
-                let base = match self.peek_type(object) {
-                    HirType::Ref { .. }
-                    | HirType::SafePointer { .. }
-                    | HirType::UnsafePointer { .. }
-                    | HirType::OwnedPointer { .. } => self.borrow_checker.project_deref(base),
+                let base = match self.peek_type(object).kind {
+                    HirTypeKind::Ref { .. }
+                    | HirTypeKind::SafePointer { .. }
+                    | HirTypeKind::UnsafePointer { .. }
+                    | HirTypeKind::OwnedPointer { .. } => self.borrow_checker.project_deref(base),
                     _ => base,
                 };
                 Some(self.borrow_checker.project_field(base, *field))
@@ -74,8 +73,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 end,
                 inclusive,
                 ..
-            } => match self.peek_type(object) {
-                HirType::Array(_, _) | HirType::Slice(_) => {
+            } => match self.peek_type(object).kind {
+                HirTypeKind::Array(_, _) | HirTypeKind::Slice(_) => {
                     let base = self.resolve_place(object)?;
                     let interval = self.slice_interval(start, end, *inclusive);
                     Some(self.borrow_checker.project_index(
@@ -84,8 +83,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         IndexContainer::Primitive,
                     ))
                 }
-                HirType::OwnedPointer { inner, .. }
-                    if matches!(*inner, HirType::Slice(_) | HirType::Array(_, _)) =>
+                HirTypeKind::OwnedPointer { inner, .. }
+                    if matches!(inner.kind, HirTypeKind::Slice(_) | HirTypeKind::Array(_, _)) =>
                 {
                     let base = self.resolve_place(object)?;
                     let deref_base = self.borrow_checker.project_deref(base);
@@ -99,8 +98,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 _ => None,
             },
 
-            HirExpr::Index { object, index, .. } => match self.peek_type(object) {
-                HirType::Array(_, _) | HirType::Slice(_) => {
+            HirExpr::Index { object, index, .. } => match self.peek_type(object).kind {
+                HirTypeKind::Array(_, _) | HirTypeKind::Slice(_) => {
                     let base = self.resolve_place(object)?;
                     let bound = self.expr_to_bound(index);
                     let interval = Interval {
@@ -113,8 +112,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         IndexContainer::Primitive,
                     ))
                 }
-                HirType::OwnedPointer { inner, .. }
-                    if matches!(*inner, HirType::Slice(_) | HirType::Array(_, _)) =>
+                HirTypeKind::OwnedPointer { inner, .. }
+                    if matches!(inner.kind, HirTypeKind::Slice(_) | HirTypeKind::Array(_, _)) =>
                 {
                     let base = self.resolve_place(object)?;
                     let deref_base = self.borrow_checker.project_deref(base);
@@ -129,7 +128,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         IndexContainer::Primitive,
                     ))
                 }
-                HirType::SafePointer { .. } | HirType::UnsafePointer { .. } => {
+                HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. } => {
                     let ptr_place = self.resolve_place(object)?;
                     let (base, cur) = self.borrow_checker.pointee_of(ptr_place)?.clone();
                     let idx_bound = self.expr_to_bound(index);
@@ -154,8 +153,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ..
             } => {
                 if !matches!(
-                    self.peek_type(left),
-                    HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                    self.peek_type(left).kind,
+                    HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. }
                 ) {
                     return None;
                 }
@@ -204,11 +203,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if p == ancestor {
                 return true;
             }
-            cur = self
-                .borrow_checker
-                .places
-                .get(p.0 as usize)
-                .and_then(|pl| pl.parent);
+            cur = self.borrow_checker.place(p).parent;
         }
         false
     }
@@ -226,7 +221,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         match expr {
             HirExpr::Number(v, _) => Some(*v),
             HirExpr::Ident(name, _) => {
-                let (sym, _) = self.context.get_variable(&str_id_to_string(*name))?;
+                let (sym, _) = self.context.get_variable(name)?;
                 self.const_symbols.get(&sym).copied()
             }
             HirExpr::Binary {
@@ -466,7 +461,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         };
 
         match provenance {
-            Some(p) => format!("{} (via {})", base, provenance_to_string(p)),
+            Some(p) => format!(
+                "{} (via {})",
+                base,
+                provenance_to_string(p, &self.context.string_pool)
+            ),
             None => base.to_string(),
         }
     }
@@ -518,36 +517,49 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     /// Loans created while checking one expression are *temporaries*: snapshot the live keys
     /// before, then end every loan whose key is new afterwards.
-    pub fn snapshot_call_loan_keys(&self) -> HashSet<usize> {
-        self.call_loans.keys().copied().collect()
+    pub fn snapshot_temp_loans(&self) -> LoanWatermark {
+        LoanWatermark {
+            call: self.call_loan_order.len(),
+            closure: self.closure_loan_order.len(),
+        }
     }
 
-    pub fn end_temp_call_loans(&mut self, before: &HashSet<usize>) {
-        let new_keys: Vec<usize> = self
-            .call_loans
-            .keys()
-            .copied()
-            .filter(|k| !before.contains(k))
-            .collect();
-        for k in new_keys {
-            if let Some(loan_id) = self.call_loans.remove(&k) {
+    pub fn end_temp_call_loans(&mut self, watermark: LoanWatermark) {
+        while self.call_loan_order.len() > watermark.call {
+            let (key, loan_id) = self.call_loan_order.pop().unwrap();
+
+            if self.call_loans.get(&key) == Some(&loan_id) {
+                self.call_loans.remove(&key);
                 self.borrow_checker.end_loan_now(loan_id);
             }
         }
     }
 
-    pub fn end_temp_closure_loans(&mut self, snap: &HashSet<usize>) {
-        let leaked: Vec<usize> = self
-            .closure_loans
-            .keys()
-            .filter(|k| !snap.contains(k))
-            .copied()
-            .collect();
-        for k in leaked {
-            if let Some(ids) = self.closure_loans.remove(&k) {
-                for id in ids {
-                    self.borrow_checker.end_loan_now(id);
+    pub fn end_temp_closure_loans(&mut self, watermark: LoanWatermark) {
+        while self.closure_loan_order.len() > watermark.closure {
+            let (key, loan_id) = self.closure_loan_order.pop().unwrap();
+
+            let removed = if let Some(ids) = self.closure_loans.get_mut(&key) {
+                if let Some(index) = ids.iter().position(|&id| id == loan_id) {
+                    ids.swap_remove(index);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            if removed {
+                self.borrow_checker.end_loan_now(loan_id);
+            }
+
+            if self
+                .closure_loans
+                .get(&key)
+                .is_some_and(|ids| ids.is_empty())
+            {
+                self.closure_loans.remove(&key);
             }
         }
     }

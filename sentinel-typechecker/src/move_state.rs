@@ -8,7 +8,7 @@ pub struct MoveState {
     pub whole_moved: LocalBitSet,
     /// 1 bit per local: at least one field of this local is moved.
     pub any_field_moved: LocalBitSet,
-    /// Sparse field moves: (local, field_name). In 99% of functions, this is empty!
+    /// Sparse field moves
     pub field_moves: SmallVec<(LocalId, StrId), 4>,
 }
 
@@ -59,25 +59,24 @@ impl MoveState {
         self.field_moves.retain(|&(l, _)| l != id);
     }
 
-    /// O(1) Branch Join using bitwise OR!
+    #[inline]
+    pub fn join_assign(&mut self, other: &MoveState) {
+        self.whole_moved.union_with(&other.whole_moved);
+        self.any_field_moved.union_with(&other.any_field_moved);
+        for &item in &other.field_moves {
+            if !self.field_moves.contains(&item) {
+                self.field_moves.push(item);
+            }
+        }
+    }
+
     #[inline]
     pub fn join(a: &MoveState, b: &MoveState) -> MoveState {
         let mut result = a.clone();
-        result.whole_moved.union_with(&b.whole_moved);
-        result.any_field_moved.union_with(&b.any_field_moved);
-
-        // Fast path: if neither branch moved fields, skip the sparse vector
-        if !b.field_moves.is_empty() {
-            for &item in &b.field_moves {
-                if !result.field_moves.contains(&item) {
-                    result.field_moves.push(item);
-                }
-            }
-        }
+        result.join_assign(b);
         result
     }
 
-    /// O(1) Superset check for loop convergence
     #[inline]
     pub fn is_superset_of(&self, other: &MoveState) -> bool {
         if !self.whole_moved.is_superset_of(&other.whole_moved) {

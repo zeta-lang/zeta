@@ -1,7 +1,8 @@
 use ir::{
     errors::type_error::TypeErrorKind,
     hir::{
-        AssignmentOperator, HirExpr, HirFunc, HirParam, HirStmt, HirType, Operator, RefKind, StrId,
+        AssignmentOperator, HirExpr, HirFunc, HirParam, HirStmt, HirType, HirTypeKind, Operator,
+        RefKind, StrId,
     },
     ir_hasher::{FxHashMap, HashSet},
     nll_cfg::PointId,
@@ -12,7 +13,6 @@ use crate::{
     dataflow::{Effect, FlowState, Solved},
     initialization_bitset::FastInitState,
     move_state::MoveState,
-    str_id_to_string,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,7 +76,7 @@ pub(crate) struct ModuleImports {
     pub(crate) named: FxHashMap<StrId, usize>, // item name -> resolved declaring module_idx
     /// `import foo::bar;`, foo::bar::whatever() becomes usable qualified,
     /// but nothing from it becomes usable bare.
-    pub(crate) modules: std::collections::HashSet<usize>,
+    pub(crate) modules: HashSet<usize>,
     pub(crate) module_aliases: FxHashMap<StrId, usize>,
     pub(crate) wildcard: Vec<usize>,
 }
@@ -344,7 +344,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if !matches!(index, HirExpr::Ident(n, _) if *n == i) {
                 continue;
             }
-            let HirType::Array(_, len) = self.peek_type(object) else {
+            let HirTypeKind::Array(_, len) = self.peek_type(object).kind else {
                 continue;
             };
             if end > len as i64 {
@@ -401,6 +401,26 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
     }
 
+    pub fn optimistically_mark_mut_slice_init(&mut self, e: &HirExpr<'a, 'bump>) {
+        let HirExpr::Slice {
+            object, start, end, ..
+        } = e
+        else {
+            return;
+        };
+        let (HirExpr::Number(lo, _), HirExpr::Number(hi, _)) = (&**start, &**end) else {
+            return; // symbolic bounds: leave uninit, the `ensures` machinery handles them
+        };
+        let Some((root, path)) = self.static_field_path(object) else {
+            return;
+        };
+        let len = match self.peek_type(object).kind {
+            HirTypeKind::Array(_, l) => Some(l),
+            _ => None,
+        };
+        self.mark_array_range(root, &path, *lo, *hi, len);
+    }
+
     pub fn optimistically_mark_mut_target_init(&mut self, expr: &HirExpr<'a, 'bump>) {
         match expr {
             HirExpr::Ident(_, _) | HirExpr::FieldAccess { .. } | HirExpr::Get { .. } => {
@@ -412,8 +432,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if let Some((root, path)) = self.static_field_path(object) {
                     match index {
                         HirExpr::Number(i, _) => {
-                            let len = match self.peek_type(object) {
-                                HirType::Array(_, l) => Some(l),
+                            let len = match self.peek_type(object).kind {
+                                HirTypeKind::Array(_, l) => Some(l),
                                 _ => None,
                             };
                             self.mark_array_range(root, &path, *i, *i + 1, len);
@@ -433,8 +453,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             } => {
                 if let Some((root, path)) = self.static_field_path(object) {
                     if let (HirExpr::Number(s, _), HirExpr::Number(e, _)) = (start, end) {
-                        let len = match self.peek_type(object) {
-                            HirType::Array(_, l) => Some(l),
+                        let len = match self.peek_type(object).kind {
+                            HirTypeKind::Array(_, l) => Some(l),
                             _ => None,
                         };
                         self.mark_array_range(root, &path, *s, *e, len);
@@ -463,14 +483,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) {
         match target {
             HirExpr::Ident(name, _) => {
-                let var_name = str_id_to_string(*name);
-                self.check_ident_init_read(*name, &var_name, ty);
+                self.check_ident_init_read(*name, name.as_str(), ty);
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 if let Some((root, mut path)) = self.static_field_path(object) {
                     path.push(*field);
-                    let root_str = str_id_to_string(root);
-                    self.check_init_read_path(root, &path, &root_str);
+                    self.check_init_read_path(root, &path, root.as_str());
                 }
             }
             HirExpr::Index { object, index, .. } => {
@@ -485,10 +503,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                             _ => false,
                         };
                         if !covered {
-                            let root_str = str_id_to_string(root);
                             self.record(TypeErrorKind::Generic(format!(
                                 "use of uninitialized value `{}[{}]`: a compound assignment reads the current value first",
-                                root_str, i
+                                root, i
                             )));
                         }
                     }
@@ -619,10 +636,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         ty: &HirType<'a, 'bump>,
     ) -> Option<Vec<(StrId, HirType<'a, 'bump>)>> {
         let t = Self::peel_indirections(*Self::strip_ref(ty));
-        let HirType::Struct { name, .. } = t else {
+        let HirTypeKind::Struct { name, .. } = t.kind else {
             return None;
         };
-        let def = self.context.get_struct(&str_id_to_string(name))?;
+        let def = self.context.get_struct(name)?;
         Some(def.fields.iter().map(|f| (f.name, f.field_type)).collect())
     }
 
@@ -672,7 +689,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return;
         };
         let status = match Self::node_exact(&node, path) {
-            Some(n @ InitNode::Struct(_)) if matches!(ty, HirType::Struct { .. }) => {
+            Some(n @ InitNode::Struct(_)) if matches!(ty.kind, HirTypeKind::Struct { .. }) => {
                 self.status_typed(n, ty)
             }
             _ => Self::status_at_path(&node, path),
@@ -692,9 +709,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn status_typed(&self, node: &InitNode, ty: &HirType<'a, 'bump>) -> InitStatus {
-        match (node, ty) {
-            (InitNode::Struct(_), HirType::Struct { name, .. }) => {
-                self.status_for_whole_struct(node, *name)
+        match (node, ty.kind) {
+            (InitNode::Struct(_), HirTypeKind::Struct { name, .. }) => {
+                self.status_for_whole_struct(node, name)
             }
             _ => Self::status_at_path(node, &[]),
         }
@@ -767,8 +784,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let Some(node) = self.init_node(name) else {
             return;
         };
-        let status = match ty {
-            HirType::Struct { name: sname, .. } => self.status_for_whole_struct(&node, *sname),
+        let status = match ty.kind {
+            HirTypeKind::Struct { name: sname, .. } => self.status_for_whole_struct(&node, sname),
             _ => Self::status_at_path(&node, &[]),
         };
         match status {
@@ -790,6 +807,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         start: &HirExpr<'a, 'bump>,
         end: &HirExpr<'a, 'bump>,
     ) {
+        if std::mem::take(&mut self.skip_slice_init_check) {
+            return;
+        }
         if self.suppress_init_read {
             return;
         }
@@ -800,7 +820,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return;
         };
         let target = Self::node_at_path_ref(&node, &path);
-        let root_str = str_id_to_string(root);
+
+        let sym_ok = match (Self::inst_bound_of(start), Self::inst_bound_of(end)) {
+            (Some(lo), Some(hi)) => self.sym_init_covers(root, &path, lo, hi),
+            _ => false,
+        };
 
         match (start, end) {
             (HirExpr::Number(s, _), HirExpr::Number(e, _)) => {
@@ -809,10 +833,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     InitNode::Whole(InitStatus::Initialized) => true,
                     _ => false,
                 };
-                if !covered {
+                if !covered && !sym_ok {
                     self.record(TypeErrorKind::Generic(format!(
                         "use of uninitialized value `{}[{}..{}]`: not every element in this range has been assigned since `uninit`",
-                        root_str, s, e
+                        root, s, e
                     )));
                 }
             }
@@ -825,11 +849,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     } => ranges.covers_full(*l as i64),
                     _ => false,
                 };
-                if !whole_ok {
+                if !whole_ok && !sym_ok {
                     self.record(TypeErrorKind::Generic(format!(
                         "slicing `{}` with a non-constant bound requires the whole array to be initialized \
                          (the compiler can't prove which elements are covered)",
-                        root_str
+                        root
                     )));
                 }
             }
@@ -1068,8 +1092,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 _ => InitStatus::Initialized,
             };
         };
-        let struct_name_str = str_id_to_string(struct_name);
-        let Some(def) = self.context.get_struct(&struct_name_str) else {
+        let Some(def) = self.context.get_struct(struct_name) else {
             return InitStatus::Maybe;
         };
         let mut any_uninit = false;
@@ -1163,10 +1186,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn mark_field_uninit(&mut self, root: StrId, path: &[StrId]) {
-        let root_ty = self
-            .context
-            .get_variable(&str_id_to_string(root))
-            .map(|(_, t)| t);
+        let root_ty = self.context.get_variable(root).map(|(_, t)| t);
         let id = self.local_table.register(root);
         self.log_effect(Effect::UninitField {
             local: id,
@@ -1352,7 +1372,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.init_state = f.init;
             }
             None => {
-                // fallback: no solved state (no CFG point, or solver skipped this function)
+                // fallback: no solved state
                 let (m, i) = self.converge_loop_states(
                     body,
                     self.move_state.clone(),

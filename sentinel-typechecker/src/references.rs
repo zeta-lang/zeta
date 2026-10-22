@@ -1,19 +1,19 @@
 use ir::{
     errors::type_error::{TypeCheckResult, TypeErrorKind},
-    hir::{HirExpr, HirType, RefKind},
+    hir::{HirExpr, HirType, HirTypeKind, RefKind, StrId},
     span::SourceSpan,
 };
 
-use crate::{TypeChecker, closures, str_id_to_string};
+use crate::{TypeChecker, closures};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn is_reference_like(&self, ty: &HirType<'a, 'bump>) -> bool {
         matches!(
-            ty,
-            HirType::Ref { .. }
-                | HirType::SafePointer { .. }
-                | HirType::UnsafePointer { .. }
-                | HirType::OwnedPointer { .. }
+            ty.kind,
+            HirTypeKind::Ref { .. }
+                | HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
+                | HirTypeKind::OwnedPointer { .. }
         )
     }
 
@@ -29,25 +29,22 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 None => false,
             },
 
-            HirExpr::Ident(name, _) => {
-                let var_name = str_id_to_string(*name);
-                self.context.is_dangling(&var_name)
-            }
+            HirExpr::Ident(name, _) => self.context.is_dangling(name),
             _ => false,
         }
     }
 
     fn is_indirection(ty: &HirType<'a, 'bump>) -> bool {
-        let ty = match ty {
-            HirType::Nullable(inner) => **inner,
-            t => *t,
+        let ty = match ty.kind {
+            HirTypeKind::Nullable(inner) => *inner,
+            _ => *ty,
         };
         matches!(
-            ty,
-            HirType::Ref { .. }
-                | HirType::SafePointer { .. }
-                | HirType::UnsafePointer { .. }
-                | HirType::OwnedPointer { .. }
+            ty.kind,
+            HirTypeKind::Ref { .. }
+                | HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
+                | HirTypeKind::OwnedPointer { .. }
         )
     }
 
@@ -86,11 +83,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let HirExpr::Ident(name, _) = expr {
-            let var_name = str_id_to_string(*name);
-            if self.context.is_dangling(&var_name) {
+            if self.context.is_dangling(name) {
                 return Err(TypeErrorKind::Generic(format!(
                     "cannot return `{}`: it holds a pointer to local stack memory that does not outlive this function",
-                    var_name
+                    name
                 )).at(self.current_span));
             }
         }
@@ -98,9 +94,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         Ok(())
     }
 
-    pub fn find_root_local_ident(&self, expr: &HirExpr<'a, 'bump>) -> Option<String> {
+    pub fn find_root_local_ident(&self, expr: &HirExpr<'a, 'bump>) -> Option<StrId> {
         match expr {
-            HirExpr::Ident(name, _) => Some(str_id_to_string(*name)),
+            HirExpr::Ident(name, _) => Some(*name),
             HirExpr::FieldAccess { object, .. } | HirExpr::Get { object, .. } => {
                 self.find_root_local_ident(object)
             }
@@ -135,11 +131,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     ) -> HirType<'a, 'bump> {
         self.set_span(span);
 
+        let prev_si = self.suppress_init_read;
+        if self.in_unsafe() {
+            self.suppress_init_read = true; // taking an address isn't a read of the value
+        }
         let inner_ty = if ref_kind != RefKind::Shared || self.resolve_place(expr).is_some() {
             self.check_expr_as_place(expr)
         } else {
             self.check_expr(expr)
         };
+        self.suppress_init_read = prev_si;
 
         let provenance = self.infer_provenance(expr);
 
@@ -165,10 +166,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        HirType::Ref {
-            inner: self.context.bump.alloc_value(inner_ty),
-            ref_kind,
-            provenance,
+        HirType {
+            kind: HirTypeKind::Ref {
+                inner: self.context.bump.alloc_value(inner_ty),
+                ref_kind,
+                provenance,
+            },
+            span,
         }
     }
 }

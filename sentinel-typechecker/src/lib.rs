@@ -6,6 +6,7 @@ pub mod closures;
 pub mod concurrency;
 pub mod control_flow;
 pub mod dataflow;
+pub mod ensures;
 pub mod expressions;
 pub mod initialization;
 pub mod initialization_bitset;
@@ -24,6 +25,6 @@ pub mod type_context;
 pub mod types;
 
 pub use type_checker::TypeChecker;
-pub use type_context::TypeContext;
-
-pub use crate::naming::str_id_to_string;
+pub use type_context::{
+    AsStrId, Binding, Globals, GlobalsBuilder, Scope, TypeContext, TypeMethodTable,
+};

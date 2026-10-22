@@ -7,12 +7,13 @@ use ir::{
     hir::{
         CaptureMode, ClosureKind, ClosureLowering, HirClosureCapture, HirEffectSegment,
         HirErrorHandlerPattern, HirExpr, HirFunc, HirGeneric, HirMatchArm, HirParam, HirStmt,
-        HirType, InterpolationPart, RefKind, StrId, effect_path_is_prefix, effect_segment_eq,
-        pattern_bound_names, static_effect_path,
+        HirType, HirTypeKind, InterpolationPart, RefKind, StrId, effect_path_is_prefix,
+        effect_segment_eq, pattern_bound_names, static_effect_path,
     },
     ir_hasher::FxHashMap,
     span::SourceSpan,
 };
+use zetaruntime::intern_fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum UseLevel {
@@ -112,7 +113,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if n == self.this_id {
             self.context.get_variable("this").is_some()
         } else {
-            self.context.is_local_binding(&str_id_to_string(n))
+            self.context.is_local_binding(n)
         }
     }
 
@@ -153,12 +154,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn describe_path(&self, source: StrId, path: &[HirEffectSegment<'bump>]) -> String {
-        let mut s = str_id_to_string(source);
+        let mut s = source.to_string();
         for seg in path {
             match seg {
                 HirEffectSegment::Field(f) => {
                     s.push('.');
-                    s.push_str(&str_id_to_string(*f));
+                    s.push_str(f.as_str());
                 }
                 HirEffectSegment::Index(_) => s.push_str("[..]"),
             }
@@ -506,10 +507,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             let place_ty = self.peek_type(&place_expr);
             let field_ty = match mode {
                 CaptureMode::ByValue => place_ty,
-                CaptureMode::ByRef(rk) => HirType::Ref {
-                    inner: self.context.bump.alloc_value(place_ty),
-                    ref_kind: rk,
-                    provenance: self.infer_provenance(&place_expr),
+                CaptureMode::ByRef(rk) => HirType {
+                    kind: HirTypeKind::Ref {
+                        inner: self.context.bump.alloc_value(place_ty),
+                        ref_kind: rk,
+                        provenance: self.infer_provenance(&place_expr),
+                    },
+                    span,
                 },
             };
 
@@ -589,6 +593,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let HirExpr::Lambda {
             params,
             return_type,
+            ensures,
             body,
             span,
             is_move,
@@ -599,7 +604,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         };
         self.set_span(*span);
         let declared_ret: HirType<'a, 'bump> = **return_type;
-        let ret_is_inferred = matches!(declared_ret, HirType::Unknown | HirType::Void);
+        let ret_is_inferred = matches!(declared_ret.kind, HirTypeKind::Unknown | HirTypeKind::Void);
 
         let mut bound: Vec<StrId> = params.iter().map(|p| p.name).collect();
         let mut raw_free = Vec::new();
@@ -612,11 +617,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         );
 
         let (sig_params, sig_ret): (Option<&[HirType<'a, 'bump>]>, Option<HirType<'a, 'bump>>) =
-            match &sig {
-                Some(HirType::Lambda {
+            match sig.map(|sig| sig.kind) {
+                Some(HirTypeKind::Lambda {
                     params: sp,
                     return_type: sr,
-                }) => (Some(*sp), Some(**sr)),
+                }) => (Some(sp), Some(*sr)),
                 _ => (None, None),
             };
         let mut param_tys: Vec<HirType<'a, 'bump>> = Vec::with_capacity(params.len());
@@ -624,7 +629,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             let from_sig = sig_params
                 .and_then(|sp| sp.get(i))
                 .copied()
-                .filter(|t| !matches!(t, HirType::Generic(_)));
+                .filter(|t| !matches!(t.kind, HirTypeKind::Generic(_)));
             let ty = match (p.param_type, from_sig) {
                 (Some(annotated), Some(expected)) => {
                     self.recover(self.types_compatible(&expected, &annotated), ());
@@ -637,7 +642,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                         self.record(TypeErrorKind::TypeCannotBeInferred);
                     }
 
-                    HirType::Unknown
+                    HirType::unknown(*span)
                 }
             };
             param_tys.push(ty);
@@ -645,14 +650,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let mut lambda_context = self.context.create_child_scope();
         for (p, ty) in params.iter().zip(param_tys.iter()) {
-            let param_name = str_id_to_string(p.name);
-            if lambda_context.get_variable(&param_name).is_some() {
+            if lambda_context.get_variable(p.name).is_some() {
                 self.record(TypeErrorKind::VariableAlreadyExists {
-                    var_name: param_name.clone(),
+                    var_name: p.name.to_string(),
                 });
             }
             let sid = self.mint_symbol_id();
-            lambda_context.add_variable(param_name, *ty, sid);
+            lambda_context.add_variable(p.name, *ty, sid);
         }
 
         lambda_context.current_return_type = if ret_is_inferred {
@@ -669,21 +673,94 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .collect(),
             static_uses: Vec::default(),
         });
+
+        // The lambda as a function, so its `ensures` go through the same machinery as a
+        // function's: checked at every exit of the body (`return`, falling off the end), and
+        // assumed by callers (`lambda_funcs` / `lambda_bindings`, see `stash_lambda_call`).
+        // `return_type: None` makes the end of the body count as an exit.
+        let synth: Option<HirFunc<'a, 'bump>> = if ensures.is_empty() {
+            None
+        } else {
+            let hparams: Vec<HirParam<'a, 'bump>> = params
+                .iter()
+                .zip(param_tys.iter())
+                .map(|(p, ty)| HirParam::Normal {
+                    name: p.name,
+                    param_type: *ty,
+                    multi_place: None,
+                    span: p.span,
+                })
+                .collect();
+            let fname = StrId(intern_fmt!(
+                self.context.string_pool,
+                "__lambda_ensures_{}",
+                Self::stmt_key(body)
+            ));
+            Some(HirFunc {
+                name: fname,
+                function_metadata: Default::default(),
+                generics: None,
+                params: Some(self.context.bump.alloc_slice(&hparams)),
+                return_type: None,
+                ensures: *ensures,
+                return_binders: &[],
+                body: Some(**body),
+                unmangled_name: fname,
+                declaring_module_idx: self.context.current_module_idx,
+                impl_target: None,
+                span: *span,
+                name_span: *span,
+            })
+        };
+
+        // A `return` in the body leaves the lambda, not the enclosing function, so the
+        // enclosing function's `ensures` don't apply to it (`current_func` is the lambda's own
+        // function, or none). Facts the body establishes end with it (it may run later, or never),
+        // and anything it assigns can change whenever it runs.
+        let saved_func = std::mem::replace(&mut self.current_func, synth);
+        let saved_body_ptr = self.fn_body_ptr;
+        self.fn_body_ptr = match (&synth, **body) {
+            (Some(_), HirStmt::Block { body: stmts, .. }) if !stmts.is_empty() => {
+                Some(stmts.as_ptr() as usize)
+            }
+            _ => None,
+        };
+        self.lambda_depth += 1;
+        self.borrow_checker.begin_scope();
+        for p in params.iter() {
+            // A parameter shadows any outer variable of the same name.
+            self.kill_facts_about(p.name);
+        }
         let old_context = std::mem::replace(&mut self.context, lambda_context);
+        if let Some(f) = &synth {
+            let _ = self.analyze_ensures(f, true);
+            if matches!(**body, HirStmt::Block { body: s, .. } if s.is_empty()) {
+                self.check_ensures_at_fallthrough(f);
+            }
+        }
         let body_ty = self.check_stmt(body);
         self.context = old_context;
+        self.borrow_checker.end_scope();
+        self.lambda_depth -= 1;
+        self.fn_body_ptr = saved_body_ptr;
+        self.current_func = saved_func;
+        if let Some(f) = synth {
+            self.lambda_funcs.insert(Self::stmt_key(body), f);
+        }
         let frame = self.closure_frames.borrow_mut().pop().unwrap_or_default();
 
-        let concrete_sig_ret = sig_ret.filter(|t| !matches!(t, HirType::Generic(_)));
+        let concrete_sig_ret = sig_ret.filter(|t| !matches!(t.kind, HirTypeKind::Generic(_)));
         let ret_ty = if ret_is_inferred {
             match (concrete_sig_ret, body_ty) {
-                (Some(sr), Some(t)) if !matches!(t, HirType::Never) && sr != HirType::Void => {
+                (Some(sr), Some(t))
+                    if !matches!(t.kind, HirTypeKind::Never) && sr.kind != HirTypeKind::Void =>
+                {
                     self.recover(self.types_compatible(&sr, &t), ());
                     sr
                 }
                 (Some(sr), _) => sr,
-                (None, Some(t)) if !matches!(t, HirType::Never) => t,
-                (None, _) => HirType::Void,
+                (None, Some(t)) if !matches!(t.kind, HirTypeKind::Never) => t,
+                (None, _) => HirType::void(*span),
             }
         } else {
             if let Some(t) = body_ty {
@@ -692,10 +769,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             declared_ret
         };
 
-        if let Some(HirType::Lambda {
+        if let Some(HirTypeKind::Lambda {
             params: sp,
             return_type: sr,
-        }) = &sig
+        }) = sig.map(|sig| sig.kind)
         {
             let mut subs = FxHashMap::default();
             for (d, a) in sp.iter().zip(param_tys.iter()) {
@@ -705,7 +782,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             for (k, v) in subs {
                 self.closure_generic_subs.entry(k).or_insert(v);
             }
-            if !matches!(**sr, HirType::Generic(_)) {
+            if !matches!(sr.kind, HirTypeKind::Generic(_)) {
                 self.recover(self.types_compatible(sr, &ret_ty), ());
             }
         }
@@ -733,10 +810,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.check_and_record_value_use(&place, &field_tys[i]);
                 }
             }
-            return HirType::Lambda {
-                params: self.context.bump.alloc_slice(&param_tys),
-                return_type: self.context.bump.alloc_value(ret_ty),
-            };
+            return HirType::lambda(
+                self.context.bump.alloc_slice(&param_tys),
+                self.context.bump.alloc_value(ret_ty),
+                *span,
+            );
         }
 
         let key = Self::stmt_key(body);
@@ -761,10 +839,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 )
             }
         };
-        let env_ty = HirType::Struct {
-            name: env_name,
-            field_types: self.context.bump.alloc_slice(&field_tys),
-            type_args: &[],
+        let env_ty = HirType {
+            kind: HirTypeKind::Struct {
+                name: env_name,
+                unmangled_name: env_name, // closure
+                field_types: self.context.bump.alloc_slice(&field_tys),
+                type_args: &[], // closure
+            },
+            span: *span,
         };
 
         for c in &captures {
@@ -795,7 +877,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     fn is_lambda_constraint(c: &HirType<'a, 'bump>) -> bool {
-        matches!(c, HirType::Lambda { .. })
+        matches!(c.kind, HirTypeKind::Lambda { .. })
     }
 
     pub(super) fn has_closure_generics(gs: &[HirGeneric<'a, 'bump>]) -> bool {
@@ -808,11 +890,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         pt: &HirType<'a, 'bump>,
         callee: Option<&HirFunc<'a, 'bump>>,
     ) -> Option<HirType<'a, 'bump>> {
-        let HirType::Generic(g) = pt else {
+        let HirTypeKind::Generic(g) = pt.kind else {
             return None;
         };
         let generics = callee?.generics?;
-        let hg = generics.iter().find(|h| h.name == *g)?;
+        let hg = generics.iter().find(|h| h.name == g)?;
         let c = hg
             .constraints
             .iter()
@@ -843,8 +925,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 other => other,
             };
             let at = self.peek_type(e);
-            if !matches!(at, HirType::Unknown) {
-                self.unify_generic(pt, &at, &mut subs);
+            if !matches!(at.kind, HirTypeKind::Unknown) {
+                self.unify_generic(&pt, &at, &mut subs);
             }
         }
         subs
@@ -873,13 +955,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         &mut self,
         generic: StrId,
         args: &[HirExpr<'a, 'bump>],
+        span: SourceSpan<'a>,
     ) -> HirType<'a, 'bump> {
-        let Some(HirType::Lambda {
+        let Some(HirTypeKind::Lambda {
             params,
             return_type,
-        }) = self.fn_closure_constraints.get(&generic).copied()
+        }) = self.fn_closure_constraints.get(&generic).map(|g| g.kind)
         else {
-            return HirType::Unknown;
+            return HirType::unknown(span);
         };
         if args.len() != params.len() {
             self.record(TypeErrorKind::InvalidFunctionCall {

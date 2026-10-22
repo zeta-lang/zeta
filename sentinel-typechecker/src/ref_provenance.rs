@@ -5,16 +5,13 @@ use ir::{
     },
     errors::type_error::TypeErrorKind,
     hir::{
-        HirExpr, HirFunc, HirParam, HirStmt, HirType, IntrinsicKind, ProvenanceAnnotation,
-        ProvenancePathSegment, ProvenanceRoot, RefKind, StrId,
+        HirExpr, HirFunc, HirParam, HirStmt, HirType, HirTypeKind, IntrinsicKind,
+        ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, RefKind, StrId,
     },
     ir_hasher::FxHashMap,
 };
 
-use crate::{
-    TypeChecker, TypeContext, naming::provenance_to_string, ref_effects::UsedIndex,
-    str_id_to_string,
-};
+use crate::{TypeChecker, TypeContext, naming::provenance_to_string, ref_effects::UsedIndex};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn infer_provenance(
@@ -98,10 +95,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn check_return_provenance(&mut self, func: &HirFunc<'a, 'bump>) {
-        let Some(HirType::Ref {
+        let Some(inner) = func.return_type else {
+            return;
+        };
+
+        let HirTypeKind::Ref {
             provenance: Some(ann),
             ..
-        }) = func.return_type
+        } = inner.kind
         else {
             return;
         };
@@ -110,7 +111,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let RefTemplate::Path { base, .. } = template else {
             self.record(TypeErrorKind::Generic(format!(
                 "return type declares provenance `{}` but the body's returned reference isn't a simple projection",
-                provenance_to_string(&ann)
+                provenance_to_string(&ann, &self.context.string_pool)
             )));
             return;
         };
@@ -134,7 +135,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if !root_matches {
             self.record(TypeErrorKind::Generic(format!(
                 "declared provenance `{}` doesn't match the parameter the returned reference is actually rooted in",
-                provenance_to_string(&ann)
+                provenance_to_string(&ann, &self.context.string_pool)
             )));
         }
     }
@@ -333,42 +334,36 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn return_type_may_alias(&self, ty: &HirType<'a, 'bump>) -> bool {
-        match ty {
-            HirType::Ref { .. }
-            | HirType::SafePointer { .. }
-            | HirType::UnsafePointer { .. }
-            | HirType::OwnedPointer { .. } => true,
+        match ty.kind {
+            HirTypeKind::Ref { .. }
+            | HirTypeKind::SafePointer { .. }
+            | HirTypeKind::UnsafePointer { .. }
+            | HirTypeKind::OwnedPointer { .. } => true,
 
-            HirType::Nullable(inner) => self.return_type_may_alias(inner),
+            HirTypeKind::Nullable(inner) => self.return_type_may_alias(inner),
 
-            HirType::Array(inner, _) => self.return_type_may_alias(inner),
+            HirTypeKind::Array(inner, _) => self.return_type_may_alias(inner),
 
-            HirType::Tuple(elems) => elems.iter().any(|e| self.return_type_may_alias(e)),
+            HirTypeKind::Tuple(elems) => elems.iter().any(|e| self.return_type_may_alias(e)),
 
-            HirType::Struct { name, .. } => {
-                let name_str = str_id_to_string(*name);
-                match self.context.get_struct(&name_str) {
-                    Some(def) => def
-                        .fields
-                        .iter()
-                        .any(|f| self.return_type_may_alias(&f.field_type)),
-                    None => true,
-                }
-            }
+            HirTypeKind::Struct { name, .. } => match self.context.get_struct(name) {
+                Some(def) => def
+                    .fields
+                    .iter()
+                    .any(|f| self.return_type_may_alias(&f.field_type)),
+                None => true,
+            },
 
-            HirType::Enum { name, .. } => {
-                let name_str = str_id_to_string(*name);
-                match self.context.get_enum(&name_str) {
-                    Some(def) => def
-                        .variants
-                        .iter()
-                        .flat_map(|v| v.fields.iter())
-                        .any(|f| self.return_type_may_alias(&f.field_type)),
-                    None => true,
-                }
-            }
+            HirTypeKind::Enum { name, .. } => match self.context.get_enum(name) {
+                Some(def) => def
+                    .variants
+                    .iter()
+                    .flat_map(|v| v.fields.iter())
+                    .any(|f| self.return_type_may_alias(&f.field_type)),
+                None => true,
+            },
 
-            HirType::Dyn { .. } | HirType::DynInterface(..) => true,
+            HirTypeKind::Dyn { .. } | HirTypeKind::DynInterface { .. } => true,
 
             _ => false,
         }
@@ -390,10 +385,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 UsedIndex::Place(root, p) => {
                     s.push('[');
-                    s.push_str(&root.to_string());
+                    s.push_str(root.as_str());
                     for seg in p {
                         s.push('.');
-                        s.push_str(&seg.to_string());
+                        s.push_str(seg.as_str());
                     }
                     s.push(']');
                 }

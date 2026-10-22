@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use ir::{
     hir::{HirExpr, Operator, StrId},
     ir_hasher::{FxHashMap, HashSet},
@@ -7,7 +9,7 @@ use crate::TypeChecker;
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn mark_non_null(&mut self, root: StrId, path: &[StrId]) {
-        self.non_null_state
+        Rc::make_mut(&mut self.non_null_state)
             .entry(root)
             .or_default()
             .insert(path.to_vec());
@@ -16,7 +18,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// Clears exact-path and every path *below* it (assigning `this.tail = x`
     /// invalidates anything previously proven about `this.tail.next`, etc.)
     pub fn clear_non_null(&mut self, root: StrId, path: &[StrId]) {
-        if let Some(set) = self.non_null_state.get_mut(&root) {
+        if let Some(set) = Rc::make_mut(&mut self.non_null_state).get_mut(&root) {
             set.retain(|p| !(p.len() >= path.len() && p[..path.len()] == *path));
         }
     }

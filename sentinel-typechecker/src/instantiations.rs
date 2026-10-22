@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use ir::{
-    hir::{HirParam, HirType, StrId},
+    hir::{HirParam, HirType, HirTypeKind, StrId},
     ir_hasher::FxHashMap,
 };
 use smallvec::SmallVec;
 
-use crate::{TypeChecker, str_id_to_string};
+use crate::TypeChecker;
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn instantiate_struct(
@@ -17,7 +17,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(cached) = self.context.get_struct_instantiation(name, args) {
             return Some(cached);
         }
-        let def = self.context.get_struct(&str_id_to_string(name))?;
+        let def = self.context.get_struct(name)?;
         let generics = def.generics?;
 
         let mut subs: FxHashMap<StrId, HirType> = HashMap::default();
@@ -55,8 +55,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Some(cached);
         }
 
-        let name_str = str_id_to_string(name);
-        let def = self.context.get_enum(&name_str)?;
+        let def = self.context.get_enum(name)?;
         let generics = def.generics?;
         if generics.len() != args.len() {
             return None;
@@ -94,73 +93,93 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if !type_contains_generic(ty, subs) {
             return *ty;
         }
-        match ty {
-            HirType::Generic(name) => subs.get(name).copied().unwrap_or(*ty),
-            HirType::Nullable(inner) => HirType::Nullable(
+        match ty.kind {
+            HirTypeKind::Generic(name) => subs.get(&name).copied().unwrap_or(*ty),
+            HirTypeKind::Nullable(inner) => HirType {
+                kind: HirTypeKind::Nullable(
+                    self.context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                ),
+                span: ty.span,
+            },
+            HirTypeKind::Array(inner, len) => HirType {
+                kind: HirTypeKind::Array(
+                    self.context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                    len,
+                ),
+                span: ty.span,
+            },
+            HirTypeKind::Slice(inner) => HirType::slice(
                 self.context
                     .bump
                     .alloc_value(self.substitute_type_local(inner, subs)),
+                ty.span,
             ),
-            HirType::Array(inner, len) => HirType::Array(
-                self.context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-                *len,
-            ),
-            HirType::Slice(inner) => HirType::Slice(
-                self.context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-            ),
-            HirType::SafePointer {
+            HirTypeKind::SafePointer {
                 inner,
                 mutability_state,
-            } => HirType::SafePointer {
-                inner: self
-                    .context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-                mutability_state: *mutability_state,
+            } => HirType {
+                kind: HirTypeKind::SafePointer {
+                    inner: self
+                        .context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                    mutability_state,
+                },
+                span: ty.span,
             },
-            HirType::UnsafePointer {
+            HirTypeKind::UnsafePointer {
                 inner,
                 mutability_state,
-            } => HirType::UnsafePointer {
-                inner: self
-                    .context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-                mutability_state: *mutability_state,
+            } => HirType {
+                kind: HirTypeKind::UnsafePointer {
+                    inner: self
+                        .context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                    mutability_state,
+                },
+                span: ty.span,
             },
-            HirType::OwnedPointer { inner, allocator } => HirType::OwnedPointer {
-                inner: self
-                    .context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-                allocator: *allocator,
+            HirTypeKind::OwnedPointer { inner, allocator } => HirType {
+                kind: HirTypeKind::OwnedPointer {
+                    inner: self
+                        .context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                    allocator,
+                },
+                span: ty.span,
             },
-            HirType::Ref {
+            HirTypeKind::Ref {
                 inner,
-                ref_kind: mutability_state,
+                ref_kind,
                 provenance,
-            } => HirType::Ref {
-                inner: self
-                    .context
-                    .bump
-                    .alloc_value(self.substitute_type_local(inner, subs)),
-                ref_kind: *mutability_state,
-                provenance: *provenance,
+            } => HirType {
+                kind: HirTypeKind::Ref {
+                    inner: self
+                        .context
+                        .bump
+                        .alloc_value(self.substitute_type_local(inner, subs)),
+                    ref_kind,
+                    provenance,
+                },
+                span: ty.span,
             },
-            HirType::Tuple(elems) => {
+            HirTypeKind::Tuple(elems) => {
                 let new_elems: Vec<_> = elems
                     .iter()
                     .map(|e| self.substitute_type_local(e, subs))
                     .collect();
-                HirType::Tuple(self.context.bump.alloc_slice_copy(&new_elems))
+                HirType::tuple(self.context.bump.alloc_slice_copy(&new_elems), ty.span)
             }
 
-            HirType::Struct {
+            HirTypeKind::Struct {
                 name,
+                unmangled_name,
                 field_types,
                 type_args,
             } => {
@@ -172,14 +191,19 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     .iter()
                     .map(|a| self.substitute_type_local(a, subs))
                     .collect();
-                HirType::Struct {
-                    name: *name,
-                    field_types: self.context.bump.alloc_slice_copy(&new_fields),
-                    type_args: self.context.bump.alloc_slice_copy(&new_args),
+                HirType {
+                    kind: HirTypeKind::Struct {
+                        name,
+                        unmangled_name,
+                        field_types: self.context.bump.alloc_slice_copy(&new_fields),
+                        type_args: self.context.bump.alloc_slice_copy(&new_args),
+                    },
+                    span: ty.span,
                 }
             }
-            HirType::Enum {
+            HirTypeKind::Enum {
                 name,
+                unmangled_name,
                 type_args,
                 variants,
             } => {
@@ -187,22 +211,29 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     .iter()
                     .map(|a| self.substitute_type_local(a, subs))
                     .collect();
-                HirType::Enum {
-                    name: *name,
-                    type_args: self.context.bump.alloc_slice_copy(&new_args),
-                    variants,
+                HirType {
+                    kind: HirTypeKind::Enum {
+                        name,
+                        unmangled_name,
+                        type_args: self.context.bump.alloc_slice_copy(&new_args),
+                        variants,
+                    },
+                    span: ty.span,
                 }
             }
-            HirType::Dyn { bounds } => {
+            HirTypeKind::Dyn { bounds } => {
                 let new_bounds: Vec<_> = bounds
                     .iter()
                     .map(|b| self.substitute_type_local(b, subs))
                     .collect();
-                HirType::Dyn {
-                    bounds: self.context.bump.alloc_slice_copy(&new_bounds),
+                HirType {
+                    kind: HirTypeKind::Dyn {
+                        bounds: self.context.bump.alloc_slice_copy(&new_bounds),
+                    },
+                    span: ty.span,
                 }
             }
-            HirType::Lambda {
+            HirTypeKind::Lambda {
                 params,
                 return_type,
             } => {
@@ -210,13 +241,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     .iter()
                     .map(|p| self.substitute_type_local(p, subs))
                     .collect();
-                HirType::Lambda {
-                    params: self.context.bump.alloc_slice_copy(&new_params),
-                    return_type: self
-                        .context
+                HirType::lambda(
+                    self.context.bump.alloc_slice_copy(&new_params),
+                    self.context
                         .bump
                         .alloc_value(self.substitute_type_local(return_type, subs)),
-                }
+                    ty.span,
+                )
             }
 
             _ => *ty,
@@ -262,55 +293,55 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         actual: &HirType<'a, 'bump>,
         subs: &mut FxHashMap<StrId, HirType<'a, 'bump>>,
     ) {
-        match declared {
-            HirType::Generic(name) => {
-                subs.entry(*name).or_insert(*actual);
+        match declared.kind {
+            HirTypeKind::Generic(name) => {
+                subs.entry(name).or_insert(*actual);
             }
-            HirType::Nullable(inner) => {
-                if let HirType::Nullable(a) = actual {
+            HirTypeKind::Nullable(inner) => {
+                if let HirTypeKind::Nullable(a) = actual.kind {
                     self.unify_generic(inner, a, subs);
                 }
             }
-            HirType::Array(inner, _) => {
-                if let HirType::Array(a, _) = actual {
+            HirTypeKind::Array(inner, _) => {
+                if let HirTypeKind::Array(a, _) = actual.kind {
                     self.unify_generic(inner, a, subs);
                 }
             }
-            HirType::Slice(inner) => {
-                if let HirType::Slice(a) = actual {
+            HirTypeKind::Slice(inner) => {
+                if let HirTypeKind::Slice(a) = actual.kind {
                     self.unify_generic(inner, a, subs);
                 }
             }
-            HirType::Ref { inner, .. } => {
+            HirTypeKind::Ref { inner, .. } => {
                 self.unify_generic(inner, Self::strip_ref(actual), subs);
             }
-            HirType::OwnedPointer { inner, .. } => {
-                if let HirType::OwnedPointer { inner: a, .. } = actual {
+            HirTypeKind::OwnedPointer { inner, .. } => {
+                if let HirTypeKind::OwnedPointer { inner: a, .. } = actual.kind {
                     self.unify_generic(inner, a, subs);
                 } else {
                     self.unify_generic(inner, actual, subs);
                 }
             }
-            HirType::SafePointer { inner, .. } => {
-                if let HirType::SafePointer { inner: a, .. } = actual {
+            HirTypeKind::SafePointer { inner, .. } => {
+                if let HirTypeKind::SafePointer { inner: a, .. } = actual.kind {
                     self.unify_generic(inner, a, subs);
                 }
             }
-            HirType::UnsafePointer { inner, .. } => {
-                if let HirType::UnsafePointer { inner: a, .. } = actual {
+            HirTypeKind::UnsafePointer { inner, .. } => {
+                if let HirTypeKind::UnsafePointer { inner: a, .. } = actual.kind {
                     self.unify_generic(inner, a, subs);
                 }
             }
-            HirType::Struct {
+            HirTypeKind::Struct {
                 name: dn,
                 type_args: da,
                 ..
             } => {
-                if let HirType::Struct {
+                if let HirTypeKind::Struct {
                     name: an,
                     type_args: aa,
                     ..
-                } = actual
+                } = actual.kind
                 {
                     if dn == an {
                         for (d, a) in da.iter().zip(aa.iter()) {
@@ -319,16 +350,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     }
                 }
             }
-            HirType::Enum {
+            HirTypeKind::Enum {
                 name: dn,
                 type_args: da,
                 ..
             } => {
-                if let HirType::Enum {
+                if let HirTypeKind::Enum {
                     name: an,
                     type_args: aa,
                     ..
-                } = actual
+                } = actual.kind
                 {
                     if dn == an {
                         for (d, a) in da.iter().zip(aa.iter()) {
@@ -370,8 +401,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if type_args.is_empty() {
             return subs;
         }
-        let name_str = str_id_to_string(struct_name);
-        if let Some(def) = self.context.get_struct(&name_str) {
+        if let Some(def) = self.context.get_struct(struct_name) {
             if let Some(generics) = def.generics {
                 for (param, arg) in generics.iter().zip(type_args.iter()) {
                     subs.insert(param.name, *arg);
@@ -383,21 +413,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 }
 
 fn type_contains_generic(ty: &HirType, subs: &FxHashMap<StrId, HirType>) -> bool {
-    match ty {
-        HirType::Generic(n) => subs.contains_key(n),
-        HirType::Nullable(i)
-        | HirType::Slice(i)
-        | HirType::Array(i, _)
-        | HirType::OwnedPointer { inner: i, .. }
-        | HirType::SafePointer { inner: i, .. }
-        | HirType::UnsafePointer { inner: i, .. }
-        | HirType::Ref { inner: i, .. } => type_contains_generic(i, subs),
-        HirType::Tuple(es) => es.iter().any(|e| type_contains_generic(e, subs)),
-        HirType::Struct { type_args, .. } | HirType::Enum { type_args, .. } => {
+    match ty.kind {
+        HirTypeKind::Generic(n) => subs.contains_key(&n),
+        HirTypeKind::Nullable(i)
+        | HirTypeKind::Slice(i)
+        | HirTypeKind::Array(i, _)
+        | HirTypeKind::OwnedPointer { inner: i, .. }
+        | HirTypeKind::SafePointer { inner: i, .. }
+        | HirTypeKind::UnsafePointer { inner: i, .. }
+        | HirTypeKind::Ref { inner: i, .. } => type_contains_generic(i, subs),
+        HirTypeKind::Tuple(es) => es.iter().any(|e| type_contains_generic(e, subs)),
+        HirTypeKind::Struct { type_args, .. } | HirTypeKind::Enum { type_args, .. } => {
             type_args.iter().any(|a| type_contains_generic(a, subs))
         }
-        HirType::Dyn { bounds } => bounds.iter().any(|b| type_contains_generic(b, subs)),
-        HirType::Lambda {
+        HirTypeKind::Dyn { bounds } => bounds.iter().any(|b| type_contains_generic(b, subs)),
+        HirTypeKind::Lambda {
             params,
             return_type,
         } => {

@@ -1,7 +1,7 @@
 use ir::{
-    borrow_checker::LoanId,
+    borrow_checker::{Bound, LoanId},
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirStmt, HirType, StrId},
+    hir::{HirExpr, HirStmt, HirType, HirTypeKind, StrId},
     span::SourceSpan,
 };
 
@@ -9,7 +9,7 @@ use crate::{
     TypeChecker,
     initialization::{InitNode, InitStatus},
     naming::type_to_string,
-    str_id_to_string,
+    type_checker::Occurrence,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -65,7 +65,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_unsafe_stmt(&mut self, body: &&HirStmt<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
         self.unsafe_depth += 1;
-        let gotten = self.check_stmt(body);
+        let gotten = match **body {
+            HirStmt::Block {
+                body: ref stmts, ..
+            } => self.check_block_with(stmts, true),
+            _ => self.check_stmt(body),
+        };
         self.unsafe_depth -= 1;
         gotten
     }
@@ -77,21 +82,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let value_type = self.check_expr(&const_stmt.value);
         let result = self.types_compatible(&const_stmt.ty, &value_type);
         self.recover(result, ());
-        let var_name = str_id_to_string(const_stmt.name);
-        if self.context.get_variable(&var_name).is_some() {
+        if self.context.get_variable(const_stmt.name).is_some() {
             self.record(TypeErrorKind::VariableAlreadyExists {
-                var_name: var_name.clone(),
+                var_name: const_stmt.name.to_string(),
             });
         }
         let symbol_id = self.mint_symbol_id();
         self.context
-            .add_variable(var_name, const_stmt.ty, symbol_id);
+            .add_variable(const_stmt.name, const_stmt.ty, symbol_id);
         None
     }
 
     pub fn check_break_stmt(
         &mut self,
         expr: &Option<&HirExpr<'a, 'bump>>,
+        span: SourceSpan<'a>,
     ) -> Option<HirType<'a, 'bump>> {
         if !self.context.in_loop {
             self.record(TypeErrorKind::BreakOutsideLoop);
@@ -104,10 +109,21 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.recover(result, ());
             }
         }
-        Some(HirType::Never)
+        Some(HirType::never(span))
     }
 
     pub fn check_block_stmt(&mut self, body: &&[HirStmt<'a, 'bump>]) -> Option<HirType<'a, 'bump>> {
+        self.check_block_with(body, false)
+    }
+
+    /// `promote_facts`: the block runs unconditionally (not a loop body or branch), so the
+    /// arithmetic facts it assumed directly survive its end, minus any that mention its locals
+    /// or a `mut` variable.
+    pub fn check_block_with(
+        &mut self,
+        body: &&[HirStmt<'a, 'bump>],
+        promote_facts: bool,
+    ) -> Option<HirType<'a, 'bump>> {
         self.borrow_checker.begin_scope();
         let mut block_context = self.context.create_child_scope();
 
@@ -132,30 +148,31 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.tail_expr_key.replace(k)
             });
 
-            let old_context = std::mem::replace(&mut self.context, block_context);
+            std::mem::swap(&mut self.context, &mut block_context);
             value = self.check_stmt(stmt);
-            block_context = self.context.clone();
-            self.context = old_context;
+            std::mem::swap(&mut self.context, &mut block_context);
 
             if let Some(prev) = prev_tail {
                 self.tail_expr_key = prev;
                 tail_borrows = std::mem::take(&mut self.tail_borrows);
             }
 
-            let after_point = self.stmt_after_points.get(&Self::stmt_key(stmt)).copied();
-
-            let dead_loans: Vec<LoanId> = self
-                .loan_owners
-                .iter()
-                .filter(|(_, owner)| local_names.contains(owner))
-                .filter(|(_, owner)| match after_point {
-                    Some(p) => !self.local_used_after(p, **owner),
-                    None => !body[(i + 1)..]
-                        .iter()
-                        .any(|s| self.stmt_references_local(s, **owner)),
-                })
-                .map(|(&loan_id, _)| loan_id)
-                .collect();
+            let dead_loans: Vec<LoanId> = if self.loan_owners.is_empty() || local_names.is_empty() {
+                Vec::new()
+            } else {
+                let after_point = self.stmt_after_points.get(&Self::stmt_key(stmt)).copied();
+                self.loan_owners
+                    .iter()
+                    .filter(|(_, owner)| local_names.contains(owner))
+                    .filter(|(_, owner)| match after_point {
+                        Some(p) => !self.local_used_after(p, **owner),
+                        None => !body[(i + 1)..]
+                            .iter()
+                            .any(|s| self.stmt_references_local(s, **owner)),
+                    })
+                    .map(|(&loan_id, _)| loan_id)
+                    .collect()
+            };
             for loan_id in dead_loans {
                 self.borrow_checker.end_loan_now(loan_id);
                 self.loan_owners.remove(&loan_id);
@@ -168,9 +185,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             .iter()
             .rev()
             .filter_map(|n| {
-                let (_, ty) = block_context.get_variable(&str_id_to_string(*n))?;
-                match ty {
-                    HirType::Struct { name, .. } | HirType::Enum { name, .. }
+                let (_, ty) = block_context.get_variable(n)?;
+                match ty.kind {
+                    HirTypeKind::Struct { name, .. } | HirTypeKind::Enum { name, .. }
                         if self.copy_analysis.borrow().implements_drop(name) =>
                     {
                         Some((*n, name))
@@ -191,8 +208,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.record(TypeErrorKind::Generic(format!(
                     "this block's value borrows from `{}` (a `{}`), which is dropped at the \
                      end of the block; the reference cannot outlive it",
-                    str_id_to_string(*l),
-                    str_id_to_string(*owner),
+                    *l, *owner,
                 )));
             }
         }
@@ -203,10 +219,44 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.borrow_checker.kill_local_storage(*n);
         }
 
+        // Falling off the end of a function body is an exit like `return`, and the facts that
+        // hold on that path are exactly the ones in this scope. (Not gated on `Never` alone:
+        // a diverging tail has already been checked at its `return`.)
+        if self.fn_body_ptr == Some(body.as_ptr() as usize)
+            && !body.is_empty()
+            && !matches!(&value, Some(t) if matches!(t.kind, HirTypeKind::Never))
+        {
+            if let Some(f) = self.current_func {
+                self.check_ensures_at_fallthrough(&f);
+            }
+        }
+
+        let promoted: Vec<(Bound, Bound, bool)> = if promote_facts {
+            self.borrow_checker
+                .current_scope_facts()
+                .into_iter()
+                .filter(|(l, r, _)| {
+                    !Self::bound_mentions(l, &local_names)
+                        && !Self::bound_mentions(r, &local_names)
+                        && self.fact_is_trackable(l, r)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.borrow_checker.end_scope();
+        for (l, r, eq) in promoted {
+            if eq {
+                self.borrow_checker.assume_equal_scoped(l, r);
+            } else {
+                self.borrow_checker.assume_not_equal_scoped(l, r);
+            }
+        }
         // sweep anything that reached scope-end without an early kill
-        self.loan_owners
-            .retain(|_, owner| !local_names.contains(owner));
+        if !self.loan_owners.is_empty() {
+            self.loan_owners
+                .retain(|_, owner| !local_names.contains(owner));
+        }
         for name in &local_names {
             self.local_provenance_place.remove(name);
             self.local_provenance.remove(name);
@@ -227,15 +277,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if let Some(cond) = condition {
-            let cond_type = self.check_expr(cond);
-            if cond_type != HirType::Boolean {
-                self.record(TypeErrorKind::TypeMismatch {
-                    expected: "bool".to_string(),
-                    found: type_to_string(&cond_type),
-                });
-            }
+            self.check_if_condition(*cond);
         }
 
+        self.kill_facts_about_mutables();
         self.context.enter_loop();
 
         let entry_state = self.move_state.clone();
@@ -251,7 +296,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.context.exit_loop();
 
         if let Some(inc) = increment {
+            let snap = self.snapshot_temp_loans();
             self.check_expr(inc);
+            self.end_temp_call_loans(snap);
+            self.end_temp_closure_loans(snap);
         }
 
         None
@@ -262,14 +310,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         cond: &&HirExpr<'a, 'bump>,
         body: &&HirStmt<'a, 'bump>,
     ) -> Option<HirType<'a, 'bump>> {
-        let cond_type = self.check_expr(cond);
-        if cond_type != HirType::Boolean {
-            self.record(TypeErrorKind::TypeMismatch {
-                expected: "bool".to_string(),
-                found: type_to_string(&cond_type),
-            });
-        }
+        self.check_if_condition(*cond);
 
+        self.kill_facts_about_mutables();
         self.context.enter_loop();
 
         let entry_state = self.move_state.clone();
@@ -287,30 +330,51 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     }
 
     pub fn check_expr_stmt(&mut self, e: &&HirExpr<'a, 'bump>) -> Option<HirType<'a, 'bump>> {
-        let snap = self.snapshot_call_loan_keys();
+        let snap = self.snapshot_temp_loans();
         let ty = self.check_expr(e);
 
+        // `call(..);` as a statement always runs, so what the callee's `ensures` promised about
+        // its arguments holds for the rest of this scope.
+        self.apply_unconditional_call_facts(e);
+
         if self.tail_expr_key == Some(Self::expr_key(e)) && self.return_type_may_alias(&ty) {
-            let found: Vec<StrId> = self
-                .call_loans
+            let found: Vec<StrId> = self.call_loan_order[snap.call..]
                 .iter()
-                .filter(|(k, _)| !snap.contains(*k))
-                .filter_map(|(_, &id)| self.borrow_checker.loan(id))
-                .filter_map(|l| self.borrow_checker.root_local_of(l.place))
+                .filter_map(|&(key, id)| (self.call_loans.get(&key) == Some(&id)).then_some(id))
+                .filter_map(|id| self.borrow_checker.loan(id))
+                .filter_map(|loan| self.borrow_checker.root_local_of(loan.place))
                 .collect();
+
             self.tail_borrows = found;
         }
 
-        self.end_temp_call_loans(&snap);
-        self.end_temp_closure_loans(&snap);
+        self.end_temp_call_loans(snap);
+        self.end_temp_closure_loans(snap);
         Some(ty)
     }
 
     pub fn check_return_stmt(
         &mut self,
         expr: &Option<&HirExpr<'a, 'bump>>,
+        span: SourceSpan<'a>,
     ) -> Option<HirType<'a, 'bump>> {
+        // Every exit must establish the function's relational `ensures` conditions, with or
+        // without a returned value. (Falling off the end of a `void` function is the other exit:
+        // `check_ensures_at_fallthrough`.)
+        if let Some(f) = self.current_func {
+            self.check_ensures_conditions_at_exit(&f);
+        }
+
         if let Some(e) = expr {
+            let skip_read = match self.current_func {
+                Some(f) => self.check_return_against_ensures(&f, Some(*e)),
+                None => false,
+            };
+            let prev_suppress = self.suppress_init_read;
+            if skip_read {
+                self.suppress_init_read = true;
+            }
+
             let expected_return = self.context.current_return_type;
             let expr_type = match expected_return {
                 Some(ret) => self.check_expr_expected(e, &ret),
@@ -322,15 +386,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if let Some(expected_return) = expected_return {
                 self.recover(self.types_compatible(&expected_return, &expr_type), ());
             }
+
+            self.suppress_init_read = prev_suppress;
         } else if let Some(expected_return) = self.context.current_return_type {
-            if expected_return != HirType::Void {
+            if expected_return.kind != HirTypeKind::Void {
                 self.record(TypeErrorKind::InvalidReturnType {
-                    expected: type_to_string(&expected_return),
+                    expected: type_to_string(&expected_return, &self.context.string_pool)
+                        .to_string(),
                     found: "void".to_string(),
                 });
             }
         }
-        Some(HirType::Never)
+        Some(HirType::never(span))
     }
 
     pub fn init_struct_with_uninit_fields(
@@ -339,10 +406,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         ty: &HirType<'a, 'bump>,
         uninit: &[StrId],
     ) {
-        let HirType::Struct { name, .. } = ty else {
+        let HirTypeKind::Struct { name, .. } = ty.kind else {
             return;
         };
-        let Some(def) = self.context.get_struct(&str_id_to_string(*name)) else {
+        let Some(def) = self.context.get_struct(name.as_str()) else {
             return;
         };
         let map = def
@@ -367,9 +434,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         value: &HirExpr<'a, 'bump>,
         mutable: &bool,
         span: &SourceSpan<'a>,
+        inferred_ty: bool,
     ) -> Option<HirType<'a, 'bump>> {
-        let var_name = str_id_to_string(*name);
-        let is_wildcard = var_name == "_";
+        let is_wildcard = name == "_";
+
+        if !inferred_ty {
+            self.record_type_occurrences(ty);
+        }
 
         if let Some((r, p)) = self.static_field_path(value) {
             if self.is_non_null(r, &p) {
@@ -377,19 +448,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        if !is_wildcard && self.context.variables.contains_key(&var_name) {
+        if !is_wildcard && self.context.variables.contains_key(name) {
             self.record(TypeErrorKind::VariableAlreadyExists {
-                var_name: var_name.clone(),
+                var_name: name.to_string(),
             });
         }
 
-        let temp_snap = self.snapshot_call_loan_keys();
+        let temp_snap = self.snapshot_temp_loans();
         let value_type = self.check_expr_expected(value, ty);
-        let ty = if matches!(ty, HirType::Unknown) {
+        let ty = if matches!(ty.kind, HirTypeKind::Unknown) {
             &value_type
         } else {
             ty
         };
+
+        // `let x = call(..);` always runs the call: assume the callee's relational `ensures`.
+        self.apply_unconditional_call_facts(value);
+        // `name` is a fresh variable: facts that mention the name (about an earlier variable it
+        // shadows, including ones the line above just applied) are not about it.
+        self.kill_facts_about(*name);
 
         let is_uninit_value = matches!(value, HirExpr::Uninit { .. });
         if !is_uninit_value {
@@ -400,24 +477,26 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.recover(result, ());
 
         if self.expr_is_dangling(value) {
-            self.context.mark_dangling(var_name.clone());
+            self.context.mark_dangling(name.clone());
         }
 
         let symbol_id = self.mint_symbol_id();
 
         self.context
-            .add_variable_with_mutability(var_name, *ty, *mutable, symbol_id);
+            .add_variable_with_mutability(name, *ty, *mutable, symbol_id);
         self.borrow_checker.declare_local(*name);
+        self.bind_lambda_ensures(*name, value, *mutable);
         let local_id = self.local_table.register(*name);
         self.move_state.clear(local_id);
-        self.occurrences.push((
-            *span,
-            *name,
-            *ty,
-            self.context.current_module_idx,
-            symbol_id,
-            true,
-        ));
+        self.occurrences.push(Occurrence {
+            span: *span,
+            name: *name,
+            hir_name: *name,
+            ty: *ty,
+            module_idx: self.context.current_module_idx,
+            symbol: symbol_id,
+            is_decl: true,
+        });
 
         if is_uninit_value {
             self.mark_whole_uninit(*name);
@@ -436,8 +515,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         if matches!(
-            ty,
-            HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            ty.kind,
+            HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. }
         ) {
             if let Some(place) = self.resolve_place(value) {
                 if let Some(&(base, ref offset)) = self.borrow_checker.pointee_of(place) {
@@ -475,22 +554,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
         }
 
-        let leftover: Vec<usize> = self
-            .call_loans
-            .keys()
-            .copied()
-            .filter(|k| !temp_snap.contains(k))
-            .collect();
+        let leftover = &self.call_loan_order[temp_snap.call..];
+
         if self.return_type_may_alias(ty) {
-            // the value may still point through these temporaries: the new local keeps them alive
-            for k in leftover {
-                if let Some(id) = self.call_loans.remove(&k) {
-                    self.loan_owners.insert(id, *name);
+            for (key, id) in leftover {
+                if self.call_loans.get(&key) != Some(&id) {
+                    continue;
+                }
+
+                self.call_loans.remove(&key);
+                self.loan_owners.insert(*id, *name);
+
+                if let Some(loan) = self.borrow_checker.loan(*id) {
+                    self.local_provenance_place.insert(*name, loan.place);
+                    self.local_provenance.insert(*name, loan.provenance_id);
                 }
             }
         } else {
-            // copied-out value (`i64` etc.): nothing borrows from the source any more
-            self.end_temp_call_loans(&temp_snap);
+            self.end_temp_call_loans(temp_snap);
         }
 
         None

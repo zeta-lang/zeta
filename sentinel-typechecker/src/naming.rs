@@ -1,6 +1,8 @@
 use ir::hir::{
-    HirType, Operator, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, RefKind, StrId,
+    HirType, HirTypeKind, JoinStr, Operator, ProvenanceAnnotation, ProvenancePathSegment,
+    ProvenanceRoot, RefKind, StrId,
 };
+use zetaruntime::{intern_fmt, string_pool::StringPool};
 
 pub fn operator_symbol(op: &Operator) -> String {
     use Operator::*;
@@ -44,147 +46,159 @@ pub fn operator_symbol(op: &Operator) -> String {
     .to_string()
 }
 
-pub fn str_id_to_string(id: StrId) -> String {
-    format!("{}", id)
-}
-
-pub fn type_to_string(ty: &HirType) -> String {
-    match ty {
-        HirType::I8 => "i8".to_string(),
-        HirType::I16 => "i16".to_string(),
-        HirType::I32 => "i32".to_string(),
-        HirType::I64 => "i64".to_string(),
-        HirType::U8 => "u8".to_string(),
-        HirType::U16 => "u16".to_string(),
-        HirType::U32 => "u32".to_string(),
-        HirType::U64 => "u64".to_string(),
-        HirType::F32 => "f32".to_string(),
-        HirType::F64 => "f64".to_string(),
-        HirType::I128 => "i128".to_string(),
-        HirType::U128 => "u128".to_string(),
-        HirType::Boolean => "bool".to_string(),
-        HirType::String => "str".to_string(),
-        HirType::Void => "void".to_string(),
-        HirType::Unknown => "<unknown>".to_string(),
-        HirType::Struct {
-            name, type_args, ..
+pub fn type_to_string(ty: &HirType, pool: &StringPool) -> StrId {
+    match ty.kind {
+        HirTypeKind::I8 => StrId::from_static("i8"),
+        HirTypeKind::I16 => StrId::from_static("i16"),
+        HirTypeKind::I32 => StrId::from_static("i32"),
+        HirTypeKind::I64 => StrId::from_static("i64"),
+        HirTypeKind::U8 => StrId::from_static("u8"),
+        HirTypeKind::U16 => StrId::from_static("u16"),
+        HirTypeKind::U32 => StrId::from_static("u32"),
+        HirTypeKind::U64 => StrId::from_static("u64"),
+        HirTypeKind::F32 => StrId::from_static("f32"),
+        HirTypeKind::F64 => StrId::from_static("f64"),
+        HirTypeKind::I128 => StrId::from_static("i128"),
+        HirTypeKind::U128 => StrId::from_static("u128"),
+        HirTypeKind::Boolean => StrId::from_static("bool"),
+        HirTypeKind::String => StrId::from_static("str"),
+        HirTypeKind::Void => StrId::from_static("void"),
+        HirTypeKind::Unknown => StrId::from_static("<unknown>"),
+        HirTypeKind::Struct {
+            unmangled_name: name,
+            type_args,
+            ..
         } => {
             if type_args.is_empty() {
-                format!("struct {}", str_id_to_string(*name))
+                StrId(intern_fmt!(pool, "struct {}", name))
             } else {
-                let args = type_args
+                let args: String = type_args
                     .iter()
-                    .map(|t| type_to_string(t))
+                    .map(|t| type_to_string(t, pool))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("struct {}<{}>", str_id_to_string(*name), args)
+                StrId(intern_fmt!(pool, "struct {}<{}>", name, args))
             }
         }
-        HirType::DynInterface(name, _) => {
-            format!("interface {}", str_id_to_string(*name))
-        }
-        HirType::Enum {
-            name, type_args, ..
+        HirTypeKind::DynInterface {
+            unmangled_name: name,
+            ..
+        } => StrId(intern_fmt!(pool, "interface {}", name)),
+        HirTypeKind::Enum {
+            unmangled_name: name,
+            type_args,
+            ..
         } => {
             if type_args.is_empty() {
-                format!("enum {}", str_id_to_string(*name))
+                StrId(intern_fmt!(pool, "enum {}", name))
             } else {
-                let args = type_args
+                let args: String = type_args
                     .iter()
-                    .map(|t| type_to_string(t))
+                    .map(|t| type_to_string(t, pool))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("enum {}<{}>", str_id_to_string(*name), args)
+                StrId(intern_fmt!(pool, "enum {}<{}>", name, args))
             }
         }
-        HirType::Generic(name) => format!("generic {}", str_id_to_string(*name)),
-        HirType::SafePointer {
+        HirTypeKind::Generic(name) => StrId(intern_fmt!(pool, "{}", name)),
+        HirTypeKind::SafePointer {
             inner,
             mutability_state,
-        } => format!("*{} {}", mutability_state, inner),
-        HirType::UnsafePointer {
+        } => StrId(intern_fmt!(pool, "*{} {}", mutability_state, inner)),
+        HirTypeKind::UnsafePointer {
             inner,
             mutability_state,
-        } => format!("[*]{} {}", mutability_state, inner),
-        HirType::Lambda { .. } => "lambda".to_string(),
-        HirType::This => "this".to_string(),
-        HirType::Null => "null".to_string(),
-        HirType::Char => "char".to_string(),
-        HirType::Ref {
+        } => StrId(intern_fmt!(pool, "[*]{} {}", mutability_state, inner)),
+        HirTypeKind::Lambda { .. } => StrId::from_static("lambda"),
+        HirTypeKind::This => StrId::from_static("this"),
+        HirTypeKind::Null => StrId::from_static("null"),
+        HirTypeKind::Char => StrId::from_static("char"),
+        HirTypeKind::Ref {
             inner,
             ref_kind,
             provenance,
         } => {
             let displayed_provenance = if let Some(provenance) = provenance {
-                format!("{}", provenance)
+                StrId(intern_fmt!(pool, "{}", provenance))
             } else {
-                String::new()
+                StrId::from_static("")
             };
-            if let RefKind::Unique = *ref_kind {
-                format!("&{} mut {}", displayed_provenance, inner)
-            } else if let RefKind::Alias = *ref_kind {
-                format!("&{} alias {}", displayed_provenance, inner)
+            if let RefKind::Unique = ref_kind {
+                StrId(intern_fmt!(pool, "&{} mut {}", displayed_provenance, inner))
+            } else if let RefKind::Alias = ref_kind {
+                StrId(intern_fmt!(
+                    pool,
+                    "&{} alias {}",
+                    displayed_provenance,
+                    inner
+                ))
             } else {
-                format!("&{} {}", displayed_provenance, inner)
+                StrId(intern_fmt!(pool, "&{} {}", displayed_provenance, inner))
             }
         }
-        HirType::Nullable(hir_type) => format!("?{}", hir_type),
-        HirType::Dyn { bounds } => {
+        HirTypeKind::Nullable(hir_type) => StrId(intern_fmt!(pool, "?{}", hir_type)),
+        HirTypeKind::Dyn { bounds } => {
             let mut bounds_str = String::new();
             let mut start = true;
-            for bound in *bounds {
-                bounds_str.push_str(&bound.to_string());
+            for bound in bounds {
+                bounds_str.push_str(type_to_string(bound, pool).as_str());
                 if start {
                     start = false;
                 } else {
                     bounds_str.push_str(" + ");
                 }
             }
-            format!("dyn {}", bounds_str)
+            StrId(intern_fmt!(pool, "dyn {}", bounds_str))
         }
-        HirType::Tuple(hir_types) => format!(
+        HirTypeKind::Tuple(hir_types) => StrId(intern_fmt!(
+            pool,
             "({})",
             hir_types
                 .iter()
-                .map(|t| type_to_string(t))
+                .map(|t| type_to_string(t, pool))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ),
-        HirType::Array(inner, len) => format!("[{}]{}", len, type_to_string(inner)),
-        HirType::Slice(inner) => format!("[]{}", type_to_string(inner)),
-        HirType::OwnedPointer { inner, allocator } => {
-            format!(
-                "^{} {}",
-                allocator
-                    .map(|all| provenance_to_string(&all))
-                    .unwrap_or(String::from("")),
-                type_to_string(inner)
-            )
-        }
-        HirType::Usize => "usize".to_string(),
-        HirType::Isize => "isize".to_string(),
-        HirType::Never => "never".to_string(),
-        HirType::Range { elem, inclusive } => format!(
+        )),
+        HirTypeKind::Array(inner, len) => StrId(intern_fmt!(
+            pool,
+            "[{}]{}",
+            len,
+            type_to_string(inner, pool)
+        )),
+        HirTypeKind::Slice(inner) => StrId(intern_fmt!(pool, "[]{}", type_to_string(inner, pool))),
+        HirTypeKind::OwnedPointer { inner, allocator } => StrId(intern_fmt!(
+            pool,
+            "^{} {}",
+            allocator
+                .map(|all| provenance_to_string(&all, pool))
+                .unwrap_or(StrId::from_static("")),
+            type_to_string(inner, pool)
+        )),
+        HirTypeKind::Usize => StrId::from_static("usize"),
+        HirTypeKind::Isize => StrId::from_static("isize"),
+        HirTypeKind::Never => StrId::from_static("never"),
+        HirTypeKind::Range { elem, inclusive } => StrId(intern_fmt!(
+            pool,
             "range<{}>{}",
-            type_to_string(elem),
-            if *inclusive { " (inclusive)" } else { "" }
-        ),
+            type_to_string(elem, pool),
+            if inclusive { " (inclusive)" } else { "" }
+        )),
     }
 }
 
-pub fn provenance_to_string(p: &ProvenanceAnnotation) -> String {
+pub fn provenance_to_string(p: &ProvenanceAnnotation, pool: &StringPool) -> StrId {
     let root = match p.root {
-        ProvenanceRoot::Var(name) => str_id_to_string(name),
-        ProvenanceRoot::ThisRoot => "this".to_string(),
+        ProvenanceRoot::Var(name) => name,
+        ProvenanceRoot::ThisRoot => StrId::from_static("this"),
         ProvenanceRoot::Global {
             module_idx: _,
             name,
-        } => str_id_to_string(name),
-        ProvenanceRoot::ImplicitParam(i) => format!("{i}"),
-        ProvenanceRoot::Static => "static".to_string(),
+        } => name,
+        ProvenanceRoot::ImplicitParam(i) => StrId(intern_fmt!(pool, "{i}")),
+        ProvenanceRoot::Static => StrId::from_static("static"),
     };
     p.path.iter().fold(root, |acc, seg| match seg {
-        ProvenancePathSegment::Field(f) => format!("{}.{}", acc, str_id_to_string(*f)),
-        ProvenancePathSegment::Deref => format!("*{}", acc),
+        ProvenancePathSegment::Field(f) => StrId(intern_fmt!(pool, "{}.{}", acc, *f)),
+        ProvenancePathSegment::Deref => StrId(intern_fmt!(pool, "*{}", acc)),
     })
 }

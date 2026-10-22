@@ -2,12 +2,12 @@ use ir::{
     borrow_checker::{BorrowKind, LoanId, RefTemplate, TemplateBase},
     errors::type_error::TypeErrorKind,
     hir::{
-        HirExpr, HirFunc, HirParam, HirType, ProvenanceAnnotation, ProvenancePathSegment,
-        ProvenanceRoot, RefKind, StrId, ThisPassingKind,
+        HirExpr, HirFunc, HirParam, HirType, HirTypeKind, ProvenanceAnnotation,
+        ProvenancePathSegment, ProvenanceRoot, RefKind, StrId, ThisPassingKind,
     },
 };
 
-use crate::{TypeChecker, closures, dataflow::Effect, naming::type_to_string, str_id_to_string};
+use crate::{TypeChecker, closures, dataflow::Effect, naming::type_to_string};
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// Records that `root` (or `root.field`) is moved out while skipping types implementing `Copy`.
@@ -54,16 +54,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 self.move_state.mark_whole_moved(local);
             }
             Some(f) => {
-                let blocks_partial_move = container_ty.is_some_and(|cty| match cty {
-                    HirType::Struct { name, .. } | HirType::Enum { name, .. } => {
-                        self.copy_analysis.borrow().implements_drop(*name)
+                let blocks_partial_move = container_ty.is_some_and(|cty| match cty.kind {
+                    HirTypeKind::Struct { name, .. } | HirTypeKind::Enum { name, .. } => {
+                        self.copy_analysis.borrow().implements_drop(name)
                     }
                     _ => false,
                 });
                 if blocks_partial_move {
                     self.record(TypeErrorKind::Generic(format!(
                         "cannot partially move out of `{}`, which implements `Drop`",
-                        container_ty.map(|t| type_to_string(t)).unwrap_or_default()
+                        container_ty
+                            .map(|t| type_to_string(t, &self.context.string_pool))
+                            .unwrap_or_default()
                     )));
                     return;
                 }
@@ -90,7 +92,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if self.move_state.blocks_whole_use(local_id) {
                     self.record(TypeErrorKind::Generic(format!(
                         "use of moved value: `{}`",
-                        str_id_to_string(root)
+                        root
                     )));
                 }
             }
@@ -98,8 +100,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 if self.move_state.is_field_moved(local_id, f) {
                     self.record(TypeErrorKind::Generic(format!(
                         "use of moved value: `{}.{}`",
-                        str_id_to_string(root),
-                        str_id_to_string(f)
+                        root, f
                     )));
                 }
             }
@@ -130,8 +131,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
             HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
                 if let HirExpr::Ident(root, _) = &**object {
-                    let root_name = str_id_to_string(*root);
-                    let container_ty = self.context.get_variable(&root_name);
+                    let container_ty = self.context.get_variable(root);
                     self.check_use(*root, Some(*field), ty);
                     self.record_move(*root, Some(*field), ty, container_ty.map(|f| f.1).as_ref());
                 }
@@ -159,15 +159,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.record(TypeErrorKind::Generic(format!(
                 "cannot move a value of type `{}` out of a reference, pointer or slice; \
                  it is not `Copy`. Use `$replace` to take it explicitly",
-                type_to_string(ty)
+                ty
             )));
         }
     }
 
     fn is_pointer_like(ty: &HirType<'a, 'bump>) -> bool {
         matches!(
-            ty,
-            HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            ty.kind,
+            HirTypeKind::Ref { .. }
+                | HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
         )
     }
 
@@ -187,7 +189,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             HirExpr::Index { object, .. } => {
                 let oty = self.peek_type(object);
                 Self::is_pointer_like(&oty)
-                    || matches!(oty, HirType::Slice(_))
+                    || matches!(oty.kind, HirTypeKind::Slice(_))
                     || self.place_is_behind_borrow(object)
             }
             _ => false,
@@ -201,11 +203,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         object: &HirExpr<'a, 'bump>,
         method_name: &str,
     ) {
-        let (value_ty, auto_deref) = match self.peek_type(object) {
-            HirType::Ref { inner, .. }
-            | HirType::SafePointer { inner, .. }
-            | HirType::UnsafePointer { inner, .. } => (*inner, true),
-            other => (other, false),
+        let peek_ty = self.peek_type(object);
+        let (value_ty, auto_deref) = match peek_ty.kind {
+            HirTypeKind::Ref { inner, .. }
+            | HirTypeKind::SafePointer { inner, .. }
+            | HirTypeKind::UnsafePointer { inner, .. } => (*inner, true),
+            _ => (peek_ty, false),
         };
         if self.copy_analysis.borrow().type_is_copy(&value_ty) {
             return;
@@ -214,8 +217,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             self.record(TypeErrorKind::Generic(format!(
                 "cannot call `{}` on a value behind a reference: it takes `this` by value, \
                  which would move `{}` out of borrowed content",
-                method_name,
-                type_to_string(&value_ty)
+                method_name, value_ty
             )));
         }
     }
@@ -240,8 +242,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ThisPassingKind::RefAlias => RefKind::Alias,
             _ => return,
         };
-        let held = match self.peek_type(object) {
-            HirType::Ref { ref_kind, .. } => ref_kind,
+        let held = match self.peek_type(object).kind {
+            HirTypeKind::Ref { ref_kind, .. } => ref_kind,
             _ => {
                 let Some((root, _)) = self.static_field_path(object) else {
                     return;
@@ -260,8 +262,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if !ok {
             let name = self
                 .static_field_path(object)
-                .map(|(r, _)| str_id_to_string(r))
-                .unwrap_or_else(|| "this value".into());
+                .map(|(r, _)| r)
+                .unwrap_or_else(|| StrId::from_static("this value"));
             let (has, wants) = (
                 match held {
                     RefKind::Shared => "`&`",
@@ -327,6 +329,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         let arg_loans = self.check_all_func_args(args, params, templated_base_param, Some(func));
+        self.register_call_ensures(expr, &func, args);
         self.apply_callee_concurrency(&func, args);
 
         if let Some(loan_id) = self.finalize_call_loans(None, args, arg_loans, &ret_ty, template) {
@@ -339,10 +342,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// The strongest reference kind appearing in a return type (`Unique` > `Alias` > `Shared`),
     /// looking through `T?`, arrays and tuples. `None` if the type holds no `&`-family reference.
     fn ret_ref_kind(ty: &HirType<'a, 'bump>) -> Option<RefKind> {
-        match ty {
-            HirType::Ref { ref_kind, .. } => Some(*ref_kind),
-            HirType::Nullable(inner) | HirType::Array(inner, _) => Self::ret_ref_kind(inner),
-            HirType::Tuple(elems) => {
+        match ty.kind {
+            HirTypeKind::Ref { ref_kind, .. } => Some(ref_kind),
+            HirTypeKind::Nullable(inner) | HirTypeKind::Array(inner, _) => {
+                Self::ret_ref_kind(inner)
+            }
+            HirTypeKind::Tuple(elems) => {
                 elems
                     .iter()
                     .filter_map(Self::ret_ref_kind)
@@ -413,16 +418,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         let ret_ref = Self::peel_nullable(ret_ty);
         let result = if matches!(
-            ret_ref,
-            HirType::Ref {
+            ret_ref.kind,
+            HirTypeKind::Ref {
                 ref_kind: RefKind::Unique,
                 ..
             }
         ) {
             self.borrow_checker.borrow_mut(place)
         } else if matches!(
-            ret_ref,
-            HirType::Ref {
+            ret_ref.kind,
+            HirTypeKind::Ref {
                 ref_kind: RefKind::Alias,
                 ..
             }

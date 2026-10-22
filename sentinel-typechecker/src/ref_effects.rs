@@ -4,11 +4,12 @@ use ir::{
     errors::type_error::TypeErrorKind,
     hir::{
         AssignmentOperator, EffectIndexKey, HirEffectAccess, HirEffectSegment,
-        HirErrorHandlerPattern, HirExpr, HirStmt, HirType, InterpolationPart, RefKind, StrId,
+        HirErrorHandlerPattern, HirExpr, HirStmt, HirType, HirTypeKind, InterpolationPart, RefKind,
+        StrId,
     },
 };
 
-use crate::{TypeChecker, str_id_to_string};
+use crate::TypeChecker;
 
 #[derive(Clone)]
 pub enum UsedIndex {
@@ -378,7 +379,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if !covered {
                 self.record(TypeErrorKind::Generic(format!(
                     "writes to `{}{}` but the declared effects don't grant `&mut` access there",
-                    str_id_to_string(root),
+                    root,
                     Self::path_display(path, range.as_ref()),
                 )));
             }
@@ -390,7 +391,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if !covered {
                 self.record(TypeErrorKind::Generic(format!(
                     "reads `{}{}` but it isn't listed in the declared effects",
-                    str_id_to_string(root),
+                    root,
                     Self::path_display(path, range.as_ref()),
                 )));
             }
@@ -403,22 +404,24 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         accesses: &[HirEffectAccess<'bump>],
     ) {
         let outer_mut = match param_type {
-            Some(HirType::Ref { ref_kind, .. }) => *ref_kind != RefKind::Shared,
-            Some(HirType::SafePointer {
-                mutability_state, ..
-            })
-            | Some(HirType::UnsafePointer {
-                mutability_state, ..
-            }) => *mutability_state == MutabilityState::Mut,
-            Some(HirType::This) => true,
             None => true,
-            _ => {
-                self.record(TypeErrorKind::Generic(
-                    "`.{...}` access lists are only valid on reference or pointer parameters"
-                        .to_string(),
-                ));
-                return;
-            }
+            Some(param_type) => match param_type.kind {
+                HirTypeKind::Ref { ref_kind, .. } => ref_kind != RefKind::Shared,
+                HirTypeKind::SafePointer {
+                    mutability_state, ..
+                }
+                | HirTypeKind::UnsafePointer {
+                    mutability_state, ..
+                } => mutability_state == MutabilityState::Mut,
+                HirTypeKind::This => true,
+                _ => {
+                    self.record(TypeErrorKind::Generic(
+                        "`.{...}` access lists are only valid on reference or pointer parameters"
+                            .to_string(),
+                    ));
+                    return;
+                }
+            },
         };
         if !outer_mut && accesses.iter().any(|a| a.ref_kind == RefKind::Unique) {
             self.record(TypeErrorKind::Generic(
@@ -431,10 +434,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         match key {
             EffectIndexKey::Const(i) => Bound::Const(*i),
             EffectIndexKey::Place { root, path } => {
-                let mut name = str_id_to_string(*root);
+                let mut name = format!("{}", *root);
                 for seg in path.iter() {
                     name.push('.');
-                    name.push_str(&str_id_to_string(*seg));
+                    name.push_str(seg.as_str());
                 }
                 Bound::Symbol(StrId(self.context.string_pool.intern(&name)))
             }

@@ -1,7 +1,7 @@
 use ir::{
     borrow_checker::LoanId,
     errors::type_error::TypeErrorKind,
-    hir::{CaptureMode, HirExpr, HirFunc, HirParam, HirType, ProvenanceRoot, StrId},
+    hir::{CaptureMode, HirExpr, HirFunc, HirParam, HirType, HirTypeKind, ProvenanceRoot, StrId},
     nll_cfg::PointId,
 };
 
@@ -10,7 +10,6 @@ use crate::{
     auto_traits::AutoTrait,
     borrow_lifetime::{CalleeConcurrency, SuspensionReport},
     naming::type_to_string,
-    str_id_to_string,
 };
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
@@ -36,7 +35,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .is_some_and(|m| matches!(m.root, ProvenanceRoot::Static));
             if is_static {
                 for (i, pty) in &normal {
-                    if matches!(pty, HirType::Generic(n) if *n == g.name) {
+                    if matches!(pty.kind, HirTypeKind::Generic(n) if n == g.name) {
                         cc.static_params.push(*i);
                     }
                 }
@@ -45,8 +44,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .constraints
                 .iter()
                 .filter_map(|c| {
-                    let display = type_to_string(c);
-                    AutoTrait::from_interface_name(&display)
+                    let display = type_to_string(c, &self.context.string_pool);
+                    AutoTrait::from_interface_name(display.as_str())
                 })
                 .collect();
             if traits.is_empty() {
@@ -54,7 +53,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             }
 
             for (i, pty) in &normal {
-                if matches!(pty, HirType::Generic(n) if *n == g.name) {
+                if matches!(pty.kind, HirTypeKind::Generic(n) if n == g.name) {
                     cc.auto_bounds.push((*i, traits.clone()));
                 }
             }
@@ -90,7 +89,6 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     /// `T: &static`; the argument may not hold a borrow of anything that is not `&static`.
     /// A closure that captures a local by reference holds exactly such a borrow.
     fn check_arg_static_bound(&mut self, callee: StrId, arg: &HirExpr<'a, 'bump>) {
-        let callee_name = str_id_to_string(callee);
         let mut problems: Vec<String> = Vec::new();
 
         let (captures, ret_ty) = match arg {
@@ -106,27 +104,28 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 problems.push(format!(
                     "the closure returns `{}`, which contains a non-`&static` reference; \
                      copy the data out before the closure ends",
-                    type_to_string(&rt)
+                    type_to_string(&rt, &self.context.string_pool)
                 ));
             }
         }
 
         if let (HirExpr::Lambda { span, .. }, Some(caps)) = (arg, captures) {
             for c in caps.iter() {
-                let who = str_id_to_string(c.source);
                 match c.mode {
                     CaptureMode::ByRef(kind) => problems.push(format!(
-                        "the closure borrows `{who}` ({kind:?}), which is not `&static`; \
-                         use `move` and share it through an `Arc` (or use `thread::scope`)"
+                        "the closure borrows `{}` ({kind:?}), which is not `&static`; \
+                         use `move` and share it through an `Arc` (or use `thread::scope`)",
+                        c.source
                     )),
                     CaptureMode::ByValue => {
                         let place = self.expr_from_path(c.source, c.source_path, *span);
                         let ty = self.peek_type(&place);
                         if Self::type_holds_nonstatic_ref(&ty) {
                             problems.push(format!(
-                                "the closure moves `{who}` of type `{}`, which contains a \
+                                "the closure moves `{}` of type `{}`, which contains a \
                                  non-`&static` reference",
-                                type_to_string(&ty)
+                                c.source,
+                                type_to_string(&ty, &self.context.string_pool)
                             ));
                         }
                     }
@@ -137,27 +136,27 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if Self::type_holds_nonstatic_ref(&ty) {
                 problems.push(format!(
                     "argument of type `{}` contains a non-`&static` reference",
-                    type_to_string(&ty)
+                    type_to_string(&ty, &self.context.string_pool)
                 ));
             }
         }
 
         for p in problems {
             self.record(TypeErrorKind::Generic(format!(
-                "`{callee_name}` requires `&static` here, but {p}"
+                "`{callee}` requires `&static` here, but {p}"
             )));
         }
     }
 
     fn type_holds_nonstatic_ref(ty: &HirType<'a, 'bump>) -> bool {
-        match ty {
-            HirType::Ref {
+        match ty.kind {
+            HirTypeKind::Ref {
                 inner, provenance, ..
             } => {
                 !provenance.is_some_and(|p| matches!(p.root, ProvenanceRoot::Static))
                     || Self::type_holds_nonstatic_ref(inner)
             }
-            HirType::Struct {
+            HirTypeKind::Struct {
                 field_types,
                 type_args,
                 ..
@@ -165,14 +164,16 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 .iter()
                 .chain(type_args.iter())
                 .any(Self::type_holds_nonstatic_ref),
-            HirType::Enum { type_args, .. } => type_args.iter().any(Self::type_holds_nonstatic_ref),
-            HirType::SafePointer { inner, .. }
-            | HirType::UnsafePointer { inner, .. }
-            | HirType::Nullable(inner)
-            | HirType::Array(inner, _)
-            | HirType::Slice(inner) => Self::type_holds_nonstatic_ref(inner),
-            HirType::OwnedPointer { inner, .. } => Self::type_holds_nonstatic_ref(inner),
-            HirType::Tuple(ts) => ts.iter().any(Self::type_holds_nonstatic_ref),
+            HirTypeKind::Enum { type_args, .. } => {
+                type_args.iter().any(Self::type_holds_nonstatic_ref)
+            }
+            HirTypeKind::SafePointer { inner, .. }
+            | HirTypeKind::UnsafePointer { inner, .. }
+            | HirTypeKind::Nullable(inner)
+            | HirTypeKind::Array(inner, _)
+            | HirTypeKind::Slice(inner) => Self::type_holds_nonstatic_ref(inner),
+            HirTypeKind::OwnedPointer { inner, .. } => Self::type_holds_nonstatic_ref(inner),
+            HirTypeKind::Tuple(ts) => ts.iter().any(Self::type_holds_nonstatic_ref),
             _ => false,
         }
     }
@@ -182,7 +183,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.current_fn_bounds.clear();
         if let Some(gs) = func.generics {
             for g in gs.iter() {
-                let bounds: Vec<String> = g.constraints.iter().map(|c| type_to_string(c)).collect();
+                let bounds: Vec<String> = g
+                    .constraints
+                    .iter()
+                    .map(|c| type_to_string(c, &self.context.string_pool).to_string())
+                    .collect();
                 self.current_fn_bounds.insert(g.name, bounds);
             }
         }
@@ -219,15 +224,15 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let report = self.analyze_suspension(point);
         if require_send {
             for local in report.frame_locals.iter() {
-                let Some((_, ty)) = self.context.get_variable(&str_id_to_string(*local)) else {
+                let Some((_, ty)) = self.context.get_variable(*local) else {
                     continue;
                 };
                 if !self.implements_auto(&ty, AutoTrait::Send) {
                     self.record(TypeErrorKind::Generic(format!(
                         "async computation cannot be sent between threads: `{}` of type `{}` \
                          is held across a suspension point and is not `Send`",
-                        str_id_to_string(*local),
-                        type_to_string(&ty)
+                        local,
+                        type_to_string(&ty, &self.context.string_pool)
                     )));
                 }
             }

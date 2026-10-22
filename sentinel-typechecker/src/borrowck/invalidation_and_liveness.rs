@@ -1,16 +1,16 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, rc::Rc};
 
 use ir::{
     borrow_checker::{PlaceId, ProvenanceId},
     errors::type_error::TypeErrorKind,
-    hir::{HirExpr, HirFunc, HirParam, HirStmt, HirType, StrId},
+    hir::{HirExpr, HirFunc, HirParam, HirStmt, HirType, HirTypeKind, StrId},
     ir_hasher::{HashMap, HashSet},
     nll_cfg::PointId,
 };
 use smallvec::SmallVec;
 
 use super::hir_visit::{HirVisitor, walk_stmt};
-use crate::{TypeChecker, str_id_to_string, type_checker::InvalidationCause};
+use crate::{TypeChecker, type_checker::InvalidationCause};
 
 /// Short-circuiting visitor: "does this expr/stmt mention `target`?"
 struct ReferencesLocal {
@@ -60,8 +60,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn invalidate_loans_under(&mut self, place: PlaceId, cause: InvalidationCause) {
         for loan in self.borrow_checker.active_loans.iter().flatten() {
             if self.place_is_within(loan.place, place) {
-                self.invalidated_provenances
-                    .insert(loan.provenance_id, cause);
+                Rc::make_mut(&mut self.invalidated_provenances).insert(loan.provenance_id, cause);
             }
         }
     }
@@ -72,7 +71,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         if let Some(&c) = self.invalidated_provenances.get(&prov) {
             return Some(c);
         }
-        let pr = self.borrow_checker.provenances.get(&prov)?;
+        let pr = self.borrow_checker.provenance(prov)?;
         if pr.parents.is_empty() {
             return None;
         }
@@ -87,7 +86,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             if let Some(&c) = self.invalidated_provenances.get(&p) {
                 return Some(c);
             }
-            if let Some(pr) = self.borrow_checker.provenances.get(&p) {
+            if let Some(pr) = self.borrow_checker.provenance(p) {
                 stack.extend_from_slice(&pr.parents);
             }
         }
@@ -105,12 +104,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             InvalidationCause::Reallocated(c) => format!(
                 "the reference's lifetime has ended because it was invalidated \
                  (`{}` may reallocate the memory it points into)",
-                str_id_to_string(c)
+                c
             ),
             InvalidationCause::Dropped(t) => format!(
                 "the reference's lifetime has ended: the `{}` it was borrowed from \
                  has been dropped (for a lock guard, the lock is released)",
-                str_id_to_string(t)
+                t
             ),
         };
         self.record(TypeErrorKind::Generic(msg));
@@ -122,12 +121,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let mut cur = owner;
         let mut ty = None;
         for (i, seg) in path.iter().enumerate() {
-            let def = self.context.get_struct(&str_id_to_string(cur))?;
+            let def = self.context.get_struct(cur)?;
             let f = def.fields.iter().find(|f| f.name == *seg)?;
             ty = Some(f.field_type);
             if i + 1 < path.len() {
-                match f.field_type {
-                    HirType::Struct { name, .. } => cur = name,
+                match f.field_type.kind {
+                    HirTypeKind::Struct { name, .. } => cur = name,
                     _ => return None,
                 }
             }
@@ -199,10 +198,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 continue;
             }
             if !path.is_empty()
-                && matches!(
-                    self.field_type_at(owner, path),
-                    Some(HirType::OwnedPointer { .. })
-                )
+                && match self.field_type_at(owner, path) {
+                    Some(matched) if let HirTypeKind::OwnedPointer { .. } = matched.kind => true,
+                    _ => false,
+                }
                 && !out.contains(path)
             {
                 out.push(path.clone());
@@ -222,7 +221,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 owner
             } else {
                 match self.field_type_at(owner, prefix) {
-                    Some(HirType::Struct { name, .. }) => name,
+                    Some(other) => match other.kind {
+                        HirTypeKind::Struct { name, .. } => name,
+                        _ => continue,
+                    },
                     _ => continue,
                 }
             };
@@ -232,11 +234,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             {
                 continue; // plain field read
             }
-            let Some(callee) = self
-                .context
-                .get_method(&str_id_to_string(holder), &last.to_string())
-                .copied()
-            else {
+            let Some(callee) = self.context.get_method(holder, last).copied() else {
                 continue;
             };
             for sub in self.analyze_invalidations(holder, &callee) {
@@ -267,8 +265,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return;
         };
         if matches!(
-            self.peek_type(receiver),
-            HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            self.peek_type(receiver).kind,
+            HirTypeKind::Ref { .. }
+                | HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
         ) {
             base = self.borrow_checker.project_deref(base);
         }
