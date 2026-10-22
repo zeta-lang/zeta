@@ -616,7 +616,7 @@ mod tests {
             NodeKind::Module { module_idx: 0 },
             Some(sid("test_module", &p)),
         );
-        let s = graph.debug_node(node, &p);
+        let s = graph.debug_node(node);
         assert!(s.contains("Module"));
         assert!(s.contains("test_module"));
     }
@@ -645,7 +645,10 @@ mod tests {
             return_type: None,
             body: None,
             span: dummy_span(),
+            name_span: dummy_span(),
             attrs: &[],
+            ensures: &[],
+            return_binders: &[],
         }));
         let struct_decl = Box::leak(Box::new(StructDecl {
             visibility: Visibility::Public,
@@ -653,6 +656,7 @@ mod tests {
             generics: None,
             params: None,
             span: dummy_span(),
+            name_span: dummy_span(),
         }));
 
         let stmts: &[Stmt] = &[Stmt::FuncDecl(func_decl), Stmt::StructDecl(struct_decl)];
@@ -694,6 +698,7 @@ mod tests {
             methods: None,
             generics: None,
             span: dummy_span(),
+            name_span: dummy_span(),
         }));
         let enum_decl = Box::leak(Box::new(EnumDecl {
             name: enum_name,
@@ -701,6 +706,7 @@ mod tests {
             generics: None,
             variants: &[],
             span: dummy_span(),
+            name_span: dummy_span(),
         }));
 
         let stmts: &[Stmt] = &[Stmt::InterfaceDecl(iface_decl), Stmt::EnumDecl(enum_decl)];
@@ -734,6 +740,7 @@ mod tests {
         let i32_ty = Type {
             kind: TypeKind::I32,
             nullable: false,
+            span: SourceSpan::default(),
         };
         let value_expr = Box::leak(Box::new(ir::ast::Expr::Number {
             value: 42,
@@ -745,6 +752,7 @@ mod tests {
             type_annotation: i32_ty,
             value: value_expr,
             span: dummy_span(),
+            visibility: Visibility::Public,
         }));
         let impl_decl = Box::leak(Box::new(ImplDecl {
             generics: None,
@@ -756,6 +764,7 @@ mod tests {
                     generics: &[],
                 },
                 nullable: false,
+                span: SourceSpan::default(),
             },
             methods: None,
             constants: None,
@@ -788,6 +797,7 @@ mod tests {
         let i32_ty = Type {
             kind: TypeKind::I32,
             nullable: false,
+            span: SourceSpan::default(),
         };
         let value_expr = Box::leak(Box::new(ir::ast::Expr::Number {
             value: 0,
@@ -802,6 +812,7 @@ mod tests {
             is_static: false,
             span: dummy_span(),
             manual: false,
+            visibility: Visibility::Public,
         }));
 
         let stmts: &[Stmt] = &[Stmt::Let(let_stmt)];
