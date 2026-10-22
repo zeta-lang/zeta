@@ -2,6 +2,7 @@ use codex_dependency_graph::dep_graph::DepGraph;
 use ir::attributes::{AttrTable, AttrTarget, KnownKind};
 use ir::auto_imports::AutoImportRegistry;
 use ir::errors::reporter::ErrorReporter;
+use ir::hir::JoinStr;
 use ir::hir::{HirEnum, HirExpr, HirFuncProto, RefKind};
 use ir::hir::{HirFunc, HirInterface, HirStruct, HirType, StrId};
 use ir::ir_hasher::{FxHashBuilder, FxHashMap};
@@ -81,6 +82,35 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
                 return own_candidate;
             }
 
+            let mut import_hit: Option<StrId> = None;
+            let imported = self.dep_graph.borrow().get_module_imports(self.module_idx);
+            for idx in imported {
+                if idx == self.module_idx {
+                    continue;
+                }
+                let candidate = self.mangle_via_module(idx, name);
+                if !self.type_exists(candidate) {
+                    continue;
+                }
+                match import_hit {
+                    None => import_hit = Some(candidate),
+                    Some(prev) if prev != candidate => {
+                        self.record_error(
+                            format!(
+                                "`{}` is ambiguous: found as `{}` and `{}` via imports; \
+                                 add an explicit `import` to disambiguate",
+                                s, prev, candidate
+                            ),
+                            span,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(c) = import_hit {
+                return c;
+            }
+
             let mut found: Option<(usize, StrId)> = None;
 
             let static_auto_paths: Vec<Vec<StrId>> = self
@@ -118,13 +148,11 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
                             .dep_graph
                             .borrow()
                             .get_module_package(existing_idx)
-                            .map(|p| p.to_string())
                             .unwrap_or_default();
                         let new_pkg = self
                             .dep_graph
                             .borrow()
                             .get_module_package(target_module_idx)
-                            .map(|p| p.to_string())
                             .unwrap_or_default();
                         self.record_error(
                             format!(
@@ -153,11 +181,7 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
             return self.mangle_via_module(target_module_idx, name);
         }
 
-        let path_str = path
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("::");
+        let path_str = path.join("::");
         self.record_error(
             format!(
                 "cannot resolve type path `{}::{}`: no module is registered for path `{}`, \
@@ -168,6 +192,12 @@ impl<'a, 'bump> LoweringCtx<'a, 'bump> {
             span,
         );
         name
+    }
+
+    fn type_exists(&self, key: StrId) -> bool {
+        self.structs.borrow().contains_key(&key)
+            || self.enums.borrow().contains_key(&key)
+            || self.interfaces.borrow().contains_key(&key)
     }
 
     pub(super) fn mangle_type_name(&self, name: StrId) -> StrId {
