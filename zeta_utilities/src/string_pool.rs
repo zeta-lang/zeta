@@ -80,7 +80,7 @@ impl BuildHasher for IdentityBuild {
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct VmString {
-    pub offset: *const u8,
+    offset: *const u8,
     pub length: usize,
 }
 
@@ -109,7 +109,7 @@ impl fmt::Display for VmString {
 
 impl VmString {
     #[inline(always)]
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         unsafe { from_utf8_unchecked(std::slice::from_raw_parts(self.offset, self.length)) }
     }
 }
@@ -162,7 +162,7 @@ unsafe impl Sync for VmString {}
 
 type StringBucket = SmallVec<VmString, 2>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StringPool {
     data_buffer: GrowableAtomicBump<'static>,
 
