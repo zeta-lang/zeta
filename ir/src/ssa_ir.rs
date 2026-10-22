@@ -309,6 +309,7 @@ impl fmt::Display for SsaType {
 
 use crate::ast::FuncModifiers;
 use crate::registry::global_registry::StaticDef;
+use crate::span::SourceSpan;
 use smallvec::SmallVec;
 use zetaruntime::string_pool::StringPool;
 
@@ -538,7 +539,10 @@ impl Function {
         }
 
         let ret_type = lower_type_hir(
-            hir_fn.return_type.as_ref().unwrap_or(&HirType::Void),
+            hir_fn
+                .return_type
+                .as_ref()
+                .unwrap_or(&HirType::void(SourceSpan::default())),
             enums,
             structs,
         );

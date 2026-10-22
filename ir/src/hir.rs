@@ -8,14 +8,114 @@ use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::ops::Deref;
-use std::str::from_utf8_unchecked;
 use zetaruntime::bump::GrowableBump;
+use zetaruntime::string_pool::StringPool;
 use zetaruntime::string_pool::VmString;
 
 /// A reference to an interned string in the global string pool
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StrId(pub VmString);
+
+pub trait JoinStr {
+    fn join(&self, sep: &str) -> String;
+}
+
+impl<T: AsRef<str>> JoinStr for &[T] {
+    fn join(&self, sep: &str) -> String {
+        let mut out = String::new();
+        for (i, p) in self.iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push_str(p.as_ref());
+        }
+        out
+    }
+}
+
+impl<T: AsRef<str>> JoinStr for Vec<T> {
+    fn join(&self, sep: &str) -> String {
+        let mut out = String::new();
+        for (i, p) in self.iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push_str(p.as_ref());
+        }
+        out
+    }
+}
+
+impl<'a, 'bump> JoinStr for Path<'a, 'bump> {
+    fn join(&self, sep: &str) -> String {
+        let mut out = String::new();
+        for (i, p) in self.path.iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push_str(p.as_ref());
+        }
+        out
+    }
+}
+
+impl Default for StrId {
+    fn default() -> Self {
+        StrId::from_static("DEFAULT_STR_ID")
+    }
+}
+
+pub struct Split<'s> {
+    inner: std::str::Split<'static, &'s str>,
+}
+
+impl<'s> Iterator for Split<'s> {
+    type Item = StrId;
+
+    #[inline]
+    fn next(&mut self) -> Option<StrId> {
+        self.inner.next().map(StrId::from_static)
+    }
+}
+
+impl AsRef<str> for StrId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl StrId {
+    pub fn split<'s>(&self, sep: &'s str) -> Split<'s> {
+        Split {
+            inner: self.as_str().split(sep),
+        }
+    }
+
+    pub fn join<I>(parts: I, sep: &str, pool: &StringPool) -> StrId
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        StrId(pool.intern(&Self::join_string(parts, sep)))
+    }
+
+    pub fn join_string<I>(parts: I, sep: &str) -> String
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut out = String::new();
+        for (i, p) in parts.into_iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            out.push_str(p.as_ref());
+        }
+        out
+    }
+}
 
 impl Ord for StrId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -63,7 +163,7 @@ impl StrId {
     }
 
     pub fn as_str(&self) -> &'static str {
-        unsafe { from_utf8_unchecked(std::slice::from_raw_parts(self.offset, self.length)) }
+        self.0.as_str()
     }
 
     pub fn len(&self) -> usize {
@@ -250,6 +350,26 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HirReturnBinder<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub name: StrId,
+    pub arg_path: &'bump [usize],
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HirEnsures<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub pattern: Option<HirPattern<'a, 'bump>>,
+    pub condition: HirExpr<'a, 'bump>,
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HirFunc<'a, 'bump>
 where
     'bump: 'a,
@@ -259,10 +379,13 @@ where
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub params: Option<&'bump [HirParam<'a, 'bump>]>,
     pub return_type: Option<HirType<'a, 'bump>>,
+    pub ensures: &'bump [HirEnsures<'a, 'bump>],
+    pub return_binders: &'bump [HirReturnBinder<'a, 'bump>],
     pub body: Option<HirStmt<'a, 'bump>>,
     pub unmangled_name: StrId,
     pub declaring_module_idx: usize,
     pub impl_target: Option<StrId>,
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -276,6 +399,8 @@ where
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub fields: &'bump [HirField<'a, 'bump>],
     pub unmangled_name: StrId,
+    pub name_span: SourceSpan<'a>,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,6 +415,11 @@ where
     pub target_generics: Option<&'bump [HirType<'a, 'bump>]>,
     pub methods: Option<&'bump [HirFunc<'a, 'bump>]>,
     pub is_unsafe: bool,
+
+    pub target_span: SourceSpan<'a>,
+    pub interface_span: SourceSpan<'a>,
+    pub span: SourceSpan<'a>,
+    pub declaring_module_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -302,6 +432,9 @@ where
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub methods: Option<&'bump [HirFunc<'a, 'bump>]>,
     pub unmangled_name: StrId,
+    pub name_span: SourceSpan<'a>,
+    pub span: SourceSpan<'a>,
+    pub declaring_module_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -311,12 +444,15 @@ pub struct HirEnum<'a, 'bump> {
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub variants: &'bump [HirEnumVariant<'a, 'bump>],
     pub unmangled_name: StrId,
+    pub name_span: SourceSpan<'a>,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct HirEnumVariant<'a, 'bump> {
     pub name: StrId,
     pub fields: &'bump [HirField<'a, 'bump>],
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -328,6 +464,7 @@ where
     pub field_type: HirType<'a, 'bump>,
     pub visibility: Visibility,
     pub manual: bool,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -388,10 +525,10 @@ where
 }
 
 impl<'a, 'bump> HirParam<'a, 'bump> {
-    pub fn get_type(&self) -> Option<&HirType<'a, 'bump>> {
+    pub fn get_type(&self) -> Option<HirType<'a, 'bump>> {
         match self {
-            HirParam::Normal { param_type, .. } => Some(param_type),
-            HirParam::This { .. } => Some(&HirType::This),
+            HirParam::Normal { param_type, .. } => Some(*param_type),
+            HirParam::This { span, .. } => Some(HirType::this(*span)),
         }
     }
 
@@ -411,6 +548,13 @@ impl<'a, 'bump> HirParam<'a, 'bump> {
             }
         )
     }
+
+    pub fn get_span(&self) -> SourceSpan<'a> {
+        match self {
+            HirParam::Normal { span, .. } => *span,
+            HirParam::This { span, .. } => *span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -419,10 +563,11 @@ pub struct HirGeneric<'a, 'bump> {
     pub constraints: &'bump [HirType<'a, 'bump>],
     pub default_type: Option<HirType<'a, 'bump>>,
     pub min_provenance: Option<ProvenanceAnnotation<'bump>>,
+    pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HirType<'a, 'bump>
+pub enum HirTypeKind<'a, 'bump>
 where
     'bump: 'a,
 {
@@ -442,12 +587,18 @@ where
     String,
     Struct {
         name: StrId,
+        unmangled_name: StrId,
         field_types: &'bump [HirType<'a, 'bump>],
         type_args: &'bump [HirType<'a, 'bump>],
     },
-    DynInterface(StrId, &'bump [HirType<'a, 'bump>]),
+    DynInterface {
+        name: StrId,
+        unmangled_name: StrId,
+        type_args: &'bump [HirType<'a, 'bump>],
+    },
     Enum {
         name: StrId,
+        unmangled_name: StrId,
         variants: &'bump [HirEnumVariant<'a, 'bump>],
         type_args: &'bump [HirType<'a, 'bump>],
     },
@@ -466,7 +617,7 @@ where
     },
     OwnedPointer {
         inner: &'bump HirType<'a, 'bump>,
-        allocator: Option<ProvenanceAnnotation<'bump>>, // None until typecheck resolves it
+        allocator: Option<ProvenanceAnnotation<'bump>>,
     },
     Lambda {
         params: &'bump [HirType<'a, 'bump>],
@@ -478,8 +629,7 @@ where
     Null,
     Char,
     /// Placeholder used when a type couldn't be determined, e.g. after a
-    /// type error has already been reported for the expression, so callers
-    /// don't cascade a second complaint about the same root cause.
+    /// type error has already been reported for the expression.
     Unknown,
     Nullable(&'a HirType<'a, 'bump>),
     Dyn {
@@ -497,6 +647,36 @@ where
     },
 }
 
+/// A type plus where it was written. `span` is `SourceSpan::default()` for
+/// synthesized types. It is deliberately ignored by `==` and `Hash`.
+#[derive(Debug, Clone, Copy)]
+pub struct HirType<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub kind: HirTypeKind<'a, 'bump>,
+    pub span: SourceSpan<'a>,
+}
+
+impl<'a, 'bump> PartialEq for HirType<'a, 'bump> {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+impl<'a, 'bump> Eq for HirType<'a, 'bump> {}
+
+impl<'a, 'bump> Hash for HirType<'a, 'bump> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+    }
+}
+
+impl<'a, 'bump> From<HirTypeKind<'a, 'bump>> for HirType<'a, 'bump> {
+    fn from(kind: HirTypeKind<'a, 'bump>) -> Self {
+        HirType::synthetic(kind)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConstStmt<'a, 'bump>
 where
@@ -505,6 +685,7 @@ where
     pub name: StrId,
     pub ty: HirType<'a, 'bump>,
     pub value: HirExpr<'a, 'bump>,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -521,6 +702,8 @@ where
         catch_pattern: Option<HirErrorHandlerPattern<'a, 'bump>>,
         span: SourceSpan<'a>,
         manual: bool,
+        visibility: Visibility,
+        inferred_ty: bool,
     },
     Const(&'bump ConstStmt<'a, 'bump>),
     Return(Option<&'bump HirExpr<'a, 'bump>>, SourceSpan<'a>),
@@ -590,30 +773,135 @@ pub struct HirMatchArm<'a, 'bump>
 where
     'bump: 'a,
 {
-    pub pattern: HirPattern<'bump>,
+    pub pattern: HirPattern<'a, 'bump>,
     pub guard: Option<&'bump HirExpr<'a, 'bump>>,
     pub body: &'bump HirStmt<'a, 'bump>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HirPattern<'bump> {
+pub enum HirPatternKind<'a, 'bump> {
     Ident(StrId, bool),
     Number(i64),
     String(StrId),
     Boolean(bool),
-    Tuple(&'bump [HirPattern<'bump>]),
-    Array(&'bump [HirPattern<'bump>]),
+    Tuple(&'bump [HirPattern<'a, 'bump>]),
+    Array(&'bump [HirPattern<'a, 'bump>]),
     Struct {
         name: StrId,
-        fields: &'bump [(StrId, HirPattern<'bump>)],
+        fields: &'bump [(StrId, HirPattern<'a, 'bump>)],
+        variant_span: SourceSpan<'a>,
     },
     EnumVariant {
         variant: StrId,
         bindings: &'bump [StrId],
+        variant_span: SourceSpan<'a>,
     },
-    Or(&'bump [HirPattern<'bump>]),
+    Or(&'bump [HirPattern<'a, 'bump>]),
     Wildcard,
     Null,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HirPattern<'a, 'bump> {
+    pub kind: HirPatternKind<'a, 'bump>,
+    pub span: SourceSpan<'a>,
+}
+
+impl<'a, 'bump> HirPattern<'a, 'bump> {
+    pub fn ident(span: SourceSpan<'a>, id: StrId, mutable: bool) -> Self {
+        Self {
+            kind: HirPatternKind::Ident(id, mutable),
+            span,
+        }
+    }
+
+    pub fn number(span: SourceSpan<'a>, value: i64) -> Self {
+        Self {
+            kind: HirPatternKind::Number(value),
+            span,
+        }
+    }
+
+    pub fn string(span: SourceSpan<'a>, value: StrId) -> Self {
+        Self {
+            kind: HirPatternKind::String(value),
+            span,
+        }
+    }
+
+    pub fn boolean(span: SourceSpan<'a>, value: bool) -> Self {
+        Self {
+            kind: HirPatternKind::Boolean(value),
+            span,
+        }
+    }
+
+    pub fn tuple(span: SourceSpan<'a>, patterns: &'bump [HirPattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: HirPatternKind::Tuple(patterns),
+            span,
+        }
+    }
+
+    pub fn array(span: SourceSpan<'a>, patterns: &'bump [HirPattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: HirPatternKind::Array(patterns),
+            span,
+        }
+    }
+
+    pub fn struct_pattern(
+        span: SourceSpan<'a>,
+        name: StrId,
+        fields: &'bump [(StrId, HirPattern<'a, 'bump>)],
+        variant_span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirPatternKind::Struct {
+                name,
+                fields,
+                variant_span,
+            },
+            span,
+        }
+    }
+
+    pub fn enum_variant(
+        span: SourceSpan<'a>,
+        variant: StrId,
+        bindings: &'bump [StrId],
+        variant_span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirPatternKind::EnumVariant {
+                variant,
+                bindings,
+                variant_span,
+            },
+            span,
+        }
+    }
+
+    pub fn or(span: SourceSpan<'a>, patterns: &'bump [HirPattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: HirPatternKind::Or(patterns),
+            span,
+        }
+    }
+
+    pub fn wildcard(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirPatternKind::Wildcard,
+            span,
+        }
+    }
+
+    pub fn null(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirPatternKind::Null,
+            span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -624,6 +912,7 @@ pub struct HirFuncProto<'a, 'bump> {
     pub function_metadata: FuncModifiers,
     pub generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
     pub unmangled_name: StrId,
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -705,6 +994,7 @@ where
         variant: StrId,
         args: &'bump [HirExpr<'a, 'bump>],
         type_args: Option<&'bump [HirType<'a, 'bump>]>,
+        variant_span: SourceSpan<'a>,
         span: SourceSpan<'a>,
     },
     ExprList {
@@ -746,6 +1036,8 @@ where
         modifier: Option<LambdaModifier>,
         params: &'bump [HirLambdaParam<'a, 'bump>],
         return_type: &'a HirType<'a, 'bump>,
+        /// Unconditional `ensures` clauses (`pattern` is always `None` for lambdas).
+        ensures: &'bump [HirEnsures<'a, 'bump>],
         body: &'bump HirStmt<'a, 'bump>,
         span: SourceSpan<'a>,
     },
@@ -795,6 +1087,60 @@ where
         inclusive: bool,
         span: SourceSpan<'a>,
     },
+}
+
+impl<'a, 'bump> HirExpr<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub fn get_span(&self) -> SourceSpan<'a> {
+        match self {
+            Self::OrElse { span, .. }
+            | Self::Intrinsic { span, .. }
+            | Self::Cast { span, .. }
+            | Self::Uninit { span, .. }
+            | Self::Binary { span, .. }
+            | Self::Call { span, .. }
+            | Self::InterfaceCall { span, .. }
+            | Self::FieldAccess { span, .. }
+            | Self::Assignment { span, .. }
+            | Self::EnumInit { span, .. }
+            | Self::ExprList { span, .. }
+            | Self::Get { span, .. }
+            | Self::StructInit { span, .. }
+            | Self::Comparison { span, .. }
+            | Self::Deref { span, .. }
+            | Self::Ref { span, .. }
+            | Self::This { span, .. }
+            | Self::Lambda { span, .. }
+            | Self::Index { span, .. }
+            | Self::ArrayLiteral { span, .. }
+            | Self::Undefined { span, .. }
+            | Self::UnknownIntrinsic { span, .. }
+            | Self::If { span, .. }
+            | Self::Match { span, .. }
+            | Self::Block { span, .. }
+            | Self::Range { span, .. }
+            | Self::Slice { span, .. } => *span,
+
+            Self::Null(span)
+            | Self::Number(_, span)
+            | Self::Char(_, span)
+            | Self::String(_, span)
+            | Self::Boolean(_, span)
+            | Self::Ident(_, span)
+            | Self::Tuple(_, span)
+            | Self::Decimal(_, span)
+            | Self::GenericIdent(_, _, span) => *span,
+
+            // Default which gives a bogus source span.. but interpolated strings aren't really even working anyway.
+            // Please no one remind me that this exists until it gives me a bug 4 years down the line when major companies depend on Zeta /j
+            // - Wildered Oct 12 2026
+            Self::InterpolatedString(_) => SourceSpan::default(),
+
+            Self::ModuleAccess(access) => access.span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -860,39 +1206,60 @@ where
     Expr(&'bump HirExpr<'a, 'bump>),
 }
 
-impl<'a, 'bump> Display for HirType<'a, 'bump>
-where
-    'bump: 'a,
-{
+impl<'a, 'bump> Display for HirType<'a, 'bump> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl<'a, 'bump> HirTypeKind<'a, 'bump> {
+    fn write_args(f: &mut Formatter, name: &StrId, args: &[HirType<'a, 'bump>]) -> fmt::Result {
+        if args.is_empty() {
+            write!(f, "{}", name)
+        } else {
+            let args_str: Vec<_> = args.iter().map(|a| a.to_string()).collect();
+            write!(f, "{}<{}>", name, args_str.join(", "))
+        }
+    }
+}
+
+impl<'a, 'bump> Display for HirTypeKind<'a, 'bump> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use HirTypeKind as K;
         match self {
-            HirType::I8 => write!(f, "i8"),
-            HirType::I16 => write!(f, "i16"),
-            HirType::I32 => write!(f, "i32"),
-            HirType::I64 => write!(f, "i64"),
-            HirType::U8 => write!(f, "u8"),
-            HirType::U16 => write!(f, "u16"),
-            HirType::U32 => write!(f, "u32"),
-            HirType::U64 => write!(f, "u64"),
-            HirType::I128 => write!(f, "i128"),
-            HirType::U128 => write!(f, "u128"),
-            HirType::Usize => write!(f, "usize"),
-            HirType::Isize => write!(f, "isize"),
-            HirType::F32 => write!(f, "f32"),
-            HirType::F64 => write!(f, "f64"),
-            HirType::Boolean => write!(f, "bool"),
-            HirType::String => write!(f, "str"),
-            HirType::Struct {
-                name,
+            K::I8 => write!(f, "i8"),
+            K::I16 => write!(f, "i16"),
+            K::I32 => write!(f, "i32"),
+            K::I64 => write!(f, "i64"),
+            K::U8 => write!(f, "u8"),
+            K::U16 => write!(f, "u16"),
+            K::U32 => write!(f, "u32"),
+            K::U64 => write!(f, "u64"),
+            K::I128 => write!(f, "i128"),
+            K::U128 => write!(f, "u128"),
+            K::Usize => write!(f, "usize"),
+            K::Isize => write!(f, "isize"),
+            K::F32 => write!(f, "f32"),
+            K::F64 => write!(f, "f64"),
+            K::Boolean => write!(f, "bool"),
+            K::String => write!(f, "str"),
+            K::Struct {
+                unmangled_name: name,
                 type_args: args,
                 ..
             } => Self::write_args(f, name, args),
 
-            HirType::DynInterface(name, args) => Self::write_args(f, name, args),
-            HirType::Enum {
-                name, type_args, ..
+            K::DynInterface {
+                unmangled_name: name,
+                type_args,
+                ..
             } => Self::write_args(f, name, type_args),
-            HirType::Lambda {
+            K::Enum {
+                unmangled_name: name,
+                type_args,
+                ..
+            } => Self::write_args(f, name, type_args),
+            K::Lambda {
                 params,
                 return_type,
             } => {
@@ -901,11 +1268,11 @@ where
 
                 write!(f, " -> {}", return_type)
             }
-            HirType::Generic(name) => write!(f, "{}", name),
-            HirType::Void => write!(f, "void"),
-            HirType::This => write!(f, "this"),
-            HirType::Null => write!(f, "null"),
-            HirType::SafePointer {
+            K::Generic(name) => write!(f, "{}", name),
+            K::Void => write!(f, "void"),
+            K::This => write!(f, "this"),
+            K::Null => write!(f, "null"),
+            K::SafePointer {
                 inner,
                 mutability_state,
             } => write!(
@@ -918,7 +1285,7 @@ where
                 },
                 inner
             ),
-            HirType::UnsafePointer {
+            K::UnsafePointer {
                 inner,
                 mutability_state,
             } => write!(
@@ -931,8 +1298,8 @@ where
                 },
                 inner
             ),
-            HirType::Char => write!(f, "char"),
-            HirType::Ref {
+            K::Char => write!(f, "char"),
+            K::Ref {
                 inner,
                 ref_kind,
                 provenance,
@@ -948,8 +1315,8 @@ where
                 }
                 write!(f, "{inner}")
             }
-            HirType::Nullable(hir_type) => write!(f, "{}?", hir_type),
-            HirType::Dyn { bounds } => {
+            K::Nullable(hir_type) => write!(f, "{}?", hir_type),
+            K::Dyn { bounds } => {
                 write!(f, "dyn ")?;
                 let mut is_start = true;
                 let mut iter = bounds.into_iter();
@@ -962,8 +1329,8 @@ where
                 }
                 Ok(())
             }
-            HirType::Unknown => write!(f, "<unknown>"),
-            HirType::Tuple(args) => {
+            K::Unknown => write!(f, "<unknown>"),
+            K::Tuple(args) => {
                 let params_str: String = args
                     .iter()
                     .map(|a| a.to_string())
@@ -972,9 +1339,9 @@ where
 
                 write!(f, "({})", params_str)
             }
-            HirType::Array(hir_type, len) => write!(f, "&[{}]{}", len, hir_type),
-            HirType::Slice(hir_type) => write!(f, "&[]{}", hir_type),
-            HirType::OwnedPointer { inner, allocator } => {
+            K::Array(hir_type, len) => write!(f, "&[{}]{}", len, hir_type),
+            K::Slice(hir_type) => write!(f, "&[]{}", hir_type),
+            K::OwnedPointer { inner, allocator } => {
                 write!(
                     f,
                     "^{} {}",
@@ -984,8 +1351,8 @@ where
                     inner
                 )
             }
-            HirType::Never => write!(f, "never"),
-            HirType::Range { elem, inclusive } => {
+            K::Never => write!(f, "never"),
+            K::Range { elem, inclusive } => {
                 write!(
                     f,
                     "range<{}>{}",
@@ -1001,74 +1368,77 @@ impl<'a, 'bump> HirType<'a, 'bump>
 where
     'bump: 'a,
 {
-    /// Creates a new safe pointer type that points to the given type (*T)
-    pub fn safe_ptr_to(inner: &'a HirType<'a, 'bump>, mutability_state: MutabilityState) -> Self {
-        HirType::SafePointer {
-            inner,
-            mutability_state,
+    pub fn new(kind: HirTypeKind<'a, 'bump>, span: SourceSpan<'a>) -> Self {
+        Self { kind, span }
+    }
+
+    /// For types that have no source location (inferred, built by the checker).
+    pub fn synthetic(kind: HirTypeKind<'a, 'bump>) -> Self {
+        Self {
+            kind,
+            span: SourceSpan::default(),
         }
     }
 
-    /// Creates a new unsafe pointer type that points to the given type ([*]T)
-    pub fn unsafe_ptr_to(inner: &'a HirType<'a, 'bump>, mutability_state: MutabilityState) -> Self {
-        HirType::UnsafePointer {
-            inner,
-            mutability_state,
-        }
+    pub fn with_span(mut self, span: SourceSpan<'a>) -> Self {
+        self.span = span;
+        self
     }
 
-    /// Returns true if this is a safe pointer type
+    pub fn has_span(&self) -> bool {
+        self.span.line != 0
+    }
+
     pub fn is_owned_slice(&self) -> bool {
-        matches!(self, HirType::OwnedPointer { inner, .. } if matches!(*inner, HirType::Slice(_)))
-    }
-
-    /// Returns true if this is a safe pointer type
-    pub fn is_safe_pointer(&self) -> bool {
-        matches!(self, HirType::SafePointer { .. })
-    }
-
-    /// Returns true if this is an unsafe pointer type
-    pub fn is_unsafe_pointer(&self) -> bool {
-        matches!(self, HirType::UnsafePointer { .. })
-    }
-
-    /// Returns true if this is any pointer type that is literally a pointer (safe or unsafe)
-    pub fn is_pointer_literal(&self) -> bool {
         matches!(
-            self,
-            HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+            self.kind,
+            HirTypeKind::OwnedPointer { inner, .. } if matches!(inner.kind, HirTypeKind::Slice(_))
         )
     }
 
-    /// Returns true if this is any pointer type that functions as a pointer (safe, unsafe or reference)
+    pub fn is_safe_pointer(&self) -> bool {
+        matches!(self.kind, HirTypeKind::SafePointer { .. })
+    }
+
+    pub fn is_unsafe_pointer(&self) -> bool {
+        matches!(self.kind, HirTypeKind::UnsafePointer { .. })
+    }
+
+    pub fn is_pointer_literal(&self) -> bool {
+        matches!(
+            self.kind,
+            HirTypeKind::SafePointer { .. } | HirTypeKind::UnsafePointer { .. }
+        )
+    }
+
     pub fn is_pointer_semantics(&self) -> bool {
         matches!(
-            self,
-            HirType::SafePointer { .. } | HirType::UnsafePointer { .. } | HirType::Ref { .. }
+            self.kind,
+            HirTypeKind::SafePointer { .. }
+                | HirTypeKind::UnsafePointer { .. }
+                | HirTypeKind::Ref { .. }
         )
     }
 
     pub fn as_safe_pointer(&self) -> Option<&'a HirType<'a, 'bump>> {
-        if let HirType::SafePointer { inner, .. } = self {
-            Some(inner)
-        } else {
-            None
+        match self.kind {
+            HirTypeKind::SafePointer { inner, .. } => Some(inner),
+            _ => None,
         }
     }
 
     pub fn as_unsafe_pointer(&self) -> Option<&'a HirType<'a, 'bump>> {
-        if let HirType::UnsafePointer { inner, .. } = self {
-            Some(inner)
-        } else {
-            None
+        match self.kind {
+            HirTypeKind::UnsafePointer { inner, .. } => Some(inner),
+            _ => None,
         }
     }
 
-    /// If this is any pointer type, returns the inner type. Otherwise returns None.
     pub fn as_pointer(&self) -> Option<&'a HirType<'a, 'bump>> {
-        match self {
-            HirType::SafePointer { inner, .. } => Some(inner),
-            HirType::UnsafePointer { inner, .. } => Some(inner),
+        match self.kind {
+            HirTypeKind::SafePointer { inner, .. } | HirTypeKind::UnsafePointer { inner, .. } => {
+                Some(inner)
+            }
             _ => None,
         }
     }
@@ -1085,34 +1455,32 @@ where
             .expect("owned pointer has no allocator and no default was supplied")
     }
 
-    /// `None` means an owned pointer somewhere inside had no allocator and no default.
-    /// A `?^T` with an unresolved allocator degrades to `Undroppable` (leak) instead.
     pub fn try_drop_kind_with(
         &self,
         default_alloc: Option<ProvenanceAnnotation<'bump>>,
     ) -> Option<DropKind<'a, 'bump>> {
-        Some(match self {
-            HirType::OwnedPointer { inner, allocator } => DropKind::OwnedPointer {
+        Some(match self.kind {
+            HirTypeKind::OwnedPointer { inner, allocator } => DropKind::OwnedPointer {
                 pointee: Box::new(inner.try_drop_kind_with(default_alloc)?),
-                pointee_ty: **inner,
+                pointee_ty: *inner,
                 allocator: allocator.or(default_alloc)?,
             },
-            HirType::Nullable(inner) => match inner.try_drop_kind_with(default_alloc) {
+            HirTypeKind::Nullable(inner) => match inner.try_drop_kind_with(default_alloc) {
                 None | Some(DropKind::Undroppable) => DropKind::Undroppable,
                 Some(k) => DropKind::Nullable {
                     inner: Box::new(k),
-                    inner_ty: **inner,
+                    inner_ty: *inner,
                 },
             },
-            HirType::Struct { name, .. }
-            | HirType::Enum { name, .. }
-            | HirType::DynInterface(name, _) => DropKind::Type(*name),
-            HirType::Slice(inner) => {
+            HirTypeKind::Struct { name, .. }
+            | HirTypeKind::Enum { name, .. }
+            | HirTypeKind::DynInterface { name, .. } => DropKind::Type(name),
+            HirTypeKind::Slice(inner) => {
                 let element = inner.try_drop_kind_with(default_alloc)?;
                 if element.is_droppable() {
                     DropKind::Slice {
                         element: Box::new(element),
-                        element_ty: **inner,
+                        element_ty: *inner,
                     }
                 } else {
                     DropKind::Undroppable
@@ -1123,29 +1491,299 @@ where
     }
 
     pub fn nominal_type_name(&self) -> Option<StrId> {
-        match self {
-            HirType::Struct { name, .. }
-            | HirType::Enum { name, .. }
-            | HirType::DynInterface(name, _) => Some(*name),
+        match self.kind {
+            HirTypeKind::Struct { name, .. }
+            | HirTypeKind::Enum { name, .. }
+            | HirTypeKind::DynInterface { name, .. } => Some(name),
 
-            HirType::Ref { inner, .. }
-            | HirType::SafePointer { inner, .. }
-            | HirType::UnsafePointer { inner, .. }
-            | HirType::OwnedPointer { inner, .. }
-            | HirType::Nullable(inner)
-            | HirType::Array(inner, _)
-            | HirType::Slice(inner) => inner.nominal_type_name(),
+            HirTypeKind::Ref { inner, .. }
+            | HirTypeKind::SafePointer { inner, .. }
+            | HirTypeKind::UnsafePointer { inner, .. }
+            | HirTypeKind::OwnedPointer { inner, .. }
+            | HirTypeKind::Nullable(inner)
+            | HirTypeKind::Array(inner, _)
+            | HirTypeKind::Slice(inner) => inner.nominal_type_name(),
 
             _ => None,
         }
     }
 
-    fn write_args(f: &mut Formatter, name: &StrId, args: &[HirType<'a, 'bump>]) -> fmt::Result {
-        if args.is_empty() {
-            write!(f, "{}", name)
-        } else {
-            let args_str: Vec<_> = args.iter().map(|a| a.to_string()).collect();
-            write!(f, "{}<{}>", name, args_str.join(", "))
+    pub const fn i8(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::I8,
+            span,
+        }
+    }
+
+    pub const fn i16(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::I16,
+            span,
+        }
+    }
+
+    pub const fn i32(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::I32,
+            span,
+        }
+    }
+
+    pub const fn i64(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::I64,
+            span,
+        }
+    }
+
+    pub const fn i128(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::I128,
+            span,
+        }
+    }
+
+    pub const fn u8(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::U8,
+            span,
+        }
+    }
+
+    pub const fn u16(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::U16,
+            span,
+        }
+    }
+
+    pub const fn u32(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::U32,
+            span,
+        }
+    }
+
+    pub const fn u64(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::U64,
+            span,
+        }
+    }
+
+    pub const fn u128(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::U128,
+            span,
+        }
+    }
+
+    pub const fn usize(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Usize,
+            span,
+        }
+    }
+
+    pub const fn isize(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Isize,
+            span,
+        }
+    }
+
+    pub const fn f32(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::F32,
+            span,
+        }
+    }
+
+    pub const fn f64(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::F64,
+            span,
+        }
+    }
+
+    pub const fn boolean(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Boolean,
+            span,
+        }
+    }
+
+    pub const fn string(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::String,
+            span,
+        }
+    }
+
+    pub const fn char(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Char,
+            span,
+        }
+    }
+
+    pub const fn void(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Void,
+            span,
+        }
+    }
+
+    pub const fn this(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::This,
+            span,
+        }
+    }
+
+    pub const fn null(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Null,
+            span,
+        }
+    }
+
+    pub const fn unknown(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Unknown,
+            span,
+        }
+    }
+
+    pub const fn never(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Never,
+            span,
+        }
+    }
+
+    pub const fn generic(name: StrId, span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Generic(name),
+            span,
+        }
+    }
+
+    pub const fn struct_type(
+        name: StrId,
+        unmangled_name: StrId,
+        field_types: &'bump [HirType<'a, 'bump>],
+        type_args: &'bump [HirType<'a, 'bump>],
+        span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirTypeKind::Struct {
+                name,
+                unmangled_name,
+                field_types,
+                type_args,
+            },
+            span,
+        }
+    }
+
+    pub const fn nullable(inner: &'a HirType<'a, 'bump>, span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Nullable(inner),
+            span,
+        }
+    }
+
+    pub const fn slice(elem: &'a HirType<'a, 'bump>, span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Slice(elem),
+            span,
+        }
+    }
+
+    pub const fn array(elem: &'a HirType<'a, 'bump>, len: usize, span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Array(elem, len),
+            span,
+        }
+    }
+
+    pub const fn tuple(elems: &'bump [HirType<'a, 'bump>], span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Tuple(elems),
+            span,
+        }
+    }
+
+    pub const fn lambda(
+        params: &'bump [HirType<'a, 'bump>],
+        return_type: &'a HirType<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirTypeKind::Lambda {
+                params,
+                return_type,
+            },
+            span,
+        }
+    }
+
+    pub const fn safe_ptr_to(
+        inner: &'a HirType<'a, 'bump>,
+        mutability_state: MutabilityState,
+        span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirTypeKind::SafePointer {
+                inner,
+                mutability_state,
+            },
+            span,
+        }
+    }
+
+    pub const fn unsafe_ptr_to(
+        inner: &'a HirType<'a, 'bump>,
+        mutability_state: MutabilityState,
+        span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirTypeKind::UnsafePointer {
+                inner,
+                mutability_state,
+            },
+            span,
+        }
+    }
+
+    pub const fn struct_name(&self) -> Option<StrId> {
+        match self.kind {
+            HirTypeKind::Struct { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub const fn enum_name(&self) -> Option<StrId> {
+        match self.kind {
+            HirTypeKind::Enum { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub const fn type_args(&self) -> &'bump [HirType<'a, 'bump>] {
+        match self.kind {
+            HirTypeKind::Struct { type_args, .. } | HirTypeKind::Enum { type_args, .. } => {
+                type_args
+            }
+            _ => &[],
+        }
+    }
+
+    pub const fn generic_name(&self) -> Option<StrId> {
+        match self.kind {
+            HirTypeKind::Generic(name) => Some(name),
+            _ => None,
         }
     }
 }
@@ -1401,30 +2039,30 @@ pub fn effect_index_key_eq(a: &EffectIndexKey<'_>, b: &EffectIndexKey<'_>) -> bo
 }
 
 /// Names a pattern binds (syntactic; shared by the checker and the hoister).
-pub fn pattern_bound_names(pat: &HirPattern<'_>, out: &mut Vec<StrId>) {
-    match pat {
-        HirPattern::Ident(n, _) => out.push(*n),
-        HirPattern::EnumVariant { bindings, .. } => out.extend(bindings.iter().copied()),
-        HirPattern::Tuple(ps) | HirPattern::Array(ps) => {
+pub fn pattern_bound_names(pat: &HirPattern<'_, '_>, out: &mut Vec<StrId>) {
+    match pat.kind {
+        HirPatternKind::Ident(n, _) => out.push(n),
+        HirPatternKind::EnumVariant { bindings, .. } => out.extend(bindings.iter().copied()),
+        HirPatternKind::Tuple(ps) | HirPatternKind::Array(ps) => {
             for p in ps.iter() {
                 pattern_bound_names(p, out);
             }
         }
-        HirPattern::Struct { fields, .. } => {
+        HirPatternKind::Struct { fields, .. } => {
             for (_, p) in fields.iter() {
                 pattern_bound_names(p, out);
             }
         }
-        HirPattern::Or(ps) => {
+        HirPatternKind::Or(ps) => {
             if let Some(first) = ps.first() {
                 pattern_bound_names(first, out);
             }
         }
-        HirPattern::Wildcard
-        | HirPattern::Number(_)
-        | HirPattern::String(_)
-        | HirPattern::Boolean(_)
-        | HirPattern::Null => {}
+        HirPatternKind::Wildcard
+        | HirPatternKind::Number(_)
+        | HirPatternKind::String(_)
+        | HirPatternKind::Boolean(_)
+        | HirPatternKind::Null => {}
     }
 }
 

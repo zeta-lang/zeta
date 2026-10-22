@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceSpan<'a> {
     pub file_name: &'a str,
 
@@ -11,7 +11,23 @@ pub struct SourceSpan<'a> {
     pub end_column: usize,
 }
 
+impl Default for SourceSpan<'_> {
+    fn default() -> Self {
+        Self::nothing()
+    }
+}
+
 impl<'a> SourceSpan<'a> {
+    pub const fn nothing() -> Self {
+        Self {
+            file_name: "Unknown",
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 0,
+        }
+    }
+
     pub fn new(file_name: &'a str, line: usize, column: usize) -> Self {
         Self {
             file_name,

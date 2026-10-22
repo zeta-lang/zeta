@@ -1,6 +1,6 @@
 use crate::{
     ast::{self, MutabilityState},
-    hir::{self, HirFunc, HirParam, HirType, Operator, RefKind, StrId},
+    hir::{self, HirFunc, HirParam, HirType, HirTypeKind, Operator, RefKind, StrId},
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -31,20 +31,20 @@ pub const fn lower_cmp_operator(op: ast::Op) -> Operator {
 }
 
 pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
-    StrId(match ty {
-        HirType::I32 => VmString::from_static("i32"),
-        HirType::I64 => VmString::from_static("i64"),
-        HirType::U32 => VmString::from_static("u32"),
-        HirType::U64 => VmString::from_static("u64"),
-        HirType::F32 => VmString::from_static("f32"),
-        HirType::F64 => VmString::from_static("f64"),
-        HirType::String => VmString::from_static("str"),
-        HirType::Boolean => VmString::from_static("boolean"),
-        HirType::Struct {
+    StrId(match ty.kind {
+        HirTypeKind::I32 => VmString::from_static("i32"),
+        HirTypeKind::I64 => VmString::from_static("i64"),
+        HirTypeKind::U32 => VmString::from_static("u32"),
+        HirTypeKind::U64 => VmString::from_static("u64"),
+        HirTypeKind::F32 => VmString::from_static("f32"),
+        HirTypeKind::F64 => VmString::from_static("f64"),
+        HirTypeKind::String => VmString::from_static("str"),
+        HirTypeKind::Boolean => VmString::from_static("boolean"),
+        HirTypeKind::Struct {
             name, type_args, ..
         } => {
             if type_args.is_empty() {
-                **name
+                *name
             } else {
                 // only real generic params recurse
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
@@ -58,24 +58,24 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
                 pool.intern(s)
             }
         }
-        HirType::Generic(name) => unreachable!(
+        HirTypeKind::Generic(name) => unreachable!(
             "[type_suffix_with_pool] unresolved generic parameter `{}` reached name mangling",
             name
         ),
-        HirType::Void => VmString::from_static("void"),
-        HirType::I8 => VmString::from_static("i8"),
-        HirType::I16 => VmString::from_static("i16"),
-        HirType::U8 => VmString::from_static("u8"),
-        HirType::U16 => VmString::from_static("u16"),
-        HirType::I128 => VmString::from_static("i128"),
-        HirType::U128 => VmString::from_static("u128"),
+        HirTypeKind::Void => VmString::from_static("void"),
+        HirTypeKind::I8 => VmString::from_static("i8"),
+        HirTypeKind::I16 => VmString::from_static("i16"),
+        HirTypeKind::U8 => VmString::from_static("u8"),
+        HirTypeKind::U16 => VmString::from_static("u16"),
+        HirTypeKind::I128 => VmString::from_static("i128"),
+        HirTypeKind::U128 => VmString::from_static("u128"),
 
-        HirType::SafePointer {
+        HirTypeKind::SafePointer {
             inner,
             mutability_state,
         } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            let tag = if *mutability_state == MutabilityState::Mut {
+            let tag = if mutability_state == MutabilityState::Mut {
                 "ptrmut"
             } else {
                 "ptrconst"
@@ -83,12 +83,12 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
         }
 
-        HirType::UnsafePointer {
+        HirTypeKind::UnsafePointer {
             inner,
             mutability_state,
         } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            let tag = if *mutability_state == MutabilityState::Mut {
+            let tag = if mutability_state == MutabilityState::Mut {
                 "uptrmut"
             } else {
                 "uptrconst"
@@ -96,15 +96,15 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
         }
 
-        HirType::Ref {
+        HirTypeKind::Ref {
             inner,
             ref_kind,
             provenance: _,
         } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            let tag = if *ref_kind == RefKind::Unique {
+            let tag = if ref_kind == RefKind::Unique {
                 "refmut"
-            } else if *ref_kind == RefKind::Alias {
+            } else if ref_kind == RefKind::Alias {
                 "refalias"
             } else {
                 "refconst"
@@ -112,13 +112,13 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
         }
 
-        HirType::OwnedPointer { inner, .. } => {
+        HirTypeKind::OwnedPointer { inner, .. } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
             let s = format!("own_{}", pool.resolve_string(&inner_suf));
             pool.intern(&s)
         }
 
-        HirType::Lambda {
+        HirTypeKind::Lambda {
             params,
             return_type,
         } => {
@@ -135,26 +135,26 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             pool.intern_bytes(buf.as_slice())
         }
 
-        HirType::This => unreachable!(
+        HirTypeKind::This => unreachable!(
             "[type_suffix_with_pool] `this` type reached name mangling unresolved, \
              should have been substituted with the concrete receiver type first"
         ),
 
-        HirType::Null => VmString::from_static("null"),
+        HirTypeKind::Null => VmString::from_static("null"),
 
-        HirType::Char => VmString::from_static("char"),
+        HirTypeKind::Char => VmString::from_static("char"),
 
-        HirType::Unknown => unreachable!(
+        HirTypeKind::Unknown => unreachable!(
             "[type_suffix_with_pool] HirType::Unknown reached name mangling, \
              type checking should have rejected this before monomorphization"
         ),
 
-        HirType::Nullable(inner) => {
+        HirTypeKind::Nullable(inner) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
             intern_fmt!(pool, "opt_{}", pool.resolve_string(&inner_suf))
         }
 
-        HirType::Dyn { bounds } => {
+        HirTypeKind::Dyn { bounds } => {
             let mut buf: SmallVec<u8, 64> = SmallVec::new();
             buf.extend_from_slice(b"dyn");
             for b in bounds.iter() {
@@ -165,7 +165,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             pool.intern_bytes(buf.as_slice())
         }
 
-        HirType::Tuple(hir_types) => {
+        HirTypeKind::Tuple(hir_types) => {
             let mut buf: SmallVec<u8, 64> = SmallVec::new();
             buf.extend_from_slice(b"tuple");
             for t in hir_types.iter() {
@@ -176,22 +176,24 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             pool.intern_bytes(buf.as_slice())
         }
 
-        HirType::Array(inner, len) => {
+        HirTypeKind::Array(inner, len) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
             intern_fmt!(pool, "arr{}_{}", len, pool.resolve_string(&inner_suf))
         }
 
-        HirType::Slice(inner) => {
+        HirTypeKind::Slice(inner) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
             intern_fmt!(pool, "slice_{}", pool.resolve_string(&inner_suf))
         }
 
-        HirType::Usize => VmString::from_static("usize"),
-        HirType::Isize => VmString::from_static("isize"),
+        HirTypeKind::Usize => VmString::from_static("usize"),
+        HirTypeKind::Isize => VmString::from_static("isize"),
 
-        HirType::DynInterface(name, type_args) => {
+        HirTypeKind::DynInterface {
+            name, type_args, ..
+        } => {
             if type_args.is_empty() {
-                **name
+                *name
             } else {
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
                 buf.extend_from_slice(pool.resolve_bytes(&*name));
@@ -204,13 +206,13 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             }
         }
 
-        HirType::Enum {
+        HirTypeKind::Enum {
             name, type_args, ..
         } => {
             if type_args.is_empty() {
                 // name is already the fully-resolved/mangled identity of this enum,
                 // same reasoning as the Struct arm above
-                **name
+                *name
             } else {
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
                 buf.extend_from_slice(pool.resolve_bytes(&*name));
@@ -223,30 +225,32 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             }
         }
 
-        HirType::Never => VmString::from_static("never"),
+        HirTypeKind::Never => VmString::from_static("never"),
 
-        HirType::Range { elem, inclusive } => {
+        HirTypeKind::Range { elem, inclusive } => {
             let elem_suf = type_suffix_with_pool(pool.clone(), elem);
-            let tag = if *inclusive { "rangeincl" } else { "range" };
+            let tag = if inclusive { "rangeincl" } else { "range" };
             intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&elem_suf))
         }
     })
 }
 
 pub fn hir_contains_this(ty: &HirType) -> bool {
-    match ty {
-        HirType::This => true,
-        HirType::Nullable(i) | HirType::Slice(i) | HirType::Array(i, _) => hir_contains_this(i),
-        HirType::Ref { inner, .. }
-        | HirType::SafePointer { inner, .. }
-        | HirType::UnsafePointer { inner, .. }
-        | HirType::OwnedPointer { inner, .. } => hir_contains_this(inner),
-        HirType::Tuple(ts) => ts.iter().any(hir_contains_this),
-        HirType::Struct { type_args, .. }
-        | HirType::Enum { type_args, .. }
-        | HirType::DynInterface(_, type_args) => type_args.iter().any(hir_contains_this),
-        HirType::Dyn { bounds } => bounds.iter().any(hir_contains_this),
-        HirType::Lambda {
+    match ty.kind {
+        HirTypeKind::This => true,
+        HirTypeKind::Nullable(i) | HirTypeKind::Slice(i) | HirTypeKind::Array(i, _) => {
+            hir_contains_this(i)
+        }
+        HirTypeKind::Ref { inner, .. }
+        | HirTypeKind::SafePointer { inner, .. }
+        | HirTypeKind::UnsafePointer { inner, .. }
+        | HirTypeKind::OwnedPointer { inner, .. } => hir_contains_this(inner),
+        HirTypeKind::Tuple(ts) => ts.iter().any(hir_contains_this),
+        HirTypeKind::Struct { type_args, .. }
+        | HirTypeKind::Enum { type_args, .. }
+        | HirTypeKind::DynInterface { type_args, .. } => type_args.iter().any(hir_contains_this),
+        HirTypeKind::Dyn { bounds } => bounds.iter().any(hir_contains_this),
+        HirTypeKind::Lambda {
             params,
             return_type,
         } => params.iter().any(hir_contains_this) || hir_contains_this(return_type),

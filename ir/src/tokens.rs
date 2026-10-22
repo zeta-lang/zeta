@@ -53,14 +53,13 @@ impl<'a, 'bump> Cursor<'a, 'bump> {
     /// Returns the kind of the next non-comment token.
     #[inline]
     pub fn peek(&self) -> TokenKind {
-        let mut idx = self.index;
-        while idx < self.tokens.len() {
-            match self.tokens.get(idx).kind {
-                TokenKind::LineComment | TokenKind::DocComment => idx += 1,
-                kind => return kind,
-            }
-        }
-        TokenKind::EOF
+        self.peek_token().kind
+    }
+
+    /// Returns the kind of the next non-comment token.
+    #[inline]
+    pub fn peek_span(&self) -> SourceSpan<'a> {
+        self.peek_token().span
     }
 
     /// Returns the next non-comment token (without advancing).
@@ -84,7 +83,7 @@ impl<'a, 'bump> Cursor<'a, 'bump> {
     ///
     /// `n = 0` is equivalent to `peek()`.
     #[inline]
-    pub fn peek_n(&self, n: usize) -> TokenKind {
+    pub fn peek_n_kind(&self, n: usize) -> TokenKind {
         let mut idx = self.index;
         let mut skipped = 0;
         while idx < self.tokens.len() {
@@ -100,6 +99,33 @@ impl<'a, 'bump> Cursor<'a, 'bump> {
             }
         }
         TokenKind::EOF
+    }
+
+    /// Peek at the nth token from the current position, skipping comments.
+    ///
+    /// `n = 0` is equivalent to `peek_token()`.
+    #[inline]
+    pub fn peek_n(&self, n: usize) -> Token<'a> {
+        let mut idx = self.index;
+        let mut skipped = 0;
+        while idx < self.tokens.len() {
+            let tok = self.tokens.get(idx);
+            match tok.kind {
+                TokenKind::LineComment | TokenKind::DocComment => idx += 1,
+                _ => {
+                    if skipped == n {
+                        return tok;
+                    }
+                    skipped += 1;
+                    idx += 1;
+                }
+            }
+        }
+        Token {
+            kind: TokenKind::EOF,
+            text: None,
+            span: Default::default(),
+        }
     }
 
     #[inline]
