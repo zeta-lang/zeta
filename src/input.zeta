@@ -8,6 +8,8 @@ import zeta::env.arg_string;
 import zeta::env.Args;
 import zeta::thread::threads;
 import zeta::thread::scope.scope;
+import zeta::thread::scope.Scope;
+import zeta::thread::scope.ScopedJoinHandle;
 import zeta::thread::threads.Thread;
 import zeta::thread::threads.JoinHandle;
 import zeta::file.FileWriter;
@@ -456,874 +458,875 @@ func test_array_list_reuse_after_clear(): i64 {
     return 0;
 }
 
-func test_linked_list_new(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_new ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    if (list.len != 0) {
-        io.stdout().writeln("[FAIL] new list was not empty");
-        return 1;
-    } else {
-        io.stdout().writeln("[PASS] new list was empty");
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[PASS] new list head was empty");
-        },
-
-        case head_value -> {
-            io.stdout().writeln("[FAIL] new list head was not null");
-            return 2;
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[PASS] new list taill was empty");
-        },
-
-        case tail_value -> {
-            io.stdout().writeln("[FAIL] new list tail was not null");
-            return 3;
-        },
-    }
-
-    io.stdout().writeln("[PASS] new list");
-
-    return 0;
-}
-
-func test_linked_list_dropping_test(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_dropping_test ===");
-
-    let mut list: LinkedList<DroppableItem> = LinkedList.new();
-
-    list.push_back(DroppableItem { tag: "clear_one" });
-    list.push_back(DroppableItem { tag: "clear_two" });
-    list.push_back(DroppableItem { tag: "clear_three" });
-
-    io.stdout().writeln("Should see 3 drops after this println");
-
-    return 0;
-}
-
-
-func test_linked_list_push_back(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_push_back ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    list.push_back(10);
-    list.push_back(20);
-    list.push_back(30);
-
-    if (list.len != 3) {
-        io.stdout().writeln("[FAIL] push_back produced wrong len");
-        return 1;
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] head was null after push_back");
-            return 2;
-        },
-
-        case head_node -> {
-            if (head_node.value != 10) {
-                io.stdout().writeln("[FAIL] head has wrong value");
-                return 3;
-            } else {
-                io.stdout().writeln("[PASS] head is 10");
-            }
-
-            match (head_node.prev) {
-                case null -> {
-                    io.stdout().writeln("[PASS] head.prev was null");
-                },
-
-                case head_prev -> {
-                    io.stdout().writeln("[FAIL] head.prev was not null");
-                    return 4;
-                },
-            }
-
-            match (head_node.next) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] head.next was null");
-                    return 5;
-                },
-
-                case second_node -> {
-                    io.stdout().writeln("[PASS] head.next was not null");
-
-                    if (second_node.value != 20) {
-                        io.stdout().writeln("[FAIL] head.next has wrong value");
-                        return 6;
-                    } else {
-                        io.stdout().writeln("[PASS] head.next is 20");
-                    }
-
-                    match (second_node.prev) {
-                        case null -> {
-                            io.stdout().writeln("[FAIL] second node.prev was null");
-                            return 7;
-                        },
-
-                        case second_prev -> {
-                            io.stdout().writeln("[PASS] second node.prev not was null");
-                            if (second_prev.value != 10) {
-                                io.stdout().writeln("[FAIL] second node.prev has wrong value");
-                                return 8;
-                            } else {
-                                io.stdout().writeln("[PASS] second node.prev is 10");
-                            }
-                        },
-                    }
-
-                    match (second_node.next) {
-                        case null -> {
-                            io.stdout().writeln("[FAIL] second node.next was null");
-                            return 9;
-                        },
-
-                        case third_node -> {
-                            if (third_node.value != 30) {
-                                io.stdout().writeln("[FAIL] third node has wrong value");
-                                return 10;
-                            } else {
-                                io.stdout().writeln("[PASS] third node is 30");
-                            }
-
-                            match (third_node.prev) {
-                                case null -> {
-                                    io.stdout().writeln("[FAIL] third node.prev was null");
-                                    return 11;
-                                },
-
-                                case third_prev -> {
-                                    io.stdout().writeln("[PASS] third node was not null");
-                                    if (third_prev.value != 20) {
-                                        io.stdout().writeln("[FAIL] third node.prev has wrong value");
-                                        return 12;
-                                    } else {
-                                        io.stdout().writeln("[PASS] third node.prev is 20");
-                                    }
-                                },
-                            }
-
-                            match (third_node.next) {
-                                case null -> {
-                                    io.stdout().writeln("[PASS] third node tail.next was null");
-                                },
-
-                                case third_next -> {
-                                    io.stdout().writeln("[FAIL] third node tail.next was not null");
-                                    return 13;
-                                },
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] tail was null after push_back");
-            return 14;
-        },
-
-        case tail_node -> {
-            if (tail_node.value != 30) {
-                io.stdout().writeln("[FAIL] tail has wrong value");
-                return 15;
-            }
-        },
-    }
-
-    io.stdout().writeln("[PASS] push_back");
-
-    return 0;
-}
-
-
-func test_linked_list_single_element(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_single_element ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    list.push_back(42);
-
-    if (list.len != 1) {
-        io.stdout().writeln("[FAIL] single-element list has wrong len");
-        return 1;
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] single-element list head was null");
-            return 2;
-        },
-
-        case head_node -> {
-            if (head_node.value != 42) {
-                io.stdout().writeln("[FAIL] single-element head has wrong value");
-                return 3;
-            }
-
-            match (head_node.prev) {
-                case null -> {},
-
-                case head_prev -> {
-                    io.stdout().writeln("[FAIL] single-element head.prev was not null");
-                    return 4;
-                },
-            }
-
-            match (head_node.next) {
-                case null -> {},
-
-                case head_next -> {
-                    io.stdout().writeln("[FAIL] single-element head.next was not null");
-                    return 5;
-                },
-            }
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] single-element list tail was null");
-            return 6;
-        },
-
-        case tail_node -> {
-            if (tail_node.value != 42) {
-                io.stdout().writeln("[FAIL] single-element tail has wrong value");
-                return 7;
-            }
-        },
-    }
-
-    let removed_value: ?i64 = list.remove_back();
-
-    if (removed_value != 42) {
-        io.stdout().writeln("[FAIL] remove_back returned wrong value");
-        return 8;
-    }
-
-    if (list.len != 0) {
-        io.stdout().writeln("[FAIL] list len was not zero after removal");
-        return 9;
-    }
-
-    match (list.head) {
-        case null -> {},
-
-        case remaining_head -> {
-            io.stdout().writeln("[FAIL] head was not null after removing only element");
-            return 10;
-        },
-    }
-
-    match (list.tail) {
-        case null -> {},
-
-        case remaining_tail -> {
-            io.stdout().writeln("[FAIL] tail was not null after removing only element");
-            return 11;
-        },
-    }
-
-    io.stdout().writeln("[PASS] single element");
-
-    return 0;
-}
-
-
-func test_linked_list_remove_back(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_remove_back ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    list.push_back(10);
-    list.push_back(20);
-    list.push_back(30);
-
-    let first_removed_value: ?i64 = list.remove_back();
-
-    if (first_removed_value != 30) {
-        io.stdout().writeln("[FAIL] first remove_back returned wrong value");
-        return 1;
-    }
-
-    if (list.len != 2) {
-        io.stdout().writeln("[FAIL] len was wrong after first remove_back");
-        return 2;
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] tail was null after first remove_back");
-            return 3;
-        },
-
-        case first_new_tail -> {
-            if (first_new_tail.value != 20) {
-                io.stdout().writeln("[FAIL] tail had wrong value after first remove_back");
-                return 4;
-            }
-
-            match (first_new_tail.next) {
-                case null -> {},
-
-                case first_new_tail_next -> {
-                    io.stdout().writeln("[FAIL] new tail.next was not null");
-                    return 5;
-                },
-            }
-
-            match (first_new_tail.prev) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] new tail.prev was null");
-                    return 6;
-                },
-
-                case first_new_tail_prev -> {
-                    if (first_new_tail_prev.value != 10) {
-                        io.stdout().writeln("[FAIL] new tail.prev had wrong value");
-                        return 7;
-                    }
-                },
-            }
-        },
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] head was null after first remove_back");
-            return 8;
-        },
-
-        case first_head -> {
-            if (first_head.value != 10) {
-                io.stdout().writeln("[FAIL] head had wrong value after first remove_back");
-                return 9;
-            }
-
-            match (first_head.next) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] head.next was null after first remove_back");
-                    return 10;
-                },
-
-                case first_head_next -> {
-                    if (first_head_next.value != 20) {
-                        io.stdout().writeln("[FAIL] head.next had wrong value after first remove_back");
-                        return 11;
-                    }
-                },
-            }
-        },
-    }
-
-    let second_removed_value: ?i64 = list.remove_back();
-
-    if (second_removed_value != 20) {
-        io.stdout().writeln("[FAIL] second remove_back returned wrong value");
-        return 12;
-    }
-
-    if (list.len != 1) {
-        io.stdout().writeln("[FAIL] len was wrong after second remove_back");
-        return 13;
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] head was null after second remove_back");
-            return 14;
-        },
-
-        case remaining_head -> {
-            if (remaining_head.value != 10) {
-                io.stdout().writeln("[FAIL] head had wrong value after second remove_back");
-                return 15;
-            }
-
-            match (remaining_head.prev) {
-                case null -> {},
-
-                case remaining_head_prev -> {
-                    io.stdout().writeln("[FAIL] remaining head.prev was not null");
-                    return 16;
-                },
-            }
-
-            match (remaining_head.next) {
-                case null -> {},
-
-                case remaining_head_next -> {
-                    io.stdout().writeln("[FAIL] remaining head.next was not null");
-                    return 17;
-                },
-            }
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] tail was null after second remove_back");
-            return 18;
-        },
-
-        case second_new_tail -> {
-            if (second_new_tail.value != 10) {
-                io.stdout().writeln("[FAIL] tail had wrong value after second remove_back");
-                return 19;
-            }
-        },
-    }
-
-    let third_removed_value: ?i64 = list.remove_back();
-
-    if (third_removed_value != 10) {
-        io.stdout().writeln("[FAIL] third remove_back returned wrong value");
-        return 20;
-    }
-
-    if (list.len != 0) {
-        io.stdout().writeln("[FAIL] len was not zero after removing everything");
-        return 21;
-    }
-
-    match (list.head) {
-        case null -> {},
-
-        case final_head -> {
-            io.stdout().writeln("[FAIL] head was not null after removing everything");
-            return 22;
-        },
-    }
-
-    match (list.tail) {
-        case null -> {},
-
-        case final_tail -> {
-            io.stdout().writeln("[FAIL] tail was not null after removing everything");
-            return 23;
-        },
-    }
-
-    io.stdout().writeln("[PASS] remove_back");
-
-    return 0;
-}
-
-
-func test_linked_list_reuse(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_reuse ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    list.push_back(10);
-    list.push_back(20);
-    list.push_back(30);
-
-    let first_removed_value: ?i64 = list.remove_back();
-
-    if (first_removed_value != 30) {
-        io.stdout().writeln("[FAIL] first remove_back returned wrong value");
-        return 1;
-    }
-
-    let second_removed_value: ?i64 = list.remove_back();
-
-    if (second_removed_value != 20) {
-        io.stdout().writeln("[FAIL] second remove_back returned wrong value");
-        return 2;
-    }
-
-    let third_removed_value: ?i64 = list.remove_back();
-
-    if (third_removed_value != 10) {
-        io.stdout().writeln("[FAIL] third remove_back returned wrong value");
-        return 3;
-    }
-
-    if (list.len != 0) {
-        io.stdout().writeln("[FAIL] list was not empty before reuse");
-        return 4;
-    }
-
-    match (list.head) {
-        case null -> {},
-
-        case old_head -> {
-            io.stdout().writeln("[FAIL] head was not null before reuse");
-            return 5;
-        },
-    }
-
-    match (list.tail) {
-        case null -> {},
-
-        case old_tail -> {
-            io.stdout().writeln("[FAIL] tail was not null before reuse");
-            return 6;
-        },
-    }
-
-    list.push_back(100);
-    list.push_back(200);
-
-    if (list.len != 2) {
-        io.stdout().writeln("[FAIL] reuse produced wrong len");
-        return 7;
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] reused list head was null");
-            return 8;
-        },
-
-        case reused_head -> {
-            if (reused_head.value != 100) {
-                io.stdout().writeln("[FAIL] reused list head had wrong value");
-                return 9;
-            }
-
-            match (reused_head.prev) {
-                case null -> {},
-
-                case reused_head_prev -> {
-                    io.stdout().writeln("[FAIL] reused list head.prev was not null");
-                    return 10;
-                },
-            }
-
-            match (reused_head.next) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] reused list head.next was null");
-                    return 11;
-                },
-
-                case reused_tail_node -> {
-                    if (reused_tail_node.value != 200) {
-                        io.stdout().writeln("[FAIL] reused list tail node had wrong value");
-                        return 12;
-                    }
-
-                    match (reused_tail_node.next) {
-                        case null -> {},
-
-                        case reused_tail_next -> {
-                            io.stdout().writeln("[FAIL] reused tail.next was not null");
-                            return 13;
-                        },
-                    }
-
-                    match (reused_tail_node.prev) {
-                        case null -> {
-                            io.stdout().writeln("[FAIL] reused tail.prev was null");
-                            return 14;
-                        },
-
-                        case reused_tail_prev -> {
-                            if (reused_tail_prev.value != 100) {
-                                io.stdout().writeln("[FAIL] reused tail.prev had wrong value");
-                                return 15;
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] reused list tail was null");
-            return 16;
-        },
-
-        case reused_list_tail -> {
-            if (reused_list_tail.value != 200) {
-                io.stdout().writeln("[FAIL] reused list tail had wrong value");
-                return 17;
-            }
-        },
-    }
-
-    let fourth_removed_value: ?i64 = list.remove_back();
-
-    if (fourth_removed_value != 200) {
-        io.stdout().writeln("[FAIL] reused list returned wrong first value");
-        return 18;
-    }
-
-    let fifth_removed_value: ?i64 = list.remove_back();
-
-    if (fifth_removed_value != 100) {
-        io.stdout().writeln("[FAIL] reused list returned wrong second value");
-        return 19;
-    }
-
-    if (list.len != 0) {
-        io.stdout().writeln("[FAIL] reused list was not empty at the end");
-        return 20;
-    }
-
-    match (list.head) {
-        case null -> {},
-
-        case final_reused_head -> {
-            io.stdout().writeln("[FAIL] reused list head was not null at the end");
-            return 21;
-        },
-    }
-
-    match (list.tail) {
-        case null -> {},
-
-        case final_reused_tail -> {
-            io.stdout().writeln("[FAIL] reused list tail was not null at the end");
-            return 22;
-        },
-    }
-
-    io.stdout().writeln("[PASS] reuse");
-
-    return 0;
-}
-
-
-func test_linked_list_stress_push_remove(): i64 {
-    io.stdout().writeln("=== Running: test_linked_list_stress_push_remove ===");
-
-    let mut list: LinkedList<i64> = LinkedList.new();
-
-    list.push_back(1);
-    list.push_back(2);
-    list.push_back(3);
-    list.push_back(4);
-    list.push_back(5);
-    list.push_back(6);
-    list.push_back(7);
-    list.push_back(8);
-    list.push_back(9);
-    list.push_back(10);
-
-    if (list.len != 10) {
-        io.stdout().writeln("[FAIL] stress push produced wrong len");
-        return 1;
-    }
-
-    let first_removed_value: ?i64 = list.remove_back();
-    if (first_removed_value != 10) {
-        io.stdout().writeln("[FAIL] expected 10");
-        return 2;
-    }
-
-    let second_removed_value: ?i64 = list.remove_back();
-    if (second_removed_value != 9) {
-        io.stdout().writeln("[FAIL] expected 9");
-        return 3;
-    }
-
-    let third_removed_value: ?i64 = list.remove_back();
-    if (third_removed_value != 8) {
-        io.stdout().writeln("[FAIL] expected 8");
-        return 4;
-    }
-
-    let fourth_removed_value: ?i64 = list.remove_back();
-    if (fourth_removed_value != 7) {
-        io.stdout().writeln("[FAIL] expected 7");
-        return 5;
-    }
-
-    let fifth_removed_value: ?i64 = list.remove_back();
-    if (fifth_removed_value != 6) {
-        io.stdout().writeln("[FAIL] expected 6");
-        return 6;
-    }
-
-    if (list.len != 5) {
-        io.stdout().writeln("[FAIL] stress remove produced wrong len");
-        return 7;
-    }
-
-    match (list.head) {
-        case null -> {
-            io.stdout().writeln("[FAIL] stress list head was null");
-            return 8;
-        },
-
-        case stress_head -> {
-            if (stress_head.value != 1) {
-                io.stdout().writeln("[FAIL] stress list head had wrong value");
-                return 9;
-            }
-        },
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] stress list tail was null");
-            return 10;
-        },
-
-        case stress_tail -> {
-            if (stress_tail.value != 5) {
-                io.stdout().writeln("[FAIL] stress list tail had wrong value");
-                return 11;
-            }
-
-            match (stress_tail.next) {
-                case null -> {},
-
-                case stress_tail_next -> {
-                    io.stdout().writeln("[FAIL] stress list tail.next was not null");
-                    return 12;
-                },
-            }
-
-            match (stress_tail.prev) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] stress list tail.prev was null");
-                    return 13;
-                },
-
-                case stress_tail_prev -> {
-                    if (stress_tail_prev.value != 4) {
-                        io.stdout().writeln("[FAIL] stress list tail.prev had wrong value");
-                        return 14;
-                    }
-                },
-            }
-        },
-    }
-
-    list.push_back(11);
-    list.push_back(12);
-
-    if (list.len != 7) {
-        io.stdout().writeln("[FAIL] push after partial removal produced wrong len");
-        return 15;
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] tail was null after pushing 11 and 12");
-            return 16;
-        },
-
-        case final_stress_tail -> {
-            if (final_stress_tail.value != 12) {
-                io.stdout().writeln("[FAIL] tail did not become 12");
-                return 17;
-            }
-
-            match (final_stress_tail.prev) {
-                case null -> {
-                    io.stdout().writeln("[FAIL] 12.prev was null");
-                    return 18;
-                },
-
-                case final_stress_prev -> {
-                    if (final_stress_prev.value != 11) {
-                        io.stdout().writeln("[FAIL] 12.prev did not point to 11");
-                        return 19;
-                    }
-                },
-            }
-        },
-    }
-
-    let sixth_removed_value: ?i64 = list.remove_back();
-    if (sixth_removed_value != 12) {
-        io.stdout().writeln("[FAIL] expected 12 after reuse");
-        return 20;
-    }
-
-    let seventh_removed_value: ?i64 = list.remove_back();
-    if (seventh_removed_value != 11) {
-        io.stdout().writeln("[FAIL] expected 11 after reuse");
-        return 21;
-    }
-
-    if (list.len != 5) {
-        io.stdout().writeln("[FAIL] len was wrong after removing reused nodes");
-        return 22;
-    }
-
-    match (list.tail) {
-        case null -> {
-            io.stdout().writeln("[FAIL] tail was null after removing reused nodes");
-            return 23;
-        },
-
-        case restored_tail -> {
-            if (restored_tail.value != 5) {
-                io.stdout().writeln("[FAIL] tail was not restored to 5");
-                return 24;
-            }
-        },
-    }
-
-    io.stdout().writeln("[PASS] stress push/remove");
-
-    return 0;
-}
-
-
-func linked_list_tests(): i64 {
-    let status1: i64 = test_linked_list_new();
-    if (status1 != 0) {
-        return status1;
-    }
-
-    let status2: i64 = test_linked_list_push_back();
-    if (status2 != 0) {
-        return status2;
-    }
-
-    let status3: i64 = test_linked_list_single_element();
-    if (status3 != 0) {
-        return status3;
-    }
-
-    let status4: i64 = test_linked_list_remove_back();
-    if (status4 != 0) {
-        return status4;
-    }
-
-    let status5: i64 = test_linked_list_reuse();
-    if (status5 != 0) {
-        return status5;
-    }
-
-    let status6: i64 = test_linked_list_stress_push_remove();
-    if (status6 != 0) {
-        return status6;
-    }
-
-    let status7: i64 = test_linked_list_dropping_test();
-    if (status7 != 0) {
-        return status7;
-    }
-
-    io.stdout().writeln(
-        "=== All LinkedList tests finished successfully ==="
-    );
-
-    return 0;
-}
+// TODO: this should be replaced with a testing framework.. as Node should preferrably stay private data
+// func test_linked_list_new(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_new ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     if (list.len != 0) {
+//         io.stdout().writeln("[FAIL] new list was not empty");
+//         return 1;
+//     } else {
+//         io.stdout().writeln("[PASS] new list was empty");
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[PASS] new list head was empty");
+//         },
+// 
+//         case head_value -> {
+//             io.stdout().writeln("[FAIL] new list head was not null");
+//             return 2;
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[PASS] new list taill was empty");
+//         },
+// 
+//         case tail_value -> {
+//             io.stdout().writeln("[FAIL] new list tail was not null");
+//             return 3;
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] new list");
+// 
+//     return 0;
+// }
+// 
+// func test_linked_list_dropping_test(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_dropping_test ===");
+// 
+//     let mut list: LinkedList<DroppableItem> = LinkedList.new();
+// 
+//     list.push_back(DroppableItem { tag: "clear_one" });
+//     list.push_back(DroppableItem { tag: "clear_two" });
+//     list.push_back(DroppableItem { tag: "clear_three" });
+// 
+//     io.stdout().writeln("Should see 3 drops after this println");
+// 
+//     return 0;
+// }
+// 
+// 
+// func test_linked_list_push_back(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_push_back ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     list.push_back(10);
+//     list.push_back(20);
+//     list.push_back(30);
+// 
+//     if (list.len != 3) {
+//         io.stdout().writeln("[FAIL] push_back produced wrong len");
+//         return 1;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] head was null after push_back");
+//             return 2;
+//         },
+// 
+//         case head_node -> {
+//             if (head_node.value != 10) {
+//                 io.stdout().writeln("[FAIL] head has wrong value");
+//                 return 3;
+//             } else {
+//                 io.stdout().writeln("[PASS] head is 10");
+//             }
+// 
+//             match (head_node.prev) {
+//                 case null -> {
+//                     io.stdout().writeln("[PASS] head.prev was null");
+//                 },
+// 
+//                 case head_prev -> {
+//                     io.stdout().writeln("[FAIL] head.prev was not null");
+//                     return 4;
+//                 },
+//             }
+// 
+//             match (head_node.next) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] head.next was null");
+//                     return 5;
+//                 },
+// 
+//                 case second_node -> {
+//                     io.stdout().writeln("[PASS] head.next was not null");
+// 
+//                     if (second_node.value != 20) {
+//                         io.stdout().writeln("[FAIL] head.next has wrong value");
+//                         return 6;
+//                     } else {
+//                         io.stdout().writeln("[PASS] head.next is 20");
+//                     }
+// 
+//                     match (second_node.prev) {
+//                         case null -> {
+//                             io.stdout().writeln("[FAIL] second node.prev was null");
+//                             return 7;
+//                         },
+// 
+//                         case second_prev -> {
+//                             io.stdout().writeln("[PASS] second node.prev not was null");
+//                             if (second_prev.value != 10) {
+//                                 io.stdout().writeln("[FAIL] second node.prev has wrong value");
+//                                 return 8;
+//                             } else {
+//                                 io.stdout().writeln("[PASS] second node.prev is 10");
+//                             }
+//                         },
+//                     }
+// 
+//                     match (second_node.next) {
+//                         case null -> {
+//                             io.stdout().writeln("[FAIL] second node.next was null");
+//                             return 9;
+//                         },
+// 
+//                         case third_node -> {
+//                             if (third_node.value != 30) {
+//                                 io.stdout().writeln("[FAIL] third node has wrong value");
+//                                 return 10;
+//                             } else {
+//                                 io.stdout().writeln("[PASS] third node is 30");
+//                             }
+// 
+//                             match (third_node.prev) {
+//                                 case null -> {
+//                                     io.stdout().writeln("[FAIL] third node.prev was null");
+//                                     return 11;
+//                                 },
+// 
+//                                 case third_prev -> {
+//                                     io.stdout().writeln("[PASS] third node was not null");
+//                                     if (third_prev.value != 20) {
+//                                         io.stdout().writeln("[FAIL] third node.prev has wrong value");
+//                                         return 12;
+//                                     } else {
+//                                         io.stdout().writeln("[PASS] third node.prev is 20");
+//                                     }
+//                                 },
+//                             }
+// 
+//                             match (third_node.next) {
+//                                 case null -> {
+//                                     io.stdout().writeln("[PASS] third node tail.next was null");
+//                                 },
+// 
+//                                 case third_next -> {
+//                                     io.stdout().writeln("[FAIL] third node tail.next was not null");
+//                                     return 13;
+//                                 },
+//                             }
+//                         },
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] tail was null after push_back");
+//             return 14;
+//         },
+// 
+//         case tail_node -> {
+//             if (tail_node.value != 30) {
+//                 io.stdout().writeln("[FAIL] tail has wrong value");
+//                 return 15;
+//             }
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] push_back");
+// 
+//     return 0;
+// }
+// 
+// 
+// func test_linked_list_single_element(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_single_element ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     list.push_back(42);
+// 
+//     if (list.len != 1) {
+//         io.stdout().writeln("[FAIL] single-element list has wrong len");
+//         return 1;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] single-element list head was null");
+//             return 2;
+//         },
+// 
+//         case head_node -> {
+//             if (head_node.value != 42) {
+//                 io.stdout().writeln("[FAIL] single-element head has wrong value");
+//                 return 3;
+//             }
+// 
+//             match (head_node.prev) {
+//                 case null -> {},
+// 
+//                 case head_prev -> {
+//                     io.stdout().writeln("[FAIL] single-element head.prev was not null");
+//                     return 4;
+//                 },
+//             }
+// 
+//             match (head_node.next) {
+//                 case null -> {},
+// 
+//                 case head_next -> {
+//                     io.stdout().writeln("[FAIL] single-element head.next was not null");
+//                     return 5;
+//                 },
+//             }
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] single-element list tail was null");
+//             return 6;
+//         },
+// 
+//         case tail_node -> {
+//             if (tail_node.value != 42) {
+//                 io.stdout().writeln("[FAIL] single-element tail has wrong value");
+//                 return 7;
+//             }
+//         },
+//     }
+// 
+//     let removed_value: ?i64 = list.remove_back();
+// 
+//     if (removed_value != 42) {
+//         io.stdout().writeln("[FAIL] remove_back returned wrong value");
+//         return 8;
+//     }
+// 
+//     if (list.len != 0) {
+//         io.stdout().writeln("[FAIL] list len was not zero after removal");
+//         return 9;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {},
+// 
+//         case remaining_head -> {
+//             io.stdout().writeln("[FAIL] head was not null after removing only element");
+//             return 10;
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {},
+// 
+//         case remaining_tail -> {
+//             io.stdout().writeln("[FAIL] tail was not null after removing only element");
+//             return 11;
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] single element");
+// 
+//     return 0;
+// }
+// 
+// 
+// func test_linked_list_remove_back(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_remove_back ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     list.push_back(10);
+//     list.push_back(20);
+//     list.push_back(30);
+// 
+//     let first_removed_value: ?i64 = list.remove_back();
+// 
+//     if (first_removed_value != 30) {
+//         io.stdout().writeln("[FAIL] first remove_back returned wrong value");
+//         return 1;
+//     }
+// 
+//     if (list.len != 2) {
+//         io.stdout().writeln("[FAIL] len was wrong after first remove_back");
+//         return 2;
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] tail was null after first remove_back");
+//             return 3;
+//         },
+// 
+//         case first_new_tail -> {
+//             if (first_new_tail.value != 20) {
+//                 io.stdout().writeln("[FAIL] tail had wrong value after first remove_back");
+//                 return 4;
+//             }
+// 
+//             match (first_new_tail.next) {
+//                 case null -> {},
+// 
+//                 case first_new_tail_next -> {
+//                     io.stdout().writeln("[FAIL] new tail.next was not null");
+//                     return 5;
+//                 },
+//             }
+// 
+//             match (first_new_tail.prev) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] new tail.prev was null");
+//                     return 6;
+//                 },
+// 
+//                 case first_new_tail_prev -> {
+//                     if (first_new_tail_prev.value != 10) {
+//                         io.stdout().writeln("[FAIL] new tail.prev had wrong value");
+//                         return 7;
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] head was null after first remove_back");
+//             return 8;
+//         },
+// 
+//         case first_head -> {
+//             if (first_head.value != 10) {
+//                 io.stdout().writeln("[FAIL] head had wrong value after first remove_back");
+//                 return 9;
+//             }
+// 
+//             match (first_head.next) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] head.next was null after first remove_back");
+//                     return 10;
+//                 },
+// 
+//                 case first_head_next -> {
+//                     if (first_head_next.value != 20) {
+//                         io.stdout().writeln("[FAIL] head.next had wrong value after first remove_back");
+//                         return 11;
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     let second_removed_value: ?i64 = list.remove_back();
+// 
+//     if (second_removed_value != 20) {
+//         io.stdout().writeln("[FAIL] second remove_back returned wrong value");
+//         return 12;
+//     }
+// 
+//     if (list.len != 1) {
+//         io.stdout().writeln("[FAIL] len was wrong after second remove_back");
+//         return 13;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] head was null after second remove_back");
+//             return 14;
+//         },
+// 
+//         case remaining_head -> {
+//             if (remaining_head.value != 10) {
+//                 io.stdout().writeln("[FAIL] head had wrong value after second remove_back");
+//                 return 15;
+//             }
+// 
+//             match (remaining_head.prev) {
+//                 case null -> {},
+// 
+//                 case remaining_head_prev -> {
+//                     io.stdout().writeln("[FAIL] remaining head.prev was not null");
+//                     return 16;
+//                 },
+//             }
+// 
+//             match (remaining_head.next) {
+//                 case null -> {},
+// 
+//                 case remaining_head_next -> {
+//                     io.stdout().writeln("[FAIL] remaining head.next was not null");
+//                     return 17;
+//                 },
+//             }
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] tail was null after second remove_back");
+//             return 18;
+//         },
+// 
+//         case second_new_tail -> {
+//             if (second_new_tail.value != 10) {
+//                 io.stdout().writeln("[FAIL] tail had wrong value after second remove_back");
+//                 return 19;
+//             }
+//         },
+//     }
+// 
+//     let third_removed_value: ?i64 = list.remove_back();
+// 
+//     if (third_removed_value != 10) {
+//         io.stdout().writeln("[FAIL] third remove_back returned wrong value");
+//         return 20;
+//     }
+// 
+//     if (list.len != 0) {
+//         io.stdout().writeln("[FAIL] len was not zero after removing everything");
+//         return 21;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {},
+// 
+//         case final_head -> {
+//             io.stdout().writeln("[FAIL] head was not null after removing everything");
+//             return 22;
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {},
+// 
+//         case final_tail -> {
+//             io.stdout().writeln("[FAIL] tail was not null after removing everything");
+//             return 23;
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] remove_back");
+// 
+//     return 0;
+// }
+// 
+// 
+// func test_linked_list_reuse(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_reuse ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     list.push_back(10);
+//     list.push_back(20);
+//     list.push_back(30);
+// 
+//     let first_removed_value: ?i64 = list.remove_back();
+// 
+//     if (first_removed_value != 30) {
+//         io.stdout().writeln("[FAIL] first remove_back returned wrong value");
+//         return 1;
+//     }
+// 
+//     let second_removed_value: ?i64 = list.remove_back();
+// 
+//     if (second_removed_value != 20) {
+//         io.stdout().writeln("[FAIL] second remove_back returned wrong value");
+//         return 2;
+//     }
+// 
+//     let third_removed_value: ?i64 = list.remove_back();
+// 
+//     if (third_removed_value != 10) {
+//         io.stdout().writeln("[FAIL] third remove_back returned wrong value");
+//         return 3;
+//     }
+// 
+//     if (list.len != 0) {
+//         io.stdout().writeln("[FAIL] list was not empty before reuse");
+//         return 4;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {},
+// 
+//         case old_head -> {
+//             io.stdout().writeln("[FAIL] head was not null before reuse");
+//             return 5;
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {},
+// 
+//         case old_tail -> {
+//             io.stdout().writeln("[FAIL] tail was not null before reuse");
+//             return 6;
+//         },
+//     }
+// 
+//     list.push_back(100);
+//     list.push_back(200);
+// 
+//     if (list.len != 2) {
+//         io.stdout().writeln("[FAIL] reuse produced wrong len");
+//         return 7;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] reused list head was null");
+//             return 8;
+//         },
+// 
+//         case reused_head -> {
+//             if (reused_head.value != 100) {
+//                 io.stdout().writeln("[FAIL] reused list head had wrong value");
+//                 return 9;
+//             }
+// 
+//             match (reused_head.prev) {
+//                 case null -> {},
+// 
+//                 case reused_head_prev -> {
+//                     io.stdout().writeln("[FAIL] reused list head.prev was not null");
+//                     return 10;
+//                 },
+//             }
+// 
+//             match (reused_head.next) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] reused list head.next was null");
+//                     return 11;
+//                 },
+// 
+//                 case reused_tail_node -> {
+//                     if (reused_tail_node.value != 200) {
+//                         io.stdout().writeln("[FAIL] reused list tail node had wrong value");
+//                         return 12;
+//                     }
+// 
+//                     match (reused_tail_node.next) {
+//                         case null -> {},
+// 
+//                         case reused_tail_next -> {
+//                             io.stdout().writeln("[FAIL] reused tail.next was not null");
+//                             return 13;
+//                         },
+//                     }
+// 
+//                     match (reused_tail_node.prev) {
+//                         case null -> {
+//                             io.stdout().writeln("[FAIL] reused tail.prev was null");
+//                             return 14;
+//                         },
+// 
+//                         case reused_tail_prev -> {
+//                             if (reused_tail_prev.value != 100) {
+//                                 io.stdout().writeln("[FAIL] reused tail.prev had wrong value");
+//                                 return 15;
+//                             }
+//                         },
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] reused list tail was null");
+//             return 16;
+//         },
+// 
+//         case reused_list_tail -> {
+//             if (reused_list_tail.value != 200) {
+//                 io.stdout().writeln("[FAIL] reused list tail had wrong value");
+//                 return 17;
+//             }
+//         },
+//     }
+// 
+//     let fourth_removed_value: ?i64 = list.remove_back();
+// 
+//     if (fourth_removed_value != 200) {
+//         io.stdout().writeln("[FAIL] reused list returned wrong first value");
+//         return 18;
+//     }
+// 
+//     let fifth_removed_value: ?i64 = list.remove_back();
+// 
+//     if (fifth_removed_value != 100) {
+//         io.stdout().writeln("[FAIL] reused list returned wrong second value");
+//         return 19;
+//     }
+// 
+//     if (list.len != 0) {
+//         io.stdout().writeln("[FAIL] reused list was not empty at the end");
+//         return 20;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {},
+// 
+//         case final_reused_head -> {
+//             io.stdout().writeln("[FAIL] reused list head was not null at the end");
+//             return 21;
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {},
+// 
+//         case final_reused_tail -> {
+//             io.stdout().writeln("[FAIL] reused list tail was not null at the end");
+//             return 22;
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] reuse");
+// 
+//     return 0;
+// }
+// 
+// 
+// func test_linked_list_stress_push_remove(): i64 {
+//     io.stdout().writeln("=== Running: test_linked_list_stress_push_remove ===");
+// 
+//     let mut list: LinkedList<i64> = LinkedList.new();
+// 
+//     list.push_back(1);
+//     list.push_back(2);
+//     list.push_back(3);
+//     list.push_back(4);
+//     list.push_back(5);
+//     list.push_back(6);
+//     list.push_back(7);
+//     list.push_back(8);
+//     list.push_back(9);
+//     list.push_back(10);
+// 
+//     if (list.len != 10) {
+//         io.stdout().writeln("[FAIL] stress push produced wrong len");
+//         return 1;
+//     }
+// 
+//     let first_removed_value: ?i64 = list.remove_back();
+//     if (first_removed_value != 10) {
+//         io.stdout().writeln("[FAIL] expected 10");
+//         return 2;
+//     }
+// 
+//     let second_removed_value: ?i64 = list.remove_back();
+//     if (second_removed_value != 9) {
+//         io.stdout().writeln("[FAIL] expected 9");
+//         return 3;
+//     }
+// 
+//     let third_removed_value: ?i64 = list.remove_back();
+//     if (third_removed_value != 8) {
+//         io.stdout().writeln("[FAIL] expected 8");
+//         return 4;
+//     }
+// 
+//     let fourth_removed_value: ?i64 = list.remove_back();
+//     if (fourth_removed_value != 7) {
+//         io.stdout().writeln("[FAIL] expected 7");
+//         return 5;
+//     }
+// 
+//     let fifth_removed_value: ?i64 = list.remove_back();
+//     if (fifth_removed_value != 6) {
+//         io.stdout().writeln("[FAIL] expected 6");
+//         return 6;
+//     }
+// 
+//     if (list.len != 5) {
+//         io.stdout().writeln("[FAIL] stress remove produced wrong len");
+//         return 7;
+//     }
+// 
+//     match (list.head) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] stress list head was null");
+//             return 8;
+//         },
+// 
+//         case stress_head -> {
+//             if (stress_head.value != 1) {
+//                 io.stdout().writeln("[FAIL] stress list head had wrong value");
+//                 return 9;
+//             }
+//         },
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] stress list tail was null");
+//             return 10;
+//         },
+// 
+//         case stress_tail -> {
+//             if (stress_tail.value != 5) {
+//                 io.stdout().writeln("[FAIL] stress list tail had wrong value");
+//                 return 11;
+//             }
+// 
+//             match (stress_tail.next) {
+//                 case null -> {},
+// 
+//                 case stress_tail_next -> {
+//                     io.stdout().writeln("[FAIL] stress list tail.next was not null");
+//                     return 12;
+//                 },
+//             }
+// 
+//             match (stress_tail.prev) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] stress list tail.prev was null");
+//                     return 13;
+//                 },
+// 
+//                 case stress_tail_prev -> {
+//                     if (stress_tail_prev.value != 4) {
+//                         io.stdout().writeln("[FAIL] stress list tail.prev had wrong value");
+//                         return 14;
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     list.push_back(11);
+//     list.push_back(12);
+// 
+//     if (list.len != 7) {
+//         io.stdout().writeln("[FAIL] push after partial removal produced wrong len");
+//         return 15;
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] tail was null after pushing 11 and 12");
+//             return 16;
+//         },
+// 
+//         case final_stress_tail -> {
+//             if (final_stress_tail.value != 12) {
+//                 io.stdout().writeln("[FAIL] tail did not become 12");
+//                 return 17;
+//             }
+// 
+//             match (final_stress_tail.prev) {
+//                 case null -> {
+//                     io.stdout().writeln("[FAIL] 12.prev was null");
+//                     return 18;
+//                 },
+// 
+//                 case final_stress_prev -> {
+//                     if (final_stress_prev.value != 11) {
+//                         io.stdout().writeln("[FAIL] 12.prev did not point to 11");
+//                         return 19;
+//                     }
+//                 },
+//             }
+//         },
+//     }
+// 
+//     let sixth_removed_value: ?i64 = list.remove_back();
+//     if (sixth_removed_value != 12) {
+//         io.stdout().writeln("[FAIL] expected 12 after reuse");
+//         return 20;
+//     }
+// 
+//     let seventh_removed_value: ?i64 = list.remove_back();
+//     if (seventh_removed_value != 11) {
+//         io.stdout().writeln("[FAIL] expected 11 after reuse");
+//         return 21;
+//     }
+// 
+//     if (list.len != 5) {
+//         io.stdout().writeln("[FAIL] len was wrong after removing reused nodes");
+//         return 22;
+//     }
+// 
+//     match (list.tail) {
+//         case null -> {
+//             io.stdout().writeln("[FAIL] tail was null after removing reused nodes");
+//             return 23;
+//         },
+// 
+//         case restored_tail -> {
+//             if (restored_tail.value != 5) {
+//                 io.stdout().writeln("[FAIL] tail was not restored to 5");
+//                 return 24;
+//             }
+//         },
+//     }
+// 
+//     io.stdout().writeln("[PASS] stress push/remove");
+// 
+//     return 0;
+// }
+// 
+// 
+// func linked_list_tests(): i64 {
+//     let status1: i64 = test_linked_list_new();
+//     if (status1 != 0) {
+//         return status1;
+//     }
+// 
+//     let status2: i64 = test_linked_list_push_back();
+//     if (status2 != 0) {
+//         return status2;
+//     }
+// 
+//     let status3: i64 = test_linked_list_single_element();
+//     if (status3 != 0) {
+//         return status3;
+//     }
+// 
+//     let status4: i64 = test_linked_list_remove_back();
+//     if (status4 != 0) {
+//         return status4;
+//     }
+// 
+//     let status5: i64 = test_linked_list_reuse();
+//     if (status5 != 0) {
+//         return status5;
+//     }
+// 
+//     let status6: i64 = test_linked_list_stress_push_remove();
+//     if (status6 != 0) {
+//         return status6;
+//     }
+// 
+//     let status7: i64 = test_linked_list_dropping_test();
+//     if (status7 != 0) {
+//         return status7;
+//     }
+// 
+//     io.stdout().writeln(
+//         "=== All LinkedList tests finished successfully ==="
+//     );
+// 
+//     return 0;
+// }
 
 func test_defer_lifo(): i64 {
     io.stdout().writeln("=== Running: test_defer_lifo ===");
@@ -1454,11 +1457,12 @@ func main(): i64 {
     io.stdout().writeln("");
     io.stdout().writeln("=== LinkedList tests ===");
 
-    status = linked_list_tests();
-    if (status != 0) {
-        io.stdout().writeln("[FAIL] LinkedList test suite");
-        return status;
-    }
+    // TODO: this should be replaced with a testing framework.. as Node should preferrably stay private data
+    // status = linked_list_tests();
+    // if (status != 0) {
+    //     io.stdout().writeln("[FAIL] LinkedList test suite");
+    //     return status;
+    // }
 
     io.stdout().writeln("");
     io.stdout().writeln("=== Assignment/drop tests ===");
@@ -3870,6 +3874,8 @@ func static_tests(): i64 {
     return 0;
 }
 
+// If we add list.push(0); we get this:
+// 
 // error: cannot prove these two accesses don't overlap (via list) at line number 3883 at column 13 inside of file named ./src/input.zeta
 //  3880 |             return list.get_mut(index);
 //  3881 |         },
@@ -3883,22 +3889,6 @@ func static_tests(): i64 {
 // error Found 1 error
 //
 // This is correct behavior :) This is clearly UB
-//
-// func get_mut_or_default(
-//     list: &mut ArrayList<i64>,
-//     index: usize,
-// ): &mut i64 {
-//     match (list.try_get_mut(index)) {
-//         case null -> {
-//             list.push(0);
-//             return list.get_mut(index);
-//         },
-//         case value -> {
-//             list.push(0); // This is the cause of the UB, without this, the code is memory safe.
-//             return value;
-//         },
-//     }
-// }
 
 func get_mut_or_default(
     list: &mut ArrayList<i64>,
@@ -3910,6 +3900,7 @@ func get_mut_or_default(
             return list.get_mut(index);
         },
         case value -> {
+            //list.push(0);
             return value;
         },
     }
