@@ -113,15 +113,21 @@ pub struct Place {
     pub root: PlaceId,
     /// Parent place.
     ///
-    /// world.players[0]
+    /// `world.players[0]`
     ///
-    /// inventory
+    /// `inventory`
+    ///
     ///   ^
-    /// index
+    ///
+    /// `index`
+    ///
     ///   ^
-    /// players
+    ///
+    /// `players`
+    ///
     ///   ^
-    /// world
+    ///
+    /// `world`
     pub parent: Option<PlaceId>,
     pub depth: u16,
     pub storage: StorageId,
