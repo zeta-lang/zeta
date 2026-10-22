@@ -1,10 +1,11 @@
 use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry};
 use crate::midend::ir::mir_lowering::FunctionLowerer;
+use crate::midend::ir::mir_lowering::const_table::ConstTable;
 use crate::midend::ir::mir_lowering::lowerer::CalleeSig;
 use codex_dependency_graph::DepGraph;
 use ir::hir::{
     Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStmt, HirStruct, HirType,
-    Operator, StrId, ThisPassingKind,
+    HirTypeKind, Operator, StrId, ThisPassingKind,
 };
 use ir::hir_utils::hir_contains_this;
 use ir::ir_conversion::lower_type_hir;
@@ -57,12 +58,12 @@ where
     interface_default_methods: HashMap<StrId, HashMap<StrId, HirFunc<'a, 'bump>>>,
     module_import_aliases: HashMap<usize, HashMap<StrId, usize>>,
     module_named_imports: HashMap<usize, HashMap<StrId, usize>>,
-    constants: HashMap<StrId, HirExpr<'a, 'bump>>,
     instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
     registry: GlobalRegistry<'r, 'bump>,
     dynamic_static_inits: Vec<(StrId, HirExpr<'a, 'bump>)>,
     func_sigs: HashMap<StrId, CalleeSig<'a, 'bump>>,
+    constants: ConstTable<'a, 'bump>,
 }
 
 impl<'a, 'cx, 'r, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
@@ -76,7 +77,6 @@ where
         context: Arc<StringPool>,
         extern_c_names: Rc<HashSet<StrId>>,
         dep_graph: &'a RefCell<DepGraph>,
-        module_idx: usize,
         glue_registry: DropGlueRegistry,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
@@ -107,7 +107,7 @@ where
             interface_default_methods: HashMap::default(),
             module_import_aliases: HashMap::default(),
             module_named_imports: HashMap::default(),
-            constants: HashMap::default(),
+            constants: ConstTable::new(),
             enum_variant_tags,
             struct_interfaces: HashMap::default(),
             enums: HashMap::default(),
@@ -116,7 +116,7 @@ where
             extern_c_names,
 
             dep_graph,
-            module_idx,
+            module_idx: 0, // sentinel until overwritten
             g_phantom_data: PhantomData,
             allocator_kind: HashMap::default(),
             glue_registry,
@@ -195,6 +195,7 @@ where
         for &idx in compilation_order {
             let mut aliases = HashMap::default();
             let mut named = HashMap::default();
+            let mut const_named = HashMap::default();
             for import_path in hir_modules[idx].imports {
                 let Some(target_idx) = self
                     .dep_graph
@@ -211,9 +212,17 @@ where
                     }
                     Some(member) => {
                         named.insert(member, target_idx);
+                        const_named.insert(
+                            member,
+                            self.dep_graph
+                                .borrow()
+                                .canonical_member_module(target_idx, member),
+                        );
                     }
                 }
             }
+            self.constants
+                .set_imports(idx, aliases.clone(), const_named);
             self.module_import_aliases.insert(idx, aliases);
             self.module_named_imports.insert(idx, named);
         }
@@ -279,9 +288,7 @@ where
                             }
                         }
                     }
-                    Hir::Const(c) => {
-                        self.constants.insert(c.name, c.value.clone());
-                    }
+                    Hir::Const(c) => self.constants.insert(idx, c.name, c.value.clone()),
                     _ => {}
                 }
             }
@@ -298,7 +305,7 @@ where
                     ..
                 }) = item
                 {
-                    self.register_static_def(*name, ty, value, *span);
+                    self.register_static_def(idx, *name, ty, value, *span);
                 }
             }
         }
@@ -502,6 +509,7 @@ where
 
     fn register_static_def(
         &mut self,
+        module: usize,
         name: StrId,
         ty: &HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
@@ -517,7 +525,7 @@ where
             _ => {
                 let mut bytes = vec![0u8; size];
                 let mut relocs: Vec<StaticReloc> = Vec::new();
-                if self.write_static_init(value, &ssa_ty, &mut bytes, 0, &mut relocs, 0) {
+                if self.write_static_init(value, &ssa_ty, &mut bytes, 0, &mut relocs, module, 0) {
                     if relocs.is_empty() {
                         StaticInit::Bytes(bytes)
                     } else {
@@ -557,22 +565,31 @@ where
         }
     }
 
-    fn const_int(&self, e: &HirExpr<'a, 'bump>, depth: u32) -> Option<i64> {
+    fn const_int(&self, e: &HirExpr<'a, 'bump>, module: usize, depth: u32) -> Option<i64> {
         if depth > 16 {
             return None;
         }
         match e {
             HirExpr::Number(n, _) => Some(*n as i64),
-            HirExpr::Cast { expr, .. } => self.const_int(expr, depth + 1),
-            HirExpr::Ident(n, _) => self
-                .constants
-                .get(n)
-                .and_then(|c| self.const_int(c, depth + 1)),
+            HirExpr::Cast { expr, .. } => self.const_int(expr, module, depth + 1),
+            HirExpr::Ident(n, _) => {
+                let (m, c) = self.constants.resolve_bare(module, *n)?;
+                self.const_int(c, m, depth + 1)
+            }
+            HirExpr::ModuleAccess(acc) => {
+                let (m, c) = self.constants.resolve_access(
+                    module,
+                    acc.path,
+                    acc.member,
+                    &self.dep_graph.borrow(),
+                )?;
+                self.const_int(c, m, depth + 1)
+            }
             HirExpr::Binary {
                 left, op, right, ..
             } => {
-                let l = self.const_int(left, depth + 1)?;
-                let r = self.const_int(right, depth + 1)?;
+                let l = self.const_int(left, module, depth + 1)?;
+                let r = self.const_int(right, module, depth + 1)?;
                 match op {
                     Operator::Add => Some(l.wrapping_add(r)),
                     Operator::Subtract => Some(l.wrapping_sub(r)),
@@ -591,6 +608,7 @@ where
         out: &mut [u8],
         base: usize,
         relocs: &mut Vec<StaticReloc>,
+        module: usize,
         depth: u32,
     ) -> bool {
         if depth > 32 {
@@ -620,14 +638,14 @@ where
                 out.copy_from_slice(&(*d as f64).to_le_bytes());
                 true
             }
-            (SsaType::F32, _) if out.len() == 4 => match self.const_int(e, 0) {
+            (SsaType::F32, _) if out.len() == 4 => match self.const_int(e, module, 0) {
                 Some(i) => {
                     out.copy_from_slice(&(i as f32).to_le_bytes());
                     true
                 }
                 None => false,
             },
-            (SsaType::F64, _) if out.len() == 8 => match self.const_int(e, 0) {
+            (SsaType::F64, _) if out.len() == 8 => match self.const_int(e, module, 0) {
                 Some(i) => {
                     out.copy_from_slice(&(i as f64).to_le_bytes());
                     true
@@ -642,7 +660,7 @@ where
                 out.copy_from_slice(&(*c as u32).to_le_bytes());
                 true
             }
-            (t, _) if t.is_integer() && t != &SsaType::Char => match self.const_int(e, 0) {
+            (t, _) if t.is_integer() && t != &SsaType::Char => match self.const_int(e, module, 0) {
                 Some(i) if out.len() <= 16 => {
                     let b = (i as i128).to_le_bytes();
                     out.copy_from_slice(&b[..out.len()]);
@@ -664,6 +682,7 @@ where
                         &mut out[i * stride..(i + 1) * stride],
                         base + i * stride,
                         relocs,
+                        module,
                         depth + 1,
                     )
                 })
@@ -695,6 +714,7 @@ where
                         &mut out[off..off + sz],
                         base + off,
                         relocs,
+                        module,
                         depth + 1,
                     )
                 })
@@ -715,6 +735,7 @@ where
                         &mut out[cursor..cursor + l.size],
                         base + cursor,
                         relocs,
+                        module,
                         depth + 1,
                     ) {
                         return false;
@@ -723,9 +744,18 @@ where
                 }
                 true
             }
-            (_, HirExpr::Ident(n, _)) => self.constants.get(n).map_or(false, |c| {
-                self.write_static_init(c, ty, out, base, relocs, depth + 1)
-            }),
+            (_, HirExpr::Ident(n, _)) => self
+                .constants
+                .resolve_bare(module, *n)
+                .map_or(false, |(m, c)| {
+                    self.write_static_init(c, ty, out, base, relocs, m, depth + 1)
+                }),
+            (_, HirExpr::ModuleAccess(acc)) => self
+                .constants
+                .resolve_access(module, acc.path, acc.member, &self.dep_graph.borrow())
+                .map_or(false, |(m, c)| {
+                    self.write_static_init(c, ty, out, base, relocs, m, depth + 1)
+                }),
             _ => false,
         }
     }
@@ -880,7 +910,7 @@ where
         )
         .unwrap();
         for (name, value) in &static_inits {
-            fl.lower_static_dynamic_init(*name, value);
+            fl.lower_static_dynamic_init(*name, self.module_idx, value);
         }
 
         fl.lower_body(hir_fn.body);
@@ -898,13 +928,13 @@ where
         let Some(HirParam::Normal { param_type, .. }) = func.params?.first() else {
             return None;
         };
-        let ty = match param_type {
-            HirType::Ref { inner, .. } => *inner,
-            other => other,
+        let ty = match param_type.kind {
+            HirTypeKind::Ref { inner, .. } => *inner,
+            _ => *param_type,
         };
-        match ty {
-            HirType::Struct { name, .. } if name.as_str().starts_with("__closure_env_") => {
-                Some(*name)
+        match ty.kind {
+            HirTypeKind::Struct { name, .. } if name.as_str().starts_with("__closure_env_") => {
+                Some(name)
             }
             _ => None,
         }
