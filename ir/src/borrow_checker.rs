@@ -1,4 +1,5 @@
 use fxhash::FxHashSet;
+use smallvec::SmallVec;
 
 use crate::{
     hir::{RefKind, StrId},
@@ -109,7 +110,7 @@ pub enum MemoryRelation {
 #[derive(Clone, Debug)]
 pub struct Place {
     pub id: PlaceId,
-
+    pub root: PlaceId,
     /// Parent place.
     ///
     /// world.players[0]
@@ -122,11 +123,10 @@ pub struct Place {
     ///   ^
     /// world
     pub parent: Option<PlaceId>,
-
+    pub depth: u16,
+    pub storage: StorageId,
     pub projection: Option<Projection>,
-
-    /// Child places (fields, derefs, indices).
-    pub children: Vec<PlaceId>,
+    pub children: SmallVec<PlaceId, 2>,
 }
 
 #[derive(Clone, Debug)]
@@ -197,11 +197,11 @@ pub struct BorrowChecker {
     pub(super) next_loan: LoanId,
     pub(super) next_provenance: ProvenanceId,
 
-    pub places: Vec<Place>,
+    pub(super) places: Vec<Place>,
     pub active_loans: Vec<Option<Loan>>,
-    pub provenances: FxHashMap<ProvenanceId, Provenance>,
+    pub(super) provenances: FxHashMap<ProvenanceId, Provenance>,
 
-    pub local_places: FxHashMap<StrId, PlaceId>,
+    pub(super) local_places: FxHashMap<StrId, PlaceId>,
 
     /// Root local that every place belongs to.
     pub place_roots: FxHashMap<PlaceId, PlaceId>,
@@ -209,19 +209,25 @@ pub struct BorrowChecker {
     /// Active loans grouped by root local.
     pub root_loans: FxHashMap<PlaceId, Vec<LoanId>>,
 
-    pub reasoning: AliasReasoner,
-    pub scopes: Vec<Scope>,
-    pub place_to_local: FxHashMap<PlaceId, StrId>,
-    pub place_provenance: FxHashMap<(PlaceId, StorageId), ProvenanceId>,
+    pub(super) reasoning: AliasReasoner,
+    pub(super) scopes: Vec<Scope>,
+    pub(super) place_to_local: FxHashMap<PlaceId, StrId>,
+    pub(super) place_provenance: FxHashMap<(PlaceId, StorageId), ProvenanceId>,
     pub(super) field_places: FxHashMap<(PlaceId, StrId), PlaceId>,
     pub(super) deref_places: FxHashMap<PlaceId, PlaceId>,
-    pub(super) index_places: FxHashMap<(PlaceId, Bound), PlaceId>,
-    pub pointee_origin: FxHashMap<PlaceId, (PlaceId, Interval)>,
-    pub place_init: FxHashMap<PlaceId, PlaceInitStatus>,
+    pub(super) index_places: FxHashMap<(PlaceId, Bound, Bound), PlaceId>,
+    /// Symbol -> index places whose interval mentions it. May contain dead ids.
+    pub(super) index_symbols: FxHashMap<StrId, SmallVec<PlaceId, 2>>,
+    /// Ids for "old value of a reassigned variable". Starts high so it can't collide with
+    /// the type checker's `fresh_opaque` counter (which starts at 0).
+    pub(super) next_opaque: u32,
+    pub(super) pointee_origin: FxHashMap<PlaceId, (PlaceId, Interval)>,
+    pub(super) place_init: FxHashMap<PlaceId, PlaceInitStatus>,
     pub(super) next_storage: StorageId,
-    pub storage_validity: FxHashMap<StorageId, bool>,
-    pub place_storage: FxHashMap<PlaceId, StorageId>,
-    pub provenance_storage: FxHashMap<ProvenanceId, StorageId>,
+    pub(super) storage_validity: FxHashMap<StorageId, bool>,
+    pub(super) place_storage: FxHashMap<PlaceId, StorageId>,
+    pub(super) provenance_storage: FxHashMap<ProvenanceId, StorageId>,
+    pub(super) has_invalidated_storage: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -282,10 +288,13 @@ pub struct AliasReasoner {
 
 #[derive(Clone)]
 pub struct Scope {
-    pub loans: Vec<LoanId>,
-    pub places: Vec<PlaceId>,
+    pub loans: SmallVec<LoanId, 4>,
+    pub places: SmallVec<PlaceId, 4>,
+    pub shadowed: SmallVec<(StrId, PlaceId), 2>,
     pub assumed_facts: Vec<(Bound, Bound, bool)>,
     pub assumed_place_facts: Vec<(PlaceId, PlaceId)>,
+    pub assumed_ranges: Vec<(Bound, Interval)>,
+    pub assumed_disjoint: Vec<(Interval, Interval)>,
 }
 
 #[derive(Clone, Debug)]

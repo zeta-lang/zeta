@@ -1,3 +1,5 @@
+use smallvec::SmallVec;
+
 use crate::ir_hasher::HashSet;
 use crate::{hir::StrId, ir_hasher::FxHashMap};
 
@@ -6,6 +8,54 @@ use crate::borrow_checker::{
     Interval, Loan, LoanId, MemoryRelation, Place, PlaceId, PlaceInitStatus, Projection,
     Provenance, ProvenanceId, ProvenanceOrigin, Scope, StorageId,
 };
+
+const VERSION_OPAQUE_BASE: u32 = 0x8000_0000;
+
+fn collect_symbols(b: &Bound, out: &mut SmallVec<StrId, 4>) {
+    match b {
+        Bound::Symbol(n) => {
+            if !out.contains(n) {
+                out.push(*n);
+            }
+        }
+        Bound::Offset { base, .. } | Bound::Scale { base, .. } => collect_symbols(base, out),
+        Bound::Sum(a, c) => {
+            collect_symbols(a, out);
+            collect_symbols(c, out);
+        }
+        Bound::Min(v) | Bound::Max(v) => v.iter().for_each(|x| collect_symbols(x, out)),
+        Bound::Const(_) | Bound::SelfField(_) | Bound::FreshPerCall | Bound::Opaque(_) => {}
+    }
+}
+
+fn substitute_symbols(b: &Bound, map: &FxHashMap<StrId, Bound>) -> Bound {
+    match b {
+        Bound::Symbol(n) => map.get(n).cloned().unwrap_or_else(|| b.clone()),
+        Bound::Offset { base, offset } => Bound::Offset {
+            base: Box::new(substitute_symbols(base, map)),
+            offset: *offset,
+        },
+        Bound::Scale { base, factor } => Bound::Scale {
+            base: Box::new(substitute_symbols(base, map)),
+            factor: *factor,
+        },
+        Bound::Sum(a, c) => Bound::Sum(
+            Box::new(substitute_symbols(a, map)),
+            Box::new(substitute_symbols(c, map)),
+        ),
+        Bound::Min(v) => Bound::Min(v.iter().map(|x| substitute_symbols(x, map)).collect()),
+        Bound::Max(v) => Bound::Max(v.iter().map(|x| substitute_symbols(x, map)).collect()),
+        Bound::Const(_) | Bound::SelfField(_) | Bound::FreshPerCall | Bound::Opaque(_) => b.clone(),
+    }
+}
+
+fn version_of(next: &mut u32, versions: &mut FxHashMap<StrId, Bound>, s: StrId) {
+    versions.entry(s).or_insert_with(|| {
+        let b = Bound::Opaque(*next);
+        *next += 1;
+        b
+    });
+}
 
 impl BorrowChecker {
     pub fn new() -> Self {
@@ -29,12 +79,15 @@ impl BorrowChecker {
             field_places: FxHashMap::default(),
             deref_places: FxHashMap::default(),
             index_places: FxHashMap::default(),
+            index_symbols: FxHashMap::default(),
+            next_opaque: VERSION_OPAQUE_BASE,
             pointee_origin: FxHashMap::default(),
             place_init: FxHashMap::default(),
             storage_validity: FxHashMap::default(),
             place_storage: FxHashMap::default(),
             next_storage: StorageId(0),
             provenance_storage: FxHashMap::default(),
+            has_invalidated_storage: false,
         }
     }
 
@@ -387,17 +440,24 @@ impl BorrowChecker {
     pub fn declare_local(&mut self, local: StrId) -> PlaceId {
         let place_id = self.alloc_place_id();
 
+        let storage = self.alloc_storage_id();
+
         self.push_place(Place {
             id: place_id,
             parent: None,
             projection: None,
-            children: Vec::new(),
+            children: SmallVec::new(),
+            root: place_id,
+            depth: 1,
+            storage: storage,
         });
 
-        let storage = self.alloc_storage_id();
-
         self.place_storage.insert(place_id, storage);
-        self.local_places.insert(local, place_id);
+        if let Some(prev) = self.local_places.insert(local, place_id) {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.shadowed.push((local, prev));
+            }
+        }
         self.place_to_local.insert(place_id, local);
 
         // A local is its own root.
@@ -425,35 +485,166 @@ impl BorrowChecker {
         index: Interval,
         container: IndexContainer,
     ) -> PlaceId {
-        let key = (base, index.lower.clone());
+        let key = (base, index.lower.clone(), index.upper.clone());
         if let Some(&existing) = self.index_places.get(&key) {
             return existing;
         }
 
-        let id = self.alloc_place_id();
+        let mut syms: SmallVec<StrId, 4> = SmallVec::new();
+        collect_symbols(&index.lower, &mut syms);
+        collect_symbols(&index.upper, &mut syms);
 
+        let id = self.alloc_place_id();
+        self.places[base.0 as usize].children.push(id);
+        let root = self.place_roots[&base];
+        let storage = self.place_storage[&base];
         self.push_place(Place {
             id,
             parent: Some(base),
             projection: Some(Projection::Index { index, container }),
-            children: Vec::new(),
+            children: SmallVec::new(),
+            root,
+            depth: 1,
+            storage,
         });
-        self.places[base.0 as usize].children.push(id);
-        let root = self.place_roots[&base];
-        let storage = self.place_storage[&base];
         self.place_storage.insert(id, storage);
         self.place_roots.insert(id, root);
         self.index_places.insert(key, id);
+        for s in syms {
+            self.index_symbols.entry(s).or_default().push(id);
+        }
         id
     }
 
     pub fn begin_scope(&mut self) {
         self.scopes.push(Scope {
-            loans: Vec::new(),
-            places: Vec::new(),
+            loans: SmallVec::new(),
+            places: SmallVec::new(),
+            shadowed: SmallVec::new(),
             assumed_facts: Vec::new(),
             assumed_place_facts: Vec::new(),
+            assumed_disjoint: Vec::new(),
+            assumed_ranges: Vec::new(),
         });
+    }
+
+    /// Arithmetic facts assumed directly in the innermost scope (not in scopes nested in it).
+    pub fn current_scope_facts(&self) -> Vec<(Bound, Bound, bool)> {
+        // Facts killed since they were assumed (a variable they mention was reassigned) are
+        // still in the scope's record; only report the ones that still hold.
+        self.scopes
+            .last()
+            .map(|s| {
+                s.assumed_facts
+                    .iter()
+                    .filter(|(l, r, eq)| {
+                        let map = if *eq {
+                            &self.reasoning.equal
+                        } else {
+                            &self.reasoning.not_equal
+                        };
+                        map.get(l).is_some_and(|set| set.contains(r))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Called from `kill_facts_where` (so every reassignment / shadowing / address-taken
+    /// event the type checker already reports goes through here) and from `end_scope`.
+    fn version_symbols_where(&mut self, pred: &dyn Fn(StrId) -> bool) {
+        let mut versions: FxHashMap<StrId, Bound> = FxHashMap::default();
+        let mut next = self.next_opaque;
+
+        // Index places.
+        let hits: SmallVec<StrId, 4> = self
+            .index_symbols
+            .keys()
+            .copied()
+            .filter(|s| pred(*s))
+            .collect();
+        let mut affected: SmallVec<PlaceId, 8> = SmallVec::new();
+        for s in hits {
+            version_of(&mut next, &mut versions, s);
+            if let Some(ids) = self.index_symbols.remove(&s) {
+                for id in ids {
+                    if !affected.contains(&id) {
+                        affected.push(id);
+                    }
+                }
+            }
+        }
+        for id in affected {
+            if !self.place_roots.contains_key(&id) {
+                continue; // dead place, stale entry
+            }
+            let place = &mut self.places[id.0 as usize];
+            let Some(parent) = place.parent else { continue };
+            let Some(Projection::Index { index, .. }) = &mut place.projection else {
+                continue;
+            };
+            let old_key = (parent, index.lower.clone(), index.upper.clone());
+            index.lower = substitute_symbols(&index.lower, &versions);
+            index.upper = substitute_symbols(&index.upper, &versions);
+            let new_key = (parent, index.lower.clone(), index.upper.clone());
+            self.index_places.remove(&old_key);
+            self.index_places.insert(new_key, id);
+        }
+
+        // Pointer pointee offsets (`record_pointee`).
+        for (_, (_, iv)) in self.pointee_origin.iter_mut() {
+            let mut syms: SmallVec<StrId, 4> = SmallVec::new();
+            collect_symbols(&iv.lower, &mut syms);
+            collect_symbols(&iv.upper, &mut syms);
+            let mut changed = false;
+            for s in syms {
+                if pred(s) {
+                    version_of(&mut next, &mut versions, s);
+                    changed = true;
+                }
+            }
+            if changed {
+                iv.lower = substitute_symbols(&iv.lower, &versions);
+                iv.upper = substitute_symbols(&iv.upper, &versions);
+            }
+        }
+
+        self.next_opaque = next;
+    }
+
+    pub fn kill_facts_where(&mut self, pred: &dyn Fn(StrId) -> bool) {
+        fn mentions(b: &Bound, pred: &dyn Fn(StrId) -> bool) -> bool {
+            match b {
+                Bound::Symbol(n) => pred(*n),
+                Bound::Offset { base, .. } | Bound::Scale { base, .. } => mentions(base, pred),
+                Bound::Sum(a, c) => mentions(a, pred) || mentions(c, pred),
+                Bound::Min(v) | Bound::Max(v) => v.iter().any(|x| mentions(x, pred)),
+                Bound::Const(_) | Bound::SelfField(_) | Bound::FreshPerCall | Bound::Opaque(_) => {
+                    false
+                }
+            }
+        }
+        let iv_mentions = |i: &Interval| mentions(&i.lower, pred) || mentions(&i.upper, pred);
+
+        for map in [
+            &mut self.reasoning.equal,
+            &mut self.reasoning.not_equal,
+            &mut self.reasoning.less_than,
+        ] {
+            map.retain(|k, _| !mentions(k, pred));
+            for set in map.values_mut() {
+                set.retain(|b| !mentions(b, pred));
+            }
+        }
+        self.reasoning
+            .ranges
+            .retain(|k, iv| !mentions(k, pred) && !iv_mentions(iv));
+        self.reasoning
+            .disjoint_intervals
+            .retain(|(l, r)| !iv_mentions(l) && !iv_mentions(r));
+
+        self.version_symbols_where(pred);
     }
 
     pub fn end_scope(&mut self) {
@@ -471,26 +662,84 @@ impl BorrowChecker {
         for (lhs, rhs) in &scope.assumed_place_facts {
             self.reasoning.retract_place_not_equal(lhs, rhs);
         }
+        for (value, iv) in &scope.assumed_ranges {
+            // Only retract our own entry; an inner kill or an outer overwrite stays as is.
+            if self.reasoning.ranges.get(value) == Some(iv) {
+                self.reasoning.ranges.remove(value);
+            }
+        }
+        for (l, r) in &scope.assumed_disjoint {
+            Self::remove_one(
+                &mut self.reasoning.disjoint_intervals,
+                &(l.clone(), r.clone()),
+            );
+            Self::remove_one(
+                &mut self.reasoning.disjoint_intervals,
+                &(r.clone(), l.clone()),
+            );
+        }
 
         for loan in scope.loans {
             self.end_loan(loan);
         }
-        for place in scope.places {
-            self.place_roots.remove(&place);
-            self.field_places
-                .retain(|(base, _), child| *base != place && *child != place);
-            self.deref_places
-                .retain(|base, child| *base != place && *child != place);
-            self.index_places
-                .retain(|(base, _), child| *base != place && *child != place);
 
-            if let Some(local) = self.place_to_local.remove(&place) {
-                self.local_places.remove(&local);
+        let mut dead_names: SmallVec<StrId, 4> = SmallVec::new();
+        let mut work: SmallVec<PlaceId, 16> = SmallVec::new();
+        for &root in &scope.places {
+            work.push(root);
+            while let Some(id) = work.pop() {
+                self.release_place(id, &mut work);
             }
+            if let Some(local) = self.place_to_local.remove(&root) {
+                dead_names.push(local);
+                if self.local_places.get(&local) == Some(&root) {
+                    self.local_places.remove(&local);
+                }
+            }
+        }
+
+        for &(local, prev) in scope.shadowed.iter().rev() {
+            if self.place_roots.contains_key(&prev) && !self.local_places.contains_key(&local) {
+                self.local_places.insert(local, prev);
+            }
+        }
+
+        if !dead_names.is_empty() && !self.index_symbols.is_empty() {
+            self.version_symbols_where(&|s| dead_names.contains(&s));
         }
     }
 
+    fn release_place(&mut self, id: PlaceId, work: &mut SmallVec<PlaceId, 16>) {
+        let Some(place) = self.places.get_mut(id.0 as usize) else {
+            return;
+        };
+        work.extend(std::mem::take(&mut place.children));
+
+        match (place.parent, &place.projection) {
+            (Some(p), Some(Projection::Field(f))) => {
+                self.field_places.remove(&(p, *f));
+            }
+            (Some(p), Some(Projection::Deref)) => {
+                self.deref_places.remove(&p);
+            }
+            (Some(p), Some(Projection::Index { index, .. })) => {
+                self.index_places
+                    .remove(&(p, index.lower.clone(), index.upper.clone()));
+            }
+            _ => {}
+        }
+        self.place_roots.remove(&id);
+    }
+
     pub fn assume_places_not_equal_scoped(&mut self, lhs: PlaceId, rhs: PlaceId) {
+        let already = self
+            .reasoning
+            .place_not_equal
+            .get(&lhs)
+            .is_some_and(|s| s.contains(&rhs));
+        if already {
+            return;
+        }
         self.reasoning
             .place_not_equal
             .entry(lhs)
@@ -526,17 +775,20 @@ impl BorrowChecker {
         }
 
         let id = self.alloc_place_id();
+        self.places[base.0 as usize].children.push(id);
+
+        let root = self.place_roots[&base];
+        let storage = self.alloc_storage_id();
 
         self.push_place(Place {
             id,
             parent: Some(base),
             projection: Some(Projection::Field(field)),
-            children: Vec::new(),
+            children: SmallVec::new(),
+            root,
+            depth: 1,
+            storage,
         });
-        self.places[base.0 as usize].children.push(id);
-
-        let root = self.place_roots[&base];
-        let storage = self.alloc_storage_id();
 
         self.place_roots.insert(id, root);
         self.place_storage.insert(id, storage);
@@ -553,16 +805,20 @@ impl BorrowChecker {
 
         let id = self.alloc_place_id();
 
-        self.push_place(Place {
-            id,
-            parent: Some(base),
-            projection: Some(Projection::Deref),
-            children: Vec::new(),
-        });
         self.places[base.0 as usize].children.push(id);
 
         let root = self.place_roots[&base];
         let storage = self.place_storage[&base];
+
+        self.push_place(Place {
+            id,
+            parent: Some(base),
+            projection: Some(Projection::Deref),
+            children: SmallVec::new(),
+            root,
+            depth: 1,
+            storage,
+        });
 
         self.place_roots.insert(id, root);
         self.place_storage.insert(id, storage);
@@ -712,6 +968,10 @@ impl BorrowChecker {
     }
 
     pub fn provenance_is_valid(&self, provenance: ProvenanceId) -> bool {
+        if !self.has_invalidated_storage {
+            return true;
+        }
+
         let mut stack = vec![provenance];
         let mut visited = HashSet::default();
 
@@ -834,57 +1094,89 @@ impl BorrowChecker {
             return Err(BorrowError::PlaceNotFound(rhs));
         }
 
-        Ok(self
-            .reasoning
-            .relation(&self.places, &self.place_to_local, lhs, rhs))
+        Ok(self.reasoning.relation(&self.places, lhs, rhs))
     }
 
     pub fn assume_equal(&mut self, lhs: Bound, rhs: Bound) {
+        self.assume_equal_scoped(lhs, rhs);
+    }
+
+    pub fn assume_not_equal(&mut self, lhs: Bound, rhs: Bound) {
+        self.assume_not_equal_scoped(lhs, rhs);
+    }
+
+    fn insert_equal(&mut self, lhs: Bound, rhs: Bound) {
         self.reasoning
             .equal
             .entry(lhs.clone())
             .or_default()
             .insert(rhs.clone());
-
         self.reasoning.equal.entry(rhs).or_default().insert(lhs);
     }
 
-    pub fn assume_not_equal(&mut self, lhs: Bound, rhs: Bound) {
+    fn insert_not_equal(&mut self, lhs: Bound, rhs: Bound) {
         self.reasoning
             .not_equal
             .entry(lhs.clone())
             .or_default()
             .insert(rhs.clone());
-
         self.reasoning.not_equal.entry(rhs).or_default().insert(lhs);
     }
 
     pub fn assume_equal_scoped(&mut self, lhs: Bound, rhs: Bound) {
-        self.assume_equal(lhs.clone(), rhs.clone());
+        let already = self
+            .reasoning
+            .equal
+            .get(&lhs)
+            .is_some_and(|s| s.contains(&rhs));
+        self.insert_equal(lhs.clone(), rhs.clone());
+        if already {
+            return;
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.assumed_facts.push((lhs, rhs, true));
         }
     }
 
     pub fn assume_not_equal_scoped(&mut self, lhs: Bound, rhs: Bound) {
-        self.assume_not_equal(lhs.clone(), rhs.clone());
+        let already = self
+            .reasoning
+            .not_equal
+            .get(&lhs)
+            .is_some_and(|s| s.contains(&rhs));
+        self.insert_not_equal(lhs.clone(), rhs.clone());
+        if already {
+            return;
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.assumed_facts.push((lhs, rhs, false));
         }
     }
 
     pub fn assume_range(&mut self, value: Bound, lower: Bound, upper: Bound) {
-        self.reasoning
-            .ranges
-            .insert(value, Interval { lower, upper });
+        let iv = Interval { lower, upper };
+        self.reasoning.ranges.insert(value.clone(), iv.clone());
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.assumed_ranges.push((value, iv));
+        }
     }
 
     pub fn assume_disjoint(&mut self, left: Interval, right: Interval) {
         self.reasoning
             .disjoint_intervals
             .push((left.clone(), right.clone()));
+        self.reasoning
+            .disjoint_intervals
+            .push((right.clone(), left.clone()));
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.assumed_disjoint.push((left, right));
+        }
+    }
 
-        self.reasoning.disjoint_intervals.push((right, left));
+    fn remove_one(v: &mut Vec<(Interval, Interval)>, x: &(Interval, Interval)) {
+        if let Some(pos) = v.iter().rposition(|p| p == x) {
+            v.swap_remove(pos);
+        }
     }
 
     pub fn record_pointee(&mut self, ptr_place: PlaceId, base: PlaceId, offset: Interval) {
@@ -932,6 +1224,96 @@ impl BorrowChecker {
             .map_or(false, |set| set.contains(rhs))
     }
 
+    fn bound_is_pure(b: &Bound) -> bool {
+        match b {
+            Bound::Const(_) | Bound::Symbol(_) | Bound::Opaque(_) => true,
+            Bound::Offset { base, .. } | Bound::Scale { base, .. } => Self::bound_is_pure(base),
+            Bound::Sum(a, c) => Self::bound_is_pure(a) && Self::bound_is_pure(c),
+            Bound::Min(v) | Bound::Max(v) => v.iter().all(Self::bound_is_pure),
+            Bound::SelfField(_) | Bound::FreshPerCall => false,
+        }
+    }
+
+    /// Splits `b` into `(base, constant)` so that `b == base + constant` (`base == None` means
+    /// the bound is just a constant). Nested offsets are flattened. `None` if `b` isn't pure or
+    /// the constants overflow, which makes every query below answer "can't prove".
+    fn split_const_offset(b: &Bound) -> Option<(Option<Bound>, i64)> {
+        match b {
+            Bound::Const(c) => Some((None, *c)),
+            Bound::Offset { base, offset } => {
+                let (inner, o) = Self::split_const_offset(base)?;
+                Some((inner, o.checked_add(*offset)?))
+            }
+            other if Self::bound_is_pure(other) => Some((Some(other.clone()), 0)),
+            _ => None,
+        }
+    }
+
+    /// Is `lhs ⋈ rhs` implied by one recorded fact `p ⋈ q` (where `⋈` is `==` or `!=`, the
+    /// facts all being of the same kind)? Facts are symmetric, and shifting both sides of a fact
+    /// by the same constant preserves it, so `i != j` also proves `i + 1 != j + 1`.
+    fn implied_by_fact(
+        lhs: &Bound,
+        rhs: &Bound,
+        facts: &FxHashMap<Bound, fxhash::FxHashSet<Bound>>,
+    ) -> bool {
+        let (Some((bl, ol)), Some((br, o_r))) =
+            (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
+        else {
+            return false;
+        };
+        let Some(diff) = ol.checked_sub(o_r) else {
+            return false;
+        };
+        for (p, qs) in facts {
+            let Some((bp, op)) = Self::split_const_offset(p) else {
+                continue;
+            };
+            for q in qs {
+                let Some((bq, oq)) = Self::split_const_offset(q) else {
+                    continue;
+                };
+                let Some(fact_diff) = op.checked_sub(oq) else {
+                    continue;
+                };
+                if bl == bp && br == bq && diff == fact_diff {
+                    return true;
+                }
+                if bl == bq && br == bp && fact_diff.checked_neg() == Some(diff) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Conservative: `true` only if `lhs != rhs` follows from the bounds themselves (two
+    /// different constants, or the same base with different offsets) or from a recorded
+    /// `!=` fact (see `assume_not_equal_scoped`). `false` means "couldn't prove", not "equal".
+    pub fn proves_not_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
+        if let (Some((bl, ol)), Some((br, o_r))) =
+            (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
+        {
+            if bl == br {
+                return ol != o_r;
+            }
+        }
+        Self::implied_by_fact(lhs, rhs, &self.reasoning.not_equal)
+    }
+
+    /// Conservative: `true` only if `lhs == rhs` is structurally obvious or follows from a
+    /// recorded `==` fact (see `assume_equal_scoped`). `false` means "couldn't prove".
+    pub fn proves_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
+        if let (Some((bl, ol)), Some((br, o_r))) =
+            (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
+        {
+            if bl == br && ol == o_r {
+                return true;
+            }
+        }
+        Self::implied_by_fact(lhs, rhs, &self.reasoning.equal)
+    }
+
     pub fn proves_index_in_bounds(&self, index: &Bound, len: &Bound) -> bool {
         self.is_less_than(index, len)
     }
@@ -944,6 +1326,7 @@ impl BorrowChecker {
     }
 
     pub fn invalidate_storage(&mut self, storage: StorageId) {
+        self.has_invalidated_storage = true; // This is safe because BorrowChecker is reset anyways.
         self.storage_validity.insert(storage, false);
     }
 
@@ -960,5 +1343,35 @@ impl BorrowChecker {
             PlaceInitStatus::Moved => Err(BorrowError::UseAfterMove { place }),
             _ => Ok(()),
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.next_place = PlaceId(0);
+        self.next_loan = LoanId(0);
+        self.next_provenance = ProvenanceId(0);
+        self.next_storage = StorageId(0);
+        self.has_invalidated_storage = false;
+        self.next_opaque = VERSION_OPAQUE_BASE;
+
+        self.reasoning.reset();
+
+        self.places.clear();
+        self.active_loans.clear();
+        self.provenances.clear();
+        self.local_places.clear();
+        self.place_roots.clear();
+        self.root_loans.clear();
+        self.scopes.clear();
+        self.place_to_local.clear();
+        self.place_provenance.clear();
+        self.field_places.clear();
+        self.deref_places.clear();
+        self.index_places.clear();
+        self.pointee_origin.clear();
+        self.place_init.clear();
+        self.storage_validity.clear();
+        self.place_storage.clear();
+        self.provenance_storage.clear();
+        self.index_symbols.clear();
     }
 }
