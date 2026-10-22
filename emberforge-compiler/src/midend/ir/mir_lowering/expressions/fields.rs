@@ -1,5 +1,5 @@
 use ir::{
-    hir::{AssignmentOperator, HirExpr, HirType, StrId},
+    hir::{AssignmentOperator, HirExpr, HirTypeKind, StrId},
     ir_conversion::{assign_op_to_bin_op, lower_type_hir},
     span::SourceSpan,
     ssa_ir::{Instruction, Operand, SsaType, Value},
@@ -214,11 +214,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             if let Some(cls_name) = cls_name {
                 if let Some(hir_struct) = self.structs.get(&cls_name) {
                     if let Some(f) = hir_struct.fields.iter().find(|f| f.name == field) {
-                        let nullable_owned = match f.field_type {
-                            HirType::Nullable(inner)
+                        let nullable_owned = match f.field_type.kind {
+                            HirTypeKind::Nullable(inner)
                                 if matches!(
-                                    inner,
-                                    HirType::OwnedPointer {
+                                    inner.kind,
+                                    HirTypeKind::OwnedPointer {
                                         allocator: Some(_),
                                         ..
                                     }

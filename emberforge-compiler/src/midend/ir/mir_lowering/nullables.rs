@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirExpr, HirType, Operator, StrId},
+    hir::{HirExpr, HirType, HirTypeKind, Operator, StrId},
     ir_conversion::lower_type_hir,
     layout::{TargetInfo, alignof_ssa, round_up_to_align},
     ssa_ir::{Instruction, Operand, SsaType, Value, cast_kind},
@@ -108,7 +108,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let v = self.current_block_data.fresh_value();
 
         match expected {
-            Some(HirType::Nullable(inner)) => {
+            Some(other) if let HirTypeKind::Nullable(inner) = other.kind => {
                 let inner_ssa = lower_type_hir(inner, self.enums, self.structs);
 
                 if inner_ssa.is_pointer() {

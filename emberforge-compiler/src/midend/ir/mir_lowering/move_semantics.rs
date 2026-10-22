@@ -1,7 +1,7 @@
 use ir::{
     hir::{
-        self, AssignmentOperator, DropKind, HirExpr, HirPattern, HirStmt, HirType, IntrinsicKind,
-        ProvenanceAnnotation, StrId,
+        self, AssignmentOperator, DropKind, HirExpr, HirPattern, HirPatternKind, HirStmt, HirType,
+        HirTypeKind, IntrinsicKind, ProvenanceAnnotation, StrId,
     },
     ir_conversion::{assign_op_to_bin_op, lower_type_hir},
     layout::TargetInfo,
@@ -49,10 +49,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         declared_ty: &HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
     ) -> Option<DropKind<'a, 'bump>> {
-        let HirType::OwnedPointer {
+        let HirTypeKind::OwnedPointer {
             inner,
             allocator: decl_alloc,
-        } = declared_ty
+        } = declared_ty.kind
         else {
             return None;
         };
@@ -70,7 +70,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         Some(DropKind::OwnedPointer {
             pointee: Box::new(inner.drop_kind()),
-            pointee_ty: **inner,
+            pointee_ty: *inner,
             allocator,
         })
     }
@@ -108,12 +108,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     HirExpr::Ref { expr, .. } => &**expr,
                     other => other,
                 };
-                match self.hir_field_type_of_place(place)? {
-                    HirType::Nullable(inner) => match *inner {
-                        HirType::OwnedPointer { allocator, .. } => allocator,
+                match self.hir_field_type_of_place(place)?.kind {
+                    HirTypeKind::Nullable(inner) => match inner.kind {
+                        HirTypeKind::OwnedPointer { allocator, .. } => allocator,
                         _ => None,
                     },
-                    HirType::OwnedPointer { allocator, .. } => allocator,
+                    HirTypeKind::OwnedPointer { allocator, .. } => allocator,
                     _ => None,
                 }
             }
@@ -1300,11 +1300,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         ty: &HirType<'a, 'bump>,
         value: &HirExpr<'a, 'bump>,
     ) -> Option<(DropKind<'a, 'bump>, HirType<'a, 'bump>)> {
-        let HirType::Nullable(inner) = ty else {
+        let HirTypeKind::Nullable(inner) = ty.kind else {
             return None;
         };
-        let owned: HirType<'a, 'bump> = **inner;
-        if !matches!(owned, HirType::OwnedPointer { .. }) {
+        let owned: HirType<'a, 'bump> = *inner;
+        if !matches!(owned.kind, HirTypeKind::OwnedPointer { .. }) {
             return None;
         }
         // A plain field read doesn't transfer ownership, and the typechecker only tracks
@@ -1400,13 +1400,14 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     pub(super) fn adopt_owned_binding(
         &mut self,
         scrutinee: &HirExpr<'a, 'bump>,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         prior_null_arm: bool,
     ) {
         if !prior_null_arm {
             return;
         }
-        let (HirExpr::Ident(src, _), HirPattern::Ident(binding, _)) = (scrutinee, pattern) else {
+        let (HirExpr::Ident(src, _), HirPatternKind::Ident(binding, _)) = (scrutinee, pattern.kind)
+        else {
             return;
         };
         let Some(owned_ty) = self.nullable_owned_locals.get(src).copied() else {
@@ -1415,22 +1416,22 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let Some(kind) = self.local_is_droppable(*src) else {
             return;
         };
-        let Some(&bound) = self.var_map.get(binding) else {
+        let Some(&bound) = self.var_map.get(&binding) else {
             return;
         };
 
         self.drop_state.mark_whole_moved(*src);
         let owned = self.retype_as_owned(bound, &owned_ty);
-        self.var_map.insert(*binding, owned);
+        self.var_map.insert(binding, owned);
         self.scope_stack
             .last_mut()
             .unwrap()
             .actions
             .push(ScopeAction::DropLocal(DropLocal {
-                name: *binding,
+                name: binding,
                 kind,
             }));
-        self.drop_state.mark_whole_initialized(*binding);
+        self.drop_state.mark_whole_initialized(binding);
     }
 
     pub(super) fn emit_indexed_element_drop(
@@ -1519,7 +1520,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         pointee_ty,
                         allocator,
                     } => {
-                        if matches!(pointee_ty, HirType::Slice(_)) {
+                        if matches!(pointee_ty.kind, HirTypeKind::Slice(_)) {
                             emitter.emit_owned_pointer_drop(
                                 None,
                                 pointee,
@@ -1579,24 +1580,24 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
     pub fn is_plain_scalar(ty: &HirType) -> bool {
         matches!(
-            ty,
-            HirType::I8
-                | HirType::I16
-                | HirType::I32
-                | HirType::I64
-                | HirType::I128
-                | HirType::U8
-                | HirType::U16
-                | HirType::U32
-                | HirType::U64
-                | HirType::U128
-                | HirType::F32
-                | HirType::F64
-                | HirType::Boolean
-                | HirType::Char
-                | HirType::Usize
-                | HirType::Isize
-                | HirType::Void
+            ty.kind,
+            HirTypeKind::I8
+                | HirTypeKind::I16
+                | HirTypeKind::I32
+                | HirTypeKind::I64
+                | HirTypeKind::I128
+                | HirTypeKind::U8
+                | HirTypeKind::U16
+                | HirTypeKind::U32
+                | HirTypeKind::U64
+                | HirTypeKind::U128
+                | HirTypeKind::F32
+                | HirTypeKind::F64
+                | HirTypeKind::Boolean
+                | HirTypeKind::Char
+                | HirTypeKind::Usize
+                | HirTypeKind::Isize
+                | HirTypeKind::Void
         )
     }
 
@@ -1677,11 +1678,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             CallOwn::Struct(name) => Some(DropKind::Type(name)),
             CallOwn::Callee(callee) => {
                 let sig = self.func_sigs.get(&callee)?;
-                let (owned, nullable) = match sig.ret? {
-                    HirType::Nullable(inner) => (*inner, true),
-                    other => (other, false),
+                let (owned, nullable) = match sig.ret?.kind {
+                    HirTypeKind::Nullable(inner) => (*inner, true),
+                    _ => (sig.ret?, false),
                 };
-                let HirType::OwnedPointer { inner, allocator } = owned else {
+                let HirTypeKind::OwnedPointer { inner, allocator } = owned.kind else {
                     return None;
                 };
                 let allocator = match allocator {

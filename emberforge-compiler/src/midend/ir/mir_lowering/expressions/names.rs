@@ -131,11 +131,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 let Some(pkg) = self.dep_graph.borrow().get_module_package(real_idx) else {
                     return member;
                 };
-                let pkg_str = pkg.to_string();
-                let segments: Vec<StrId> = pkg_str
-                    .split("::")
-                    .map(|s| StrId(self.context.intern(s)))
-                    .collect();
+                let segments: Vec<StrId> = pkg.split("::").collect();
                 optimized_string_buffering::build_module_scoped_name(
                     &segments,
                     member,

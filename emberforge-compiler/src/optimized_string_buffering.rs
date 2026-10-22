@@ -1,4 +1,5 @@
 use codex_dependency_graph::DepGraph;
+use ir::hir::JoinStr;
 use ir::hir::StrId;
 use smallvec::SmallVec;
 use std::cell::RefCell;
@@ -33,13 +34,10 @@ pub fn build_module_scoped_name(
     extra: Option<StrId>,
     context: Arc<StringPool>,
 ) -> StrId {
-    let mut parts: Vec<String> = path
-        .iter()
-        .map(|s| context.resolve_string(s).to_string())
-        .collect();
-    parts.push(context.resolve_string(&member).to_string());
+    let mut parts: Vec<StrId> = path.iter().map(|s| *s).collect();
+    parts.push(member);
     if let Some(e) = extra {
-        parts.push(context.resolve_string(&e).to_string());
+        parts.push(e);
     }
     let joined = parts.join("_");
     StrId(context.intern(&joined))

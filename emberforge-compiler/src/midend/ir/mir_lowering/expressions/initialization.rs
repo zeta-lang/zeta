@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirEnum, HirExpr, HirFieldInit, HirType, StrId},
+    hir::{HirEnum, HirExpr, HirFieldInit, HirTypeKind, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
     span::SourceSpan,
@@ -179,8 +179,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 field_ty,
                 SsaType::Pointer(ir::ssa_ir::SsaPointerKind::UnsafeMut, _)
             ) || matches!(
-                hir_field.field_type,
-                HirType::Ref { .. } | HirType::SafePointer { .. } | HirType::UnsafePointer { .. }
+                hir_field.field_type.kind,
+                HirTypeKind::Ref { .. }
+                    | HirTypeKind::SafePointer { .. }
+                    | HirTypeKind::UnsafePointer { .. }
             );
             if Self::is_move_by_value(&field_ty) {
                 self.record_arg_move(&arg.value);

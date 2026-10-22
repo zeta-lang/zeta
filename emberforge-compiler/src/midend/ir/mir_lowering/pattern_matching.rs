@@ -1,5 +1,5 @@
 use ir::{
-    hir::{HirEnum, HirExpr, HirMatchArm, HirPattern, HirStmt, StrId},
+    hir::{HirEnum, HirExpr, HirMatchArm, HirPattern, HirPatternKind, HirStmt, StrId},
     ir_conversion::lower_type_hir,
     ir_hasher::HashMap,
     layout::TargetInfo,
@@ -297,7 +297,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// enum (to help debugging name-mangling mismatches) and panics.
     pub(super) fn resolve_enum_for_variant(&self, enum_name: &StrId) -> &HirEnum<'a, 'bump> {
         self.enums.get(enum_name).unwrap_or_else(|| {
-            println!("All enums: {:?}", self.enums.keys().collect::<Vec<_>>());
+            println!("All enums: {:?}", self.enums.keys());
             panic!("[resolve_enum_for_variant] unknown enum {}", enum_name)
         })
     }
@@ -316,7 +316,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// Otherwise it dispatches on the pattern kind to one of the `test_*_pattern` functions below.
     pub(super) fn lower_pattern_test(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
@@ -326,25 +326,31 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 return self.lower_nullable_inner_test(pattern, scrutinee, ty, span);
             }
         }
-        match pattern {
-            HirPattern::Wildcard | HirPattern::Ident(..) => None,
-            HirPattern::Array(_) => self.test_array_pattern(pattern, scrutinee, scrutinee_ty, span),
-            HirPattern::Struct { .. } => {
+        match pattern.kind {
+            HirPatternKind::Wildcard | HirPatternKind::Ident(..) => None,
+            HirPatternKind::Array(_) => {
+                self.test_array_pattern(pattern, scrutinee, scrutinee_ty, span)
+            }
+            HirPatternKind::Struct { .. } => {
                 self.test_struct_pattern(pattern, scrutinee, scrutinee_ty, span)
             }
-            HirPattern::Or(_) => self.test_or_pattern(pattern, scrutinee, scrutinee_ty, span),
-            HirPattern::Boolean(b) => {
-                Some(self.test_literal_eq(scrutinee, SsaType::Bool, Operand::ConstBool(*b)))
+            HirPatternKind::Or(_) => self.test_or_pattern(pattern, scrutinee, scrutinee_ty, span),
+            HirPatternKind::Boolean(b) => {
+                Some(self.test_literal_eq(scrutinee, SsaType::Bool, Operand::ConstBool(b)))
             }
-            HirPattern::Number(n) => {
-                Some(self.test_literal_eq(scrutinee, SsaType::I64, Operand::ConstInt(*n)))
+            HirPatternKind::Number(n) => {
+                Some(self.test_literal_eq(scrutinee, SsaType::I64, Operand::ConstInt(n)))
             }
-            HirPattern::String(s) => Some(self.test_string_eq(scrutinee, Operand::ConstString(*s))),
-            HirPattern::EnumVariant { .. } => {
+            HirPatternKind::String(s) => {
+                Some(self.test_string_eq(scrutinee, Operand::ConstString(s)))
+            }
+            HirPatternKind::EnumVariant { .. } => {
                 Some(self.test_enum_variant_pattern(pattern, scrutinee, scrutinee_ty))
             }
-            HirPattern::Null => Some(self.test_null_pattern(scrutinee, scrutinee_ty)),
-            HirPattern::Tuple(_) => self.test_tuple_pattern(pattern, scrutinee, scrutinee_ty, span),
+            HirPatternKind::Null => Some(self.test_null_pattern(scrutinee, scrutinee_ty)),
+            HirPatternKind::Tuple(_) => {
+                self.test_tuple_pattern(pattern, scrutinee, scrutinee_ty, span)
+            }
         }
     }
 
@@ -354,12 +360,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// pattern is tested recursively. The element tests are ANDed together.
     fn test_array_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Array(elems) = pattern else {
+        let HirPatternKind::Array(elems) = pattern.kind else {
             unreachable!("test_array_pattern called with a non-array pattern")
         };
         let (elem_ty, elem_size) =
@@ -382,15 +388,15 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     ///   (the enum is found from the scrutinee's type).
     fn test_struct_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Struct { name, .. } = pattern else {
+        let HirPatternKind::Struct { name, .. } = pattern.kind else {
             unreachable!("test_struct_pattern called with a non-struct pattern")
         };
-        if self.struct_field_offsets.get(name).is_some() {
+        if self.struct_field_offsets.get(&name).is_some() {
             self.test_plain_struct_pattern(pattern, scrutinee, span)
         } else {
             self.test_enum_struct_pattern(pattern, scrutinee, scrutinee_ty, span)
@@ -401,17 +407,17 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// its sub-pattern. Fields the pattern does not mention are never touched.
     fn test_plain_struct_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Struct { name, fields } = pattern else {
+        let HirPatternKind::Struct { name, fields, .. } = pattern.kind else {
             unreachable!("test_plain_struct_pattern called with a non-struct pattern")
         };
         let mut combined: Option<Value> = None;
         for (field_name, field_pat) in fields.iter() {
             let (offset, field_ty) =
-                self.pattern_struct_field_slot(name, field_name, "lower_pattern_test");
+                self.pattern_struct_field_slot(&name, field_name, "lower_pattern_test");
             let field_val = self.emit_pattern_slot_value(scrutinee, offset, &field_ty);
             let cond = self.lower_pattern_test(field_pat, field_val, Some(&field_ty), span);
             self.and_pattern_cond(&mut combined, cond);
@@ -429,12 +435,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// definition from overlapping with the emitting calls.
     fn test_enum_struct_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Struct { name, fields } = pattern else {
+        let HirPatternKind::Struct { name, fields, .. } = pattern.kind else {
             unreachable!("test_enum_struct_pattern called with a non-struct pattern")
         };
 
@@ -448,7 +454,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         let hir_enum = self.resolve_enum_for_variant(enum_name);
         let payload_offset = self.pattern_enum_payload_offset(hir_enum);
         let variant_idx =
-            Self::pattern_enum_variant_index(hir_enum, enum_name, name, "lower_pattern_test");
+            Self::pattern_enum_variant_index(hir_enum, enum_name, &name, "lower_pattern_test");
         let variant_def = &hir_enum.variants[variant_idx];
 
         // Plan: which mentioned fields to read, where, and with which sub-pattern.
@@ -478,12 +484,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// Otherwise the alternatives' tests are ORed together ([`Self::or_conds`]).
     fn test_or_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Or(alts) = pattern else {
+        let HirPatternKind::Or(alts) = pattern.kind else {
             unreachable!("test_or_pattern called with a non-or pattern")
         };
         let mut combined: Option<Value> = None;
@@ -540,11 +546,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// patterns test fields); tuple-variant bindings are introduced later by [`Self::bind_pattern`].
     fn test_enum_variant_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) -> Value {
-        let HirPattern::EnumVariant { variant, .. } = pattern else {
+        let HirPatternKind::EnumVariant { variant, .. } = pattern.kind else {
             unreachable!("test_enum_variant_pattern called with a non-variant pattern")
         };
         let enum_name = self.extract_enum_name_from_ty(scrutinee_ty).unwrap_or_else(|| {
@@ -556,7 +562,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         });
         let hir_enum = self.resolve_enum_for_variant(enum_name);
         let variant_idx =
-            Self::pattern_enum_variant_index(hir_enum, enum_name, variant, "lower_pattern_test");
+            Self::pattern_enum_variant_index(hir_enum, enum_name, &variant, "lower_pattern_test");
         self.emit_pattern_tag_eq(scrutinee, variant_idx as i64)
     }
 
@@ -622,12 +628,12 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// the field types in order ([`Self::pattern_next_packed_offset`]).
     fn test_tuple_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
         span: SourceSpan<'a>,
     ) -> Option<Value> {
-        let HirPattern::Tuple(elems) = pattern else {
+        let HirPatternKind::Tuple(elems) = pattern.kind else {
             unreachable!("test_tuple_pattern called with a non-tuple pattern")
         };
         let field_types = Self::pattern_tuple_field_types(scrutinee_ty, elems.len());
@@ -664,7 +670,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// necessarily `check_bb`. A null scrutinee never matches, hence the constant `false`.
     pub(super) fn lower_nullable_inner_test(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         ty: &SsaType,
         span: SourceSpan<'a>,
@@ -673,7 +679,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             unreachable!()
         };
         let is_null = self
-            .lower_pattern_test(&HirPattern::Null, scrutinee, Some(ty), span)
+            .lower_pattern_test(&HirPattern::null(span), scrutinee, Some(ty), span)
             .expect("null test always yields a condition");
 
         let check_bb = self.current_block_data.new_block();
@@ -754,10 +760,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// `null`, `_` and plain identifiers never inspect the payload. An or-pattern is exempt too:
     /// each alternative is tested separately through [`Self::lower_pattern_test`], and so
     /// applies its own nullability check.
-    pub(super) fn pattern_needs_nonnull(pattern: &HirPattern<'bump>) -> bool {
+    pub(super) fn pattern_needs_nonnull(pattern: &HirPattern<'a, 'bump>) -> bool {
         !matches!(
-            pattern,
-            HirPattern::Null | HirPattern::Wildcard | HirPattern::Ident(..) | HirPattern::Or(_)
+            pattern.kind,
+            HirPatternKind::Null
+                | HirPatternKind::Wildcard
+                | HirPatternKind::Ident(..)
+                | HirPatternKind::Or(_)
         )
     }
 
@@ -772,28 +781,30 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// Patterns that bind nothing (wildcards, literals, `null`, tuple-less enum variants) do nothing.
     pub(super) fn bind_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
         let (scrutinee, scrutinee_ty) =
             self.unwrap_scrutinee_for_binding(pattern, scrutinee, scrutinee_ty);
-        match pattern {
-            HirPattern::Ident(name, _) => {
+        match pattern.kind {
+            HirPatternKind::Ident(name, _) => {
                 let bound = self.bind_ident_value(scrutinee, scrutinee_ty);
-                self.var_map.insert(*name, bound);
+                self.var_map.insert(name, bound);
             }
-            HirPattern::Array(_) => self.bind_array_pattern(pattern, scrutinee, scrutinee_ty),
-            HirPattern::Struct { .. } => self.bind_struct_pattern(pattern, scrutinee, scrutinee_ty),
-            HirPattern::Or(alts) => {
+            HirPatternKind::Array(_) => self.bind_array_pattern(pattern, scrutinee, scrutinee_ty),
+            HirPatternKind::Struct { .. } => {
+                self.bind_struct_pattern(pattern, scrutinee, scrutinee_ty)
+            }
+            HirPatternKind::Or(alts) => {
                 for alt in alts.iter() {
                     self.bind_pattern(alt, scrutinee, scrutinee_ty);
                 }
             }
-            HirPattern::EnumVariant { bindings, .. } if !bindings.is_empty() => {
+            HirPatternKind::EnumVariant { bindings, .. } if !bindings.is_empty() => {
                 self.bind_enum_variant_bindings(pattern, scrutinee, scrutinee_ty)
             }
-            HirPattern::Tuple(_) => self.bind_tuple_pattern(pattern, scrutinee, scrutinee_ty),
+            HirPatternKind::Tuple(_) => self.bind_tuple_pattern(pattern, scrutinee, scrutinee_ty),
             _ => {}
         }
     }
@@ -805,7 +816,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// non-null before this arm could be chosen ([`Self::lower_nullable_inner_test`]).
     fn unwrap_scrutinee_for_binding<'t>(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&'t SsaType>,
     ) -> (Value, Option<&'t SsaType>) {
@@ -837,11 +848,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// [`Self::test_array_pattern`]).
     fn bind_array_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
-        let HirPattern::Array(elems) = pattern else {
+        let HirPatternKind::Array(elems) = pattern.kind else {
             unreachable!("bind_array_pattern called with a non-array pattern")
         };
         let (elem_ty, elem_size) = Self::pattern_array_elem_info(scrutinee_ty, "bind_pattern");
@@ -856,18 +867,18 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// named fields (the same split as in the test phase; see [`Self::test_struct_pattern`]).
     fn bind_struct_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
-        let HirPattern::Struct { name, fields } = pattern else {
+        let HirPatternKind::Struct { name, fields, .. } = pattern.kind else {
             unreachable!("bind_struct_pattern called with a non-struct pattern")
         };
 
-        if self.struct_field_offsets.get(name).is_some() {
+        if self.struct_field_offsets.get(&name).is_some() {
             for (field_name, field_pat) in fields.iter() {
                 let (offset, field_ty) =
-                    self.pattern_struct_field_slot(name, field_name, "[bind_pattern]");
+                    self.pattern_struct_field_slot(&name, field_name, "[bind_pattern]");
                 let field_val = self.emit_pattern_slot_value(scrutinee, offset, &field_ty);
                 self.bind_pattern(field_pat, field_val, Some(&field_ty));
             }
@@ -881,11 +892,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// without the tag test). Reads are planned before any emission, for the same reason as there.
     fn bind_enum_struct_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
-        let HirPattern::Struct { name, fields } = pattern else {
+        let HirPatternKind::Struct { name, fields, .. } = pattern.kind else {
             unreachable!("bind_enum_struct_pattern called with a non-struct pattern")
         };
 
@@ -900,7 +911,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             });
         let hir_enum = self.resolve_enum_for_variant(enum_name);
         let variant_idx =
-            Self::pattern_enum_variant_index(hir_enum, enum_name, name, "[bind_pattern]");
+            Self::pattern_enum_variant_index(hir_enum, enum_name, &name, "[bind_pattern]");
         let variant_def = &hir_enum.variants[variant_idx];
         let payload_offset = self.pattern_enum_payload_offset(hir_enum);
 
@@ -933,13 +944,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// as long as the layout puts the payload at 8.
     fn bind_enum_variant_bindings(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
-        let HirPattern::EnumVariant {
+        let HirPatternKind::EnumVariant {
             variant, bindings, ..
-        } = pattern
+        } = pattern.kind
         else {
             unreachable!("bind_enum_variant_bindings called with a non-variant pattern")
         };
@@ -955,7 +966,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             });
         let hir_enum = self.resolve_enum_for_variant(enum_name);
         let variant_idx =
-            Self::pattern_enum_variant_index(hir_enum, enum_name, variant, "bind_pattern");
+            Self::pattern_enum_variant_index(hir_enum, enum_name, &variant, "bind_pattern");
         let variant_def = &hir_enum.variants[variant_idx];
         debug_assert_eq!(
             bindings.len(),
@@ -983,11 +994,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     /// [`Self::test_tuple_pattern`]).
     fn bind_tuple_pattern(
         &mut self,
-        pattern: &HirPattern<'bump>,
+        pattern: &HirPattern<'a, 'bump>,
         scrutinee: Value,
         scrutinee_ty: Option<&SsaType>,
     ) {
-        let HirPattern::Tuple(elems) = pattern else {
+        let HirPatternKind::Tuple(elems) = pattern.kind else {
             unreachable!("bind_tuple_pattern called with a non-tuple pattern")
         };
         let field_types = Self::pattern_tuple_field_types(scrutinee_ty, elems.len());
@@ -1072,7 +1083,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             // An earlier unguarded `null` arm means this arm can never see null.
             let prior_null_arm = arms[..arm_idx]
                 .iter()
-                .any(|a| a.guard.is_none() && matches!(a.pattern, HirPattern::Null));
+                .any(|a| a.guard.is_none() && matches!(a.pattern.kind, HirPatternKind::Null));
             self.lower_match_arm_body(
                 &scrutinee,
                 arm,

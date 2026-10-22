@@ -1,7 +1,7 @@
 use crate::borrow_checker::{Bound, Interval};
 use crate::hir::{
-    AssignmentOperator, Hir, HirEnum, HirExpr, HirModule, HirParam, HirType, Operator, RefKind,
-    StrId,
+    AssignmentOperator, Hir, HirEnum, HirExpr, HirModule, HirParam, HirType, HirTypeKind, Operator,
+    RefKind, StrId,
 };
 use crate::ir_hasher::FxHashMap;
 use crate::registry::global_registry::GlobalRegistry;
@@ -675,50 +675,50 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
     }
 
     pub fn type_is_copy(&self, ty: &HirType<'a, 'bump>) -> bool {
-        match ty {
-            HirType::I8
-            | HirType::I16
-            | HirType::I32
-            | HirType::I64
-            | HirType::U8
-            | HirType::U16
-            | HirType::U32
-            | HirType::U64
-            | HirType::I128
-            | HirType::U128
-            | HirType::F32
-            | HirType::F64
-            | HirType::Boolean
-            | HirType::Char
-            | HirType::Void
-            | HirType::This
-            | HirType::Null
-            | HirType::String
-            | HirType::Lambda { .. }
-            | HirType::Never
-            | HirType::Range { .. }
-            | HirType::SafePointer { .. }
-            | HirType::UnsafePointer { .. } => true,
+        match ty.kind {
+            HirTypeKind::I8
+            | HirTypeKind::I16
+            | HirTypeKind::I32
+            | HirTypeKind::I64
+            | HirTypeKind::U8
+            | HirTypeKind::U16
+            | HirTypeKind::U32
+            | HirTypeKind::U64
+            | HirTypeKind::I128
+            | HirTypeKind::U128
+            | HirTypeKind::F32
+            | HirTypeKind::F64
+            | HirTypeKind::Boolean
+            | HirTypeKind::Char
+            | HirTypeKind::Void
+            | HirTypeKind::This
+            | HirTypeKind::Null
+            | HirTypeKind::String
+            | HirTypeKind::Lambda { .. }
+            | HirTypeKind::Never
+            | HirTypeKind::Range { .. }
+            | HirTypeKind::SafePointer { .. }
+            | HirTypeKind::UnsafePointer { .. } => true,
 
-            HirType::Ref { ref_kind, .. } => *ref_kind != RefKind::Unique,
+            HirTypeKind::Ref { ref_kind, .. } => ref_kind != RefKind::Unique,
 
-            HirType::Nullable(inner) => self.type_is_copy(inner),
+            HirTypeKind::Nullable(inner) => self.type_is_copy(inner),
 
-            HirType::Struct { name, .. } => self.is_copy.get(name).copied().unwrap_or(false),
-            HirType::Enum { name, .. } => self.is_copy.get(name).copied().unwrap_or(false),
+            HirTypeKind::Struct { name, .. } => self.is_copy.get(&name).copied().unwrap_or(false),
+            HirTypeKind::Enum { name, .. } => self.is_copy.get(&name).copied().unwrap_or(false),
 
-            HirType::Dyn { .. } | HirType::DynInterface(..) => false,
+            HirTypeKind::Dyn { .. } | HirTypeKind::DynInterface { .. } => false,
 
-            HirType::Generic(_) | HirType::Unknown => false,
-            HirType::Tuple(args) => args.iter().all(|arg| self.type_is_copy(arg)),
+            HirTypeKind::Generic(_) | HirTypeKind::Unknown => false,
+            HirTypeKind::Tuple(args) => args.iter().all(|arg| self.type_is_copy(arg)),
 
             // A kind of pointer known to be able to store multiple elements
-            HirType::Array(_, _) => false,
+            HirTypeKind::Array(_, _) => false,
             // A kind of reference to an array of compile-time-unknown length, known to be able to store multiple elements
-            HirType::Slice(_) => true,
-            HirType::OwnedPointer { .. } => false,
-            HirType::Usize => true,
-            HirType::Isize => true,
+            HirTypeKind::Slice(_) => true,
+            HirTypeKind::OwnedPointer { .. } => false,
+            HirTypeKind::Usize => true,
+            HirTypeKind::Isize => true,
         }
     }
 

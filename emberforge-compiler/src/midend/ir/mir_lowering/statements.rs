@@ -1,5 +1,5 @@
 use ir::{
-    hir::{DropKind, HirErrorHandlerPattern, HirExpr, HirStmt, HirType, StrId},
+    hir::{DropKind, HirErrorHandlerPattern, HirExpr, HirStmt, HirType, HirTypeKind, StrId},
     ir_conversion::lower_type_hir,
     layout::TargetInfo,
     span::SourceSpan,
@@ -50,11 +50,11 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         if matches!(value, HirExpr::Uninit { .. }) {
             self.drop_state.mark_whole_uninit(*name);
-            if let HirType::Struct {
+            if let HirTypeKind::Struct {
                 name: struct_name, ..
-            } = ty
+            } = ty.kind
             {
-                if let Some(hir_struct) = self.structs.get(struct_name) {
+                if let Some(hir_struct) = self.structs.get(&struct_name) {
                     for f in hir_struct.fields.iter() {
                         self.drop_state.mark_field_uninit(*name, f.name);
                     }
@@ -140,22 +140,21 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         value: &HirExpr<'a, 'bump>,
         span: SourceSpan<'a>,
     ) {
-        if let HirType::Struct {
+        if let HirTypeKind::Struct {
             name: struct_name, ..
-        } = ty
+        } = ty.kind
         {
-            if self.glue_registry.is_droppable(*struct_name) || self.struct_owns_chain(*struct_name)
-            {
+            if self.glue_registry.is_droppable(struct_name) || self.struct_owns_chain(struct_name) {
                 self.scope_stack
                     .last_mut()
                     .unwrap()
                     .actions
                     .push(ScopeAction::DropLocal(DropLocal {
                         name: *name,
-                        kind: DropKind::Type(*struct_name),
+                        kind: DropKind::Type(struct_name),
                     }));
             }
-        } else if let HirType::OwnedPointer { allocator, .. } = ty {
+        } else if let HirTypeKind::OwnedPointer { allocator, .. } = ty.kind {
             let drop_kind = if allocator.is_some() {
                 ty.drop_kind()
             } else {
