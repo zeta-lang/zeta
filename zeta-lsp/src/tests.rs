@@ -5,12 +5,12 @@ mod tests {
         go_to_definition, hover_at,
     };
     use crate::doc_comments::{doc_comment_above, format_as_zeta_comments};
-    use crate::state::{Document, ServerState};
+    use crate::state::{CompletionCache, Document, ServerState};
     use crate::urls::path_to_uri;
     use ir::ast::{
         ExternModifier, FuncModifiers, FuncSafety, InlineModifier, MutabilityState, Visibility,
     };
-    use ir::hir::{HirEnum, HirField, HirFunc, HirParam, HirStruct, HirType, StrId};
+    use ir::hir::{HirEnum, HirField, HirFunc, HirParam, HirStruct, HirType, HirTypeKind, StrId};
     use ir::span::SourceSpan;
     use lsp_types::{
         GotoDefinitionParams, HoverContents, HoverParams, Position, TextDocumentIdentifier,
@@ -20,15 +20,18 @@ mod tests {
     use zeta_compiler_api::file_handling::compiler_lib_path;
     use zeta_compiler_api::file_loader::choose_file_loader;
 
-    static HIR_I32: HirType<'static, 'static> = HirType::I32;
-    static HIR_U64: HirType<'static, 'static> = HirType::U64;
+    static HIR_I32: HirType<'static, 'static> = HirType::i32(SourceSpan::nothing());
+    static HIR_U64: HirType<'static, 'static> = HirType::u64(SourceSpan::nothing());
 
     #[test]
     fn test_format_func_signature_extern_c_with_unsafe_ptr_param() {
         // extern "C" func pthread_mutex_unlock(mutex: [*]mut i32): i32;
-        let param_type = HirType::UnsafePointer {
-            inner: &HIR_I32,
-            mutability_state: MutabilityState::Mut,
+        let param_type = HirType {
+            kind: HirTypeKind::UnsafePointer {
+                inner: &HIR_I32,
+                mutability_state: MutabilityState::Mut,
+            },
+            span: SourceSpan::default(),
         };
         let params: &[HirParam<'static, 'static>] = &[HirParam::Normal {
             name: StrId::from_static("mutex"),
@@ -46,12 +49,15 @@ mod tests {
             },
             generics: None,
             params: Some(params),
-            return_type: Some(HirType::I32),
+            return_type: Some(HirType::i32(SourceSpan::default())),
             body: None,
             unmangled_name: StrId::from_static("pthread_mutex_unlock"),
             declaring_module_idx: 0,
             impl_target: None,
             span: SourceSpan::default(),
+            name_span: SourceSpan::default(),
+            ensures: &[],
+            return_binders: &[],
         };
 
         let sig = format_func_signature(&func);
@@ -66,7 +72,7 @@ mod tests {
         // func square(x: i32): i32;
         let params: &[HirParam<'static, 'static>] = &[HirParam::Normal {
             name: StrId::from_static("x"),
-            param_type: HirType::I32,
+            param_type: HirType::i32(SourceSpan::default()),
             multi_place: None,
             span: SourceSpan::default(),
         }];
@@ -80,12 +86,15 @@ mod tests {
             },
             generics: None,
             params: Some(params),
-            return_type: Some(HirType::I32),
+            return_type: Some(HirType::i32(SourceSpan::default())),
             body: None,
             unmangled_name: StrId::from_static("square"),
             declaring_module_idx: 0,
             impl_target: None,
             span: SourceSpan::default(),
+            name_span: SourceSpan::default(),
+            ensures: &[],
+            return_binders: &[],
         };
 
         let sig = format_func_signature(&func);
@@ -105,12 +114,15 @@ mod tests {
             },
             generics: None,
             params: Some(&[]),
-            return_type: Some(HirType::Void),
+            return_type: Some(HirType::void(SourceSpan::default())),
             body: None,
             unmangled_name: StrId::from_static("init"),
+            name_span: SourceSpan::default(),
             declaring_module_idx: 0,
             impl_target: None,
             span: SourceSpan::default(),
+            ensures: &[],
+            return_binders: &[],
         };
 
         let sig = format_func_signature(&func);
@@ -130,12 +142,15 @@ mod tests {
             },
             generics: None,
             params: Some(&[]),
-            return_type: Some(HirType::Void),
+            return_type: Some(HirType::void(SourceSpan::default())),
             body: None,
             unmangled_name: StrId::from_static("dangerous"),
             declaring_module_idx: 0,
             impl_target: None,
+            name_span: SourceSpan::default(),
             span: SourceSpan::default(),
+            ensures: &[],
+            return_binders: &[],
         };
 
         let sig = format_func_signature(&func);
@@ -150,6 +165,8 @@ mod tests {
             generics: None,
             fields: &[],
             unmangled_name: StrId::from_static("Empty"),
+            span: SourceSpan::nothing(),
+            name_span: SourceSpan::nothing(),
         };
         let sig = format_struct_signature(&s);
         assert_eq!(sig, "struct Empty {}");
@@ -160,16 +177,19 @@ mod tests {
         // struct Wrapper { value: i32, }
         let fields: &[HirField<'static, 'static>] = &[HirField {
             name: StrId::from_static("value"),
-            field_type: HirType::I32,
+            field_type: HirType::i32(SourceSpan::default()),
             visibility: Visibility::Public,
             manual: false,
+            span: SourceSpan::default(),
         }];
         let s = HirStruct {
             name: StrId::from_static("Wrapper"),
             visibility: Visibility::Public,
             generics: None,
             fields,
+            name_span: SourceSpan::nothing(),
             unmangled_name: StrId::from_static("Wrapper"),
+            span: SourceSpan::nothing(),
         };
         let sig = format_struct_signature(&s);
         assert!(sig.contains("struct Wrapper {"), "got: {sig:?}");
@@ -179,12 +199,13 @@ mod tests {
     #[test]
     fn test_format_struct_signature_with_array_field() {
         // struct Buffer { data: &[8]u64, }
-        let field_type = HirType::Array(&HIR_U64, 8);
+        let field_type = HirType::array(&HIR_U64, 8, SourceSpan::default());
         let fields: &[HirField<'static, 'static>] = &[HirField {
             name: StrId::from_static("data"),
             field_type,
             visibility: Visibility::Public,
             manual: false,
+            span: SourceSpan::default(),
         }];
         let s = HirStruct {
             name: StrId::from_static("Buffer"),
@@ -192,6 +213,8 @@ mod tests {
             generics: None,
             fields,
             unmangled_name: StrId::from_static("Buffer"),
+            name_span: SourceSpan::nothing(),
+            span: SourceSpan::nothing(),
         };
         let sig = format_struct_signature(&s);
         assert!(sig.contains("struct Buffer {"), "got: {sig:?}");
@@ -206,6 +229,8 @@ mod tests {
             generics: None,
             variants: &[],
             unmangled_name: StrId::from_static("Color"),
+            name_span: SourceSpan::nothing(),
+            span: SourceSpan::nothing(),
         };
         let sig = format_enum_signature(&e);
         assert_eq!(sig, "enum Color {}");
@@ -219,6 +244,8 @@ mod tests {
             generics: None,
             variants: &[],
             unmangled_name: StrId::from_static("Internal"),
+            name_span: SourceSpan::nothing(),
+            span: SourceSpan::nothing(),
         };
         let sig = format_enum_signature(&e);
         assert_eq!(sig, "private enum Internal {}");
@@ -324,9 +351,10 @@ mod tests {
 
         let mut state = ServerState {
             compiler,
-            workspace_root: Some(PathBuf::from("/home/flameyosflow/zeta")),
+            workspace_root: Some(PathBuf::from(std::env::var_os("HOME").unwrap())),
             documents: Default::default(),
             should_exit: false,
+            completion_cache: CompletionCache::default(),
         };
         let _ = state.compiler.load_directory(&loader, &stdlib, true);
 
