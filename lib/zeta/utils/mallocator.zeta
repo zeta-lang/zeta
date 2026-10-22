@@ -42,7 +42,7 @@ impl RawMallocator by RawAllocator {
     }
 }
 
-struct Mallocator {}
+public struct Mallocator {}
 
 impl Mallocator by Clone {
     func clone(&this): Mallocator {
