@@ -2,6 +2,39 @@ use crate::span::SourceSpan;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TypeWarningKind {
+    ReturnTypeLessVisible {
+        func_name: String,
+        func_visibility: String,
+        type_name: String,
+        type_visibility: String,
+    },
+}
+
+impl fmt::Display for TypeWarningKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeWarningKind::ReturnTypeLessVisible {
+                func_name,
+                func_visibility,
+                type_name,
+                type_visibility,
+            } => write!(
+                f,
+                "{} function `{}` returns `{}`, which is only {}; callers outside its visibility cannot name this type",
+                func_visibility, func_name, type_name, type_visibility
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeWarning<'a> {
+    pub kind: TypeWarningKind,
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypeErrorKind {
     UndefinedVariable(String),
     UndefinedType(String),
