@@ -1,11 +1,14 @@
 use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::{DropMoveState, DropScope};
 use crate::midend::ir::block_data::CurrentBlockData;
+use crate::midend::ir::mir_lowering::const_table::ConstTable;
 use crate::midend::ir::mir_lowering::control_flow::LoopCtx;
 use codex_dependency_graph::DepGraph;
 use ir::ast::FuncSafety;
 use ir::attributes::{AttrTarget, KnownKind};
-use ir::hir::{DropKind, HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, StrId};
+use ir::hir::{
+    DropKind, HirEnum, HirExpr, HirFunc, HirParam, HirStmt, HirStruct, HirType, HirTypeKind, StrId,
+};
 use ir::ir_conversion::lower_type_hir;
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::registry::global_registry::GlobalRegistry;
@@ -115,7 +118,7 @@ where
     pub(super) bump: &'s GrowableBump<'bump>,
     pub(super) module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
     pub(super) module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
-    pub(super) constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
+    pub(super) constants: &'s ConstTable<'a, 'bump>,
     pub(super) promoted_to_stack: HashSet<StrId>,
     pub(super) narrowed_fields: HashMap<(StrId, Vec<StrId>), Value>,
     pub(super) nullable_owned_locals: HashMap<StrId, HirType<'a, 'bump>>,
@@ -132,6 +135,7 @@ where
     pub(super) expr_overrides: HashMap<usize, Value>, // expr address -> pre-lowered value
     pub(super) call_temps: HashMap<usize, StrId>,     // call expr address -> hidden temp
     pub(super) unsafe_depth: usize,
+    pub(crate) const_depth: usize,
 }
 
 impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r>
@@ -162,7 +166,7 @@ where
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
+        constants: &'s ConstTable<'a, 'bump>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
@@ -224,7 +228,7 @@ where
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
+        constants: &'s ConstTable<'a, 'bump>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
@@ -286,7 +290,7 @@ where
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
-        constants: &'s HashMap<StrId, HirExpr<'a, 'bump>>,
+        constants: &'s ConstTable<'a, 'bump>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
@@ -375,6 +379,7 @@ where
             pending_temps: Vec::default(),
             cond_depth: 0,
             next_temp: 0,
+            const_depth: 0,
             temp_values: HashMap::default(),
             call_temps: HashMap::default(),
             expr_overrides: HashMap::default(),
@@ -389,16 +394,17 @@ where
         &self,
         expr: &HirExpr<'a, 'bump>,
     ) -> Option<(StrId, StrId)> {
-        self.resolve_constant_enum_variant_depth(expr, 0)
+        self.resolve_constant_enum_variant_depth(expr, self.module_idx, 0)
     }
 
     fn resolve_constant_enum_variant_depth(
         &self,
         expr: &HirExpr<'a, 'bump>,
+        module: usize,
         depth: u32,
     ) -> Option<(StrId, StrId)> {
         if depth > 16 {
-            return None; // guards against constant cycles
+            return None;
         }
         match expr {
             HirExpr::EnumInit {
@@ -406,16 +412,71 @@ where
                 variant,
                 args,
                 ..
-            } if args.is_empty() => {
-                let known = self.enum_variant_tags.get(enum_name)?.contains_key(variant);
-                known.then_some((*enum_name, *variant))
-            }
+            } if args.is_empty() => self
+                .enum_variant_tags
+                .get(enum_name)?
+                .contains_key(variant)
+                .then_some((*enum_name, *variant)),
             HirExpr::Ident(name, _) => {
-                let c = self.constants.get(name)?;
-                self.resolve_constant_enum_variant_depth(c, depth + 1)
+                let (m, c) = self.constants.resolve_bare(module, *name)?;
+                self.resolve_constant_enum_variant_depth(c, m, depth + 1)
+            }
+            HirExpr::ModuleAccess(acc) if !acc.member.is_empty() => {
+                let (m, c) = self.constants.resolve_access(
+                    module,
+                    acc.path,
+                    acc.member,
+                    &self.dep_graph.borrow(),
+                )?;
+                self.resolve_constant_enum_variant_depth(c, m, depth + 1)
             }
             _ => None,
         }
+    }
+
+    /// The module-level const that `e` (`N` / `alias.N`) names, with its defining module.
+    pub(super) fn const_ref(&self, e: &HirExpr<'a, 'bump>) -> Option<(usize, HirExpr<'a, 'bump>)> {
+        match e {
+            HirExpr::Ident(name, _)
+                if !self.var_map.contains_key(name) && !self.is_static_name(name) =>
+            {
+                self.constants
+                    .resolve_bare(self.module_idx, *name)
+                    .map(|(m, v)| (m, *v))
+            }
+            HirExpr::ModuleAccess(acc) if !acc.member.is_empty() => self
+                .constants
+                .resolve_access(
+                    self.module_idx,
+                    acc.path,
+                    acc.member,
+                    &self.dep_graph.borrow(),
+                )
+                .map(|(m, v)| (m, *v)),
+            _ => None,
+        }
+    }
+
+    /// Lowers a const's value as if written at the use site, but resolved in its own module
+    /// and without the caller's locals.
+    pub(super) fn lower_const_value(
+        &mut self,
+        module: usize,
+        value: &HirExpr<'a, 'bump>,
+        expected: Option<&SsaType>,
+    ) -> Value {
+        assert!(self.const_depth < 64, "const definitions form a cycle");
+        self.const_depth += 1;
+        let prev_module = std::mem::replace(&mut self.module_idx, module);
+        let saved_vars = std::mem::take(&mut self.var_map);
+        let v = match expected {
+            Some(t) => self.lower_expr_expected(value, t),
+            None => self.lower_expr(value),
+        };
+        self.var_map = saved_vars;
+        self.module_idx = prev_module;
+        self.const_depth -= 1;
+        v
     }
 
     pub fn known_type_target(&self, name: StrId) -> Option<AttrTarget> {
@@ -440,27 +501,34 @@ where
 
     pub fn peel_indirections(mut ty: HirType<'a, 'bump>) -> HirType<'a, 'bump> {
         loop {
-            match ty {
-                HirType::Ref { inner, .. }
-                | HirType::SafePointer { inner, .. }
-                | HirType::OwnedPointer { inner, .. } => ty = *inner,
+            match ty.kind {
+                HirTypeKind::Ref { inner, .. }
+                | HirTypeKind::SafePointer { inner, .. }
+                | HirTypeKind::OwnedPointer { inner, .. } => ty = *inner,
                 _ => return ty,
             }
         }
     }
 
     pub(super) fn resolve_hir_enum_name(&self, ty: &HirType<'a, 'bump>) -> Option<StrId> {
-        match Self::peel_indirections(*ty) {
-            HirType::Enum { name, .. } => Some(name),
-            HirType::Nullable(inner) => self.resolve_hir_enum_name(inner),
+        match Self::peel_indirections(*ty).kind {
+            HirTypeKind::Enum { name, .. } => Some(name),
+            HirTypeKind::Nullable(inner) => self.resolve_hir_enum_name(inner),
             _ => None,
         }
     }
 
-    pub(crate) fn lower_static_dynamic_init(&mut self, name: StrId, value: &HirExpr<'a, 'bump>) {
+    pub(crate) fn lower_static_dynamic_init(
+        &mut self,
+        name: StrId,
+        module: usize,
+        value: &HirExpr<'a, 'bump>,
+    ) {
+        let prev = std::mem::replace(&mut self.module_idx, module);
         let (addr, ty) = self.lower_static_addr(name).expect("static vanished");
         let init = self.lower_init_operand(value, &ty);
         self.store_init(addr, 0, &ty, init);
+        self.module_idx = prev;
     }
 
     pub(crate) fn lower_body(&mut self, body: Option<HirStmt<'a, 'bump>>) {
@@ -770,6 +838,9 @@ where
             }
 
             _ => {
+                if let Some((m, v)) = self.const_ref(expr) {
+                    return self.lower_const_value(m, &v, Some(expected));
+                }
                 let v = self.lower_expr(expr);
                 self.coerce_owned_ref(v, expected)
             }
@@ -780,6 +851,11 @@ where
         if !self.expr_overrides.is_empty() {
             if let Some(&v) = self.expr_overrides.get(&Self::expr_key(expr)) {
                 return v;
+            }
+        }
+        if matches!(expr, HirExpr::Ident(..) | HirExpr::ModuleAccess(..)) {
+            if let Some((m, v)) = self.const_ref(expr) {
+                return self.lower_const_value(m, &v, None);
             }
         }
         match expr {
@@ -860,6 +936,7 @@ where
                 args,
                 span,
                 type_args: _,
+                ..
             } => self.lower_enum_init(enum_name, variant, args, span),
 
             HirExpr::ExprList { list, span: _ } => self.lower_expr_list_expr(list),

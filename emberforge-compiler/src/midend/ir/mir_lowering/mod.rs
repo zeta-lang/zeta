@@ -1,4 +1,5 @@
 pub mod comparisons;
+pub mod const_table;
 pub mod contiguous_memory;
 pub mod control_flow;
 pub mod expressions;
