@@ -59,6 +59,7 @@ pub struct TypeAliasDecl<'a, 'bump> {
     pub name: StrId,
     pub generics: Option<&'bump [Generic<'a, 'bump>]>,
     pub ty: Type<'a, 'bump>,
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -107,6 +108,7 @@ where
     pub catch_pattern: Option<ErrorHandlerPattern<'a, 'bump>>,
     pub span: SourceSpan<'a>,
     pub manual: bool,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,6 +120,7 @@ where
     pub type_annotation: Type<'a, 'bump>,
     pub value: &'bump Expr<'a, 'bump>,
     pub span: SourceSpan<'a>,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,6 +148,7 @@ where
     pub permits: Option<&'bump PermitsExpr<'a, 'bump>>,
     pub methods: Option<&'bump [FuncDecl<'a, 'bump>]>,
     pub generics: Option<&'bump [Generic<'a, 'bump>]>,
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -154,6 +158,7 @@ pub struct EnumDecl<'a, 'bump> {
     pub visibility: Visibility,
     pub generics: Option<&'bump [Generic<'a, 'bump>]>,
     pub variants: &'bump [EnumVariant<'a, 'bump>],
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -258,31 +263,136 @@ pub struct MatchArm<'a, 'bump>
 where
     'bump: 'a,
 {
-    pub pattern: Pattern<'bump>,
+    pub pattern: Pattern<'a, 'bump>,
     pub guard: Option<&'bump Expr<'a, 'bump>>,
     pub block: &'bump Block<'a, 'bump>,
     pub span: SourceSpan<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Pattern<'bump> {
+pub enum PatternKind<'a, 'bump> {
     Ident(StrId, bool),
     Number(i64),
     String(StrId),
     Boolean(bool),
-    Tuple(&'bump [Pattern<'bump>]),
-    Array(&'bump [Pattern<'bump>]),
+    Tuple(&'bump [Pattern<'a, 'bump>]),
+    Array(&'bump [Pattern<'a, 'bump>]),
     Struct {
         name: StrId,
-        fields: &'bump [(StrId, Pattern<'bump>)],
+        fields: &'bump [(StrId, Pattern<'a, 'bump>)],
+        variant_span: SourceSpan<'a>,
     },
     EnumVariant {
         name: StrId,
-        bindings: &'bump [Pattern<'bump>],
+        bindings: &'bump [Pattern<'a, 'bump>],
+        variant_span: SourceSpan<'a>,
     },
-    Or(&'bump [Pattern<'bump>]),
+    Or(&'bump [Pattern<'a, 'bump>]),
     Wildcard,
     Null,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pattern<'a, 'bump> {
+    pub kind: PatternKind<'a, 'bump>,
+    pub span: SourceSpan<'a>,
+}
+
+impl<'a, 'bump> Pattern<'a, 'bump> {
+    pub fn ident(span: SourceSpan<'a>, id: StrId, mutable: bool) -> Self {
+        Self {
+            kind: PatternKind::Ident(id, mutable),
+            span,
+        }
+    }
+
+    pub fn number(span: SourceSpan<'a>, value: i64) -> Self {
+        Self {
+            kind: PatternKind::Number(value),
+            span,
+        }
+    }
+
+    pub fn string(span: SourceSpan<'a>, value: StrId) -> Self {
+        Self {
+            kind: PatternKind::String(value),
+            span,
+        }
+    }
+
+    pub fn boolean(span: SourceSpan<'a>, value: bool) -> Self {
+        Self {
+            kind: PatternKind::Boolean(value),
+            span,
+        }
+    }
+
+    pub fn tuple(span: SourceSpan<'a>, patterns: &'bump [Pattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: PatternKind::Tuple(patterns),
+            span,
+        }
+    }
+
+    pub fn array(span: SourceSpan<'a>, patterns: &'bump [Pattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: PatternKind::Array(patterns),
+            span,
+        }
+    }
+
+    pub fn struct_pattern(
+        span: SourceSpan<'a>,
+        name: StrId,
+        fields: &'bump [(StrId, Pattern<'a, 'bump>)],
+        variant_span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: PatternKind::Struct {
+                name,
+                fields,
+                variant_span,
+            },
+            span,
+        }
+    }
+
+    pub fn enum_variant(
+        span: SourceSpan<'a>,
+        name: StrId,
+        bindings: &'bump [Pattern<'a, 'bump>],
+        variant_span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: PatternKind::EnumVariant {
+                name,
+                bindings,
+                variant_span,
+            },
+            span,
+        }
+    }
+
+    pub fn or(span: SourceSpan<'a>, patterns: &'bump [Pattern<'a, 'bump>]) -> Self {
+        Self {
+            kind: PatternKind::Or(patterns),
+            span,
+        }
+    }
+
+    pub fn wildcard(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: PatternKind::Wildcard,
+            span,
+        }
+    }
+
+    pub fn null(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: PatternKind::Null,
+            span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +401,29 @@ where
     'bump: 'a,
 {
     pub block: &'bump Block<'a, 'bump>,
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReturnBinder<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub name: StrId,
+    /// Generic-argument indices from the root return type:
+    /// `: n <- usize` -> [], `Result<n <- usize, E>` -> [0], `Option<Result<n <- usize, E>>` -> [0, 0].
+    pub arg_path: &'bump [usize],
+    pub span: SourceSpan<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnsuresClause<'a, 'bump>
+where
+    'bump: 'a,
+{
+    /// `ensures case <pattern> -> <cond>`; `None` means unconditional.
+    pub pattern: Option<&'bump Pattern<'a, 'bump>>,
+    pub condition: &'bump Expr<'a, 'bump>,
     pub span: SourceSpan<'a>,
 }
 
@@ -305,6 +438,9 @@ where
     pub params: Option<&'bump [Param<'a, 'bump>]>,
     pub return_type: Option<Type<'a, 'bump>>,
     pub body: Option<&'bump Block<'a, 'bump>>,
+    pub return_binders: &'bump [ReturnBinder<'a, 'bump>],
+    pub ensures: &'bump [EnsuresClause<'a, 'bump>],
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
     pub attrs: &'bump [Attribute<'a, 'bump>],
 }
@@ -318,6 +454,7 @@ where
     pub name: StrId,
     pub generics: Option<&'bump [Generic<'a, 'bump>]>,
     pub params: Option<&'bump [Param<'a, 'bump>]>,
+    pub name_span: SourceSpan<'a>,
     pub span: SourceSpan<'a>,
 }
 
@@ -540,6 +677,8 @@ where
         modifiers: Option<LambdaModifier>,
         params: &'bump [LambdaParam<'a, 'bump>],
         return_type: Option<Type<'a, 'bump>>,
+        /// `fn (a, b) ensures a != b { .. }`: unconditional clauses only (`pattern` is `None`).
+        ensures: &'bump [EnsuresClause<'a, 'bump>],
         body: &'bump Block<'a, 'bump>,
         span: SourceSpan<'a>,
     },
@@ -615,13 +754,20 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Type<'a, 'bump>
 where
     'bump: 'a,
 {
     pub kind: TypeKind<'a, 'bump>,
     pub nullable: bool,
+    pub span: SourceSpan<'a>,
+}
+
+impl<'a, 'bump> PartialEq for Type<'a, 'bump> {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.nullable == other.nullable
+    }
 }
 
 impl<'a, 'bump> Type<'a, 'bump> {
@@ -890,8 +1036,6 @@ pub enum FuncSafety {
     Unsafe,
 }
 
-// General Metadata
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MutabilityState {
     Mut,
@@ -900,8 +1044,8 @@ pub enum MutabilityState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Default, Eq)]
 pub enum Visibility {
-    #[default]
     Public,
+    #[default]
     Private,
     Module,
     Internal,
@@ -1066,150 +1210,171 @@ impl<'a, 'bump> Type<'a, 'bump> {
         )
     }
 
-    pub fn i8() -> Self {
+    pub fn i8(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::I8,
             nullable: false,
+            span,
         }
     }
 
-    pub fn i16() -> Self {
+    pub fn i16(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::I16,
             nullable: false,
+            span,
         }
     }
 
-    pub fn i32() -> Self {
+    pub fn i32(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::I32,
             nullable: false,
+            span,
         }
     }
 
-    pub fn i64() -> Self {
+    pub fn i64(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::I64,
             nullable: false,
+            span,
         }
     }
 
-    pub fn i128() -> Self {
+    pub fn i128(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::I128,
             nullable: false,
+            span,
         }
     }
 
-    pub fn u8() -> Self {
+    pub fn u8(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::U8,
             nullable: false,
+            span,
         }
     }
 
-    pub fn u16() -> Self {
+    pub fn u16(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::U16,
             nullable: false,
+            span,
         }
     }
 
-    pub fn u32() -> Self {
+    pub fn u32(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::U32,
             nullable: false,
+            span,
         }
     }
 
-    pub fn u64() -> Self {
+    pub fn u64(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::U64,
             nullable: false,
+            span,
         }
     }
 
-    pub fn u128() -> Self {
+    pub fn u128(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::U128,
             nullable: false,
+            span,
         }
     }
 
-    pub fn usize() -> Self {
+    pub fn usize(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Usize,
             nullable: false,
+            span,
         }
     }
 
-    pub fn isize() -> Self {
+    pub fn isize(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Isize,
             nullable: false,
+            span,
         }
     }
 
-    pub fn f32() -> Self {
+    pub fn f32(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::F32,
             nullable: false,
+            span,
         }
     }
 
-    pub fn f64() -> Self {
+    pub fn f64(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::F64,
             nullable: false,
+            span,
         }
     }
 
-    pub fn boolean() -> Self {
+    pub fn boolean(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Boolean,
             nullable: false,
+            span,
         }
     }
 
-    pub fn string() -> Self {
+    pub fn string(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::String,
             nullable: false,
+            span,
         }
     }
 
-    pub fn void() -> Self {
+    pub fn void(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Void,
             nullable: false,
+            span,
         }
     }
 
-    pub fn this() -> Self {
+    pub fn this(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::This,
             nullable: false,
+            span,
         }
     }
 
-    pub fn char() -> Self {
+    pub fn char(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Char,
             nullable: false,
+            span,
         }
     }
 
-    pub fn infer() -> Self {
+    pub fn infer(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Infer,
             nullable: false,
+            span,
         }
     }
 
-    pub fn never() -> Self {
+    pub fn never(span: SourceSpan<'a>) -> Self {
         Type {
             kind: TypeKind::Never,
             nullable: false,
+            span,
         }
     }
 
