@@ -1,7 +1,8 @@
 use ir::ast::ExternModifier;
 use ir::hir::{
     ConstStmt, Hir, HirErrorHandlerPattern, HirExpr, HirFunc, HirGeneric, HirImpl, HirMatchArm,
-    HirModule, HirParam, HirPattern, HirStmt, HirType, InterpolationPart, StrId,
+    HirModule, HirParam, HirPattern, HirPatternKind, HirStmt, HirType, HirTypeKind,
+    InterpolationPart, StrId,
 };
 use ir::ir_hasher::FxHashMap;
 use zetaruntime::bump::GrowableBump;
@@ -611,37 +612,39 @@ where
     }
 
     fn visit_type(&mut self, ty: &HirType<'a, 'bump>) {
-        match ty {
-            HirType::Struct {
+        match ty.kind {
+            HirTypeKind::Struct {
                 name, type_args, ..
             }
-            | HirType::Enum {
+            | HirTypeKind::Enum {
                 name, type_args, ..
             } => {
-                self.mark_type(*name);
+                self.mark_type(name);
                 self.visit_types(type_args);
             }
-            HirType::DynInterface(name, args) => {
-                self.mark_type(*name);
-                self.visit_types(args);
+            HirTypeKind::DynInterface {
+                name, type_args, ..
+            } => {
+                self.mark_type(name);
+                self.visit_types(type_args);
             }
-            HirType::SafePointer { inner, .. }
-            | HirType::UnsafePointer { inner, .. }
-            | HirType::Ref { inner, .. } => self.visit_type(inner),
-            HirType::OwnedPointer { inner, .. } => self.visit_type(inner),
-            HirType::Nullable(inner) | HirType::Array(inner, _) | HirType::Slice(inner) => {
-                self.visit_type(inner)
-            }
-            HirType::Range { elem, .. } => self.visit_type(elem),
-            HirType::Lambda {
+            HirTypeKind::SafePointer { inner, .. }
+            | HirTypeKind::UnsafePointer { inner, .. }
+            | HirTypeKind::Ref { inner, .. } => self.visit_type(inner),
+            HirTypeKind::OwnedPointer { inner, .. } => self.visit_type(inner),
+            HirTypeKind::Nullable(inner)
+            | HirTypeKind::Array(inner, _)
+            | HirTypeKind::Slice(inner) => self.visit_type(inner),
+            HirTypeKind::Range { elem, .. } => self.visit_type(elem),
+            HirTypeKind::Lambda {
                 params,
                 return_type,
             } => {
                 self.visit_types(params);
                 self.visit_type(return_type);
             }
-            HirType::Dyn { bounds } => self.visit_types(bounds),
-            HirType::Tuple(ts) => self.visit_types(ts),
+            HirTypeKind::Dyn { bounds } => self.visit_types(bounds),
+            HirTypeKind::Tuple(ts) => self.visit_types(ts),
             _ => {}
         }
     }
@@ -651,26 +654,26 @@ where
         self.visit_expr(&c.value);
     }
 
-    fn visit_pattern(&mut self, p: &HirPattern<'bump>) {
-        match p {
-            HirPattern::Struct { name, fields } => {
-                self.mark_type(*name);
+    fn visit_pattern(&mut self, p: &HirPattern<'a, 'bump>) {
+        match p.kind {
+            HirPatternKind::Struct { name, fields, .. } => {
+                self.mark_type(name);
                 for (_, fp) in fields.iter() {
                     self.visit_pattern(fp);
                 }
             }
-            HirPattern::Tuple(ps) | HirPattern::Array(ps) | HirPattern::Or(ps) => {
+            HirPatternKind::Tuple(ps) | HirPatternKind::Array(ps) | HirPatternKind::Or(ps) => {
                 for sp in ps.iter() {
                     self.visit_pattern(sp);
                 }
             }
-            HirPattern::Ident(..)
-            | HirPattern::Number(_)
-            | HirPattern::String(_)
-            | HirPattern::Boolean(_)
-            | HirPattern::EnumVariant { .. }
-            | HirPattern::Wildcard
-            | HirPattern::Null => {}
+            HirPatternKind::Ident(..)
+            | HirPatternKind::Number(_)
+            | HirPatternKind::String(_)
+            | HirPatternKind::Boolean(_)
+            | HirPatternKind::EnumVariant { .. }
+            | HirPatternKind::Wildcard
+            | HirPatternKind::Null => {}
         }
     }
 
