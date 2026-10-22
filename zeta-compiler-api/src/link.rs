@@ -15,21 +15,23 @@ pub fn link<'a>(objects: &[&str], output: &str, link_libc: bool) -> Result<(), C
     cmd.args(objects);
 
     // Look for the runtime in the user's installed Zeta directory.
-    if let Some(home) = std::env::var_os("HOME") {
-        let runtime = PathBuf::from(home)
+    if std::path::Path::new("zeta_rt.o").is_file() {
+        cmd.arg("zeta_rt.o");
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let zeta_share = PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("zeta")
-            .join("zeta_rt.c");
-
-        if runtime.is_file() {
-            cmd.arg(runtime);
-        } else if std::path::Path::new("zeta_rt.c").is_file() {
-            // Development fallback.
-            cmd.arg("zeta_rt.c");
+            .join("zeta");
+        
+        let compiled_rt = zeta_share.as_path().join("zeta_rt.o");
+        if compiled_rt.is_file() {
+            cmd.arg(compiled_rt);
         }
-    } else if std::path::Path::new("zeta_rt.c").is_file() {
-        cmd.arg("zeta_rt.c");
+
+        let uncompiled_rt = zeta_share.as_path().join("zeta_rt.c");
+        if uncompiled_rt.is_file() {
+            cmd.arg(uncompiled_rt);
+        }
     }
 
     cmd.arg("-o").arg(output);

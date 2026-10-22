@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use codex_dependency_graph::dep_graph::{AstModule, DepGraph};
 use engraver_assembly_emit::backend::Backend;
-use engraver_assembly_emit::cranelift::cranelift_backend::CraneliftBackend;
 use ir::analysis_context::CopyAnalysisCtx;
 use ir::ast::Stmt;
 use ir::auto_imports::AutoImportRegistry;
@@ -24,7 +23,6 @@ use sentinel_typechecker::TypeChecker;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
-pub mod compilation_passes;
 pub mod file_handling;
 pub mod file_loader;
 #[cfg(target_os = "linux")]
@@ -43,42 +41,93 @@ struct CompilerTimings {
     frontend: Duration,
     typecheck_borrowck: Duration,
     monomorphization: Duration,
-    codegen_link: Duration,
+    codegen: Duration,
+    linking: Duration,
 }
 
 impl CompilerTimings {
-    fn report(&self) {
-        let stages = [
+    fn report_check(&self) {
+        let stages: [(&str, Duration); 2] = [
             ("Frontend", self.frontend),
-            ("Type checking and borrow checking", self.typecheck_borrowck),
+            ("Type & borrow checking", self.typecheck_borrowck),
+        ];
+        let total = self.frontend + self.typecheck_borrowck;
+        Self::display_report(&stages, total);
+    }
+
+    fn report_with_linking(&self) {
+        let stages: [(&str, Duration); 5] = [
+            ("Frontend", self.frontend),
+            ("Type & borrow checking", self.typecheck_borrowck),
             ("Monomorphization", self.monomorphization),
-            ("Codegen", self.codegen_link),
+            ("Codegen", self.codegen),
+            ("Linking", self.linking),
         ];
 
-        let total =
-            self.frontend + self.typecheck_borrowck + self.monomorphization + self.codegen_link;
+        let total = self.frontend
+            + self.typecheck_borrowck
+            + self.monomorphization
+            + self.codegen
+            + self.linking;
+
+        Self::display_report(&stages, total);
+    }
+
+    fn report(&self) {
+        let stages: [(&str, Duration); 4] = [
+            ("Frontend", self.frontend),
+            ("Type & borrow checking", self.typecheck_borrowck),
+            ("Monomorphization", self.monomorphization),
+            ("Codegen", self.codegen),
+        ];
+
+        let total = self.frontend + self.typecheck_borrowck + self.monomorphization + self.codegen;
+
+        Self::display_report(&stages, total);
+    }
+
+    fn display_report(stages: &[(&str, Duration)], total: Duration) {
+        let total_secs = total.as_secs_f64();
+
+        let rows: Vec<String> = stages
+            .iter()
+            .map(|(name, elapsed)| {
+                let ms = elapsed.as_secs_f64() * 1_000.0;
+                let percentage = if total_secs > 0.0 {
+                    elapsed.as_secs_f64() / total_secs * 100.0
+                } else {
+                    0.0
+                };
+
+                format!("{name:<28} {ms:>10.3} ms  {percentage:>5.1}%")
+            })
+            .collect();
+
+        let total_row = format!("{:<28} {:>10.3} ms", "Total measured", total_secs * 1_000.0);
+
+        let title = "Zeta Compiler Timings";
+        let content_width = rows
+            .iter()
+            .map(String::len)
+            .chain([total_row.len(), title.len()])
+            .max()
+            .unwrap_or(0)
+            + 4;
+
+        let border = "─".repeat(content_width);
 
         eprintln!();
-        eprintln!("========== Zeta compiler timings ==========");
+        eprintln!("┌{border}┐");
+        eprintln!("│{:^content_width$}│", title);
+        eprintln!("├{border}┤");
 
-        for (name, elapsed) in stages {
-            let ms = elapsed.as_secs_f64() * 1_000.0;
-            let percentage = if total.as_secs_f64() > 0.0 {
-                elapsed.as_secs_f64() / total.as_secs_f64() * 100.0
-            } else {
-                0.0
-            };
-
-            eprintln!("  {name:<34} {ms:>10.3} ms  ({percentage:>5.1}%)");
+        for row in &rows {
+            eprintln!("│  {row:<width$}  │", width = content_width - 4);
         }
 
-        eprintln!("===========================================");
-        eprintln!(
-            "  {:<34} {:>10.3} ms",
-            "Total measured",
-            total.as_secs_f64() * 1_000.0
-        );
-        eprintln!("===========================================");
+        eprintln!("├{border}┤");
+        eprintln!("│  {total_row:<width$}  │", width = content_width - 4);
+        eprintln!("└{border}┘");
         eprintln!();
     }
 }
@@ -175,6 +224,10 @@ where
             dce_enabled: true,
             timings: CompilerTimings::default(),
         })
+    }
+
+    pub fn report_check_timings(&self) {
+        self.timings.report_check();
     }
 
     pub fn set_dead_code_elimination(&mut self, enabled: bool) {
@@ -346,15 +399,12 @@ where
         let mismatches = self
             .dep_graph
             .borrow()
-            .check_package_paths(&[dir.to_path_buf()], &self.pool);
+            .check_package_paths(&[dir.to_path_buf()]);
         for m in &mismatches {
             eprintln!("error: {}", m);
         }
 
-        let unresolved = self
-            .dep_graph
-            .borrow()
-            .unresolved_import_messages(&self.pool);
+        let unresolved = self.dep_graph.borrow().unresolved_import_messages();
         for msg in &unresolved {
             eprintln!("error: {}", msg);
         }
@@ -697,6 +747,10 @@ where
         {
             let mut checker = self.type_checker.borrow_mut();
             for &m in &invalidation_set {
+                checker.forget_module(m);
+            }
+
+            for &m in &invalidation_set {
                 if let Some(hir) = self.hir_modules.get(&m) {
                     checker.register_module(hir, m);
                 }
@@ -818,7 +872,7 @@ where
         let mismatches = self
             .dep_graph
             .borrow()
-            .check_package_paths(&self.source_roots, &self.pool);
+            .check_package_paths(&self.source_roots);
         if !mismatches.is_empty() {
             return Err(BuildError::CompilationAborted {
                 reason: mismatches
@@ -829,10 +883,7 @@ where
             });
         }
 
-        let unresolved = self
-            .dep_graph
-            .borrow()
-            .unresolved_import_messages(&self.pool);
+        let unresolved = self.dep_graph.borrow().unresolved_import_messages();
         if !unresolved.is_empty() {
             return Err(BuildError::CompilationAborted {
                 reason: unresolved.join("\n"),
@@ -845,37 +896,35 @@ where
             .filter_map(|i| self.codegen_hir_modules.get(&i).copied())
             .collect();
 
-        let codegen_start = Instant::now();
-
-        let mut backend: CraneliftBackend =
-            CraneliftBackend::new(self.pool.clone(), optimize, verbose);
-
-        crate::file_handling::emit_all(
+        let (codegen_start, backend) = crate::file_handling::emit_all(
             &ordered_hir,
             &compilation_order,
-            &mut backend,
             self.pool.clone(),
             Rc::new(crate::file_handling::collect_extern_c_names(&ordered_hir)),
             self.dep_graph,
             self.registry.clone(),
+            optimize,
+            verbose,
         );
 
         let out_obj = match backend.finish(&out_dir.to_path_buf()) {
             Ok(path) => path,
             Err(e) => {
-                self.timings.codegen_link += codegen_start.elapsed();
+                self.timings.codegen += codegen_start.elapsed();
                 self.timings.report();
 
                 return Err(BuildError::FinishError(Box::new(e)));
             }
         };
 
+        self.timings.codegen += codegen_start.elapsed();
+
         if emit_obj {
-            self.timings.codegen_link += codegen_start.elapsed();
             self.timings.report();
 
             Ok(out_obj)
         } else {
+            let linking_start = Instant::now();
             let program_path = out_dir.join("program");
 
             let link_result = crate::link::link(
@@ -884,12 +933,10 @@ where
                 true,
             );
 
-            self.timings.codegen_link += codegen_start.elapsed();
-            self.timings.report();
+            self.timings.linking += linking_start.elapsed();
+            self.timings.report_with_linking();
 
-            link_result?;
-
-            Ok(program_path)
+            link_result.map(|_| program_path)
         }
     }
 
@@ -961,7 +1008,7 @@ where
             if let Some(imp_module) = self.modules.get(&imp_idx) {
                 let imp_ast = AstModule {
                     name: imp_module.name,
-                    path: imp_module.path.clone(), // was parsed.path
+                    path: imp_module.path.clone(),
                     stmts: imp_module.parse_result.statements.as_slice(),
                 };
                 self.dep_graph
@@ -990,6 +1037,10 @@ where
         self.modules.insert(module_idx, parsed);
         self.hir_modules.insert(module_idx, hir);
 
+        if reporter.has_errors() {
+            return reporter;
+        }
+
         let invalidation_set = self
             .dep_graph
             .borrow()
@@ -997,6 +1048,11 @@ where
 
         {
             let mut checker = self.type_checker.borrow_mut();
+
+            for &m in &invalidation_set {
+                checker.forget_module(m);
+            }
+
             for &m in &invalidation_set {
                 if let Some(hir) = self.hir_modules.get(&m) {
                     checker.register_module(hir, m);
@@ -1098,14 +1154,11 @@ where
         let mismatches = self
             .dep_graph
             .borrow()
-            .check_package_paths(&[stdlib_path.to_path_buf()], &self.pool);
+            .check_package_paths(&[stdlib_path.to_path_buf()]);
         for m in &mismatches {
             eprintln!("error: {}", m);
         }
-        let unresolved = self
-            .dep_graph
-            .borrow()
-            .unresolved_import_messages(&self.pool);
+        let unresolved = self.dep_graph.borrow().unresolved_import_messages();
         for msg in &unresolved {
             eprintln!("error: {}", msg);
         }
@@ -1162,7 +1215,7 @@ where
             self.auto_imports.clone(),
         );
 
-        let monomorphizer = Monomorphizer::new(
+        let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
             &scratch_bump,
             self.registry.functions.clone(),
@@ -1189,7 +1242,7 @@ where
             self.auto_imports.clone(),
         );
 
-        let monomorphizer = Monomorphizer::new(
+        let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
             &scratch_lowerer.ctx.bump,
             self.registry.functions.clone(),
