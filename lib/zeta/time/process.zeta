@@ -10,15 +10,9 @@ public func sleep(duration: Duration): void {
         return;
     }
 
-    let request: Timespec = Timespec {
-        tv_sec: duration.total_seconds(),
-        tv_nsec: duration.nanoseconds() as i64,
-    };
+    let request: Timespec = Timespec.new(duration.total_seconds(), duration.nanoseconds() as i64);
 
-    let mut remaining: Timespec = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
+    let mut remaining: Timespec = Timespec.new(0, 0);
 
     // Relative CLOCK_MONOTONIC sleep.
     let result: i32 = libc_time.clock_nanosleep(

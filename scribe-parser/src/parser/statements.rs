@@ -1,4 +1,4 @@
-use crate::parser::descent_parser::{DescentParser, token_to_visibility};
+use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
     Block, DeferAction, DeferStmt, ElseBranch, Expr, ForKind, ForStmt, IfStmt, ImportStmt,
     InternalExprStmt, LetStmt, MatchStmt, ModuleDecl, PackageStmt, Pattern, PatternKind,
@@ -244,16 +244,7 @@ where
         let let_stmt = if self.cursor.peek() == TokenKind::Semicolon {
             None
         } else {
-            let inner_visibility = if self.cursor.peek() == TokenKind::Private
-                || self.cursor.peek() == TokenKind::Module
-                || self.cursor.peek() == TokenKind::Package
-            {
-                let vis = token_to_visibility(self.cursor.peek());
-                self.cursor.advance();
-                vis
-            } else {
-                Visibility::Public
-            };
+            let inner_visibility = self.eat_visibility(Visibility::Public);
 
             let stmt = if self.cursor.peek() == TokenKind::Let {
                 self.parse_let_stmt(inner_visibility)?

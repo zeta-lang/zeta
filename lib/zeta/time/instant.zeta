@@ -14,10 +14,7 @@ public struct Instant {
 
 impl Instant {
     public func now(): Instant {
-        let mut ts: Timespec = Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
+        let mut ts: Timespec = Timespec.new(0, 0);
 
         let result: i32 = unsafe {
             libc_time.clock_gettime(

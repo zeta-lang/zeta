@@ -47,16 +47,7 @@ where
             let mut fields = Vec::new();
 
             while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
-                let field_vis = if self.cursor.peek() == TokenKind::Private
-                    || self.cursor.peek() == TokenKind::Module
-                    || self.cursor.peek() == TokenKind::Package
-                {
-                    let vis = token_to_visibility(self.cursor.peek());
-                    self.cursor.advance();
-                    vis
-                } else {
-                    Visibility::Private
-                };
+                let field_vis = self.eat_visibility(Visibility::Private);
 
                 let manual = self.eat_manual_modifier();
                 let (field_name, field_span) = self.cursor.expect_ident()?;
@@ -207,16 +198,7 @@ where
         while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
             let attrs = self.parse_attributes()?; // empty slice if there's no `#`
 
-            let inner_visibility = if self.cursor.peek() == TokenKind::Public
-                || self.cursor.peek() == TokenKind::Module
-                || self.cursor.peek() == TokenKind::Package
-            {
-                let vis = token_to_visibility(self.cursor.peek());
-                self.cursor.advance();
-                vis
-            } else {
-                Visibility::Public
-            };
+            let inner_visibility = self.eat_visibility(Visibility::Public);
 
             if self.cursor.peek() == TokenKind::Const {
                 let Stmt::Const(const_stmt) = self.parse_const_stmt(inner_visibility)? else {
@@ -268,6 +250,16 @@ where
         ))
     }
 
+    pub(crate) fn eat_visibility(&mut self, default: Visibility) -> Visibility {
+        match token_to_visibility(self.cursor.peek()) {
+            Some(vis) => {
+                self.cursor.advance();
+                vis
+            }
+            None => default,
+        }
+    }
+
     fn parse_tuple_struct_fields(
         &mut self,
     ) -> Result<&'bump [Param<'a, 'bump>], DiagnosticError<'a>> {
@@ -276,16 +268,7 @@ where
         let mut fields = Vec::new();
 
         while self.cursor.peek() != TokenKind::RParen && self.cursor.peek() != TokenKind::EOF {
-            let field_vis = if self.cursor.peek() == TokenKind::Private
-                || self.cursor.peek() == TokenKind::Module
-                || self.cursor.peek() == TokenKind::Package
-            {
-                let vis = token_to_visibility(self.cursor.peek());
-                self.cursor.advance();
-                vis
-            } else {
-                Visibility::Private
-            };
+            let field_vis = self.eat_visibility(Visibility::Private);
 
             let peeked_token = self.cursor.peek_token();
             let manual = self.eat_manual_modifier();
@@ -412,16 +395,7 @@ where
         let mut methods = Vec::new();
 
         while self.cursor.peek() != TokenKind::RBrace && self.cursor.peek() != TokenKind::EOF {
-            let method_vis = if self.cursor.peek() == TokenKind::Private
-                || self.cursor.peek() == TokenKind::Module
-                || self.cursor.peek() == TokenKind::Package
-            {
-                let vis = token_to_visibility(self.cursor.peek());
-                self.cursor.advance();
-                vis
-            } else {
-                Visibility::Public
-            };
+            let method_vis = self.eat_visibility(Visibility::Private);
 
             if matches!(
                 self.cursor.peek(),
@@ -622,11 +596,12 @@ where
     }
 }
 
-fn token_to_visibility(token_kind: TokenKind) -> Visibility {
+fn token_to_visibility(token_kind: TokenKind) -> Option<Visibility> {
     match token_kind {
-        TokenKind::Public => Visibility::Public,
-        TokenKind::Module => Visibility::Module,
-        TokenKind::Package => Visibility::Internal,
-        _ => Visibility::Private,
+        TokenKind::Public => Some(Visibility::Public),
+        TokenKind::Private => Some(Visibility::Private),
+        TokenKind::Module => Some(Visibility::Module),
+        TokenKind::Internal => Some(Visibility::Internal),
+        _ => None,
     }
 }

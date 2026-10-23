@@ -3,17 +3,17 @@ package zeta::libc;
 public type Pthread = usize;
 
 public struct PthreadAttr {
-    opaque: [128]u8,
+    public opaque: [128]u8,
 }
 
 // 8-byte aligned and 64 bytes, big enough for pthread_mutex_t on glibc (40)
 // and Darwin (64). Using u64 words gives the alignment that [N]u8 would not.
 public struct PthreadMutex {
-    opaque: [8]u64,
+    public opaque: [8]u64,
 }
 
 public struct PthreadMutexAttr {
-    opaque: [8]u64,
+    public opaque: [8]u64,
 }
 
 public unsafe extern "C" func pthread_mutex_init(

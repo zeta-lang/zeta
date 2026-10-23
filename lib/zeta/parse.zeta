@@ -18,8 +18,8 @@ public enum ParseErrorKind {
 }
 
 public struct ParseError {
-    kind: ParseErrorKind,
-    position: usize,
+    public kind: ParseErrorKind,
+    public position: usize,
 }
 
 public interface Parse {

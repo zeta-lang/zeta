@@ -323,15 +323,6 @@ where
     }
 }
 
-pub fn token_to_visibility(token_kind: TokenKind) -> Visibility {
-    match token_kind {
-        TokenKind::Private => Visibility::Private,
-        TokenKind::Module => Visibility::Module,
-        TokenKind::Package => Visibility::Internal,
-        _ => Visibility::Public,
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ParseResult<'a, 'bump> {
     pub statements: Vec<Stmt<'a, 'bump>>,

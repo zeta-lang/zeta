@@ -718,6 +718,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ty_struct.unmangled_name,
                 field_init.name,
                 ty_struct.fields[field_idx].visibility,
+                ty_struct.fields[field_idx].span,
+                field_init.name_span,
             );
 
             let field_type = resolved_field_types[field_idx];
@@ -1558,6 +1560,8 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             struct_def.unmangled_name,
             field,
             struct_def.fields[field_idx].visibility,
+            struct_def.fields[field_idx].span,
+            Self::field_ident_span(expr_span, field).unwrap_or(expr_span),
         );
 
         let ty = if type_args.is_empty() {
@@ -1741,13 +1745,25 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         unmangled_struct_name: StrId,
         field: StrId,
         visibility: Visibility,
+        decl_span: SourceSpan<'a>,
+        use_span: SourceSpan<'a>,
     ) {
-        // Builtin/unowned structs have no owning module: nothing to enforce.
         let Some(owner) = self.context.struct_owner(struct_name) else {
             return;
         };
+
+        if owner == self.context.current_module_idx {
+            return;
+        }
+        if visibility == Visibility::Private && decl_span.file_name == use_span.file_name {
+            return;
+        }
+
         let item = format!("{}.{}", unmangled_struct_name, field);
+        let saved = self.current_span;
+        self.current_span = use_span;
         let result = self.check_visibility(visibility, owner, "field", &item);
+        self.current_span = saved;
         self.recover(result, ());
     }
 
@@ -1765,17 +1781,12 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         let visible = match visibility {
             Visibility::Public => true,
             Visibility::Private => self.context.current_module_idx == declaring_module_idx,
-            Visibility::Module => {
-                // TODO: this literally can't be implemented until we implement the build system and modules
-                // For now, it's equivalent to `internal`
-                let dep_graph = self.context.dep_graph.borrow();
-                dep_graph.get_module_package(self.context.current_module_idx)
-                    == dep_graph.get_module_package(declaring_module_idx)
-            }
-            Visibility::Internal => {
-                let dep_graph = self.context.dep_graph.borrow();
-                dep_graph.get_module_package(self.context.current_module_idx)
-                    == dep_graph.get_module_package(declaring_module_idx)
+            // TODO: Module can't be implemented until we implement the build system and modules
+            // For now, it's equivalent to `internal`
+            Visibility::Module | Visibility::Internal => {
+                let cur = self.package_root(self.context.current_module_idx);
+                let decl = self.package_root(declaring_module_idx);
+                cur.is_some() && cur == decl
             }
         };
 
@@ -1788,6 +1799,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ))
             .at(self.current_span))
         }
+    }
+
+    /// Package identity for visibility: the library root, e.g. `zeta`.
+    fn package_root(&self, module_idx: usize) -> Option<String> {
+        let dg = self.context.dep_graph.borrow();
+        let pkg = dg.get_module_package(module_idx)?;
+        let s = pkg.to_string();
+        Some(s.split("::").next().unwrap_or(&s).to_string())
     }
 
     fn field_receiver_type(

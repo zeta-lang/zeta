@@ -324,10 +324,7 @@ impl DateTime by Parse {
 
 impl DateTime {
     public func now(): DateTime {
-        let mut ts: Timespec = Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
+        let mut ts: Timespec = Timespec.new(0, 0);
 
         let result: i32 = unsafe {
             libc_time.clock_gettime(
