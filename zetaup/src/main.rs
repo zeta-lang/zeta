@@ -69,6 +69,11 @@ fn run_upgrade(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if is_newer(CURRENT_VERSION, latest_version) {
+        println!("Zetaup is newer than latest version. No wizards allowed!");
+        return Ok(());
+    }
+
     let asset = release
         .assets
         .iter()
@@ -121,7 +126,8 @@ fn download_and_extract(
         println!("Downloading {url}");
     }
 
-    let response = ureq::get(url).header("User-Agent", "zetaup").call()?;
+    let response: ureq::http::Response<ureq::Body> =
+        ureq::get(url).header("User-Agent", "zetaup").call()?;
 
     let decoder = flate2::read::GzDecoder::new(response.into_body().into_reader());
 
