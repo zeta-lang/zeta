@@ -162,6 +162,7 @@ pub struct Compiler<'a, 'bump> {
     deferred_lowerer_slot: FxHashMap<usize, usize>,
     dce_enabled: bool,
     timings: CompilerTimings,
+    retired_modules: Vec<ModuleWithArena<'a, 'bump>>,
 }
 
 impl<'a, 'bump> Compiler<'a, 'bump>
@@ -223,6 +224,7 @@ where
             deferred_lowerer_slot: FxHashMap::default(),
             dce_enabled: true,
             timings: CompilerTimings::default(),
+            retired_modules: Vec::default(),
         })
     }
 
@@ -243,8 +245,7 @@ where
     }
 
     pub fn module_idx_for_path(&self, path: &Path) -> Option<usize> {
-        let name = StrId(self.pool.intern(path.to_string_lossy().as_ref()));
-        self.module_ids.get(&name).copied()
+        self.module_ids.get(&self.canonical_key(path)).copied()
     }
 
     fn register_implicit_imports(&self, module_idx: usize) {
@@ -292,11 +293,7 @@ where
         let mut batch: Vec<(usize, StrId, ModuleWithArena<'a, 'bump>)> = Vec::new();
 
         for file in sources {
-            let canonical_name = file
-                .path
-                .to_str()
-                .ok_or_else(|| BuildError::InvalidFileName(Vec::new()))?;
-            let name = StrId(self.pool.intern(canonical_name));
+            let name = self.canonical_key(&file.path);
             let module_idx = self.module_idx_for(name);
 
             let parsed = crate::file_handling::parse_single_file_from_source(
@@ -962,6 +959,12 @@ where
         let canonical_name = self.canonical_key(path);
         let module_idx = self.module_idx_for(canonical_name);
 
+        if let Some(m) = self.modules.get(&module_idx) {
+            if &m.source == &source && self.hir_modules.contains_key(&module_idx) {
+                return self.make_reporter();
+            }
+        }
+
         let parsed = match crate::file_handling::parse_single_file_from_source(
             self.pool.clone(),
             PathBuf::from(canonical_name.as_str()),
@@ -1018,15 +1021,10 @@ where
             }
         }
 
-        let mut lowerer = HirLowerer::new(
-            self.pool.clone(),
-            parsed.bump_ref(),
-            self.dep_graph,
-            self.registry.clone(),
-            self.auto_imports.clone(),
-        );
-        lowerer.lower_module_types(&parsed.parse_result.statements, module_idx);
-        let hir = lowerer.lower_module(&parsed.parse_result.statements, module_idx);
+        let mut lowerer = self.make_lowerer(&parsed);
+        lowerer.lower_module_prototypes(&parsed.parse_result.statements, module_idx);
+
+        let lowered = lowerer.lower_module_bodies(&parsed.parse_result.statements, module_idx);
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
                 kind: TypeErrorKind::Generic(err.0.clone()),
@@ -1035,16 +1033,29 @@ where
         }
 
         self.modules.insert(module_idx, parsed);
-        self.hir_modules.insert(module_idx, hir);
+        self.hir_modules.insert(module_idx, lowered);
 
         if reporter.has_errors() {
             return reporter;
         }
 
-        let invalidation_set = self
+        self.type_checker
+            .borrow_mut()
+            .check_attributes(&lowerer.ctx.attrs.borrow());
+
+        let order = self.dep_graph.borrow().get_module_compilation_order();
+        let rank: FxHashMap<usize, usize> =
+            order.iter().enumerate().map(|(i, &m)| (m, i)).collect();
+        let mut invalidation_set: Vec<usize> = self
             .dep_graph
             .borrow()
-            .reverse_deps_transitive_modules(module_idx);
+            .reverse_deps_transitive_modules(module_idx)
+            .into_iter()
+            .collect();
+        if !invalidation_set.contains(&module_idx) {
+            invalidation_set.push(module_idx);
+        }
+        invalidation_set.sort_by_key(|m| rank.get(m).copied().unwrap_or(usize::MAX));
 
         {
             let mut checker = self.type_checker.borrow_mut();
@@ -1187,13 +1198,89 @@ where
         StrId(self.pool.intern(&p.to_string_lossy()))
     }
 
-    pub fn close_module(&mut self, name: &str) {
-        let canonical_name = self.canonical_key(&Path::new(name));
-        if let Some(&idx) = self.module_ids.get(&canonical_name) {
-            self.modules.remove(&idx);
-            self.hir_modules.remove(&idx);
-            self.cpy_ctx.borrow_mut().remove_module(idx);
+    pub fn is_in_source_roots(&self, path: &Path) -> bool {
+        let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.source_roots.iter().any(|r| {
+            let r = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+            p.starts_with(r)
+        })
+    }
+
+    pub fn remove_module(&mut self, path: &Path) -> ErrorReporter<'a> {
+        let name = self.canonical_key(path);
+        let Some(&idx) = self.module_ids.get(&name) else {
+            return self.make_reporter();
+        };
+
+        // must be computed BEFORE the graph forgets the module
+        let order = self.dep_graph.borrow().get_module_compilation_order();
+        let rank: FxHashMap<usize, usize> =
+            order.iter().enumerate().map(|(i, &m)| (m, i)).collect();
+        let mut dependents: Vec<usize> = self
+            .dep_graph
+            .borrow()
+            .reverse_deps_transitive_modules(idx)
+            .into_iter()
+            .filter(|&m| m != idx)
+            .collect();
+        dependents.sort_by_key(|m| rank.get(m).copied().unwrap_or(usize::MAX));
+
+        self.dep_graph.borrow_mut().remove_module(idx);
+        self.type_checker.borrow_mut().forget_module(idx);
+        self.cpy_ctx.borrow_mut().remove_module(idx);
+        self.module_ids.remove(&name);
+        self.stdlib_module_ids.remove(&idx);
+        self.loaded_sources.remove(name.as_str());
+        self.pending_mono.retain(|&m| m != idx);
+        self.hir_modules.remove(&idx);
+        self.codegen_hir_modules.remove(&idx);
+        if let Some(old) = self.modules.remove(&idx) {
+            self.retired_modules.push(old);
         }
+
+        let mut reporter = self.make_reporter();
+
+        for &d in &dependents {
+            if let Some(m) = self.modules.get(&d) {
+                let ast = AstModule {
+                    name: m.name,
+                    path: m.path.clone(),
+                    stmts: m.parse_result.statements.as_slice(),
+                };
+                self.dep_graph
+                    .borrow_mut()
+                    .extract_edges_for_module(d, &ast, &self.pool);
+            }
+        }
+
+        {
+            let mut checker = self.type_checker.borrow_mut();
+            for &m in &dependents {
+                checker.forget_module(m);
+            }
+            for &m in &dependents {
+                if let Some(h) = self.hir_modules.get(&m) {
+                    checker.register_module(h, m);
+                }
+            }
+        }
+        let updated: Vec<(usize, &HirModule<'a, 'bump>)> = dependents
+            .iter()
+            .filter_map(|&m| self.hir_modules.get(&m).map(|h| (m, h)))
+            .collect();
+        self.cpy_ctx.borrow_mut().recompute(&updated);
+        {
+            let mut checker = self.type_checker.borrow_mut();
+            for &m in &dependents {
+                if let Some(h) = self.hir_modules.get(&m) {
+                    checker.check_module_body(h, m);
+                }
+            }
+            for err in checker.take_errors() {
+                reporter.add_type_error(err);
+            }
+        }
+        reporter
     }
 
     fn first_ctx_structs_lookup(&self, name: &StrId) -> Option<HirStruct<'a, 'bump>> {

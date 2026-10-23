@@ -1,6 +1,6 @@
 use crate::{
     ast::{self, MutabilityState},
-    hir::{self, HirFunc, HirParam, HirType, HirTypeKind, Operator, RefKind, StrId},
+    hir::{HirFunc, HirParam, HirType, HirTypeKind, Operator, RefKind, StrId},
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -8,15 +8,6 @@ use zetaruntime::{
     intern_fmt,
     string_pool::{StringPool, VmString},
 };
-
-pub const fn lower_visibility(visibility: &ast::Visibility) -> hir::Visibility {
-    match visibility {
-        ast::Visibility::Public => hir::Visibility::Public,
-        ast::Visibility::Private => hir::Visibility::Private,
-        ast::Visibility::Module => hir::Visibility::Module,
-        ast::Visibility::Internal => hir::Visibility::Internal,
-    }
-}
 
 pub const fn lower_cmp_operator(op: ast::Op) -> Operator {
     match op {

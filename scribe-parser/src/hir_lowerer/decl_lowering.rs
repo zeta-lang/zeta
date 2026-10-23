@@ -10,7 +10,6 @@ use ir::hir::{
     HirEnumVariant, HirField, HirFunc, HirGeneric, HirImpl, HirInterface, HirParam,
     HirReturnBinder, HirStmt, HirStruct, HirType, HirTypeKind, StrId, ThisPassingKind,
 };
-use ir::hir_utils::lower_visibility;
 use ir::span::SourceSpan;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::intern_fmt;
@@ -316,7 +315,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
         HirStruct {
             name: mangled,
-            visibility: lower_visibility(&c.visibility),
+            visibility: c.visibility,
             generics,
             fields,
             unmangled_name: c.name,
@@ -330,7 +329,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             Param::Normal(p) => HirField {
                 name: p.name,
                 field_type: self.lower_type(&p.type_annotation, p.span),
-                visibility: lower_visibility(&p.visibility),
+                visibility: p.visibility,
                 manual: p.manual,
                 span: p.span,
             },
@@ -367,7 +366,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
         HirInterface {
             name: interface_name,
-            visibility: lower_visibility(&i.visibility),
+            visibility: i.visibility,
             methods: if methods.is_empty() {
                 None
             } else {
@@ -620,7 +619,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         HirField {
                             name: f.name,
                             field_type,
-                            visibility: lower_visibility(&f.visibility),
+                            visibility: f.visibility,
                             manual: f.manual,
                             span: f.span,
                         }
@@ -645,7 +644,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 
         HirEnum {
             name: mangled,
-            visibility: lower_visibility(&e.visibility),
+            visibility: e.visibility,
             generics,
             variants,
             unmangled_name: e.name,
@@ -674,7 +673,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             name: const_stmt.ident,
             ty: final_type,
             value,
-            visibility: lower_visibility(&const_stmt.visibility),
+            visibility: const_stmt.visibility,
         }
     }
 

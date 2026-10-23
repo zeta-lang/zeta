@@ -1051,6 +1051,18 @@ pub enum Visibility {
     Internal,
 }
 
+impl fmt::Display for Visibility {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let displayed = match self {
+            Visibility::Public => "public ",
+            Visibility::Private => "",
+            Visibility::Module => "module ",
+            Visibility::Internal => "internal ",
+        };
+        write!(f, "{displayed}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
     Add,

@@ -370,7 +370,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .entry(mangled)
                         .or_insert(HirStruct {
                             name: mangled,
-                            visibility: ir::hir_utils::lower_visibility(&s.visibility),
+                            visibility: s.visibility,
                             generics: None,
                             fields: self.ctx.bump.alloc_slice::<HirField>(&[]),
                             unmangled_name: s.name,
@@ -390,7 +390,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .entry(mangled)
                         .or_insert(HirEnum {
                             name: mangled,
-                            visibility: ir::hir_utils::lower_visibility(&e.visibility),
+                            visibility: e.visibility,
                             generics: None,
                             variants: self.ctx.bump.alloc_slice::<HirEnumVariant>(&[]),
                             unmangled_name: e.name,
@@ -419,7 +419,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         .entry(mangled)
                         .or_insert(HirInterface {
                             name: mangled,
-                            visibility: ir::hir_utils::lower_visibility(&i.visibility),
+                            visibility: i.visibility,
                             methods: None,
                             generics: None,
                             unmangled_name: i.name,

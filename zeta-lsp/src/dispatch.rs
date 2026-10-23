@@ -27,6 +27,7 @@ use lsp_types::{
 };
 use sentinel_typechecker::type_checker::SymbolId;
 use sentinel_typechecker::{TypeChecker, TypeContext};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -134,9 +135,9 @@ fn build_module_candidates<'a, 'bump>(
             let stmt = s.peel().1;
             let vis = match stmt {
                 Stmt::FuncDecl(f) => f.function_metadata.visibility,
-                Stmt::StructDecl(x) => ir::hir_utils::lower_visibility(&x.visibility),
-                Stmt::EnumDecl(x) => ir::hir_utils::lower_visibility(&x.visibility),
-                Stmt::InterfaceDecl(x) => ir::hir_utils::lower_visibility(&x.visibility),
+                Stmt::StructDecl(x) => x.visibility,
+                Stmt::EnumDecl(x) => x.visibility,
+                Stmt::InterfaceDecl(x) => x.visibility,
                 _ => continue,
             };
             if vis == Visibility::Private {
@@ -600,7 +601,12 @@ pub fn notification<'a, 'bump>(
             let uri = params.text_document.uri;
             state.completion_cache.invalidate_all();
             if let Some(doc) = state.documents.remove(&uri) {
-                state.compiler.close_module(&doc.path.to_string_lossy());
+                if let Ok(disk) = std::fs::read_to_string(&doc.path) {
+                    if disk != doc.text {
+                        let r = state.compiler.update_module(&doc.path, disk);
+                        publish_all(connection, &r, Some(&doc.path))?;
+                    }
+                }
             }
         }
 
@@ -781,6 +787,10 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
         return import_hover(state, ctx, &r);
     }
 
+    if let Some(m) = module_receiver_at(state, &checker, module_idx, &source, position, word) {
+        return module_hover(state, m);
+    }
+
     // 1. Try tightest_occurrence first
     if let Some(occ) = tightest_occurrence(checker.occurrences(), module_idx, line, column) {
         if occ.name.as_str() == word {
@@ -802,7 +812,7 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
                             format!("({})", tys.join(", "))
                         })
                         .unwrap_or_default();
-                    let sig = format!("{}::{}{}", owner, variant_name, payload);
+                    let sig = format!("{}.{}{}", owner, variant_name, payload);
                     return Some(Hover {
                         contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
                         range: None,
@@ -829,8 +839,7 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
                             .map(|d| format_struct_signature(d))
                             .or_else(|| ctx.enums.get(key).map(|e| format_enum_signature(e)))
                             .or_else(|| item_declaration_text(state, m, item_idx, tag)),
-                        "const" => Some(format!("const {}: {}", word, occ.ty)),
-                        "static" => Some(format!("static {}: {}", word, occ.ty)),
+                        "const" | "static" => item_declaration_text(state, m, item_idx, tag),
                         "trait" => ctx
                             .interfaces
                             .get(key)
@@ -870,16 +879,24 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
                     field_name,
                 } => {
                     let doc = doc_for_symbol(state, &checker, symbol_id);
-                    let owner = ctx
-                        .structs
-                        .get(struct_name.as_str())
-                        .map(|s| s.unmangled_name)
-                        .unwrap_or(struct_name);
-                    let sig = format!("{}.{}: {}", owner, field_name, occ.ty);
-                    return Some(Hover {
-                        contents: HoverContents::Markup(format_hover_markup(&sig, doc.as_deref())),
-                        range: None,
-                    });
+                    let owner = ctx.structs.get(struct_name.as_str());
+                    if let Some(owner) = owner {
+                        // PANIC SAFETY: type checker should give this an error if the field does not exist
+                        // before an occurrence is given to Field anyway.
+                        let field = owner.fields.iter().find(|f| f.name == field_name).unwrap();
+                        let manual_display: &str = if field.manual { "manual " } else { "" };
+                        let sig = format!(
+                            "{}{}{}: {}",
+                            owner.visibility, manual_display, field_name, occ.ty
+                        );
+                        return Some(Hover {
+                            contents: HoverContents::Markup(format_hover_markup(
+                                &sig,
+                                doc.as_deref(),
+                            )),
+                            range: None,
+                        });
+                    }
                 }
                 SymbolId::Local(..) => {
                     let doc = doc_for_symbol(state, &checker, symbol_id);
@@ -910,6 +927,73 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
     }
 
     None
+}
+
+pub fn module_receiver_at<'a, 'bump>(
+    state: &ServerState<'a, 'bump>,
+    checker: &TypeChecker<'a, 'bump>,
+    module_idx: usize,
+    source: &str,
+    position: Position,
+    word: &str,
+) -> Option<usize> {
+    let line_text = line_at(source, position.line)?;
+    let cursor = byte_offset_from_utf16(line_text, position.character).min(line_text.len());
+    let is_id = |c: char| c.is_alphanumeric() || c == '_';
+    let start = line_text[..cursor]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_id(c))
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(cursor);
+    let end = cursor
+        + line_text[cursor..]
+            .find(|c: char| !is_id(c))
+            .unwrap_or(line_text.len() - cursor);
+    if &line_text[start..end] != word {
+        return None;
+    }
+
+    // must be the head of a `recv.member` chain (not `x.args.y`, `a::args.y`, or `args..5`)
+    let after = line_text[end..].trim_start();
+    if !after.starts_with('.') || after.starts_with("..") {
+        return None;
+    }
+    let before = line_text[..start].trim_end();
+    if before.ends_with('.') || before.ends_with("::") {
+        return None;
+    }
+
+    // a real variable / type / const wins; only a function hit (or nothing) is overridden
+    let (line, column) = to_span_coords(source, position);
+    if let Some(occ) = tightest_occurrence(checker.occurrences(), module_idx, line, column) {
+        let is_fn = matches!(
+            occ.symbol,
+            SymbolId::Item {
+                tag: "func_sig" | "func_body",
+                ..
+            } | SymbolId::Method { .. }
+        );
+        if occ.name.as_str() == word && !is_fn {
+            return None;
+        }
+    }
+
+    module_for_alias(state, checker.context(), module_idx, word)
+}
+
+fn module_hover<'a, 'bump>(state: &ServerState<'a, 'bump>, m: usize) -> Option<Hover> {
+    let pkg = state
+        .compiler
+        .dep_graph_ref()
+        .borrow()
+        .get_module_package(m)?;
+    let sig = format!("package {}", pkg.as_str());
+    Some(Hover {
+        contents: HoverContents::Markup(format_hover_markup(&sig, module_doc(state, m).as_deref())),
+        range: None,
+    })
 }
 
 fn item_declaration_text<'a, 'bump>(
@@ -1092,6 +1176,8 @@ pub fn format_struct_signature(s: &HirStruct) -> String {
         for f in s.fields {
             sig.push_str("    ");
             sig.push_str(visibility_prefix(f.visibility));
+            let manual_display: &str = if f.manual { "manual " } else { "" };
+            sig.push_str(manual_display);
             sig.push_str(f.name.as_str());
             sig.push_str(": ");
             sig.push_str(&f.field_type.to_string());
@@ -1271,6 +1357,10 @@ pub fn go_to_definition<'a, 'bump>(
             )?;
             return Some(GotoDefinitionResponse::Scalar(loc));
         }
+        return module_location(state, m).map(GotoDefinitionResponse::Scalar);
+    }
+
+    if let Some(m) = module_receiver_at(state, &checker, module_idx, &source, position, word) {
         return module_location(state, m).map(GotoDefinitionResponse::Scalar);
     }
 
@@ -2119,19 +2209,14 @@ fn item_from_stmt<'a, 'bump>(
         Stmt::StructDecl(s) => (
             s.name,
             K::STRUCT,
-            ir::hir_utils::lower_visibility(&s.visibility) == Visibility::Private,
+            s.visibility == Visibility::Private,
             s.span,
         ),
-        Stmt::EnumDecl(e) => (
-            e.name,
-            K::ENUM,
-            ir::hir_utils::lower_visibility(&e.visibility) == Visibility::Private,
-            e.span,
-        ),
+        Stmt::EnumDecl(e) => (e.name, K::ENUM, e.visibility == Visibility::Private, e.span),
         Stmt::InterfaceDecl(i) => (
             i.name,
             K::INTERFACE,
-            ir::hir_utils::lower_visibility(&i.visibility) == Visibility::Private,
+            i.visibility == Visibility::Private,
             i.span,
         ),
         Stmt::TypeAliasDecl(t) => (t.name, K::TYPE_PARAMETER, false, t.span),

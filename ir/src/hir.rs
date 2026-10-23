@@ -335,7 +335,7 @@ impl<'bump> fmt::Display for ProvenanceAnnotation<'bump> {
             }
         }
 
-        Ok(())
+        write!(f, " ")
     }
 }
 
@@ -1339,12 +1339,12 @@ impl<'a, 'bump> Display for HirTypeKind<'a, 'bump> {
 
                 write!(f, "({})", params_str)
             }
-            K::Array(hir_type, len) => write!(f, "&[{}]{}", len, hir_type),
+            K::Array(hir_type, len) => write!(f, "[{}]{}", len, hir_type),
             K::Slice(hir_type) => write!(f, "&[]{}", hir_type),
             K::OwnedPointer { inner, allocator } => {
                 write!(
                     f,
-                    "^{} {}",
+                    "^{}{}",
                     allocator
                         .map(|all| all.to_string())
                         .unwrap_or(String::from("")),
@@ -1465,6 +1465,18 @@ where
                 pointee_ty: *inner,
                 allocator: allocator.or(default_alloc)?,
             },
+            HirTypeKind::Array(inner, len) => {
+                let element = inner.try_drop_kind_with(default_alloc)?;
+                if element.is_droppable() {
+                    DropKind::Array {
+                        element: Box::new(element),
+                        element_ty: *inner,
+                        len,
+                    }
+                } else {
+                    DropKind::Undroppable
+                }
+            }
             HirTypeKind::Nullable(inner) => match inner.try_drop_kind_with(default_alloc) {
                 None | Some(DropKind::Undroppable) => DropKind::Undroppable,
                 Some(k) => DropKind::Nullable {
@@ -1791,6 +1803,11 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DropKind<'a, 'bump> {
     Type(StrId),
+    Array {
+        element: Box<DropKind<'a, 'bump>>,
+        element_ty: HirType<'a, 'bump>,
+        len: usize,
+    },
     OwnedPointer {
         pointee: Box<DropKind<'a, 'bump>>,
         pointee_ty: HirType<'a, 'bump>,

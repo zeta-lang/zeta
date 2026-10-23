@@ -3,7 +3,6 @@ use ir::ast::{self, Block, ElseBranch, ErrorHandlerPattern, LetStmt, MatchArm, S
 use ir::hir::{
     HirErrorHandlerBranch, HirErrorHandlerPattern, HirMatchArm, HirStmt, HirType, StrId,
 };
-use ir::hir_utils::lower_visibility;
 
 impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub(super) fn lower_stmt(&self, stmt: Stmt<'a, 'bump>) -> HirStmt<'a, 'bump> {
@@ -412,7 +411,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             catch_pattern,
             span: l.span,
             manual: l.manual,
-            visibility: lower_visibility(&l.visibility),
+            visibility: l.visibility,
             inferred_ty,
         }
     }
