@@ -16,7 +16,7 @@ use crate::midend::{
         drop_emitter::{
             DropEmitter, FnAllocatorResolver, find_allocator_field, is_struct_owns_chain,
         },
-        drop_tracking::{DropLocal, DropScope, ScopeAction, Tri, record_move_if_any},
+        drop_tracking::{DropLocal, DropScope, ScopeAction, Tri, peel_or_else, record_move_if_any},
     },
     ir::mir_lowering::{
         FunctionLowerer,
@@ -376,6 +376,20 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     );
 
                     match &drop_kind {
+                        DropKind::Array {
+                            element,
+                            element_ty,
+                            len,
+                        } => {
+                            emitter.emit_array_drop(
+                                element,
+                                element_ty,
+                                *len,
+                                val_to_drop,
+                                &mut resolver,
+                                span,
+                            );
+                        }
                         DropKind::Nullable { inner, inner_ty } => {
                             emitter.emit_nullable_drop(
                                 inner,
@@ -536,22 +550,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     }
 
     pub fn record_move_if_any(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::OrElse { value, .. } => self.record_move_if_any(value),
-            HirExpr::Ident(name, _) => {
-                if self.local_is_droppable(*name).is_some() {
-                    self.drop_state.mark_whole_moved(*name);
-                }
-                self.set_array_flags(*name, 0);
-            }
-            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
-                if let HirExpr::Ident(root, _) = &**object {
-                    if let Some(_) = self.local_is_droppable(*root) {
-                        self.drop_state.mark_field_moved(*root, *field);
-                    }
-                }
-            }
-            _ => {}
+        record_move_if_any(&self.scope_stack, &mut self.drop_state, expr);
+        if let HirExpr::Ident(n, _) = peel_or_else(expr) {
+            self.set_array_flags(*n, 0);
         }
     }
 
@@ -940,6 +941,31 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         span: SourceSpan<'a>,
     ) {
         match kind {
+            DropKind::Array {
+                element,
+                element_ty,
+                len,
+            } => {
+                let mut resolver = FnAllocatorResolver {
+                    var_map: &self.var_map,
+                    context: self.context.clone(),
+                    dep_graph: self.dep_graph,
+                };
+                let mut emitter = DropEmitter::new(
+                    &mut self.current_block_data,
+                    self.context.clone(),
+                    self.struct_mangled_map,
+                    self.struct_field_offsets,
+                    self.structs,
+                    self.enums,
+                    self.allocator_kind,
+                    self.glue_registry,
+                    self.instantiated_functions.clone(),
+                    self.instantiated_struct_methods.clone(),
+                    self.bump,
+                );
+                emitter.emit_array_drop(element, element_ty, *len, val, &mut resolver, span);
+            }
             DropKind::Nullable { inner, inner_ty } => {
                 let mut resolver = FnAllocatorResolver {
                     var_map: &self.var_map,
@@ -1481,7 +1507,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             f.field_type.drop_kind_with(default_alloc)
         };
         if drop_kind.is_droppable() {
-            let is_uninit = owner.map_or(false, |o| self.drop_state.is_field_moved(o, field));
+            let is_uninit = owner.map_or(false, |o| {
+                self.drop_state.is_path_moved(o, &[field])
+                    || self.drop_state.has_moved_below(o, &[field])
+            });
             if !is_uninit {
                 let field_addr = self.current_block_data.fresh_value();
                 self.emit(Instruction::FieldAddr {
@@ -1515,6 +1544,20 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     self.bump,
                 );
                 match &drop_kind {
+                    DropKind::Array {
+                        element,
+                        element_ty,
+                        len,
+                    } => {
+                        emitter.emit_array_drop(
+                            element,
+                            element_ty,
+                            *len,
+                            field_addr,
+                            &mut resolver,
+                            span,
+                        );
+                    }
                     DropKind::OwnedPointer {
                         pointee,
                         pointee_ty,

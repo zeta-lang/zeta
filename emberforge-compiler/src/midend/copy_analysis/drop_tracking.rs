@@ -36,12 +36,13 @@ impl Tri {
     }
 }
 
+pub type FieldPath = Vec<StrId>;
+
 #[derive(Clone, Debug)]
 pub struct DropLocalState {
     pub moved_whole: Tri,
-    pub moved_fields: HashMap<StrId, Tri>,
-    /// Init status of every array index not listed in `indices`.
-    /// `Yes` for ordinary arrays, `No` for `= uninit` or moved-out arrays.
+    /// Keyed by full field path from the local: `a.b.c` => [b, c].
+    pub moved_fields: HashMap<FieldPath, Tri>,
     pub default_index: Tri,
     pub indices: HashMap<i64, Tri>,
 }
@@ -62,12 +63,36 @@ impl DropLocalState {
         self.indices.get(&i).copied().unwrap_or(self.default_index)
     }
 
+    /// Status of `path` itself or any ancestor (moving `a.b` moves `a.b.c`).
+    fn path_status(&self, path: &[StrId]) -> Tri {
+        let mut acc = Tri::No;
+        for n in 1..=path.len() {
+            match self
+                .moved_fields
+                .get(&path[..n])
+                .copied()
+                .unwrap_or(Tri::No)
+            {
+                Tri::Yes => return Tri::Yes,
+                Tri::Maybe => acc = Tri::Maybe,
+                Tri::No => {}
+            }
+        }
+        acc
+    }
+
+    /// True if some strict descendant of `path` is (maybe) moved.
+    fn has_moved_below(&self, path: &[StrId]) -> bool {
+        self.moved_fields
+            .iter()
+            .any(|(k, t)| *t != Tri::No && k.len() > path.len() && k.starts_with(path))
+    }
+
     fn join(&self, o: &Self) -> Self {
         let mut moved_fields = HashMap::default();
         for k in self.moved_fields.keys().chain(o.moved_fields.keys()) {
-            let a = self.moved_fields.get(k).copied().unwrap_or(Tri::No);
-            let b = o.moved_fields.get(k).copied().unwrap_or(Tri::No);
-            moved_fields.insert(*k, a.join(b));
+            // effective status, so an ancestor move on one side is respected
+            moved_fields.insert(k.clone(), self.path_status(k).join(o.path_status(k)));
         }
         let mut indices = HashMap::default();
         for k in self.indices.keys().chain(o.indices.keys()) {
@@ -99,6 +124,7 @@ impl<'a, 'bump> DropMoveState<'a, 'bump> {
         s.moved_whole = Tri::Yes;
         s.default_index = Tri::No;
         s.indices.clear();
+        s.moved_fields.clear();
     }
 
     pub fn mark_whole_uninit(&mut self, name: StrId) {
@@ -113,22 +139,48 @@ impl<'a, 'bump> DropMoveState<'a, 'bump> {
         }
     }
 
-    pub fn mark_field_moved(&mut self, name: StrId, field: StrId) {
+    pub fn mark_path_moved(&mut self, name: StrId, path: &[StrId]) {
+        let s = self.locals.entry(name).or_default();
+        s.moved_fields.retain(|k, _| !k.starts_with(path)); // descendants now redundant
+        s.moved_fields.insert(path.to_vec(), Tri::Yes);
+    }
+
+    pub fn mark_path_initialized(&mut self, name: StrId, path: &[StrId]) {
+        if let Some(s) = self.locals.get_mut(&name) {
+            s.moved_fields.retain(|k, _| !k.starts_with(path));
+        }
+    }
+
+    /// Path itself or an ancestor moved. `Maybe` counts as moved (leak, never double-free).
+    pub fn is_path_moved(&self, name: StrId, path: &[StrId]) -> bool {
         self.locals
-            .entry(name)
-            .or_default()
-            .moved_fields
-            .insert(field, Tri::Yes);
+            .get(&name)
+            .map_or(false, |l| l.path_status(path) != Tri::No)
+    }
+
+    /// Some strict descendant of `path` is moved => `path` needs a partial drop.
+    /// `path = []` means "any field of the local".
+    pub fn has_moved_below(&self, name: StrId, path: &[StrId]) -> bool {
+        self.locals
+            .get(&name)
+            .map_or(false, |l| l.has_moved_below(path))
+    }
+
+    pub fn mark_field_moved(&mut self, n: StrId, f: StrId) {
+        self.mark_path_moved(n, &[f])
+    }
+    pub fn mark_field_initialized(&mut self, n: StrId, f: StrId) {
+        self.mark_path_initialized(n, &[f])
+    }
+    pub fn is_field_moved(&self, n: StrId, f: StrId) -> bool {
+        self.is_path_moved(n, &[f])
+    }
+    pub fn has_any_field_moves(&self, n: StrId) -> bool {
+        self.has_moved_below(n, &[])
     }
 
     pub fn mark_field_uninit(&mut self, name: StrId, field: StrId) {
         self.mark_field_moved(name, field);
-    }
-
-    pub fn mark_field_initialized(&mut self, name: StrId, field: StrId) {
-        if let Some(s) = self.locals.get_mut(&name) {
-            s.moved_fields.remove(&field);
-        }
     }
 
     // Whole/field queries: `Maybe` counts as moved. That leaks on one path
@@ -137,18 +189,6 @@ impl<'a, 'bump> DropMoveState<'a, 'bump> {
         self.locals
             .get(&name)
             .map_or(false, |l| l.moved_whole != Tri::No)
-    }
-
-    pub fn is_field_moved(&self, name: StrId, field: StrId) -> bool {
-        self.locals.get(&name).map_or(false, |l| {
-            l.moved_fields.get(&field).copied().unwrap_or(Tri::No) != Tri::No
-        })
-    }
-
-    pub fn has_any_field_moves(&self, name: StrId) -> bool {
-        self.locals
-            .get(&name)
-            .map_or(false, |s| s.moved_fields.values().any(|t| *t != Tri::No))
     }
 
     // Arrays: exact tri-state.
@@ -212,31 +252,51 @@ pub(crate) fn local_is_droppable<'a, 'bump>(
         })
 }
 
+pub fn peel_or_else<'e, 'a, 'b>(e: &'e HirExpr<'a, 'b>) -> &'e HirExpr<'a, 'b> {
+    match e {
+        HirExpr::OrElse { value, .. } => peel_or_else(value),
+        _ => e,
+    }
+}
+
+/// `a.b.c` => (a, [b, c]); `this.x` => (this, [x]); bare `a` => (a, []).
+pub fn move_path_of(expr: &HirExpr) -> Option<(StrId, Vec<StrId>)> {
+    let mut path = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                path.push(*field);
+                cur = &**object;
+            }
+            HirExpr::Deref { expr, .. } => cur = &**expr,
+            HirExpr::Ident(n, _) => {
+                path.reverse();
+                return Some((*n, path));
+            }
+            HirExpr::This { .. } => {
+                path.reverse();
+                return Some((StrId::from_static("this"), path));
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub fn record_move_if_any<'a, 'bump>(
     scope_stack: &[DropScope<'a, 'bump>],
     drop_state: &mut DropMoveState<'a, 'bump>,
     expr: &HirExpr,
 ) {
-    match expr {
-        HirExpr::OrElse { value, .. } => record_move_if_any(scope_stack, drop_state, value),
-        HirExpr::Ident(name, _) => {
-            if local_is_droppable(scope_stack, *name).is_some() {
-                drop_state.mark_whole_moved(*name);
-            }
+    let Some((root, path)) = move_path_of(peel_or_else(expr)) else {
+        return;
+    };
+    let this = StrId::from_static("this");
+    if path.is_empty() {
+        if local_is_droppable(scope_stack, root).is_some() {
+            drop_state.mark_whole_moved(root);
         }
-        HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
-            match &**object {
-                HirExpr::Ident(root, _) => {
-                    if local_is_droppable(scope_stack, *root).is_some() {
-                        drop_state.mark_field_moved(*root, *field);
-                    }
-                }
-                HirExpr::This { .. } => {
-                    drop_state.mark_field_moved(StrId::from_static("this"), *field);
-                }
-                _ => {}
-            }
-        }
-        _ => {}
+    } else if root == this || local_is_droppable(scope_stack, root).is_some() {
+        drop_state.mark_path_moved(root, &path);
     }
 }
