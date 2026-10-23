@@ -9,8 +9,8 @@ import zeta::io;
 
 import zeta::lang::traits.Send;
 
-struct ThreadCtxHeader {
-    invoke: &func(arg: [*]mut void): void,
+internal struct ThreadCtxHeader {
+    internal invoke: &func(arg: [*]mut void): void,
 }
 
 struct ThreadCtx<F, R, A: Allocator> {
