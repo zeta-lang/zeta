@@ -1287,9 +1287,6 @@ impl BorrowChecker {
         false
     }
 
-    /// Conservative: `true` only if `lhs != rhs` follows from the bounds themselves (two
-    /// different constants, or the same base with different offsets) or from a recorded
-    /// `!=` fact (see `assume_not_equal_scoped`). `false` means "couldn't prove", not "equal".
     pub fn proves_not_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
         if let (Some((bl, ol)), Some((br, o_r))) =
             (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
@@ -1301,8 +1298,6 @@ impl BorrowChecker {
         Self::implied_by_fact(lhs, rhs, &self.reasoning.not_equal)
     }
 
-    /// Conservative: `true` only if `lhs == rhs` is structurally obvious or follows from a
-    /// recorded `==` fact (see `assume_equal_scoped`). `false` means "couldn't prove".
     pub fn proves_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
         if let (Some((bl, ol)), Some((br, o_r))) =
             (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
