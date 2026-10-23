@@ -384,6 +384,22 @@ impl DepGraph {
         self.nodes[idx].hint = None;
     }
 
+    pub fn remove_module(&mut self, module_idx: usize) {
+        self.remove_module_items(module_idx);
+
+        if let Some(node_idx) = self.item_index.remove(&(module_idx, 0, "module")) {
+            self.remove_node(node_idx);
+        }
+
+        self.package_hierarchy.remove(&module_idx);
+        if let Some(segs) = self.package_segments.remove(&module_idx) {
+            if self.path_index.map.get(&segs) == Some(&module_idx) {
+                self.path_index.map.remove(&segs);
+            }
+        }
+        self.module_paths.remove(&module_idx);
+    }
+
     pub fn remove_module_items(&mut self, module_idx: usize) {
         let keys: Vec<ItemKey> = self
             .item_index
