@@ -208,6 +208,11 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     self.collect_root_accesses_stmt(s, root, writes, reads);
                 }
             }
+            HirExpr::ComptimeBlock { body, .. } => {
+                for s in body.iter() {
+                    self.collect_root_accesses_stmt(s, root, writes, reads);
+                }
+            }
             HirExpr::Lambda { params, body, .. } => {
                 let shadowed = params.iter().any(|p| p.name == root);
                 if !shadowed {
