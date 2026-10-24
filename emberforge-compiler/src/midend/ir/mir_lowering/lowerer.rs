@@ -1018,7 +1018,7 @@ where
                 let ssa_ty = lower_type_hir(ty, self.enums, self.structs);
                 self.lower_uninit_value(&ssa_ty)
             }
-            HirExpr::ComptimeBlock { body, span } => todo!(),
+            HirExpr::ComptimeBlock { body: _, span: _ } => todo!(),
         }
     }
 
