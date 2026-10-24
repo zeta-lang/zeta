@@ -475,6 +475,11 @@ where
                     },
                 )))
             }
+            TokenKind::Comptime => {
+                self.cursor.advance();
+                let block = self.parse_block()?;
+                Ok(Expr::ComptimeBlock(self.bump.alloc_value_immutable(block)))
+            }
 
             TokenKind::Hexadecimal => {
                 self.cursor.advance();

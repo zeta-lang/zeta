@@ -924,6 +924,7 @@ where
                 }
             }
             HirExpr::Block { body, .. } => self.visit_stmts(body),
+            HirExpr::ComptimeBlock { body, .. } => self.visit_stmts(body),
             HirExpr::Range { start, end, .. } => {
                 self.visit_expr(start);
                 self.visit_expr(end);
