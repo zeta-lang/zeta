@@ -1723,6 +1723,7 @@ impl DepGraph {
         if let Some(&(m, i, tag)) = symbol_table.get(&(name, current_module_idx)) {
             return self.lookup_item_node(m, i, tag);
         }
+
         for imp_idx in self.get_module_imports(current_module_idx) {
             if let Some(&(m, i, tag)) = symbol_table.get(&(name, imp_idx)) {
                 return self.lookup_item_node(m, i, tag);
