@@ -2545,7 +2545,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.borrow_checker
             .kill_facts_where(&|s| names.contains(&s));
         for &n in &names {
-            self.kill_facts_about(n); // whatever else the checker tracks per variable
+            self.kill_facts_about(n);
         }
     }
 }
