@@ -9,6 +9,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use zetaruntime::string_pool::StringPool;
 
+use crate::nodes::{DepNode, NodeKind};
+use crate::sccs;
+
 const PACKAGE_FILE_NAME: &str = "package.zeta";
 const MAX_REEXPORT_DEPTH: usize = 16;
 
@@ -44,89 +47,6 @@ pub struct AstModule<'a, 'bump> {
     pub name: StrId,
     pub path: PathBuf,
     pub stmts: &'bump [Stmt<'a, 'bump>],
-}
-
-#[derive(Clone, Debug)]
-pub enum NodeKind {
-    Module {
-        module_idx: usize,
-    },
-    TypeDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    FuncSig {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    FuncBody {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    ConstDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    TraitDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    TraitImpl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    Method {
-        module_idx: usize,
-        item_idx: usize,
-        method_idx: usize,
-    },
-}
-
-impl NodeKind {
-    pub fn is_func_body(&self) -> bool {
-        matches!(self, NodeKind::FuncBody { .. })
-    }
-    pub fn is_method(&self) -> bool {
-        matches!(self, NodeKind::Method { .. })
-    }
-    pub fn is_type_decl(&self) -> bool {
-        matches!(self, NodeKind::TypeDecl { .. })
-    }
-    pub fn module_idx(&self) -> Option<usize> {
-        match self {
-            NodeKind::Module { module_idx }
-            | NodeKind::TypeDecl { module_idx, .. }
-            | NodeKind::FuncSig { module_idx, .. }
-            | NodeKind::FuncBody { module_idx, .. }
-            | NodeKind::ConstDecl { module_idx, .. }
-            | NodeKind::TraitDecl { module_idx, .. }
-            | NodeKind::TraitImpl { module_idx, .. }
-            | NodeKind::Method { module_idx, .. } => Some(*module_idx),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct DepNode {
-    pub idx: NodeIdx,
-    pub kind: NodeKind,
-    pub hint: Option<StrId>,
-    /// Outgoing edges: this node depends on these.
-    pub deps: Vec<NodeIdx>,
-    /// Reverse edges: these nodes depend on this one.
-    pub rev_deps: Vec<NodeIdx>,
-}
-
-impl DepNode {
-    fn new(idx: NodeIdx, kind: NodeKind, hint: Option<StrId>) -> Self {
-        DepNode {
-            idx,
-            kind,
-            hint,
-            deps: Vec::new(),
-            rev_deps: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1732,34 +1652,12 @@ impl DepGraph {
         None
     }
 
-    pub fn tarjan_scc(&self) -> Vec<Vec<NodeIdx>> {
-        let n = self.nodes.len();
-        let mut index: Vec<Option<usize>> = vec![None; n];
-        let mut lowlink: Vec<usize> = vec![0; n];
-        let mut onstack: Vec<bool> = vec![false; n];
-        let mut stack: Vec<NodeIdx> = Vec::new();
-        let mut counter = 0usize;
-        let mut sccs: Vec<Vec<NodeIdx>> = Vec::new();
-
-        for v in 0..n {
-            if index[v].is_none() {
-                strongconnect(
-                    v,
-                    &mut index,
-                    &mut lowlink,
-                    &mut onstack,
-                    &mut stack,
-                    &mut counter,
-                    &self.nodes,
-                    &mut sccs,
-                );
-            }
-        }
-        sccs
+    pub fn find_sccs_of_nodes(&self) -> Vec<Vec<NodeIdx>> {
+        sccs::find_sccs_of_nodes(&self.nodes)
     }
 
     pub fn scc_topo_order(&self) -> Vec<Vec<NodeIdx>> {
-        let sccs = self.tarjan_scc();
+        let sccs = self.find_sccs_of_nodes();
         let n = self.nodes.len();
         let mut node_to_scc = vec![0usize; n];
         for (sidx, comp) in sccs.iter().enumerate() {
@@ -1800,7 +1698,7 @@ impl DepGraph {
     }
 
     pub fn detect_circular_imports(&self) -> Vec<Vec<usize>> {
-        self.tarjan_scc()
+        self.find_sccs_of_nodes()
             .into_iter()
             .filter_map(|scc| {
                 let module_indices: Vec<usize> = scc
@@ -1828,7 +1726,7 @@ impl DepGraph {
     }
 
     pub fn detect_recursive_cycles(&self) -> Vec<Vec<(usize, usize)>> {
-        self.tarjan_scc()
+        self.find_sccs_of_nodes()
             .into_iter()
             .filter_map(|scc| {
                 let func_refs: Vec<(usize, usize)> = scc
@@ -2098,7 +1996,7 @@ impl DepGraph {
     }
 
     pub fn modules_in_same_scc(&self, module_idx: usize) -> Vec<usize> {
-        for scc in self.tarjan_scc() {
+        for scc in self.find_sccs_of_nodes() {
             let modules: Vec<usize> = scc
                 .iter()
                 .filter_map(|&ni| match self.nodes.get(ni).map(|n| &n.kind) {
@@ -2119,7 +2017,7 @@ impl DepGraph {
             if std::env::var_os("ZETA_DEBUG").is_none() {
                 return;
             }
-            let sccs = self.tarjan_scc();
+            let sccs = self.find_sccs_of_nodes();
             for (i, scc) in sccs.iter().enumerate() {
                 if scc.len() > 1 {
                     eprintln!("[zeta-debug] SCC #{i} has {} nodes (CYCLE):", scc.len());
@@ -2204,45 +2102,6 @@ impl DepGraph {
             .iter()
             .filter_map(|&m| self.package_segments.get(&m).cloned())
             .collect()
-    }
-}
-
-fn strongconnect(
-    v: NodeIdx,
-    index: &mut Vec<Option<usize>>,
-    lowlink: &mut Vec<usize>,
-    onstack: &mut Vec<bool>,
-    stack: &mut Vec<NodeIdx>,
-    counter: &mut usize,
-    nodes: &[DepNode],
-    sccs: &mut Vec<Vec<NodeIdx>>,
-) {
-    index[v] = Some(*counter);
-    lowlink[v] = *counter;
-    *counter += 1;
-    stack.push(v);
-    onstack[v] = true;
-
-    for &w in &nodes[v].deps {
-        if index[w].is_none() {
-            strongconnect(w, index, lowlink, onstack, stack, counter, nodes, sccs);
-            lowlink[v] = lowlink[v].min(lowlink[w]);
-        } else if onstack[w] {
-            lowlink[v] = lowlink[v].min(index[w].unwrap());
-        }
-    }
-
-    if lowlink[v] == index[v].unwrap() {
-        let mut component = Vec::new();
-        loop {
-            let w = stack.pop().expect("tarjan: stack underflow");
-            onstack[w] = false;
-            component.push(w);
-            if w == v {
-                break;
-            }
-        }
-        sccs.push(component);
     }
 }
 

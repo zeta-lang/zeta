@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use zetaruntime::string_pool::StringPool;
 
-pub struct ModuleBuilder<'bump> {
-    pub modules: ModulesSoA<'bump>,
+pub struct ModuleBuilder {
+    pub modules: ModulesSoA,
 }
 
-impl<'bump> ModuleBuilder<'bump> {
+impl ModuleBuilder {
     pub fn run<'a>(ast_modules: &[AstModule<'a, '_>], string_pool: Arc<StringPool>) -> Self {
         let mut modules = ModulesSoA::new();
 
