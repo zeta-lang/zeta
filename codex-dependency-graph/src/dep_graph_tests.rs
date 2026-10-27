@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::dep_graph::{AstModule, DepGraph, NodeKind};
+    use crate::dep_graph::{AstModule, DepGraph};
     use crate::module_collection_builder::ModuleBuilder;
+    use crate::nodes::NodeKind;
+    use crate::sccs;
     use ir::ast::{
         ConstStmt, EnumDecl, ExternModifier, FuncDecl, FuncModifiers, FuncSafety, ImplDecl,
         InlineModifier, InterfaceDecl, LetStmt, Path, Stmt, StructDecl, Type, TypeKind, Visibility,
@@ -200,7 +202,7 @@ mod tests {
         graph.add_edge(n0, n1);
         graph.add_edge(n1, n2);
 
-        let sccs = graph.tarjan_scc();
+        let sccs = sccs::find_sccs_of_nodes(graph.nodes());
         assert_eq!(sccs.len(), 3);
     }
 
@@ -212,7 +214,7 @@ mod tests {
         graph.add_edge(n0, n1);
         graph.add_edge(n1, n0);
 
-        let sccs = graph.tarjan_scc();
+        let sccs = sccs::find_sccs_of_nodes(graph.nodes());
         assert_eq!(sccs.len(), 1);
         assert_eq!(sccs[0].len(), 2);
     }

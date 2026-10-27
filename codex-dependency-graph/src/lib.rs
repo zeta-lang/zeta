@@ -1,4 +1,5 @@
 pub mod dep_graph;
+pub mod dep_graph_tests;
 pub mod module_collection_builder;
 pub mod new_dep_graph;
 pub mod nodes;
