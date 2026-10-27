@@ -27,11 +27,13 @@ This policy is not an attempt to prohibit AI from software development altogethe
 AI tools may be used for the following purposes:
 
 - **Research:** Investigating algorithms, compiler architectures, programming language design, memory models, optimization techniques, relevant literature, and existing implementations.
+- **Review:** Reviewing the human-written code for any errors, soundness issues or bugs.
 - **Analysis:** Examining existing code, identifying potential bugs, investigating performance bottlenecks, finding overlooked edge cases, and questioning existing assumptions.
 - **Design discussions:** Exploring architectural alternatives, discussing algorithms, evaluating trade-offs, and examining the implications of different design decisions.
 - **Code review assistance:** Asking AI to analyze human-written code, identify potential problems, challenge assumptions, and suggest areas requiring further investigation.
 - **Optimization research:** Investigating possible macro optimizations, hot-path improvements, vectorization opportunities, and alternative algorithms.
 - **Explanations:** Understanding unfamiliar concepts, interpreting errors, studying existing implementations, and learning about relevant technical subjects.
+- **Writing code that doesn't add/change functionality**: Adding tests, benchmarks, and removing *unused* functionality (such as code cleanup after a refactor) etc, can be fully AI generated so long as they are reviewed by a human. An exception to this rule is writing documentation.
 
 While it is encouraged to not rely as much on AI (meaning, if you don't need AI and could instead ask someone who's experienced in the Zeta programming language implementation, it's preferable to do so), it is completely allowed to use AI on the zeta programming languages while following the former conditions. 
 
@@ -42,6 +44,8 @@ AI suggestions are not authoritative, and the responsibility for all engineering
 **No LLM-generated code may be contributed to the canonical Zeta codebase and exceptions will not be made.**
 
 All implementation code must be authored by humans, including code that is repetitive, mechanical, trivial, or otherwise straightforward to generate automatically.
+
+While adding code that doesn't change functionality, add functionality, or change *how* the functionality works, is allowed, they must be completely authored and fully reviewed by a human, if we find your tests and benchmarks are doing bogus work, your entire pull request may be rejected, however AI disclosure for this is not required.
 
 The prohibition includes, but is not limited to:
 
@@ -161,3 +165,5 @@ Repeatedly submitting prohibited code or attempting to circumvent the prohibitio
 As well as deliberately lying about the origin of code (where it originated from AI and not a human) which will result in immediate termination from being able to contribute forever.
 
 Additionally, requests to weaken this AI policy to be able to create slop PRs is prone to immediate rejection, not requiring further reasoning on why we rejected it.
+
+*P.S this does not mean we won't take your feedback into consideration if you suggest a proper reasoning for weakening the AI policy, but some stuff will never be allowed. e.g. completely vibe coding a massive feature pull-request.*
