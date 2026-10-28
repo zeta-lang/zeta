@@ -1551,6 +1551,9 @@ impl DepGraph {
             Expr::Block(block) => {
                 self.walk_block(block, from_node, module_idx, pool);
             }
+            Expr::ComptimeBlock(block) => {
+                self.walk_block(block, from_node, module_idx, pool);
+            }
             Expr::UnsafeBlock(unsafe_block) => {
                 self.walk_block(unsafe_block.block, from_node, module_idx, pool);
             }
