@@ -1,18 +1,26 @@
-use ir::ast::{
-    Block, ConstStmt, DeferAction, ElseBranch, EnumDecl, Expr, Field, ForKind, FuncDecl, ImplDecl,
-    InterfaceDecl, Param, Path, Stmt, StructDecl, Type, TypeKind,
-};
+#![allow(unused)]
+
 use ir::hir::JoinStr;
-use ir::hir::StrId;
-use ir::ir_hasher::{HashMap, HashSet};
-use std::collections::VecDeque;
 use std::path::PathBuf;
+
+use ir::{
+    ast::{Expr, Stmt, Type, TypeKind},
+    hir::StrId,
+    ir_hasher::{HashMap, HashSet},
+    span::SourceSpan,
+};
 use zetaruntime::string_pool::StringPool;
+
+use crate::{
+    nodes::{
+        DepNode, Edge, EdgeKind, ItemKey, MethodKey, MethodLookupKey, ModuleIdx, NodeIdx, NodeKind,
+        SymbolKey,
+    },
+    sccs,
+};
 
 const PACKAGE_FILE_NAME: &str = "package.zeta";
 const MAX_REEXPORT_DEPTH: usize = 16;
-
-pub type NodeIdx = usize;
 
 fn is_package_file(path: &std::path::Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some(PACKAGE_FILE_NAME)
@@ -39,110 +47,20 @@ impl std::fmt::Display for PackageMismatch {
     }
 }
 
-#[derive(Clone)]
 pub struct AstModule<'a, 'bump> {
     pub name: StrId,
     pub path: PathBuf,
     pub stmts: &'bump [Stmt<'a, 'bump>],
 }
 
-#[derive(Clone, Debug)]
-pub enum NodeKind {
-    Module {
-        module_idx: usize,
-    },
-    TypeDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    FuncSig {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    FuncBody {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    ConstDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    TraitDecl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    TraitImpl {
-        module_idx: usize,
-        item_idx: usize,
-    },
-    Method {
-        module_idx: usize,
-        item_idx: usize,
-        method_idx: usize,
-    },
-}
-
-impl NodeKind {
-    pub fn is_func_body(&self) -> bool {
-        matches!(self, NodeKind::FuncBody { .. })
-    }
-    pub fn is_method(&self) -> bool {
-        matches!(self, NodeKind::Method { .. })
-    }
-    pub fn is_type_decl(&self) -> bool {
-        matches!(self, NodeKind::TypeDecl { .. })
-    }
-    pub fn module_idx(&self) -> Option<usize> {
-        match self {
-            NodeKind::Module { module_idx }
-            | NodeKind::TypeDecl { module_idx, .. }
-            | NodeKind::FuncSig { module_idx, .. }
-            | NodeKind::FuncBody { module_idx, .. }
-            | NodeKind::ConstDecl { module_idx, .. }
-            | NodeKind::TraitDecl { module_idx, .. }
-            | NodeKind::TraitImpl { module_idx, .. }
-            | NodeKind::Method { module_idx, .. } => Some(*module_idx),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct DepNode {
-    pub idx: NodeIdx,
-    pub kind: NodeKind,
-    pub hint: Option<StrId>,
-    /// Outgoing edges: this node depends on these.
-    pub deps: Vec<NodeIdx>,
-    /// Reverse edges: these nodes depend on this one.
-    pub rev_deps: Vec<NodeIdx>,
-}
-
-impl DepNode {
-    fn new(idx: NodeIdx, kind: NodeKind, hint: Option<StrId>) -> Self {
-        DepNode {
-            idx,
-            kind,
-            hint,
-            deps: Vec::new(),
-            rev_deps: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct UnresolvedImport {
-    /// The module that contains the import statement.
     pub from_module_idx: usize,
-    /// The full path segments as written in source, e.g. `["zeta", "io", "File"]`.
     pub path: Vec<StrId>,
 }
 
-type ItemKey = (usize, usize, &'static str);
-
 #[derive(Default, Debug)]
 struct PathIndex {
-    /// key: Vec<StrId> representing the full qualified path of a module,
-    /// value: module_idx
     map: HashMap<Vec<StrId>, usize>,
 }
 
@@ -162,49 +80,45 @@ impl PathIndex {
     }
 }
 
+type NodeList<'a> = Vec<DepNode<'a>>;
+
+impl<'a> std::ops::IndexMut<NodeIdx> for Vec<DepNode<'a>> {
+    fn index_mut(&mut self, index: NodeIdx) -> &mut Self::Output {
+        &mut self[index.0]
+    }
+}
+
+impl<'a> std::ops::Index<NodeIdx> for Vec<DepNode<'a>> {
+    type Output = DepNode<'a>;
+
+    fn index(&self, index: NodeIdx) -> &Self::Output {
+        &self[index.0]
+    }
+}
+
 #[derive(Default, Debug)]
-pub struct DepGraph {
-    nodes: Vec<DepNode>,
+pub struct DepGraph<'a> {
+    nodes: NodeList<'a>,
 
-    /// (module_idx, item_idx, role) -> NodeIdx
     item_index: HashMap<ItemKey, NodeIdx>,
+    symbol_table: HashMap<SymbolKey, ItemKey>,
+    method_index: HashMap<MethodKey, NodeIdx>,
+    method_symbol_table: HashMap<MethodLookupKey, MethodKey>,
+    package_hierarchy: HashMap<ModuleIdx, StrId>,
+    package_segments: HashMap<ModuleIdx, Vec<StrId>>,
+    module_paths: HashMap<ModuleIdx, PathBuf>,
+    package_facades: HashSet<ModuleIdx>,
+    facade_exports: HashMap<(ModuleIdx, StrId), Vec<StrId>>,
+    current_locals: HashMap<StrId, ItemKey>,
+    current_self_type: Option<ItemKey>,
 
-    /// (name StrId, module_idx) -> (module_idx, item_idx, role)
-    /// Used for name-based resolution within / across modules.
-    symbol_table: HashMap<(StrId, usize), (usize, usize, &'static str)>,
-
-    /// module_idx -> package path StrId (the `package a::b::c` declaration)
-    package_hierarchy: HashMap<usize, StrId>,
-
-    /// Fast path-segment lookup built from package declarations.
     path_index: PathIndex,
 
-    module_paths: HashMap<usize, PathBuf>,
-
-    /// Imports that could not be resolved during graph construction.
-    pub unresolved_imports: Vec<UnresolvedImport>,
-
-    /// (module_idx, impl_item_idx, method_idx) -> NodeIdx
-    method_index: HashMap<(usize, usize, usize), NodeIdx>,
-
-    /// (declaring type name, method name) -> (module_idx, impl_item_idx, method_idx).
-    /// Global by design, methods aren't module-scoped for lookup the way
-    /// free functions are (a call site knows the receiver's type, not
-    /// which module declared the impl).
-    method_symbol_table: HashMap<(StrId, StrId), (usize, usize, usize)>,
-
-    current_locals: HashMap<StrId, StrId>,
-    current_self_type: Option<StrId>,
-    package_segments: HashMap<usize, Vec<StrId>>,
-    /// Modules that are `package.zeta` facades.
-    package_facades: HashSet<usize>,
-    /// (facade module, exported name) -> module path the name is imported from.
-    /// Stored as raw segments and resolved lazily, so file load order is irrelevant.
-    facade_exports: HashMap<(usize, StrId), Vec<StrId>>,
+    unresolved_imports: Vec<UnresolvedImport>,
     auto_import_modules: HashSet<usize>,
 }
 
-impl DepGraph {
+impl<'a> DepGraph<'a> {
     pub fn new() -> Self {
         DepGraph {
             nodes: Vec::new(),
@@ -223,6 +137,279 @@ impl DepGraph {
             package_facades: HashSet::default(),
             auto_import_modules: HashSet::default(),
         }
+    }
+
+    pub fn register_import(&mut self, current_module_idx: usize, imported_module_idx: usize) {
+        todo!()
+    }
+
+    pub fn register_package(
+        &mut self,
+        module_idx: usize,
+        path_segments: Vec<ir::hir::StrId>,
+        path_strid: ir::hir::StrId,
+    ) {
+        todo!()
+    }
+
+    pub fn register_item_node(
+        &mut self,
+        module_idx: usize,
+        item_idx: usize,
+        tag: &'static str,
+        node_idx: NodeIdx,
+    ) {
+        todo!()
+    }
+
+    pub fn register_module_structure<'r, 'bump>(
+        &mut self,
+        module_idx: usize,
+        module: &AstModule<'r, 'bump>,
+        pool: &zetaruntime::string_pool::StringPool,
+    ) {
+        todo!()
+    }
+
+    pub fn module_symbols(
+        &self,
+        module_idx: usize,
+    ) -> impl Iterator<Item = (ir::hir::StrId, &'static str)> + '_ {
+        Vec::new().into_iter()
+    }
+
+    pub fn resolve_item_in_module(
+        &self,
+        module_idx: usize,
+        name: ir::hir::StrId,
+    ) -> Option<(usize, usize, &'static str)> {
+        todo!()
+    }
+
+    pub fn remove_module(&mut self, module_idx: usize) {
+        todo!()
+    }
+
+    /// Remove all
+    pub fn remove_file_items(&mut self, module_idx: usize) {
+        todo!()
+    }
+
+    pub fn extract_edges_for_module<'r, 'bump>(
+        &mut self,
+        module_idx: usize,
+        module: &AstModule<'r, 'bump>,
+        pool: &zetaruntime::string_pool::StringPool,
+    ) {
+        todo!()
+    }
+
+    pub fn update_module_items<'r, 'bump>(
+        &mut self,
+        module_idx: usize,
+        module: &AstModule<'r, 'bump>,
+        pool: &zetaruntime::string_pool::StringPool,
+    ) {
+        todo!()
+    }
+
+    pub fn module_path(&self, module_idx: usize) -> Option<&std::path::Path> {
+        todo!()
+    }
+
+    pub fn reverse_deps_transitive_modules(
+        &self,
+        module_idx: usize,
+    ) -> ir::ir_hasher::HashSet<usize> {
+        todo!()
+    }
+
+    pub fn resolve_module_path(&self, path: &[ir::hir::StrId]) -> Option<usize> {
+        todo!()
+    }
+
+    pub fn resolve_global_const(
+        &self,
+        module_idx: usize,
+        name: ir::hir::StrId,
+    ) -> Option<(usize, usize)> {
+        todo!()
+    }
+
+    pub fn resolve_method(
+        &self,
+        target_type: ir::hir::StrId,
+        method_name: ir::hir::StrId,
+    ) -> Option<(usize, usize, usize)> {
+        todo!()
+    }
+
+    pub fn resolve_function_in_module(
+        &self,
+        module_idx: usize,
+        name: ir::hir::StrId,
+    ) -> Option<(usize, usize)> {
+        todo!()
+    }
+
+    pub fn find_function_by_name_anywhere(&self, name: ir::hir::StrId) -> Vec<usize> {
+        todo!()
+    }
+
+    pub fn push_node(&mut self, kind: NodeKind, hint: Option<ir::hir::StrId>) -> NodeIdx {
+        todo!()
+    }
+
+    pub fn lookup_item_node(
+        &self,
+        module_idx: usize,
+        item_idx: usize,
+        tag: &'static str,
+    ) -> Option<NodeIdx> {
+        todo!()
+    }
+
+    pub fn add_edge(&mut self, a: NodeIdx, b: NodeIdx, kind: EdgeKind, span: SourceSpan<'a>) {
+        if a.0 >= self.nodes.len() || b.0 >= self.nodes.len() {
+            return;
+        }
+        if !self.nodes[a]
+            .deps
+            .iter()
+            .any(|e| e.to == b && e.kind == kind)
+        {
+            self.nodes[a].deps.push(Edge { to: b, kind, span });
+        }
+        if !self.nodes[b].rev_deps.contains(&a) {
+            self.nodes[b].rev_deps.push(a);
+        }
+    }
+
+    pub fn nodes(&self) -> &[DepNode<'a>] {
+        &self.nodes
+    }
+
+    pub fn package_segments(&self, module_idx: usize) -> Option<&[ir::hir::StrId]> {
+        todo!()
+    }
+
+    pub fn has_unresolved_imports(&self) -> bool {
+        todo!()
+    }
+
+    pub fn unresolved_import_messages(&self) -> Vec<String> {
+        todo!()
+    }
+
+    pub fn check_package_paths(&self, roots: &[std::path::PathBuf]) -> Vec<PackageMismatch> {
+        todo!()
+    }
+
+    pub fn build_symbol_table(
+        &self,
+    ) -> ir::ir_hasher::HashMap<(ir::hir::StrId, usize), (usize, usize, &'static str)> {
+        todo!()
+    }
+
+    pub fn link_stdlib_to_user(&mut self, stdlib_module_idx: usize, user_module_indices: &[usize]) {
+        todo!()
+    }
+
+    pub fn get_module_imports(&self, module_idx: usize) -> Vec<usize> {
+        todo!()
+    }
+
+    pub fn get_module_importers(&self, module_idx: usize) -> Vec<usize> {
+        todo!()
+    }
+
+    pub fn get_module_package(&self, module_idx: usize) -> Option<ir::hir::StrId> {
+        todo!()
+    }
+
+    pub fn resolve_name(
+        &self,
+        name: ir::hir::StrId,
+        current_module_idx: usize,
+        symbol_table: &ir::ir_hasher::HashMap<
+            (ir::hir::StrId, usize),
+            (usize, usize, &'static str),
+        >,
+    ) -> Option<NodeIdx> {
+        todo!()
+    }
+
+    pub fn find_sccs_of_nodes(&self) -> Vec<Vec<NodeIdx>> {
+        sccs::find_sccs_of_nodes(&self.nodes)
+    }
+
+    pub fn get_module_compilation_order(&self) -> Vec<usize> {
+        todo!()
+    }
+
+    pub fn get_function_callers(
+        &self,
+        target_module: usize,
+        target_item: usize,
+    ) -> Vec<(usize, usize)> {
+        todo!()
+    }
+
+    pub fn resolve_reexport(&self, module_idx: usize, name: ir::hir::StrId) -> Option<usize> {
+        todo!()
+    }
+
+    pub fn canonical_member_module(&self, module_idx: usize, name: ir::hir::StrId) -> usize {
+        todo!()
+    }
+
+    pub fn is_package_facade(&self, module_idx: usize) -> bool {
+        todo!()
+    }
+
+    pub fn get_function_callees(
+        &self,
+        caller_module: usize,
+        caller_item: usize,
+    ) -> Vec<(usize, usize)> {
+        todo!()
+    }
+
+    pub fn get_function_type_deps(
+        &self,
+        module_idx: usize,
+        item_idx: usize,
+    ) -> Vec<(usize, usize)> {
+        todo!()
+    }
+
+    pub fn can_access(
+        &self,
+        from_module: usize,
+        target_module: usize,
+        _target_item_idx: usize,
+    ) -> bool {
+        todo!()
+    }
+
+    pub fn debug_node(&self, node_idx: NodeIdx) -> String {
+        todo!()
+    }
+
+    pub fn modules_in_same_scc(&self, module_idx: usize) -> Vec<usize> {
+        todo!()
+    }
+
+    pub fn debug_dump_sccs(&self) {
+        todo!()
+    }
+
+    pub fn debug_dump_module_order(&self, module_names: &ir::ir_hasher::HashMap<usize, String>) {
+        todo!()
+    }
+
+    pub fn auto_import_packages(&self) -> Vec<Vec<ir::hir::StrId>> {
+        todo!()
     }
 
     pub fn package_mangle_segments(&self, module_idx: usize) -> Vec<StrId> {
@@ -297,1956 +484,10 @@ impl DepGraph {
         Some(StrId::from_static(s))
     }
 
-    fn type_name_of<'a, 'bump>(&self, ty: &Type<'a, 'bump>) -> Option<StrId> {
+    fn type_name_of<'bump>(&self, ty: &Type<'a, 'bump>) -> Option<StrId> {
         match &ty.kind {
             TypeKind::Struct { name, path, .. } if path.is_empty() => Some(*name),
             other => self.builtin_type_strid(other),
         }
     }
-
-    fn expr_type_name<'a, 'bump>(&self, expr: &Expr<'a, 'bump>) -> Option<StrId> {
-        match expr {
-            Expr::This { .. } => self.current_self_type,
-            Expr::Ident { name, .. } => self.current_locals.get(name).copied(),
-            Expr::String { .. } => Some(StrId::from_static("str")),
-            Expr::Number { .. } => Some(StrId::from_static("i64")),
-            Expr::Decimal { .. } => Some(StrId::from_static("f64")),
-            Expr::Boolean { .. } => Some(StrId::from_static("bool")),
-            Expr::Char { .. } => Some(StrId::from_static("char")),
-            Expr::StructInit { callee, .. } => match callee {
-                Expr::Ident { name, .. } => Some(*name),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn record_method_call_dep<'a, 'bump>(
-        &mut self,
-        object: &Expr<'a, 'bump>,
-        field: StrId,
-        from_node: NodeIdx,
-    ) {
-        let Some(type_name) = self.expr_type_name(object) else {
-            return;
-        };
-        let Some(&(m, i, method_idx)) = self.method_symbol_table.get(&(type_name, field)) else {
-            return;
-        };
-        if let Some(&method_node) = self.method_index.get(&(m, i, method_idx)) {
-            self.add_edge(from_node, method_node);
-        }
-    }
-
-    pub fn register_module_structure<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        module: &AstModule<'a, 'bump>,
-        pool: &StringPool,
-    ) {
-        self.remove_module_items(module_idx);
-        self.create_nodes_for_module(module_idx, module, pool);
-        self.populate_symbol_table_for_module(module_idx);
-        self.module_paths.insert(module_idx, module.path.clone());
-    }
-
-    pub fn module_symbols(
-        &self,
-        module_idx: usize,
-    ) -> impl Iterator<Item = (StrId, &'static str)> + '_ {
-        self.symbol_table
-            .iter()
-            .filter(move |&(&(_, m), _)| m == module_idx)
-            .map(|(&(name, _), &(_, _, tag))| (name, tag))
-    }
-
-    pub fn resolve_item_in_module(
-        &self,
-        module_idx: usize,
-        name: StrId,
-    ) -> Option<(usize, usize, &'static str)> {
-        self.lookup_symbol(name, module_idx)
-    }
-
-    fn remove_node(&mut self, idx: NodeIdx) {
-        let deps = std::mem::take(&mut self.nodes[idx].deps);
-        for d in deps {
-            if let Some(dn) = self.nodes.get_mut(d) {
-                dn.rev_deps.retain(|&x| x != idx);
-            }
-        }
-        let rev_deps = std::mem::take(&mut self.nodes[idx].rev_deps);
-        for r in rev_deps {
-            if let Some(rn) = self.nodes.get_mut(r) {
-                rn.deps.retain(|&x| x != idx);
-            }
-        }
-        self.nodes[idx].hint = None;
-    }
-
-    pub fn remove_module(&mut self, module_idx: usize) {
-        self.remove_module_items(module_idx);
-
-        if let Some(node_idx) = self.item_index.remove(&(module_idx, 0, "module")) {
-            self.remove_node(node_idx);
-        }
-
-        self.package_hierarchy.remove(&module_idx);
-        if let Some(segs) = self.package_segments.remove(&module_idx) {
-            if self.path_index.map.get(&segs) == Some(&module_idx) {
-                self.path_index.map.remove(&segs);
-            }
-        }
-        self.module_paths.remove(&module_idx);
-    }
-
-    pub fn remove_module_items(&mut self, module_idx: usize) {
-        let keys: Vec<ItemKey> = self
-            .item_index
-            .keys()
-            .filter(|(m, _, tag)| *m == module_idx && *tag != "module")
-            .copied()
-            .collect();
-        for key in keys {
-            if let Some(node_idx) = self.item_index.remove(&key) {
-                self.remove_node(node_idx);
-            }
-        }
-
-        let method_keys: Vec<(usize, usize, usize)> = self
-            .method_index
-            .keys()
-            .filter(|(m, _, _)| *m == module_idx)
-            .copied()
-            .collect();
-        for key in method_keys {
-            if let Some(node_idx) = self.method_index.remove(&key) {
-                self.remove_node(node_idx);
-            }
-        }
-        self.method_symbol_table
-            .retain(|_, &mut (m, _, _)| m != module_idx);
-
-        self.symbol_table.retain(|&(_, m), _| m != module_idx);
-        self.unresolved_imports
-            .retain(|imp| imp.from_module_idx != module_idx);
-        self.facade_exports.retain(|&(m, _), _| m != module_idx);
-        self.package_facades.remove(&module_idx);
-        self.auto_import_modules.remove(&module_idx);
-
-        if let Some(mod_node_idx) = self.lookup_item_node(module_idx, 0, "module") {
-            let old_deps = self.nodes[mod_node_idx].deps.clone();
-            for d in old_deps {
-                let is_module_dep = matches!(
-                    self.nodes.get(d).map(|n| &n.kind),
-                    Some(NodeKind::Module { .. })
-                );
-                if is_module_dep {
-                    self.nodes[mod_node_idx].deps.retain(|&x| x != d);
-                    if let Some(dn) = self.nodes.get_mut(d) {
-                        dn.rev_deps.retain(|&x| x != mod_node_idx);
-                    }
-                }
-            }
-        }
-    }
-
-    fn create_nodes_for_module<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        module: &AstModule<'a, 'bump>,
-        pool: &StringPool,
-    ) {
-        let module_node = self.get_or_create_module_node(module_idx);
-        if let Some(node) = self.nodes.get_mut(module_node) {
-            node.hint = Some(module.name);
-        }
-        self.register_item_node(module_idx, 0, "module", module_node);
-
-        for stmt in module.stmts {
-            if let Stmt::Package(pkg) = stmt {
-                let path_str = path_to_strid(&pkg.path, pool);
-                self.package_hierarchy.insert(module_idx, path_str);
-                let seg_vec: Vec<StrId> = pkg.path.path.to_vec();
-                self.package_segments.insert(module_idx, seg_vec.clone());
-                self.path_index.insert(seg_vec, module_idx);
-            }
-        }
-        if is_package_file(&module.path) {
-            self.package_facades.insert(module_idx);
-            for stmt in module.stmts {
-                if let Stmt::Import(imp) = stmt {
-                    if let Some(member) = imp.path.member {
-                        self.facade_exports
-                            .insert((module_idx, member), imp.path.path.to_vec());
-                    }
-                }
-            }
-        }
-        for (item_idx, stmt) in module.stmts.iter().enumerate() {
-            self.create_node_for_stmt(module_idx, item_idx, stmt);
-        }
-    }
-
-    fn symbol_entries(&self, only_module: Option<usize>) -> Vec<(ItemKey, NodeIdx)> {
-        let mut entries: Vec<(ItemKey, NodeIdx)> = self
-            .item_index
-            .iter()
-            .filter(|((m, _, tag), _)| *tag != "impl" && only_module.map_or(true, |om| *m == om))
-            .map(|(&k, &v)| (k, v))
-            .collect();
-        let prio = |t: &str| match t {
-            "module" => 0,
-            "func_body" => 2,
-            _ => 1,
-        };
-        entries.sort_by_key(|((m, idx, tag), _)| (prio(tag), *m, *idx));
-        entries
-    }
-
-    fn populate_symbol_table_for_module(&mut self, module_idx: usize) {
-        for ((m, item_idx, tag), node_idx) in self.symbol_entries(Some(module_idx)) {
-            if let Some(hint) = self.nodes.get(node_idx).and_then(|n| n.hint) {
-                self.symbol_table.insert((hint, m), (m, item_idx, tag));
-            }
-        }
-    }
-
-    pub fn extract_edges_for_module<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        module: &AstModule<'a, 'bump>,
-        pool: &StringPool,
-    ) {
-        for (item_idx, stmt) in module.stmts.iter().enumerate() {
-            self.extract_edges_for_stmt(module_idx, item_idx, stmt, pool);
-        }
-    }
-
-    pub fn update_module_items<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        module: &AstModule<'a, 'bump>,
-        pool: &StringPool,
-    ) {
-        self.remove_module_items(module_idx);
-        self.create_nodes_for_module(module_idx, module, pool);
-        self.populate_symbol_table_for_module(module_idx);
-        self.extract_edges_for_module(module_idx, module, pool);
-
-        self.module_paths.insert(module_idx, module.path.clone());
-    }
-
-    pub fn module_path(&self, module_idx: usize) -> Option<&std::path::Path> {
-        self.module_paths.get(&module_idx).map(PathBuf::as_path)
-    }
-
-    pub fn reverse_deps_transitive_modules(&self, module_idx: usize) -> HashSet<usize> {
-        let mut visited = HashSet::default();
-        let mut queue = VecDeque::new();
-        visited.insert(module_idx);
-        queue.push_back(module_idx);
-        while let Some(m) = queue.pop_front() {
-            for importer in self.get_module_importers(m) {
-                if visited.insert(importer) {
-                    queue.push_back(importer);
-                }
-            }
-        }
-        visited
-    }
-
-    pub fn resolve_module_path(&self, path: &[StrId]) -> Option<usize> {
-        self.path_index.resolve(path)
-    }
-
-    pub fn resolve_global_const(&self, module_idx: usize, name: StrId) -> Option<(usize, usize)> {
-        let (m, item_idx, tag) = self.lookup_symbol(name, module_idx)?;
-
-        if tag == "const" {
-            Some((m, item_idx))
-        } else {
-            None
-        }
-    }
-
-    pub fn resolve_method(
-        &self,
-        target_type: StrId,
-        method_name: StrId,
-    ) -> Option<(usize, usize, usize)> {
-        self.method_symbol_table
-            .get(&(target_type, method_name))
-            .copied()
-    }
-
-    pub fn resolve_function_in_module(
-        &self,
-        module_idx: usize,
-        name: StrId,
-    ) -> Option<(usize, usize)> {
-        let (m, i, tag) = self.lookup_symbol(name, module_idx)?;
-        if tag == "func_sig" || tag == "func_body" {
-            Some((m, i))
-        } else {
-            None
-        }
-    }
-
-    pub fn find_function_by_name_anywhere(&self, name: StrId) -> Vec<usize> {
-        self.symbol_table
-            .iter()
-            .filter_map(|(&(sym_name, module_idx), &(_, _, tag))| {
-                if sym_name == name && (tag == "func_sig" || tag == "func_body") {
-                    Some(module_idx)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn push_node(&mut self, kind: NodeKind, hint: Option<StrId>) -> NodeIdx {
-        let idx = self.nodes.len();
-        self.nodes.push(DepNode::new(idx, kind, hint));
-        idx
-    }
-
-    pub fn register_item_node(
-        &mut self,
-        module_idx: usize,
-        item_idx: usize,
-        tag: &'static str,
-        node_idx: NodeIdx,
-    ) {
-        self.item_index
-            .insert((module_idx, item_idx, tag), node_idx);
-    }
-
-    pub fn lookup_item_node(
-        &self,
-        module_idx: usize,
-        item_idx: usize,
-        tag: &'static str,
-    ) -> Option<NodeIdx> {
-        self.item_index.get(&(module_idx, item_idx, tag)).copied()
-    }
-
-    /// Add a directed edge `a -> b` meaning "a depends on b".
-    pub fn add_edge(&mut self, a: NodeIdx, b: NodeIdx) {
-        if a >= self.nodes.len() || b >= self.nodes.len() || a == b {
-            return;
-        }
-        if !self.nodes[a].deps.contains(&b) {
-            self.nodes[a].deps.push(b);
-        }
-        if !self.nodes[b].rev_deps.contains(&a) {
-            self.nodes[b].rev_deps.push(a);
-        }
-    }
-
-    pub fn nodes(&self) -> &[DepNode] {
-        &self.nodes
-    }
-
-    pub fn build_from_ast<'a, 'bump>(
-        &mut self,
-        modules: &[AstModule<'a, 'bump>],
-        pool: &StringPool,
-    ) {
-        self.phase_a_create_nodes(modules, pool);
-        self.phase_b_populate_symbol_table();
-        self.phase_c_extract_edges(modules, pool);
-    }
-
-    fn phase_a_create_nodes<'a, 'bump>(
-        &mut self,
-        modules: &[AstModule<'a, 'bump>],
-        pool: &StringPool,
-    ) {
-        for (midx, module) in modules.iter().enumerate() {
-            let module_node =
-                self.push_node(NodeKind::Module { module_idx: midx }, Some(module.name));
-            self.register_item_node(midx, 0, "module", module_node);
-
-            for stmt in module.stmts {
-                if let Stmt::Package(pkg) = stmt {
-                    let path_str = path_to_strid(&pkg.path, pool);
-                    self.package_hierarchy.insert(midx, path_str);
-                    let seg_vec: Vec<StrId> = pkg.path.path.to_vec();
-                    self.package_segments.insert(midx, seg_vec.clone());
-                    self.path_index.insert(seg_vec, midx);
-                }
-            }
-
-            for (item_idx, stmt) in module.stmts.iter().enumerate() {
-                self.create_node_for_stmt(midx, item_idx, stmt);
-            }
-        }
-    }
-
-    pub fn package_segments(&self, module_idx: usize) -> Option<&[StrId]> {
-        self.package_segments.get(&module_idx).map(|v| v.as_slice())
-    }
-
-    pub fn has_unresolved_imports(&self) -> bool {
-        !self.unresolved_imports.is_empty()
-    }
-
-    pub fn unresolved_import_messages(&self) -> Vec<String> {
-        self.unresolved_imports
-            .iter()
-            .map(|imp| {
-                let path_str = imp.path.join("::");
-                let file = self
-                    .module_paths
-                    .get(&imp.from_module_idx)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| format!("<module {}>", imp.from_module_idx));
-                format!(
-                    "{}: cannot resolve import `{}`: no module is registered for this path \
-                     (check the file exists and its `package` declaration matches this path)",
-                    file, path_str
-                )
-            })
-            .collect()
-    }
-
-    pub fn check_package_paths(&self, roots: &[PathBuf]) -> Vec<PackageMismatch> {
-        let mut mismatches = Vec::new();
-
-        for (&module_idx, segments) in &self.package_segments {
-            let Some(file_path) = self.module_paths.get(&module_idx) else {
-                continue;
-            };
-
-            let canonical_file = file_path
-                .canonicalize()
-                .unwrap_or_else(|_| file_path.clone());
-
-            let Some(rel) = roots.iter().find_map(|root| {
-                let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-                canonical_file.strip_prefix(&canonical_root).ok()
-            }) else {
-                continue;
-            };
-
-            let mut expected_components: Vec<String> = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .collect();
-
-            if let Some(last) = expected_components.last_mut() {
-                if let Some(stem) = std::path::Path::new(last.as_str()).file_stem() {
-                    *last = stem.to_string_lossy().to_string();
-                }
-            }
-
-            if expected_components.last().map(String::as_str) == Some("package") {
-                expected_components.pop();
-                if expected_components.is_empty() {
-                    continue;
-                }
-            }
-
-            let mut equal = segments.len() == expected_components.len();
-            for i in 0..segments.len() {
-                if segments[i] != expected_components[i].as_str() {
-                    equal = false;
-                    break;
-                }
-            }
-
-            if !equal {
-                mismatches.push(PackageMismatch {
-                    module_idx,
-                    file_path: file_path.clone(),
-                    declared_package: segments.join("::"),
-                    expected_package: expected_components.join("::"),
-                });
-            }
-        }
-
-        mismatches
-    }
-
-    fn create_node_for_stmt<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        item_idx: usize,
-        stmt: &Stmt<'a, 'bump>,
-    ) {
-        let (_, stmt) = stmt.peel();
-        let stmt = &stmt;
-        match stmt {
-            Stmt::Let(l) if l.is_static => {
-                let n = self.push_node(
-                    NodeKind::ConstDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(l.ident),
-                );
-                self.register_item_node(module_idx, item_idx, "static", n);
-            }
-            Stmt::FuncDecl(f) => {
-                let sig = self.push_node(
-                    NodeKind::FuncSig {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(f.name),
-                );
-                self.register_item_node(module_idx, item_idx, "func_sig", sig);
-
-                let body = self.push_node(
-                    NodeKind::FuncBody {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(f.name),
-                );
-                self.register_item_node(module_idx, item_idx, "func_body", body);
-            }
-            Stmt::TypeAliasDecl(t) => {
-                let n = self.push_node(
-                    NodeKind::TypeDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(t.name),
-                );
-                self.register_item_node(module_idx, item_idx, "type", n);
-            }
-            Stmt::StructDecl(s) => {
-                let td = self.push_node(
-                    NodeKind::TypeDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(s.name),
-                );
-                self.register_item_node(module_idx, item_idx, "type", td);
-            }
-            Stmt::EnumDecl(e) => {
-                let td = self.push_node(
-                    NodeKind::TypeDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(e.name),
-                );
-                self.register_item_node(module_idx, item_idx, "type", td);
-            }
-            Stmt::InterfaceDecl(i) => {
-                let td = self.push_node(
-                    NodeKind::TraitDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(i.name),
-                );
-
-                self.register_item_node(module_idx, item_idx, "trait", td);
-
-                if let Some(methods) = i.methods {
-                    for (method_idx, m) in methods.iter().enumerate() {
-                        let mn = self.push_node(
-                            NodeKind::Method {
-                                module_idx,
-                                item_idx,
-                                method_idx,
-                            },
-                            Some(m.name),
-                        );
-                        self.method_index
-                            .insert((module_idx, item_idx, method_idx), mn);
-                        self.add_edge(mn, td);
-                        self.method_symbol_table
-                            .insert((i.name, m.name), (module_idx, item_idx, method_idx));
-                    }
-                }
-            }
-            Stmt::ImplDecl(i) => {
-                let target_name = self.type_name_of(&i.target);
-                let td = self.push_node(
-                    NodeKind::TraitImpl {
-                        module_idx,
-                        item_idx,
-                    },
-                    target_name,
-                );
-                self.register_item_node(module_idx, item_idx, "impl", td);
-
-                if let Some(methods) = i.methods {
-                    for (method_idx, method) in methods.iter().enumerate() {
-                        let method_node = self.push_node(
-                            NodeKind::Method {
-                                module_idx,
-                                item_idx,
-                                method_idx,
-                            },
-                            Some(method.name),
-                        );
-                        self.method_index
-                            .insert((module_idx, item_idx, method_idx), method_node);
-                        self.add_edge(method_node, td);
-                        if let Some(target_name) = target_name {
-                            self.method_symbol_table.insert(
-                                (target_name, method.name),
-                                (module_idx, item_idx, method_idx),
-                            );
-                        }
-                    }
-                }
-            }
-            Stmt::Const(c) => {
-                let cd = self.push_node(
-                    NodeKind::ConstDecl {
-                        module_idx,
-                        item_idx,
-                    },
-                    Some(c.ident),
-                );
-                self.register_item_node(module_idx, item_idx, "const", cd);
-            }
-            // Import / Package / Let / other control-flow stmts at module
-            // scope do not produce independent graph nodes.
-            _ => {}
-        }
-    }
-
-    fn phase_b_populate_symbol_table(&mut self) {
-        for ((m, item_idx, tag), node_idx) in self.symbol_entries(None) {
-            if let Some(hint) = self.nodes.get(node_idx).and_then(|n| n.hint) {
-                self.symbol_table.insert((hint, m), (m, item_idx, tag));
-            }
-        }
-    }
-
-    fn phase_c_extract_edges<'a, 'bump>(
-        &mut self,
-        modules: &[AstModule<'a, 'bump>],
-        pool: &StringPool,
-    ) {
-        for (midx, module) in modules.iter().enumerate() {
-            for (item_idx, stmt) in module.stmts.iter().enumerate() {
-                self.extract_edges_for_stmt(midx, item_idx, stmt, pool);
-            }
-        }
-    }
-
-    pub fn build_symbol_table(&self) -> HashMap<(StrId, usize), (usize, usize, &'static str)> {
-        let mut table = HashMap::default();
-        for ((m, item_idx, tag), node_idx) in self.symbol_entries(None) {
-            if let Some(hint) = self.nodes.get(node_idx).and_then(|n| n.hint) {
-                table.insert((hint, m), (m, item_idx, tag));
-            }
-        }
-        table
-    }
-
-    fn extract_edges_for_stmt<'a, 'bump>(
-        &mut self,
-        module_idx: usize,
-        item_idx: usize,
-        stmt: &Stmt<'a, 'bump>,
-        pool: &StringPool,
-    ) {
-        let (_, stmt) = stmt.peel();
-        let stmt = &stmt;
-        match stmt {
-            Stmt::TypeAliasDecl(t) => {
-                if let Some(n) = self.lookup_item_node(module_idx, item_idx, "type") {
-                    self.add_ast_type_dep(n, &t.ty, module_idx, pool);
-                }
-            }
-            Stmt::Let(l) if l.is_static => {
-                if let Some(n) = self.lookup_item_node(module_idx, item_idx, "static") {
-                    self.add_ast_type_dep(n, &l.type_annotation, module_idx, pool);
-                    self.walk_expr(l.value, n, module_idx, pool);
-                }
-            }
-            Stmt::Import(imp) => {
-                let seg_vec: Vec<StrId> = imp.path.path.to_vec();
-                match self.path_index.resolve(&seg_vec) {
-                    Some(target) => {
-                        self.register_import(module_idx, target);
-                        if let Some(member) = imp.path.member {
-                            if let Some(real) = self.resolve_reexport(target, member) {
-                                self.register_import(module_idx, real);
-                            }
-                            if self.package_facades.contains(&module_idx)
-                                && self.lookup_symbol(member, target).is_none()
-                            {
-                                let mut path = seg_vec.clone();
-                                path.push(member);
-                                self.unresolved_imports.push(UnresolvedImport {
-                                    from_module_idx: module_idx,
-                                    path,
-                                });
-                            }
-                        }
-                    }
-                    None => {
-                        self.unresolved_imports.push(UnresolvedImport {
-                            from_module_idx: module_idx,
-                            path: seg_vec,
-                        });
-                    }
-                }
-            }
-
-            Stmt::FuncDecl(f) => {
-                if let Some(sig_node) = self.lookup_item_node(module_idx, item_idx, "func_sig") {
-                    self.walk_func_signature(f, sig_node, module_idx, pool);
-                }
-                if let Some(body_node) = self.lookup_item_node(module_idx, item_idx, "func_body") {
-                    self.walk_func_body(f, body_node, module_idx, pool);
-                    if let Some(sig_node) = self.lookup_item_node(module_idx, item_idx, "func_sig")
-                    {
-                        self.add_edge(body_node, sig_node);
-                    }
-                }
-            }
-
-            Stmt::StructDecl(s) => {
-                if let Some(type_node) = self.lookup_item_node(module_idx, item_idx, "type") {
-                    self.walk_struct_decl(s, type_node, module_idx, pool);
-                }
-            }
-
-            Stmt::EnumDecl(e) => {
-                if let Some(type_node) = self.lookup_item_node(module_idx, item_idx, "type") {
-                    self.walk_enum_decl(e, type_node, module_idx, pool);
-                }
-            }
-
-            Stmt::InterfaceDecl(i) => {
-                if let Some(trait_node) = self.lookup_item_node(module_idx, item_idx, "trait") {
-                    self.walk_interface_decl(i, trait_node, module_idx, pool);
-                }
-            }
-
-            Stmt::ImplDecl(i) => {
-                if let Some(impl_node) = self.lookup_item_node(module_idx, item_idx, "impl") {
-                    self.walk_impl_decl(i, impl_node, module_idx, item_idx, pool);
-                }
-            }
-
-            Stmt::Const(c) => {
-                if let Some(const_node) = self.lookup_item_node(module_idx, item_idx, "const") {
-                    self.walk_const_stmt(c, const_node, module_idx, pool);
-                }
-            }
-
-            _ => {}
-        }
-    }
-
-    fn populate_locals_from_params<'a, 'bump>(
-        &mut self,
-        params: Option<&'bump [Param<'a, 'bump>]>,
-    ) {
-        let Some(params) = params else { return };
-        for p in params {
-            if let Param::Normal(np) = p {
-                if let Some(type_name) = self.type_name_of(&np.type_annotation) {
-                    self.current_locals.insert(np.name, type_name);
-                }
-            }
-        }
-    }
-
-    fn walk_func_signature<'a, 'bump>(
-        &mut self,
-        f: &FuncDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        if let Some(params) = f.params {
-            for param in params {
-                match param {
-                    Param::Normal(np) => {
-                        self.add_ast_type_dep(from_node, &np.type_annotation, module_idx, pool);
-                    }
-                    Param::This(_) => {}
-                }
-            }
-        }
-        if let Some(ret) = &f.return_type {
-            self.add_ast_type_dep(from_node, ret, module_idx, pool);
-        }
-        if let Some(generics) = f.generics {
-            for g in generics {
-                for constraint in g.constraints {
-                    self.add_ast_type_dep(from_node, constraint, module_idx, pool);
-                }
-            }
-        }
-    }
-
-    fn walk_func_body<'a, 'bump>(
-        &mut self,
-        f: &FuncDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        self.current_locals.clear();
-        self.current_self_type = None;
-        self.populate_locals_from_params(f.params);
-        if let Some(body) = f.body {
-            self.walk_block(body, from_node, module_idx, pool);
-        }
-    }
-
-    fn walk_struct_decl<'a, 'bump>(
-        &mut self,
-        s: &StructDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        if let Some(generics) = s.generics {
-            for g in generics {
-                for c in g.constraints {
-                    self.add_ast_type_dep(from_node, c, module_idx, pool);
-                }
-            }
-        }
-        if let Some(params) = s.params {
-            for param in params {
-                if let Param::Normal(np) = param {
-                    self.add_ast_type_dep(from_node, &np.type_annotation, module_idx, pool);
-                }
-            }
-        }
-    }
-
-    fn walk_enum_decl<'a, 'bump>(
-        &mut self,
-        e: &EnumDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        if let Some(generics) = e.generics {
-            for g in generics {
-                for c in g.constraints {
-                    self.add_ast_type_dep(from_node, c, module_idx, pool);
-                }
-            }
-        }
-        for variant in e.variants {
-            for field in variant.fields {
-                self.walk_field(field, from_node, module_idx, pool);
-            }
-        }
-    }
-
-    fn walk_interface_decl<'a, 'bump>(
-        &mut self,
-        i: &InterfaceDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        if let Some(generics) = i.generics {
-            for g in generics {
-                for c in g.constraints {
-                    self.add_ast_type_dep(from_node, c, module_idx, pool);
-                }
-            }
-        }
-        if let Some(permits) = i.permits {
-            for ty in permits.types {
-                self.add_ast_type_dep(from_node, ty, module_idx, pool);
-            }
-        }
-        if let Some(methods) = i.methods {
-            for m in methods {
-                self.walk_func_signature(m, from_node, module_idx, pool);
-                if let Some(body) = m.body {
-                    self.walk_block(body, from_node, module_idx, pool);
-                }
-            }
-        }
-    }
-
-    fn walk_impl_decl<'a, 'bump>(
-        &mut self,
-        i: &ImplDecl<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        item_idx: usize,
-        pool: &StringPool,
-    ) {
-        self.add_ast_type_dep(from_node, &i.target, module_idx, pool);
-        if let Some(iface) = &i.interface {
-            self.add_ast_type_dep(from_node, iface, module_idx, pool);
-        }
-        self.record_auto_import_eligibility(i, module_idx);
-        if let Some(generics) = i.generics {
-            for g in generics {
-                for c in g.constraints {
-                    self.add_ast_type_dep(from_node, c, module_idx, pool);
-                }
-            }
-        }
-        let self_type = i.target.struct_name();
-        if let Some(methods) = i.methods {
-            for (method_idx, m) in methods.iter().enumerate() {
-                let method_node = self
-                    .method_index
-                    .get(&(module_idx, item_idx, method_idx))
-                    .copied()
-                    .unwrap_or(from_node);
-                self.walk_func_signature(m, method_node, module_idx, pool);
-                if let Some(body) = m.body {
-                    self.current_locals.clear();
-                    self.current_self_type = self_type;
-                    self.populate_locals_from_params(m.params);
-                    self.walk_block(body, method_node, module_idx, pool);
-                    self.current_self_type = None;
-                }
-            }
-        }
-        if let Some(constants) = i.constants {
-            for c in constants {
-                self.walk_const_stmt(c, from_node, module_idx, pool);
-            }
-        }
-    }
-
-    fn walk_const_stmt<'a, 'bump>(
-        &mut self,
-        c: &ConstStmt<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        self.add_ast_type_dep(from_node, &c.type_annotation, module_idx, pool);
-        self.walk_expr(c.value, from_node, module_idx, pool);
-    }
-
-    fn walk_field<'a, 'bump>(
-        &mut self,
-        field: &Field<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        self.add_ast_type_dep(from_node, &field.field_type, module_idx, pool);
-    }
-
-    fn walk_block<'a, 'bump>(
-        &mut self,
-        block: &Block<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        for stmt in block.block {
-            self.walk_stmt(stmt, from_node, module_idx, pool);
-        }
-    }
-
-    fn walk_stmt<'a, 'bump>(
-        &mut self,
-        stmt: &Stmt<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        match stmt {
-            Stmt::Let(l) => {
-                self.add_ast_type_dep(from_node, &l.type_annotation, module_idx, pool);
-                self.walk_expr(l.value, from_node, module_idx, pool);
-                if let Some(type_name) = self.type_name_of(&l.type_annotation) {
-                    self.current_locals.insert(l.ident, type_name);
-                }
-            }
-            Stmt::Const(c) => {
-                self.walk_const_stmt(c, from_node, module_idx, pool);
-            }
-            Stmt::Return(r) => {
-                if let Some(val) = r.value {
-                    self.walk_expr(val, from_node, module_idx, pool);
-                }
-            }
-            Stmt::If(i) => {
-                self.walk_expr(i.condition, from_node, module_idx, pool);
-                self.walk_block(i.then_branch, from_node, module_idx, pool);
-                if let Some(else_branch) = i.else_branch {
-                    match else_branch {
-                        ElseBranch::If(nested) => {
-                            self.walk_expr(nested.condition, from_node, module_idx, pool);
-                            self.walk_block(nested.then_branch, from_node, module_idx, pool);
-                            if let Some(eb) = nested.else_branch {
-                                self.walk_else_branch(eb, from_node, module_idx, pool);
-                            }
-                        }
-                        ElseBranch::Else(block) => {
-                            self.walk_block(block, from_node, module_idx, pool);
-                        }
-                    }
-                }
-            }
-            Stmt::While(w) => {
-                self.walk_expr(w.condition, from_node, module_idx, pool);
-                self.walk_block(w.block, from_node, module_idx, pool);
-            }
-            Stmt::For(f) => {
-                match &f.kind {
-                    ForKind::CStyle {
-                        let_stmt,
-                        condition,
-                        increment,
-                    } => {
-                        if let Some(ls) = let_stmt {
-                            self.add_ast_type_dep(from_node, &ls.type_annotation, module_idx, pool);
-                            self.walk_expr(ls.value, from_node, module_idx, pool);
-                        }
-                        if let Some(cond) = condition {
-                            self.walk_expr(cond, from_node, module_idx, pool);
-                        }
-                        if let Some(inc) = increment {
-                            self.walk_expr(inc, from_node, module_idx, pool);
-                        }
-                    }
-                    ForKind::RangeBased { iterable, .. } => {
-                        self.walk_expr(iterable, from_node, module_idx, pool);
-                    }
-                }
-                self.walk_block(f.block, from_node, module_idx, pool);
-            }
-            Stmt::Match(m) => {
-                self.walk_expr(m.expr, from_node, module_idx, pool);
-                for arm in m.arms {
-                    if let Some(guard) = arm.guard {
-                        self.walk_expr(guard, from_node, module_idx, pool);
-                    }
-                    self.walk_block(arm.block, from_node, module_idx, pool);
-                }
-            }
-            Stmt::UnsafeBlock(u) => {
-                self.walk_block(u.block, from_node, module_idx, pool);
-            }
-            Stmt::Block(b) => {
-                self.walk_block(b, from_node, module_idx, pool);
-            }
-            Stmt::Defer(d) => match d.action {
-                DeferAction::Block(b) => self.walk_block(b, from_node, module_idx, pool),
-                DeferAction::Stmt(s) => self.walk_stmt(s, from_node, module_idx, pool),
-            },
-            Stmt::ExprStmt(e) => {
-                self.walk_expr(e.expr, from_node, module_idx, pool);
-            }
-            Stmt::FuncDecl(f) => {
-                self.walk_func_signature(f, from_node, module_idx, pool);
-                if let Some(body) = f.body {
-                    self.walk_block(body, from_node, module_idx, pool);
-                }
-            }
-            Stmt::StructDecl(s) => {
-                self.walk_struct_decl(s, from_node, module_idx, pool);
-            }
-            Stmt::EnumDecl(e) => {
-                self.walk_enum_decl(e, from_node, module_idx, pool);
-            }
-            Stmt::Break(Some(expr), _) => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-            }
-            // Import / Package / Continue / Break(None), no deps to extract
-            // from inside a function body.
-            _ => {}
-        }
-    }
-
-    fn walk_else_branch<'a, 'bump>(
-        &mut self,
-        branch: &ElseBranch<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        match branch {
-            ElseBranch::If(i) => {
-                self.walk_expr(i.condition, from_node, module_idx, pool);
-                self.walk_block(i.then_branch, from_node, module_idx, pool);
-                if let Some(eb) = i.else_branch {
-                    self.walk_else_branch(eb, from_node, module_idx, pool);
-                }
-            }
-            ElseBranch::Else(b) => {
-                self.walk_block(b, from_node, module_idx, pool);
-            }
-        }
-    }
-
-    fn walk_expr<'a, 'bump>(
-        &mut self,
-        expr: &Expr<'a, 'bump>,
-        from_node: NodeIdx,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        match expr {
-            Expr::Ident { name, .. } => {
-                // A bare identifier may refer to a top-level declaration.
-                self.resolve_name_to_edge(*name, from_node, module_idx);
-            }
-            Expr::GenericIdent {
-                name, generic_args, ..
-            } => {
-                self.resolve_name_to_edge(*name, from_node, module_idx);
-                for ty in *generic_args {
-                    self.add_ast_type_dep(from_node, ty, module_idx, pool);
-                }
-            }
-            Expr::Call {
-                callee,
-                generic_args,
-                arguments,
-                ..
-            } => {
-                if let Expr::FieldAccess { object, field, .. } | Expr::Get { object, field, .. } =
-                    callee
-                {
-                    self.record_method_call_dep(object, *field, from_node);
-                }
-                self.walk_expr(callee, from_node, module_idx, pool);
-                for ty in *generic_args {
-                    self.add_ast_type_dep(from_node, ty, module_idx, pool);
-                }
-                for arg in *arguments {
-                    self.walk_expr(arg, from_node, module_idx, pool);
-                }
-            }
-            Expr::StructInit {
-                callee, arguments, ..
-            } => {
-                self.walk_expr(callee, from_node, module_idx, pool);
-                for arg in *arguments {
-                    self.walk_expr(&arg.value, from_node, module_idx, pool);
-                }
-            }
-            Expr::FieldAccess { object, .. } | Expr::Get { object, .. } => {
-                self.walk_expr(object, from_node, module_idx, pool);
-            }
-            Expr::Binary { left, right, .. }
-            | Expr::Comparison {
-                lhs: left,
-                rhs: right,
-                ..
-            } => {
-                self.walk_expr(left, from_node, module_idx, pool);
-                self.walk_expr(right, from_node, module_idx, pool);
-            }
-            Expr::Assignment { lhs, rhs, .. } => {
-                self.walk_expr(lhs, from_node, module_idx, pool);
-                self.walk_expr(rhs, from_node, module_idx, pool);
-            }
-            Expr::Unary { operand, .. } => {
-                self.walk_expr(operand, from_node, module_idx, pool);
-            }
-            Expr::OrElse { value, .. } => {
-                self.walk_expr(value, from_node, module_idx, pool);
-            }
-            Expr::ArrayIndex { expr, index, .. } => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-                self.walk_expr(index, from_node, module_idx, pool);
-            }
-            Expr::ExprList { expressions, .. } => {
-                for e in *expressions {
-                    self.walk_expr(e, from_node, module_idx, pool);
-                }
-            }
-            Expr::If { if_stmt, .. } => {
-                self.walk_expr(if_stmt.condition, from_node, module_idx, pool);
-                self.walk_block(if_stmt.then_branch, from_node, module_idx, pool);
-                if let Some(eb) = if_stmt.else_branch {
-                    self.walk_else_branch(eb, from_node, module_idx, pool);
-                }
-            }
-            Expr::Match { match_stmt, .. } => {
-                self.walk_expr(match_stmt.expr, from_node, module_idx, pool);
-                for arm in match_stmt.arms {
-                    if let Some(g) = arm.guard {
-                        self.walk_expr(g, from_node, module_idx, pool);
-                    }
-                    self.walk_block(arm.block, from_node, module_idx, pool);
-                }
-            }
-            Expr::Deref { expr, .. } | Expr::Ref { expr, .. } => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-            }
-            Expr::Null { .. }
-            | Expr::Number { .. }
-            | Expr::Decimal { .. }
-            | Expr::String { .. }
-            | Expr::Boolean { .. }
-            | Expr::Char { .. }
-            | Expr::This { .. } => {}
-            Expr::Lambda {
-                params,
-                return_type,
-                body,
-                ..
-            } => {
-                for p in *params {
-                    if let Some(ty) = &p.type_annotation {
-                        self.add_ast_type_dep(from_node, ty, module_idx, pool);
-                    }
-                }
-                if let Some(ret) = return_type {
-                    self.add_ast_type_dep(from_node, ret, module_idx, pool);
-                }
-                self.walk_block(body, from_node, module_idx, pool);
-            }
-            Expr::ModulePath { segments, .. } => {
-                self.add_module_path_dep(from_node, segments);
-            }
-
-            Expr::ModuleAccess { segments, .. } => {
-                self.add_module_path_dep(from_node, segments);
-            }
-            Expr::ArrayLiteral { elements, span: _ } => {
-                for element in *elements {
-                    self.walk_expr(element, from_node, module_idx, pool);
-                }
-            }
-            Expr::Undefined { .. } | Expr::Uninit { .. } => {}
-            Expr::Cast {
-                expr,
-                target_type: _,
-                span: _,
-            } => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-            }
-            Expr::Intrinsic {
-                name,
-                generic_args,
-                arguments,
-                span,
-            } => {
-                self.walk_expr(
-                    &Expr::Ident {
-                        name: *name,
-                        span: *span,
-                    },
-                    from_node,
-                    module_idx,
-                    pool,
-                );
-                for ty in *generic_args {
-                    self.add_ast_type_dep(from_node, ty, module_idx, pool);
-                }
-                for arg in *arguments {
-                    self.walk_expr(arg, from_node, module_idx, pool);
-                }
-            }
-            Expr::Block(block) => {
-                self.walk_block(block, from_node, module_idx, pool);
-            }
-            Expr::UnsafeBlock(unsafe_block) => {
-                self.walk_block(unsafe_block.block, from_node, module_idx, pool);
-            }
-            Expr::Tuple { values, .. } => {
-                for value in *values {
-                    self.walk_expr(&value, from_node, module_idx, pool);
-                }
-            }
-            Expr::Attributed { expr, .. } => {
-                self.walk_expr(expr, from_node, module_idx, pool);
-            }
-        }
-    }
-
-    fn add_module_path_dep(&mut self, from_node: NodeIdx, segments: &[StrId]) {
-        let Some(target_module_idx) = self.path_index.resolve(segments) else {
-            return;
-        };
-        let target_node = self.get_or_create_module_node(target_module_idx);
-        self.add_edge(from_node, target_node);
-    }
-
-    fn add_ast_type_dep<'a, 'bump>(
-        &mut self,
-        from_node: NodeIdx,
-        ty: &Type<'a, 'bump>,
-        module_idx: usize,
-        pool: &StringPool,
-    ) {
-        match ty.kind {
-            TypeKind::Struct {
-                name,
-                path: _,
-                generics,
-            } => {
-                self.resolve_name_to_edge(name, from_node, module_idx);
-                for g in generics {
-                    self.add_ast_type_dep(from_node, g, module_idx, pool);
-                }
-            }
-            TypeKind::SafePointer { inner, .. }
-            | TypeKind::UnsafePointer { inner, .. }
-            | TypeKind::Array { inner, .. }
-            | TypeKind::Slice { inner }
-            | TypeKind::Ref { inner, .. } => {
-                self.add_ast_type_dep(from_node, inner, module_idx, pool);
-            }
-            TypeKind::Lambda {
-                params,
-                return_type,
-            } => {
-                for p in params {
-                    self.add_ast_type_dep(from_node, p, module_idx, pool);
-                }
-                self.add_ast_type_dep(from_node, return_type, module_idx, pool);
-            }
-            TypeKind::Dyn { bounds } => {
-                for b in bounds {
-                    self.add_ast_type_dep(from_node, b, module_idx, pool);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn resolve_name_to_edge(&mut self, name: StrId, from_node: NodeIdx, module_idx: usize) {
-        if let Some((m, i, tag)) = self.lookup_symbol(name, module_idx) {
-            if let Some(to) = self.lookup_item_node(m, i, tag) {
-                self.add_edge(from_node, to);
-                return;
-            }
-        }
-        let imports = self.get_module_imports(module_idx);
-        for imp_idx in imports {
-            if let Some((m, i, tag)) = self.lookup_symbol(name, imp_idx) {
-                if let Some(to) = self.lookup_item_node(m, i, tag) {
-                    self.add_edge(from_node, to);
-                    return;
-                }
-            }
-        }
-    }
-
-    pub fn register_import(&mut self, current_module_idx: usize, imported_module_idx: usize) {
-        let cur = self.get_or_create_module_node(current_module_idx);
-        let imp = self.get_or_create_module_node(imported_module_idx);
-        self.add_edge(cur, imp);
-    }
-
-    fn get_or_create_module_node(&mut self, module_idx: usize) -> NodeIdx {
-        if let Some(idx) = self.lookup_item_node(module_idx, 0, "module") {
-            return idx;
-        }
-        let idx = self.push_node(NodeKind::Module { module_idx }, None);
-        self.register_item_node(module_idx, 0, "module", idx);
-        idx
-    }
-
-    pub fn register_package(
-        &mut self,
-        module_idx: usize,
-        path_segments: Vec<StrId>,
-        path_strid: StrId,
-    ) {
-        self.package_hierarchy.insert(module_idx, path_strid);
-        self.path_index.insert(path_segments, module_idx);
-        if let Some(node_idx) = self.lookup_item_node(module_idx, 0, "module") {
-            if let Some(node) = self.nodes.get_mut(node_idx) {
-                node.hint = Some(path_strid);
-            }
-        }
-    }
-
-    pub fn link_stdlib_to_user(&mut self, stdlib_module_idx: usize, user_module_indices: &[usize]) {
-        for &user_idx in user_module_indices {
-            self.register_import(user_idx, stdlib_module_idx);
-        }
-    }
-
-    pub fn get_module_imports(&self, module_idx: usize) -> Vec<usize> {
-        let Some(node_idx) = self.lookup_item_node(module_idx, 0, "module") else {
-            return Vec::new();
-        };
-        let Some(node) = self.nodes.get(node_idx) else {
-            return Vec::new();
-        };
-        node.deps
-            .iter()
-            .filter_map(|&dep_idx| {
-                let dep = self.nodes.get(dep_idx)?;
-                if let NodeKind::Module { module_idx: imp } = dep.kind {
-                    Some(imp)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_module_importers(&self, module_idx: usize) -> Vec<usize> {
-        let Some(node_idx) = self.lookup_item_node(module_idx, 0, "module") else {
-            return Vec::new();
-        };
-        let Some(node) = self.nodes.get(node_idx) else {
-            return Vec::new();
-        };
-        node.rev_deps
-            .iter()
-            .filter_map(|&rev_idx| {
-                let rev = self.nodes.get(rev_idx)?;
-                if let NodeKind::Module { module_idx: imp } = rev.kind {
-                    Some(imp)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_module_package(&self, module_idx: usize) -> Option<StrId> {
-        self.package_hierarchy.get(&module_idx).copied()
-    }
-
-    pub fn resolve_name(
-        &self,
-        name: StrId,
-        current_module_idx: usize,
-        symbol_table: &HashMap<(StrId, usize), (usize, usize, &'static str)>,
-    ) -> Option<NodeIdx> {
-        if let Some(&(m, i, tag)) = symbol_table.get(&(name, current_module_idx)) {
-            return self.lookup_item_node(m, i, tag);
-        }
-        for imp_idx in self.get_module_imports(current_module_idx) {
-            if let Some(&(m, i, tag)) = symbol_table.get(&(name, imp_idx)) {
-                return self.lookup_item_node(m, i, tag);
-            }
-        }
-        None
-    }
-
-    pub fn tarjan_scc(&self) -> Vec<Vec<NodeIdx>> {
-        let n = self.nodes.len();
-        let mut index: Vec<Option<usize>> = vec![None; n];
-        let mut lowlink: Vec<usize> = vec![0; n];
-        let mut onstack: Vec<bool> = vec![false; n];
-        let mut stack: Vec<NodeIdx> = Vec::new();
-        let mut counter = 0usize;
-        let mut sccs: Vec<Vec<NodeIdx>> = Vec::new();
-
-        for v in 0..n {
-            if index[v].is_none() {
-                strongconnect(
-                    v,
-                    &mut index,
-                    &mut lowlink,
-                    &mut onstack,
-                    &mut stack,
-                    &mut counter,
-                    &self.nodes,
-                    &mut sccs,
-                );
-            }
-        }
-        sccs
-    }
-
-    pub fn scc_topo_order(&self) -> Vec<Vec<NodeIdx>> {
-        let sccs = self.tarjan_scc();
-        let n = self.nodes.len();
-        let mut node_to_scc = vec![0usize; n];
-        for (sidx, comp) in sccs.iter().enumerate() {
-            for &v in comp {
-                node_to_scc[v] = sidx;
-            }
-        }
-
-        let scc_count = sccs.len();
-        let mut scc_adj: Vec<HashSet<usize>> = vec![HashSet::default(); scc_count];
-        let mut indeg: Vec<usize> = vec![0usize; scc_count];
-
-        for (u, node) in self.nodes.iter().enumerate() {
-            let su = node_to_scc[u];
-            for &v in &node.deps {
-                let sv = node_to_scc[v];
-                if su == sv {
-                    continue;
-                }
-                if scc_adj[su].insert(sv) {
-                    indeg[sv] += 1;
-                }
-            }
-        }
-
-        let mut q: VecDeque<usize> = (0..scc_count).filter(|&s| indeg[s] == 0).collect();
-        let mut ordered: Vec<Vec<NodeIdx>> = Vec::with_capacity(scc_count);
-        while let Some(s) = q.pop_front() {
-            ordered.push(sccs[s].clone());
-            for &nbr in &scc_adj[s] {
-                indeg[nbr] -= 1;
-                if indeg[nbr] == 0 {
-                    q.push_back(nbr);
-                }
-            }
-        }
-        ordered
-    }
-
-    pub fn detect_circular_imports(&self) -> Vec<Vec<usize>> {
-        self.tarjan_scc()
-            .into_iter()
-            .filter_map(|scc| {
-                let module_indices: Vec<usize> = scc
-                    .iter()
-                    .filter_map(|&ni| {
-                        let node = self.nodes.get(ni)?;
-                        if let NodeKind::Module { module_idx } = node.kind {
-                            if scc.len() > 1 || node.deps.contains(&ni) {
-                                Some(module_idx)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if module_indices.is_empty() {
-                    None
-                } else {
-                    Some(module_indices)
-                }
-            })
-            .collect()
-    }
-
-    pub fn detect_recursive_cycles(&self) -> Vec<Vec<(usize, usize)>> {
-        self.tarjan_scc()
-            .into_iter()
-            .filter_map(|scc| {
-                let func_refs: Vec<(usize, usize)> = scc
-                    .iter()
-                    .filter_map(|&ni| {
-                        let node = self.nodes.get(ni)?;
-                        if let NodeKind::FuncBody {
-                            module_idx,
-                            item_idx,
-                        } = node.kind
-                        {
-                            if scc.len() > 1 || node.deps.contains(&ni) {
-                                Some((module_idx, item_idx))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if func_refs.is_empty() {
-                    None
-                } else {
-                    Some(func_refs)
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_compilation_order(&self) -> Vec<Vec<(usize, usize)>> {
-        self.scc_topo_order()
-            .iter()
-            .rev()
-            .filter_map(|scc| {
-                let refs: Vec<(usize, usize)> = scc
-                    .iter()
-                    .filter_map(|&ni| {
-                        let node = self.nodes.get(ni)?;
-                        if let NodeKind::FuncBody {
-                            module_idx,
-                            item_idx,
-                        } = node.kind
-                        {
-                            Some((module_idx, item_idx))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if refs.is_empty() { None } else { Some(refs) }
-            })
-            .collect()
-    }
-
-    pub fn get_module_compilation_order(&self) -> Vec<usize> {
-        let mut seen: HashSet<usize> = HashSet::default();
-        self.scc_topo_order()
-            .iter()
-            .rev()
-            .flat_map(|scc| scc.iter().copied())
-            .filter_map(|ni| {
-                let node = self.nodes.get(ni)?;
-                if let NodeKind::Module { module_idx } = node.kind {
-                    if seen.insert(module_idx) {
-                        Some(module_idx)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_function_callers(
-        &self,
-        target_module: usize,
-        target_item: usize,
-    ) -> Vec<(usize, usize)> {
-        let Some(target_node) = self.lookup_item_node(target_module, target_item, "func_body")
-        else {
-            return Vec::new();
-        };
-        let Some(node) = self.nodes.get(target_node) else {
-            return Vec::new();
-        };
-        node.rev_deps
-            .iter()
-            .filter_map(|&ri| {
-                let rn = self.nodes.get(ri)?;
-                if let NodeKind::FuncBody {
-                    module_idx,
-                    item_idx,
-                } = rn.kind
-                {
-                    Some((module_idx, item_idx))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn resolve_reexport(&self, module_idx: usize, name: StrId) -> Option<usize> {
-        let mut current = module_idx;
-        for _ in 0..MAX_REEXPORT_DEPTH {
-            if self.symbol_table.contains_key(&(name, current)) {
-                break;
-            }
-            let Some(path) = self.facade_exports.get(&(current, name)) else {
-                break;
-            };
-            match self.path_index.resolve(path) {
-                Some(next) if next != current => current = next,
-                _ => break,
-            }
-        }
-        (current != module_idx).then_some(current)
-    }
-
-    pub fn canonical_member_module(&self, module_idx: usize, name: StrId) -> usize {
-        self.resolve_reexport(module_idx, name)
-            .unwrap_or(module_idx)
-    }
-
-    fn lookup_symbol(
-        &self,
-        name: StrId,
-        module_idx: usize,
-    ) -> Option<(usize, usize, &'static str)> {
-        if let Some(&e) = self.symbol_table.get(&(name, module_idx)) {
-            return Some(e);
-        }
-        let real = self.resolve_reexport(module_idx, name)?;
-        self.symbol_table.get(&(name, real)).copied()
-    }
-
-    pub fn is_package_facade(&self, module_idx: usize) -> bool {
-        self.package_facades.contains(&module_idx)
-    }
-
-    pub fn get_function_callees(
-        &self,
-        caller_module: usize,
-        caller_item: usize,
-    ) -> Vec<(usize, usize)> {
-        let Some(caller_node) = self.lookup_item_node(caller_module, caller_item, "func_body")
-        else {
-            return Vec::new();
-        };
-        let Some(node) = self.nodes.get(caller_node) else {
-            return Vec::new();
-        };
-        node.deps
-            .iter()
-            .filter_map(|&di| {
-                let dn = self.nodes.get(di)?;
-                if let NodeKind::FuncBody {
-                    module_idx,
-                    item_idx,
-                } = dn.kind
-                {
-                    Some((module_idx, item_idx))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_function_type_deps(
-        &self,
-        module_idx: usize,
-        item_idx: usize,
-    ) -> Vec<(usize, usize)> {
-        let Some(sig_node) = self.lookup_item_node(module_idx, item_idx, "func_sig") else {
-            return Vec::new();
-        };
-        let Some(node) = self.nodes.get(sig_node) else {
-            return Vec::new();
-        };
-        node.deps
-            .iter()
-            .filter_map(|&di| {
-                let dn = self.nodes.get(di)?;
-                if let NodeKind::TypeDecl {
-                    module_idx: m,
-                    item_idx: i,
-                } = dn.kind
-                {
-                    Some((m, i))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn can_access(
-        &self,
-        from_module: usize,
-        target_module: usize,
-        _target_item_idx: usize,
-    ) -> bool {
-        from_module == target_module
-            || self
-                .get_module_imports(from_module)
-                .contains(&target_module)
-    }
-
-    pub fn debug_node(&self, node_idx: NodeIdx) -> String {
-        let node = &self.nodes[node_idx];
-        let kind_str = match &node.kind {
-            NodeKind::Module { module_idx } => format!("Module({})", module_idx),
-            NodeKind::TypeDecl {
-                module_idx,
-                item_idx,
-            } => {
-                format!("TypeDecl(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::FuncSig {
-                module_idx,
-                item_idx,
-            } => {
-                format!("FuncSig(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::FuncBody {
-                module_idx,
-                item_idx,
-            } => {
-                format!("FuncBody(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::ConstDecl {
-                module_idx,
-                item_idx,
-            } => {
-                format!("Const(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::TraitDecl {
-                module_idx,
-                item_idx,
-            } => {
-                format!("Trait(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::TraitImpl {
-                module_idx,
-                item_idx,
-            } => {
-                format!("Impl(m{}:i{})", module_idx, item_idx)
-            }
-            NodeKind::Method {
-                module_idx,
-                item_idx,
-                method_idx,
-            } => format!(
-                "Method(mo_idx{}:i{}:me_idx{})",
-                module_idx, item_idx, method_idx
-            ),
-        };
-        let hint_str = node.hint.unwrap_or_else(|| StrId::from_static("<no-hint>"));
-        format!(
-            "Node[{}] {} hint={} -> deps={:?}",
-            node.idx, kind_str, hint_str, node.deps
-        )
-    }
-
-    pub fn modules_in_same_scc(&self, module_idx: usize) -> Vec<usize> {
-        for scc in self.tarjan_scc() {
-            let modules: Vec<usize> = scc
-                .iter()
-                .filter_map(|&ni| match self.nodes.get(ni).map(|n| &n.kind) {
-                    Some(NodeKind::Module { module_idx: m }) => Some(*m),
-                    _ => None,
-                })
-                .collect();
-            if modules.contains(&module_idx) {
-                return modules;
-            }
-        }
-        vec![module_idx]
-    }
-
-    pub fn debug_dump_sccs(&self) {
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var_os("ZETA_DEBUG").is_none() {
-                return;
-            }
-            let sccs = self.tarjan_scc();
-            for (i, scc) in sccs.iter().enumerate() {
-                if scc.len() > 1 {
-                    eprintln!("[zeta-debug] SCC #{i} has {} nodes (CYCLE):", scc.len());
-                    for &ni in scc {
-                        if let Some(node) = self.nodes.get(ni) {
-                            let hint = node.hint.unwrap_or_else(|| StrId::from_static("<no-hint>"));
-                            eprintln!("[zeta-debug]   node[{}] {:?} hint={}", ni, node.kind, hint);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn debug_dump_module_order(&self, module_names: &HashMap<usize, String>) {
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var_os("ZETA_DEBUG").is_none() {
-                return;
-            }
-            for m in self.get_module_compilation_order() {
-                let name = module_names.get(&m).cloned().unwrap_or_default();
-                eprintln!("[zeta-debug] compile order: module {m} ({name})");
-            }
-        }
-    }
-
-    fn record_auto_import_eligibility<'a, 'bump>(
-        &mut self,
-        i: &ImplDecl<'a, 'bump>,
-        module_idx: usize,
-    ) {
-        let eligible = match &i.interface {
-            None => !self.target_declared_in_own_package(&i.target, module_idx),
-            Some(iface_ty) => {
-                let TypeKind::Struct {
-                    name: iface_name,
-                    path: iface_path,
-                    ..
-                } = iface_ty.kind
-                else {
-                    return;
-                };
-                let decl_module = if iface_path.is_empty() {
-                    self.lookup_symbol(iface_name, module_idx)
-                        .filter(|&(_, _, tag)| tag == "trait")
-                        .map(|(m, _, _)| m)
-                } else {
-                    self.path_index.resolve(iface_path)
-                };
-                decl_module.is_some_and(|dm| {
-                    self.package_segments.get(&dm) == self.package_segments.get(&module_idx)
-                })
-            }
-        };
-        if eligible {
-            self.auto_import_modules.insert(module_idx);
-        }
-    }
-
-    fn target_declared_in_own_package<'a, 'bump>(
-        &self,
-        target: &Type<'a, 'bump>,
-        module_idx: usize,
-    ) -> bool {
-        let TypeKind::Struct { name, path, .. } = target.kind else {
-            return false;
-        };
-        let decl_module = if path.is_empty() {
-            self.lookup_symbol(name, module_idx).map(|(m, _, _)| m)
-        } else {
-            self.path_index.resolve(path)
-        };
-        decl_module.is_some_and(|dm| {
-            self.package_segments.get(&dm) == self.package_segments.get(&module_idx)
-        })
-    }
-
-    pub fn auto_import_packages(&self) -> Vec<Vec<StrId>> {
-        self.auto_import_modules
-            .iter()
-            .filter_map(|&m| self.package_segments.get(&m).cloned())
-            .collect()
-    }
-}
-
-fn strongconnect(
-    v: NodeIdx,
-    index: &mut Vec<Option<usize>>,
-    lowlink: &mut Vec<usize>,
-    onstack: &mut Vec<bool>,
-    stack: &mut Vec<NodeIdx>,
-    counter: &mut usize,
-    nodes: &[DepNode],
-    sccs: &mut Vec<Vec<NodeIdx>>,
-) {
-    index[v] = Some(*counter);
-    lowlink[v] = *counter;
-    *counter += 1;
-    stack.push(v);
-    onstack[v] = true;
-
-    for &w in &nodes[v].deps {
-        if index[w].is_none() {
-            strongconnect(w, index, lowlink, onstack, stack, counter, nodes, sccs);
-            lowlink[v] = lowlink[v].min(lowlink[w]);
-        } else if onstack[w] {
-            lowlink[v] = lowlink[v].min(index[w].unwrap());
-        }
-    }
-
-    if lowlink[v] == index[v].unwrap() {
-        let mut component = Vec::new();
-        loop {
-            let w = stack.pop().expect("tarjan: stack underflow");
-            onstack[w] = false;
-            component.push(w);
-            if w == v {
-                break;
-            }
-        }
-        sccs.push(component);
-    }
-}
-
-fn path_to_strid<'a, 'bump>(path: &Path<'a, 'bump>, pool: &StringPool) -> StrId {
-    // e.g. ["zeta", "io", "files"] -> "zeta::io::files"
-    let joined = path.join("::");
-    StrId(pool.intern(&joined))
 }

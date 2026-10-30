@@ -49,7 +49,7 @@ where
 
     enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>>,
     struct_interfaces: HashMap<StrId, Vec<StrId>>,
-    pub dep_graph: &'a RefCell<DepGraph>,
+    pub dep_graph: &'a RefCell<DepGraph<'a>>,
     pub module_idx: usize,
     g_phantom_data: PhantomData<&'g ()>,
     glue_registry: DropGlueRegistry,
@@ -76,7 +76,7 @@ where
     pub fn new(
         context: Arc<StringPool>,
         extern_c_names: Rc<HashSet<StrId>>,
-        dep_graph: &'a RefCell<DepGraph>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
         glue_registry: DropGlueRegistry,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,

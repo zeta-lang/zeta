@@ -2,39 +2,36 @@ use ir::hir::StrId;
 use ir::ir_hasher::FxHashBuilder;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use zetaruntime::bump::GrowableBump;
 
 #[derive(Debug)]
-pub struct SymbolsSoA<'bump> {
-    pub names: Vec<StrId, GrowableBump<'bump>>,
-    pub kinds: Vec<StrId, GrowableBump<'bump>>,
+pub struct SymbolsSoA {
+    pub names: Vec<StrId>,
+    pub kinds: Vec<StrId>,
 }
 
-impl<'bump> SymbolsSoA<'bump> {
+impl SymbolsSoA {
     pub fn new() -> Self {
-        let bump = GrowableBump::new(8 * 1024, 8);
         Self {
-            names: Vec::new_in(bump.clone()),
-            kinds: Vec::new_in(bump),
+            names: Vec::new(),
+            kinds: Vec::new(),
         }
     }
 }
 
-pub struct ModulesSoA<'bump> {
-    pub names: Vec<StrId, GrowableBump<'bump>>,
-    pub paths: Vec<PathBuf, GrowableBump<'bump>>,
-    pub symbols: Vec<SymbolsSoA<'bump>, GrowableBump<'bump>>,
-    pub deps: Vec<HashSet<usize, FxHashBuilder>, GrowableBump<'bump>>,
+pub struct ModulesSoA {
+    pub names: Vec<StrId>,
+    pub paths: Vec<PathBuf>,
+    pub symbols: Vec<SymbolsSoA>,
+    pub deps: Vec<HashSet<usize, FxHashBuilder>>,
 }
 
-impl<'bump> ModulesSoA<'bump> {
+impl ModulesSoA {
     pub fn new() -> Self {
-        let bump = GrowableBump::new(8 * 1024, 8);
         Self {
-            names: Vec::new_in(bump.clone()),
-            paths: Vec::new_in(bump.clone()),
-            deps: Vec::new_in(bump.clone()),
-            symbols: Vec::new_in(bump),
+            names: Vec::new(),
+            paths: Vec::new(),
+            deps: Vec::new(),
+            symbols: Vec::new(),
         }
     }
 
@@ -43,7 +40,7 @@ impl<'bump> ModulesSoA<'bump> {
         name: StrId,
         path: PathBuf,
         deps: HashSet<usize, FxHashBuilder>,
-        symbols: SymbolsSoA<'bump>,
+        symbols: SymbolsSoA,
     ) -> usize {
         let idx = self.names.len();
         self.names.push(name);

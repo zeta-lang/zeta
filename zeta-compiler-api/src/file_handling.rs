@@ -172,7 +172,7 @@ pub(crate) fn emit_all<'a, 'bump>(
     compilation_order: &[usize],
     pool: Arc<StringPool>,
     extern_c_names: Rc<HashSet<StrId>>,
-    dep_graph: &'a RefCell<DepGraph>,
+    dep_graph: &'a RefCell<DepGraph<'a>>,
     registry: GlobalRegistry<'a, 'bump>,
     optimize: bool,
     verbose: bool,
