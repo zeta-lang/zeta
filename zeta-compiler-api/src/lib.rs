@@ -137,9 +137,9 @@ pub struct Compiler<'a, 'bump> {
     registry: GlobalRegistry<'a, 'bump>,
     auto_imports: Rc<RefCell<AutoImportRegistry>>,
 
-    dep_graph: &'a RefCell<DepGraph>,
+    dep_graph: &'a RefCell<DepGraph<'a>>,
     #[allow(unused)] // Avoids a UB
-    dep_graph_storage: Box<RefCell<DepGraph>>,
+    dep_graph_storage: Box<RefCell<DepGraph<'a>>>,
     type_checker: Rc<RefCell<TypeChecker<'a, 'bump>>>,
     cpy_ctx: Rc<RefCell<CopyAnalysisCtx<'a, 'bump>>>,
 
@@ -236,7 +236,7 @@ where
         self.dce_enabled = enabled;
     }
 
-    pub fn dep_graph(&self) -> &'a RefCell<DepGraph> {
+    pub fn dep_graph(&self) -> &'a RefCell<DepGraph<'a>> {
         self.dep_graph
     }
 
@@ -267,7 +267,7 @@ where
         self.type_checker.clone()
     }
 
-    pub fn dep_graph_ref(&self) -> &'a RefCell<DepGraph> {
+    pub fn dep_graph_ref(&self) -> &'a RefCell<DepGraph<'a>> {
         self.dep_graph
     }
 
@@ -863,27 +863,6 @@ where
                         .collect::<Vec<_>>()
                         .join("\n  "),
                 ),
-            });
-        }
-
-        let mismatches = self
-            .dep_graph
-            .borrow()
-            .check_package_paths(&self.source_roots);
-        if !mismatches.is_empty() {
-            return Err(BuildError::CompilationAborted {
-                reason: mismatches
-                    .iter()
-                    .map(|m| m.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            });
-        }
-
-        let unresolved = self.dep_graph.borrow().unresolved_import_messages();
-        if !unresolved.is_empty() {
-            return Err(BuildError::CompilationAborted {
-                reason: unresolved.join("\n"),
             });
         }
 
