@@ -2,7 +2,6 @@ use ir::hir::StrId;
 use ir::ir_hasher::FxHashBuilder;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use zetaruntime::bump::GrowableBump;
 
 #[derive(Debug)]
 pub struct SymbolsSoA {

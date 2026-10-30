@@ -29,13 +29,13 @@ pub trait AllocatorResolver {
     }
 }
 
-pub struct FnAllocatorResolver<'r> {
+pub struct FnAllocatorResolver<'a, 'r> {
     pub var_map: &'r HashMap<StrId, Value>,
     pub context: Arc<StringPool>,
-    pub dep_graph: &'r RefCell<DepGraph>,
+    pub dep_graph: &'r RefCell<DepGraph<'a>>,
 }
 
-impl<'r> AllocatorResolver for FnAllocatorResolver<'r> {
+impl<'a, 'r> AllocatorResolver for FnAllocatorResolver<'a, 'r> {
     fn resolve_root(&mut self, root: &hir::ProvenanceRoot) -> Value {
         match root {
             hir::ProvenanceRoot::Var(name) => *self.var_map.get(name).unwrap_or_else(|| {
