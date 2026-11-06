@@ -462,7 +462,7 @@ pub struct Globals<'a, 'bump> {
             &'bump [(StrId, &'bump [HirType<'a, 'bump>])],
         )>,
     >,
-    pub dep_graph: &'a RefCell<DepGraph>,
+    pub dep_graph: &'a RefCell<DepGraph<'a>>,
     pub bump: &'bump GrowableBump<'bump>,
     pub string_pool: Arc<StringPool>,
 }
@@ -487,14 +487,14 @@ pub struct GlobalsBuilder<'a, 'bump> {
             &'bump [(StrId, &'bump [HirType<'a, 'bump>])],
         )>,
     >,
-    pub dep_graph: &'a RefCell<DepGraph>,
+    pub dep_graph: &'a RefCell<DepGraph<'a>>,
     pub bump: &'bump GrowableBump<'bump>,
     pub string_pool: Arc<StringPool>,
 }
 
 impl<'a, 'bump> GlobalsBuilder<'a, 'bump> {
     pub fn new(
-        dep_graph: &'a RefCell<DepGraph>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
         bump: &'bump GrowableBump<'bump>,
         string_pool: Arc<StringPool>,
     ) -> Self {
@@ -609,7 +609,7 @@ impl<'a, 'bump> GlobalsBuilder<'a, 'bump> {
 
 impl<'a, 'bump> Globals<'a, 'bump> {
     pub fn new(
-        dep_graph: &'a RefCell<DepGraph>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
         bump: &'bump GrowableBump<'bump>,
         string_pool: Arc<StringPool>,
     ) -> Self {
@@ -797,7 +797,7 @@ impl<'a, 'bump> std::ops::Deref for TypeContext<'a, 'bump> {
 
 impl<'a, 'bump> TypeContext<'a, 'bump> {
     pub fn new(
-        dep_graph: &'a RefCell<DepGraph>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
         bump: &'bump GrowableBump<'bump>,
         string_pool: Arc<StringPool>,
     ) -> Self {

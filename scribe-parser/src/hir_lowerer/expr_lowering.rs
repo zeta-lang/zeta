@@ -58,7 +58,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             return None;
         }
         let dg = self.ctx.dep_graph.borrow();
-        // Same order as resolve_type_path_name: alias first, then full path.
         let module_idx = self
             .ctx
             .imported_modules

@@ -1,4 +1,3 @@
-#![feature(allocator_api)]
 extern crate core;
 
 pub mod hir_lowerer;

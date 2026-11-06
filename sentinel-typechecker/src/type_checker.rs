@@ -299,7 +299,7 @@ pub struct TypeChecker<'a, 'bump> {
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn new(
-        dep_graph: &'a RefCell<DepGraph>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
         bump: &'bump GrowableBump<'bump>,
         copy_analysis: Rc<RefCell<CopyAnalysisCtx<'a, 'bump>>>,
         string_pool: Arc<StringPool>,
@@ -2545,7 +2545,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.borrow_checker
             .kill_facts_where(&|s| names.contains(&s));
         for &n in &names {
-            self.kill_facts_about(n); // whatever else the checker tracks per variable
+            self.kill_facts_about(n);
         }
     }
 }

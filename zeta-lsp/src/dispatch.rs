@@ -1192,7 +1192,7 @@ pub fn format_enum_signature(e: &HirEnum) -> String {
     let mut sig = String::new();
     sig.push_str(visibility_prefix(e.visibility));
     sig.push_str("enum ");
-    sig.push_str(e.name.as_str());
+    sig.push_str(e.unmangled_name.as_str());
     if let Some(generics) = e.generics {
         if !generics.is_empty() {
             sig.push('<');
@@ -1226,7 +1226,7 @@ pub fn format_interface_signature(i: &HirInterface) -> String {
     let mut sig = String::new();
     sig.push_str(visibility_prefix(i.visibility));
     sig.push_str("interface ");
-    sig.push_str(i.name.as_str());
+    sig.push_str(i.unmangled_name.as_str());
     if let Some(generics) = i.generics {
         if !generics.is_empty() {
             sig.push('<');
@@ -1966,8 +1966,6 @@ const PRIMITIVES: &[&str] = &[
     "f64", "bool", "char", "str", "void",
 ];
 
-/// Drop cached completion candidates for the module at `path` (and, for open/close, the module
-/// count). Called *before* the compiler call so the borrows stay disjoint.
 fn invalidate_completions<'a, 'bump>(
     compiler: &zeta_compiler_api::Compiler<'a, 'bump>,
     cache: &mut crate::state::CompletionCache,
@@ -2004,7 +2002,6 @@ pub fn completions_at<'a, 'bump>(
     let cursor = byte_offset_from_utf16(line_text, position.character);
     let before = &line_text[..cursor];
 
-    // not inside a comment or string literal
     if let Some(i) = before.find("//") {
         if before[..i].matches('"').count() % 2 == 0 {
             return vec![];
@@ -2063,7 +2060,6 @@ fn split_typed(before: &str) -> (&str, &str) {
     (&before[..i], &before[i..])
 }
 
-/// `a.b.c` -> ["a", "b", "c"]; None if the receiver is anything else (call, index, ...).
 fn receiver_chain(base: &str) -> Option<Vec<&str>> {
     let mut segs = Vec::new();
     let mut rest = base;
@@ -2082,8 +2078,6 @@ fn receiver_chain(base: &str) -> Option<Vec<&str>> {
     segs.reverse();
     Some(segs)
 }
-
-// ---------- item builders ----------
 
 fn mk(label: &str, kind: K, detail: Option<String>, sort: &str) -> CompletionItem {
     CompletionItem {
@@ -2409,8 +2403,6 @@ fn import_completions<'a, 'bump>(
     }
     Some(items)
 }
-
-// ---------- member access ----------
 
 enum Recv<'a, 'bump> {
     Value(HirType<'a, 'bump>),
@@ -2744,8 +2736,6 @@ fn static_items<'a, 'bump>(
     method_items(ctx, key, false, from, &mut items, &mut seen);
     items
 }
-
-// ---------- struct literal fields ----------
 
 fn struct_init_items<'a, 'bump>(
     state: &ServerState<'a, 'bump>,
