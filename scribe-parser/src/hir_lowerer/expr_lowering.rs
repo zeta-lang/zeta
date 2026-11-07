@@ -723,6 +723,15 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 span: *span,
                 ty: HirType::unknown(*span),
             },
+            Expr::ComptimeBlock(block) => {
+                let HirStmt::Block { body, span: _ } = self.lower_block(block) else {
+                    unreachable!()
+                };
+                HirExpr::ComptimeBlock {
+                    body,
+                    span: block.span,
+                }
+            }
             Expr::Block(block) => {
                 let HirStmt::Block { body, span: _ } = self.lower_block(block) else {
                     unreachable!()

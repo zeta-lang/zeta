@@ -958,17 +958,17 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
     pub fn check_block_expr(
         &mut self,
-        body: &&[HirStmt<'a, 'bump>],
-        is_unsafe: &bool,
+        body: &[HirStmt<'a, 'bump>],
+        is_unsafe: bool,
     ) -> HirType<'a, 'bump> {
-        if *is_unsafe {
+        if is_unsafe {
             self.unsafe_depth += 1;
         }
 
         self.borrow_checker.begin_scope();
         let mut block_context = self.context.create_child_scope();
         let mut value = HirType::synthetic(HirTypeKind::Void);
-        for stmt in *body {
+        for stmt in body {
             std::mem::swap(&mut self.context, &mut block_context);
             value = self
                 .check_stmt(stmt)
@@ -977,7 +977,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
         self.borrow_checker.end_scope();
 
-        if *is_unsafe {
+        if is_unsafe {
             self.unsafe_depth -= 1;
         }
         value
@@ -2038,7 +2038,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         // The else body only runs when the value is null.
         let before = self.move_state.clone();
-        let else_ty = self.check_block_expr(&else_body, &false);
+        let else_ty = self.check_block_expr(&else_body, false);
 
         if else_ty.kind == HirTypeKind::Never {
             // Diverges (return/break/panic): that path never reaches the code after us.

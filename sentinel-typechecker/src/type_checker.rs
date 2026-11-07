@@ -2059,7 +2059,14 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 span,
             } => {
                 self.set_span(*span);
-                self.check_block_expr(body, is_unsafe)
+                self.check_block_expr(body, *is_unsafe)
+            }
+
+            HirExpr::ComptimeBlock { body, span } => {
+                self.set_span(*span);
+
+                // TODO: comptime: add real comptime
+                self.check_block_expr(body, false)
             }
 
             HirExpr::Range {

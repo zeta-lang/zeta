@@ -1074,6 +1074,10 @@ where
         is_unsafe: bool,
         span: SourceSpan<'a>,
     },
+    ComptimeBlock {
+        body: &'bump [HirStmt<'a, 'bump>],
+        span: SourceSpan<'a>,
+    },
     Range {
         start: &'bump HirExpr<'a, 'bump>,
         end: &'bump HirExpr<'a, 'bump>,
@@ -1121,6 +1125,7 @@ where
             | Self::Match { span, .. }
             | Self::Block { span, .. }
             | Self::Range { span, .. }
+            | Self::ComptimeBlock { span, .. }
             | Self::Slice { span, .. } => *span,
 
             Self::Null(span)

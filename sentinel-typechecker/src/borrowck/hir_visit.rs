@@ -39,6 +39,11 @@ where
                 v.visit_stmt(s);
             }
         }
+        HirExpr::ComptimeBlock { body, .. } => {
+            for s in body.iter() {
+                v.visit_stmt(s);
+            }
+        }
         HirExpr::Range { start, end, .. } => {
             v.visit_expr(start);
             v.visit_expr(end);

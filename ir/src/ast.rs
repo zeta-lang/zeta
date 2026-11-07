@@ -707,6 +707,7 @@ where
     },
     Block(&'bump Block<'a, 'bump>),
     UnsafeBlock(&'bump UnsafeBlock<'a, 'bump>),
+    ComptimeBlock(&'bump Block<'a, 'bump>),
 }
 
 /// A closure/anonymous-function parameter. Unlike `NormalParam`, the type

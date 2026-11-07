@@ -430,6 +430,13 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 }
                 bound.truncate(m);
             }
+            HirExpr::ComptimeBlock { body, .. } => {
+                let m = bound.len();
+                for s in body.iter() {
+                    self.fv_stmt(s, bound, out);
+                }
+                bound.truncate(m);
+            }
             HirExpr::Lambda { params, body, .. } => {
                 let m = bound.len();
                 bound.extend(params.iter().map(|p| p.name));
