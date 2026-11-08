@@ -2,6 +2,7 @@ use crate::{
     ast::{self, MutabilityState},
     hir::{HirFunc, HirParam, HirType, HirTypeKind, Operator, RefKind, StrId},
 };
+use ir::hir::JoinStr;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use zetaruntime::{
@@ -223,6 +224,30 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             let tag = if inclusive { "rangeincl" } else { "range" };
             intern_fmt!(pool, "{}_{}", tag, elem_suf)
         }
+        HirTypeKind::AnonStruct { fields } => {
+            intern_fmt!(
+                pool,
+                "anon_struct_{}",
+                fields
+                    .iter()
+                    .map(|t| type_suffix_with_pool(pool.clone(), &t.field_type))
+                    .collect::<Vec<StrId>>()
+                    .join("_")
+            )
+        }
+        HirTypeKind::AnonEnum { variants } => {
+            intern_fmt!(
+                pool,
+                "anon_enum_{}",
+                variants
+                    .iter()
+                    .flat_map(|v| v.fields)
+                    .map(|t| type_suffix_with_pool(pool.clone(), &t.field_type))
+                    .collect::<Vec<StrId>>()
+                    .join("_")
+            )
+        }
+        HirTypeKind::Type => todo!(),
     })
 }
 

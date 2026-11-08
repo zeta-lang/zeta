@@ -183,6 +183,9 @@ pub fn type_to_string(ty: &HirType, pool: &StringPool) -> StrId {
             type_to_string(elem, pool),
             if inclusive { " (inclusive)" } else { "" }
         )),
+        HirTypeKind::AnonStruct { fields } => todo!(),
+        HirTypeKind::AnonEnum { variants } => todo!(),
+        HirTypeKind::Type => todo!(),
     }
 }
 

@@ -717,6 +717,14 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             HirTypeKind::OwnedPointer { .. } => false,
             HirTypeKind::Usize => true,
             HirTypeKind::Isize => true,
+            HirTypeKind::AnonStruct { fields } => {
+                fields.iter().all(|f| self.type_is_copy(&f.field_type))
+            }
+            HirTypeKind::AnonEnum { variants } => variants
+                .iter()
+                .flat_map(|v| v.fields)
+                .all(|f| self.type_is_copy(&f.field_type)),
+            HirTypeKind::Type => false, // unknown
         }
     }
 

@@ -9,8 +9,10 @@ use std::{
 
 use ir::{
     ast::{
-        self, AstExecutionMode, ConstStmt, EnumDecl, Expr, FuncDecl, ImplDecl, InterfaceDecl,
-        LetStmt, Stmt, StructDecl, Type, TypeKind,
+        self, AstExecutionMode, Block, ConstStmt, DeferAction, ElseBranch, EnumDecl,
+        ErrorHandlerPattern, Expr, ExternModifier, ForKind, FuncDecl, IfStmt, ImplDecl,
+        InterfaceDecl, LetStmt, MatchStmt, Pattern, PatternKind, Stmt, StructDecl, Type,
+        TypeAliasDecl, TypeKind,
     },
     hir::{StrId, Visibility},
     ir_hasher::{FpHasher, HashCtx, StableHash},
@@ -23,8 +25,8 @@ use crate::{
     dep_graph::AstModule,
     nodes::{
         BodyRule, EdgeKind, ExecutionMode, Fingerprint, ImplFacts, ImportFacts, ItemFacts, ItemIdx,
-        ItemKey, ItemRole, ModuleFacts, ModuleIdx, PackageFacts, ParamHow, ParamUse, RefFacts,
-        RefTarget, ScanDiag, ScanKey, SymbolKind, ViaArg,
+        ItemKey, ItemRole, ModuleFacts, ModuleId, ModuleIdx, PackageFacts, ParamHow, ParamUse,
+        RefFacts, RefTarget, ResolvedItem, ScanDiag, ScanKey, SymbolKind, SymbolName, ViaArg,
     },
 };
 
@@ -32,6 +34,13 @@ const TAG_PACKAGE: u8 = 1;
 const TAG_IMPORTS: u8 = 2;
 const TAG_ITEMS: u8 = 3;
 const TAG_COMPTIME_BODY: u8 = 4;
+
+const VALUE_KINDS: [SymbolKind; 4] = [
+    SymbolKind::Const,
+    SymbolKind::Static,
+    SymbolKind::Function,
+    SymbolKind::Type,
+];
 
 pub struct Scanner<'p, 'a, 'bump> {
     pool: &'p StringPool,
@@ -45,6 +54,9 @@ pub struct Scanner<'p, 'a, 'bump> {
     iface_digests: Vec<u128>,
     body_digests: Vec<u128>,
     cur: Option<ScanKey>,
+    /// `(cur, param_uses)` of the enclosing items,
+    /// so items nested in an `impl`/`interface` don't clobber the outer item's state.
+    frames: Vec<(Option<ScanKey>, Vec<ParamUse>)>,
     scopes: Vec<BTreeSet<StrId>>,
     self_type: Option<StrId>,
     next_item: usize,
@@ -81,6 +93,7 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
             body_digests: Vec::new(),
             ordinals: BTreeMap::new(),
             cur: None,
+            frames: Vec::new(),
             scopes: Vec::new(),
             self_type: None,
             via_stack: Vec::new(),
@@ -106,8 +119,28 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
             },
             ordinal,
         };
+        self.frames
+            .push((self.cur, std::mem::take(&mut self.param_uses)));
         self.cur = Some(key);
         key
+    }
+
+    /// Undoes `begin_item` for an item that is dropped without being recorded.
+    fn abort_item(&mut self, key: ScanKey) {
+        debug_assert_eq!(self.cur, Some(key), "abort_item out of order");
+        debug_assert_eq!(
+            key.item_key.item.0 + 1,
+            self.next_item,
+            "can only abort the most recently started item"
+        );
+        self.next_item -= 1;
+        if let Some(n) = self.ordinals.get_mut(&(key.name, key.item_key.role)) {
+            *n = n.saturating_sub(1);
+        }
+        let (prev_cur, prev_uses) = self.frames.pop().expect("abort_item without begin_item");
+        self.cur = prev_cur;
+        self.param_uses = prev_uses;
+        self.via_stack.clear();
     }
 
     fn emit(&mut self, target: RefTarget, kind: EdgeKind, span: SourceSpan<'a>) {
@@ -180,7 +213,8 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
             self.via_stack.is_empty(),
             "unbalanced generic-argument stack"
         );
-        let param_uses = std::mem::take(&mut self.param_uses);
+        let (prev_cur, prev_uses) = self.frames.pop().expect("finish_item without begin_item");
+        let param_uses = std::mem::replace(&mut self.param_uses, prev_uses);
 
         self.items.push(ItemFacts {
             key,
@@ -192,8 +226,8 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
             param_uses,
         });
 
-        let popped = self.cur.take();
-        debug_assert_eq!(popped, Some(key), "finish_item out of order");
+        debug_assert_eq!(self.cur, Some(key), "finish_item out of order");
+        self.cur = prev_cur;
     }
 
     fn digest(&self, key: ScanKey, fp: Fingerprint) -> u128 {
@@ -217,14 +251,6 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
 
     fn scan_stmt(&mut self, stmt: &Stmt<'a, 'bump>, body_rule: BodyRule) {
         match stmt {
-            Stmt::Import(s) => {
-                self.scan_import_stmt(s);
-            }
-
-            Stmt::Package(s) => {
-                self.scan_package_stmt(s);
-            }
-
             Stmt::Return(_)
             | Stmt::If(_)
             | Stmt::While(_)
@@ -254,30 +280,61 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
             Stmt::ImplDecl(i) => self.scan_impl_decl(i),
             Stmt::EnumDecl(e) => self.scan_enum_decl(e),
             Stmt::Module(m) => self.scan_top(m.body),
-            Stmt::TypeAliasDecl(_) => self.unsupported(stmt, "type alias declaration"),
+            Stmt::TypeAliasDecl(a) => self.scan_type_alias_decl(a),
             Stmt::Attributed(stmt) => self.scan_stmt(&stmt.inner, body_rule),
             Stmt::Let(l) => self.scan_static_decl(l),
+            Stmt::Import(s) => self.scan_import_stmt(s),
+            Stmt::Package(s) => self.scan_package_stmt(s),
         }
     }
 
     fn scan_const_decl(&mut self, c: &ConstStmt<'a, 'bump>) {
         let key = self.begin_item(c.ident, ItemRole::Const);
+        let depth = if let Some(generics) = c.generics {
+            self.enter_generics(generics.iter().map(|g| g.type_name))
+        } else {
+            0
+        };
 
         let mut ih = FpHasher::new();
         c.stable_hash(&self.cx, &mut ih);
 
-        if let Some(ty) = &c.type_annotation {
-            self.walk_type(ty);
-        }
+        self.walk_type(&c.type_annotation);
 
-        // `const A: usize = B * 2` gives A -> B
-        self.walk_expr(&c.value, EdgeKind::ConstEval);
+        // `A :: B * 2` gives A -> B
+        self.walk_expr(c.value, EdgeKind::ConstEval);
 
+        self.exit_generics(depth);
         self.finish_item(
             key,
             c.visibility,
             ExecutionMode::Comptime,
             c.span,
+            ih,
+            FpHasher::new(),
+        );
+    }
+
+    fn scan_type_alias_decl(&mut self, a: &TypeAliasDecl<'a, 'bump>) {
+        let key = self.begin_item(a.name, ItemRole::Type);
+        let depth = if let Some(generics) = a.generics {
+            self.enter_generics(generics.iter().map(|g| g.type_name))
+        } else {
+            0
+        };
+
+        let mut ih = FpHasher::new();
+        a.stable_hash(&self.cx, &mut ih);
+
+        // The alias *is* its target, so the target is referenced by value.
+        self.walk_type(&a.ty);
+
+        self.exit_generics(depth);
+        self.finish_item(
+            key,
+            a.visibility,
+            ExecutionMode::Runtime,
+            a.span,
             ih,
             FpHasher::new(),
         );
@@ -297,8 +354,16 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
         self.finish_item(key, l.visibility, ExecutionMode::Runtime, l.span, ih, bh);
     }
 
+    fn impl_item_name(&self, target: &Type<'a, 'bump>) -> StrId {
+        match target.kind {
+            TypeKind::Struct { name, .. } => name,
+            _ => StrId(self.pool.intern("<impl>")),
+        }
+    }
+
     fn scan_impl_decl(&mut self, i: &ImplDecl<'a, 'bump>) {
-        let key = self.begin_item(i.target, ItemRole::Type);
+        let name = self.impl_item_name(&i.target);
+        let key = self.begin_item(name, ItemRole::Impl);
         let depth = if let Some(generics) = i.generics {
             self.enter_generics(generics.iter().map(|g| g.type_name))
         } else {
@@ -307,6 +372,11 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
 
         let mut ih = FpHasher::new();
         i.stable_hash(&self.cx, &mut ih);
+
+        self.walk_indirectly_referenced_type(&i.target);
+        if let Some(interface) = &i.interface {
+            self.walk_indirectly_referenced_type(interface);
+        }
 
         if let Some(methods) = i.methods {
             for method in methods {
@@ -323,11 +393,18 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
         self.exit_generics(depth);
 
         let bh = FpHasher::new();
-        self.finish_item(key, i.visibility, ExecutionMode::Runtime, i.span, ih, bh);
+        self.finish_item(
+            key,
+            Visibility::Public,
+            ExecutionMode::Runtime,
+            i.span,
+            ih,
+            bh,
+        );
     }
 
     fn scan_interface_decl(&mut self, i: &InterfaceDecl<'a, 'bump>) {
-        let key = self.begin_item(i.name, ItemRole::Type);
+        let key = self.begin_item(i.name, ItemRole::Interface);
         let depth = if let Some(generics) = i.generics {
             self.enter_generics(generics.iter().map(|g| g.type_name))
         } else {
@@ -419,11 +496,16 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
 
         if let Some(fields) = s.params {
             for field in fields.iter() {
-                let ast::Param::Normal(field) = *field else {
-                    unreachable!()
-                };
-
-                self.walk_type(&field.type_annotation);
+                match *field {
+                    ast::Param::Normal(field) => {
+                        self.walk_type(&field.type_annotation);
+                    }
+                    ast::Param::This(this_param) => {
+                        self.diags.push(ScanDiag::StructFieldsContainsThis {
+                            span: this_param.span,
+                        })
+                    }
+                }
             }
         }
 
@@ -449,32 +531,35 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
         let mut ih = FpHasher::new();
         f.stable_hash_signature(&self.cx, &mut ih);
 
-        let mut bh = if let Some(body) = f.body
-            && !body.block.is_empty()
-        {
-            if exec_mode == ExecutionMode::Comptime {
-                ih.u8(TAG_COMPTIME_BODY);
-                f.stable_hash_body(&self.cx, &mut ih);
-            }
+        let is_extern = !matches!(meta.extern_modifier, ExternModifier::None);
 
-            let mut bh = FpHasher::new();
-            f.stable_hash_body(&self.cx, &mut bh);
-            bh
-        } else if let BodyRule::Required = body_rule {
-            self.diags
-                .push(ScanDiag::RequiredBodyAbsent { span: f.name_span });
-            self.exit_generics(depth);
-            return;
-        } else {
-            FpHasher::new()
+        let bh = match f.body {
+            Some(body) => {
+                if exec_mode == ExecutionMode::Comptime {
+                    ih.u8(TAG_COMPTIME_BODY);
+                    f.stable_hash_body(&self.cx, &mut ih);
+                }
+
+                let mut bh = FpHasher::new();
+                f.stable_hash_body(&self.cx, &mut bh);
+                bh
+            }
+            None if matches!(body_rule, BodyRule::Required) && !is_extern => {
+                self.diags
+                    .push(ScanDiag::RequiredBodyAbsent { span: f.name_span });
+                self.exit_generics(depth);
+                self.abort_item(key);
+                return;
+            }
+            None => FpHasher::new(),
         };
 
         if let Some(params) = f.params {
             for param in params.iter() {
-                let ast::Param::Normal(param) = *param else {
-                    unreachable!()
-                };
-                self.walk_type(&param.type_annotation);
+                // `this` receivers name the enclosing type, there is nothing to walk there
+                if let ast::Param::Normal(param) = *param {
+                    self.walk_type(&param.type_annotation);
+                }
             }
         }
 
@@ -522,7 +607,7 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
 
             TypeKind::Array { inner, length } => {
                 self.walk_type(inner);
-                self.walk_expr(length, EdgeKind::ConstEval); // fn f() -> [u8; N]  gives  f -> N
+                self.walk_expr(length, EdgeKind::ConstEval); // `f :: func(): [N]u8` gives f -> N
             }
 
             TypeKind::Tuple { values } => {
@@ -588,9 +673,18 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
                 self.diags.push(ScanDiag::ByValueDyn { span });
             }
 
+            // An anonymous struct/enum holds its fields by value
             TypeKind::AnonStruct { fields } => {
                 for field in fields.iter() {
-                    self.walk_indirectly_referenced_type(&field.field_type);
+                    self.walk_type(&field.field_type);
+                }
+            }
+
+            TypeKind::AnonEnum { variants } => {
+                for variant in variants.iter() {
+                    for field in variant.fields.iter() {
+                        self.walk_type(&field.field_type);
+                    }
                 }
             }
 
@@ -691,105 +785,431 @@ impl<'p, 'a, 'bump> Scanner<'p, 'a, 'bump> {
                     self.walk_indirectly_referenced_type(&field.field_type);
                 }
             }
+            TypeKind::AnonEnum { variants } => {
+                for variant in variants.iter() {
+                    for field in variant.fields.iter() {
+                        self.walk_indirectly_referenced_type(&field.field_type);
+                    }
+                }
+            }
             TypeKind::Type => {}
         }
     }
 
-    fn walk_expr(&self, expr: &Expr<'a, 'bump>, edge_kind: EdgeKind) {
+    fn push_scope(&mut self) {
+        self.scopes.push(BTreeSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare_local(&mut self, name: StrId) {
+        if self.scopes.is_empty() {
+            self.push_scope();
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name);
+        }
+    }
+
+    fn is_local(&self, name: StrId) -> bool {
+        self.scopes.iter().any(|s| s.contains(&name))
+    }
+
+    /// The target of an unqualified value name (`B` in `A :: B * 2`).
+    fn value_target(&self, name: StrId) -> RefTarget {
+        RefTarget::ValueName(name)
+    }
+
+    fn walk_name(&mut self, name: StrId, span: SourceSpan<'a>, edge_kind: EdgeKind) {
+        if self.is_local(name) {
+            return;
+        }
+        // a const generic parameter, `N` in `Buf<N> :: [N]u8`
+        if let Some(p) = self.param_index(name, &[], 0) {
+            self.record_param_use(p);
+            return;
+        }
+        let target = self.value_target(name);
+        self.emit(target, edge_kind, span);
+    }
+
+    fn walk_expr(&mut self, expr: &Expr<'a, 'bump>, edge_kind: EdgeKind) {
         match expr {
-            Expr::OrElse {
-                value,
-                else_block,
-                span,
-            } => todo!(),
-            Expr::Attributed { attrs, expr, span } => todo!(),
-            Expr::Intrinsic {
-                name,
-                generic_args,
-                arguments,
-                span,
-            } => todo!(),
-            Expr::Null { span } => todo!(),
-            Expr::Cast {
-                expr,
-                target_type,
-                span,
-            } => todo!(),
-            Expr::Number { value, span } => todo!(),
-            Expr::Decimal { value, span } => todo!(),
-            Expr::String { value, span } => todo!(),
-            Expr::Ident { name, span } => todo!(),
+            Expr::Null { .. }
+            | Expr::Number { .. }
+            | Expr::Decimal { .. }
+            | Expr::String { .. }
+            | Expr::Char { .. }
+            | Expr::Boolean { .. }
+            | Expr::This { .. }
+            | Expr::Undefined { .. }
+            | Expr::Uninit { .. } => {}
+
+            Expr::Ident { name, span } => self.walk_name(*name, *span, edge_kind),
+
+            // `Y<Z>`: a generic function or a type, either way `Y` is referenced and `Z` is a type.
             Expr::GenericIdent {
                 name,
                 generic_args,
                 span,
-            } => todo!(),
-            Expr::Boolean { value, span } => todo!(),
-            Expr::Comparison { lhs, op, rhs, span } => todo!(),
-            Expr::StructInit {
-                callee,
-                arguments,
-                type_args,
-                span,
-            } => todo!(),
-            Expr::FieldAccess {
-                object,
-                field,
-                span,
-            } => todo!(),
-            Expr::Binary {
-                left,
-                op,
-                right,
-                span,
-            } => todo!(),
-            Expr::Call {
-                callee,
-                generic_args,
-                arguments,
-                span,
-            } => todo!(),
-            Expr::Get {
-                object,
-                field,
-                span,
-            } => todo!(),
-            Expr::If { if_stmt, span } => todo!(),
-            Expr::Match { match_stmt, span } => todo!(),
-            Expr::Assignment { lhs, op, rhs, span } => todo!(),
-            Expr::ExprList { expressions, span } => todo!(),
-            Expr::Char { value, span } => todo!(),
-            Expr::Unary { op, operand, span } => todo!(),
-            Expr::ArrayIndex { expr, index, span } => todo!(),
-            Expr::Deref { expr, span } => todo!(),
-            Expr::This { span } => todo!(),
-            Expr::Ref {
-                expr,
-                ref_kind,
-                span,
-            } => todo!(),
-            Expr::Lambda {
-                is_move,
-                modifiers,
-                params,
-                return_type,
-                ensures,
-                body,
-                span,
-            } => todo!(),
-            Expr::Tuple { values, span } => todo!(),
-            Expr::ModulePath { segments, span } => todo!(),
+            } => {
+                self.walk_name(*name, *span, edge_kind);
+                for g in generic_args.iter() {
+                    self.walk_type(g);
+                }
+            }
+
+            Expr::ModulePath { segments, span } => {
+                self.emit(RefTarget::Path(segments.to_vec()), edge_kind, *span);
+            }
+
             Expr::ModuleAccess {
                 segments,
                 member,
                 span,
-            } => todo!(),
-            Expr::ArrayLiteral { elements, span } => todo!(),
-            Expr::Undefined { span } => todo!(),
-            Expr::Uninit { span } => todo!(),
-            Expr::Block(block) => todo!(),
-            Expr::UnsafeBlock(unsafe_block) => todo!(),
-            Expr::ComptimeBlock(block) => todo!(),
+            } => {
+                let mut path = segments.to_vec();
+                path.push(*member);
+                self.emit(RefTarget::Path(path), edge_kind, *span);
+            }
+
+            Expr::Intrinsic {
+                generic_args,
+                arguments,
+                ..
+            } => {
+                for g in generic_args.iter() {
+                    self.walk_type(g);
+                }
+                for a in arguments.iter() {
+                    self.walk_expr(a, edge_kind);
+                }
+            }
+
+            Expr::Cast {
+                expr: inner,
+                target_type,
+                ..
+            } => {
+                self.walk_expr(inner, edge_kind);
+                self.walk_type(target_type);
+            }
+
+            Expr::Comparison { lhs, rhs, .. } | Expr::Assignment { lhs, rhs, .. } => {
+                self.walk_expr(lhs, edge_kind);
+                self.walk_expr(rhs, edge_kind);
+            }
+            Expr::Binary { left, right, .. } => {
+                self.walk_expr(left, edge_kind);
+                self.walk_expr(right, edge_kind);
+            }
+            Expr::Unary { operand, .. } => self.walk_expr(operand, edge_kind),
+            Expr::Deref { expr: inner, .. }
+            | Expr::Ref { expr: inner, .. }
+            | Expr::Attributed { expr: inner, .. } => self.walk_expr(inner, edge_kind),
+            Expr::FieldAccess { object, .. } | Expr::Get { object, .. } => {
+                self.walk_expr(object, edge_kind)
+            }
+            Expr::ArrayIndex {
+                expr: inner, index, ..
+            } => {
+                self.walk_expr(inner, edge_kind);
+                self.walk_expr(index, edge_kind);
+            }
+            Expr::Tuple { values, .. } => {
+                for v in values.iter() {
+                    self.walk_expr(v, edge_kind);
+                }
+            }
+            Expr::ArrayLiteral { elements, .. } => {
+                for e in elements.iter() {
+                    self.walk_expr(e, edge_kind);
+                }
+            }
+            Expr::ExprList { expressions, .. } => {
+                for e in expressions.iter() {
+                    self.walk_expr(e, edge_kind);
+                }
+            }
+
+            Expr::Call {
+                callee,
+                generic_args,
+                arguments,
+                ..
+            } => {
+                self.walk_expr(callee, edge_kind);
+                for g in generic_args.iter() {
+                    self.walk_type(g);
+                }
+                for a in arguments.iter() {
+                    self.walk_expr(a, edge_kind);
+                }
+            }
+
+            Expr::StructInit {
+                callee,
+                arguments,
+                type_args,
+                ..
+            } => {
+                self.walk_init_target(callee, edge_kind);
+                for t in type_args.iter() {
+                    self.walk_type(t);
+                }
+                for field in arguments.iter() {
+                    self.walk_expr(&field.value, edge_kind);
+                }
+            }
+
+            Expr::OrElse {
+                value, else_block, ..
+            } => {
+                self.walk_expr(value, edge_kind);
+                self.walk_block(else_block, edge_kind);
+            }
+
+            Expr::If { if_stmt, .. } => self.walk_if(if_stmt, edge_kind),
+            Expr::Match { match_stmt, .. } => self.walk_match(match_stmt, edge_kind),
+
+            Expr::Lambda {
+                params,
+                return_type,
+                ensures,
+                body,
+                ..
+            } => {
+                for p in params.iter() {
+                    if let Some(t) = &p.type_annotation {
+                        self.walk_indirectly_referenced_type(t);
+                    }
+                }
+                if let Some(t) = return_type {
+                    self.walk_indirectly_referenced_type(t);
+                }
+                self.push_scope();
+                for p in params.iter() {
+                    self.declare_local(p.name);
+                }
+                for e in ensures.iter() {
+                    self.walk_expr(e.condition, edge_kind);
+                }
+                self.walk_block(body, edge_kind);
+                self.pop_scope();
+            }
+
+            Expr::Block(block) | Expr::ComptimeBlock(block) => self.walk_block(block, edge_kind),
+            Expr::UnsafeBlock(block) => self.walk_block(block.block, edge_kind),
+        }
+    }
+
+    fn walk_init_target(&mut self, callee: &Expr<'a, 'bump>, edge_kind: EdgeKind) {
+        match callee {
+            Expr::Ident { name, span } => {
+                if self.param_index(*name, &[], 0).is_none() {
+                    let target = self.check_type_target(*name, &[]);
+                    self.emit(target, EdgeKind::TypeByValue, *span);
+                }
+            }
+            Expr::GenericIdent {
+                name,
+                generic_args,
+                span,
+            } => {
+                let target = self.check_type_target(*name, &[]);
+                self.emit(target, EdgeKind::TypeByValue, *span);
+                for g in generic_args.iter() {
+                    self.walk_type(g);
+                }
+            }
+            Expr::ModulePath { segments, span } => {
+                self.emit(
+                    RefTarget::Path(segments.to_vec()),
+                    EdgeKind::TypeByValue,
+                    *span,
+                );
+            }
+            Expr::ModuleAccess {
+                segments,
+                member,
+                span,
+            } => {
+                let target = self.check_type_target(*member, segments);
+                self.emit(target, EdgeKind::TypeByValue, *span);
+            }
+            other => self.walk_expr(other, edge_kind),
+        }
+    }
+
+    fn walk_block(&mut self, block: &Block<'a, 'bump>, edge_kind: EdgeKind) {
+        self.push_scope();
+        for stmt in block.block.iter() {
+            self.walk_body_stmt(stmt, edge_kind);
+        }
+        self.pop_scope();
+    }
+
+    fn walk_if(&mut self, stmt: &IfStmt<'a, 'bump>, edge_kind: EdgeKind) {
+        self.walk_expr(stmt.condition, edge_kind);
+        self.walk_block(stmt.then_branch, edge_kind);
+        match stmt.else_branch {
+            Some(ElseBranch::If(nested)) => self.walk_if(nested, edge_kind),
+            Some(ElseBranch::Else(block)) => self.walk_block(block, edge_kind),
+            None => {}
+        }
+    }
+
+    fn walk_match(&mut self, stmt: &MatchStmt<'a, 'bump>, edge_kind: EdgeKind) {
+        self.walk_expr(stmt.expr, edge_kind);
+        for arm in stmt.arms.iter() {
+            self.push_scope();
+            let mut bound = Vec::new();
+            Self::pattern_bindings(&arm.pattern, &mut bound);
+            for name in bound {
+                self.declare_local(name);
+            }
+            if let Some(guard) = arm.guard {
+                self.walk_expr(guard, edge_kind);
+            }
+            self.walk_block(arm.block, edge_kind);
+            self.pop_scope();
+        }
+    }
+
+    fn pattern_bindings(pattern: &Pattern<'a, 'bump>, out: &mut Vec<StrId>) {
+        match &pattern.kind {
+            PatternKind::Ident(name, _) => out.push(*name),
+            PatternKind::Tuple(ps) | PatternKind::Array(ps) | PatternKind::Or(ps) => {
+                for p in ps.iter() {
+                    Self::pattern_bindings(p, out);
+                }
+            }
+            PatternKind::Struct { fields, .. } => {
+                for (_, p) in fields.iter() {
+                    Self::pattern_bindings(p, out);
+                }
+            }
+            PatternKind::EnumVariant { bindings, .. } => {
+                for p in bindings.iter() {
+                    Self::pattern_bindings(p, out);
+                }
+            }
+            PatternKind::Number(_)
+            | PatternKind::String(_)
+            | PatternKind::Boolean(_)
+            | PatternKind::Wildcard
+            | PatternKind::Null => {}
+        }
+    }
+
+    fn walk_let(&mut self, l: &LetStmt<'a, 'bump>, edge_kind: EdgeKind) {
+        self.walk_type(&l.type_annotation);
+        self.walk_expr(l.value, edge_kind);
+        match &l.catch_pattern {
+            Some(ErrorHandlerPattern::Single {
+                error_type,
+                binding,
+                body,
+            }) => {
+                self.walk_type(error_type);
+                self.push_scope();
+                if let Some(b) = binding {
+                    self.declare_local(*b);
+                }
+                self.walk_block(body, edge_kind);
+                self.pop_scope();
+            }
+            Some(ErrorHandlerPattern::Multiple { branches }) => {
+                for branch in branches.iter() {
+                    self.walk_type(&branch.error_type);
+                    self.push_scope();
+                    if let Some(b) = branch.binding {
+                        self.declare_local(b);
+                    }
+                    self.walk_block(branch.body, edge_kind);
+                    self.pop_scope();
+                }
+            }
+            None => {}
+        }
+        self.declare_local(l.ident);
+    }
+
+    /// A statement inside a `comptime { .. }` block or a lambda body.
+    fn walk_body_stmt(&mut self, stmt: &Stmt<'a, 'bump>, edge_kind: EdgeKind) {
+        match stmt {
+            Stmt::Let(l) => self.walk_let(l, edge_kind),
+            Stmt::Const(c) => {
+                self.walk_type(&c.type_annotation);
+
+                self.walk_expr(c.value, edge_kind);
+                self.declare_local(c.ident);
+            }
+            Stmt::Return(r) => {
+                if let Some(value) = r.value {
+                    self.walk_expr(value, edge_kind);
+                }
+            }
+            Stmt::If(i) => self.walk_if(i, edge_kind),
+            Stmt::While(w) => {
+                self.walk_expr(w.condition, edge_kind);
+                self.walk_block(w.block, edge_kind);
+            }
+            Stmt::For(f) => {
+                self.push_scope();
+                match &f.kind {
+                    ForKind::CStyle {
+                        let_stmt,
+                        condition,
+                        increment,
+                    } => {
+                        if let Some(l) = let_stmt {
+                            self.walk_let(l, edge_kind);
+                        }
+                        if let Some(c) = condition {
+                            self.walk_expr(c, edge_kind);
+                        }
+                        if let Some(i) = increment {
+                            self.walk_expr(i, edge_kind);
+                        }
+                    }
+                    ForKind::RangeBased { variable, iterable } => {
+                        self.walk_expr(iterable, edge_kind);
+                        self.declare_local(*variable);
+                    }
+                }
+                self.walk_block(f.block, edge_kind);
+                self.pop_scope();
+            }
+            Stmt::Match(m) => self.walk_match(m, edge_kind),
+            Stmt::UnsafeBlock(u) => self.walk_block(u.block, edge_kind),
+            Stmt::Block(b) => self.walk_block(b, edge_kind),
+            Stmt::Defer(d) => match d.action {
+                DeferAction::Block(b) => self.walk_block(b, edge_kind),
+                DeferAction::Stmt(s) => self.walk_body_stmt(s, edge_kind),
+            },
+            Stmt::ExprStmt(e) => self.walk_expr(e.expr, edge_kind),
+            Stmt::Break(value, _) => {
+                if let Some(value) = value {
+                    self.walk_expr(value, edge_kind);
+                }
+            }
+            Stmt::Continue(_) => {}
+            Stmt::Attributed(a) => self.walk_body_stmt(&a.inner, edge_kind),
+
+            Stmt::Import(_)
+            | Stmt::Package(_)
+            | Stmt::Module(_)
+            | Stmt::FuncDecl(_)
+            | Stmt::StructDecl(_)
+            | Stmt::InterfaceDecl(_)
+            | Stmt::ImplDecl(_)
+            | Stmt::EnumDecl(_)
+            | Stmt::TypeAliasDecl(_) => {
+                self.unsupported(stmt, "declaration inside an expression body");
+            }
         }
     }
 

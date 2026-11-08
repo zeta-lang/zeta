@@ -632,11 +632,11 @@ where
             }
 
             (SsaType::F32, HirExpr::Decimal(d, _)) if out.len() == 4 => {
-                out.copy_from_slice(&(*d as f32).to_le_bytes());
+                out.copy_from_slice(&(d.get() as f32).to_le_bytes());
                 true
             }
             (SsaType::F64, HirExpr::Decimal(d, _)) if out.len() == 8 => {
-                out.copy_from_slice(&(*d as f64).to_le_bytes());
+                out.copy_from_slice(&(d.get()).to_le_bytes());
                 true
             }
             (SsaType::F32, _) if out.len() == 4 => match self.const_int(e, module, 0) {

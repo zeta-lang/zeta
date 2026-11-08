@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 scribe-parser = { path = "../scribe-parser" }
+scribe-hir-lowerer = { path = "../scribe-hir-lowerer" }
 emberforge-compiler = { path = "../emberforge-compiler" }
 codex-dependency-graph = { path = "../codex-dependency-graph" }
 zetaruntime = { path = "../zeta_utilities" }

@@ -445,14 +445,31 @@ pub struct HirEnum<'a, 'bump> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+/// Like `HirType`, the `span` is deliberately ignored by `==` and `Hash`, so that two
+/// anonymous enums written in different places (`enum { A, B }`) are the same type.
+#[derive(Debug, Clone, Copy)]
 pub struct HirEnumVariant<'a, 'bump> {
     pub name: StrId,
     pub fields: &'bump [HirField<'a, 'bump>],
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+impl<'a, 'bump> PartialEq for HirEnumVariant<'a, 'bump> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.fields == other.fields
+    }
+}
+impl<'a, 'bump> Eq for HirEnumVariant<'a, 'bump> {}
+
+impl<'a, 'bump> Hash for HirEnumVariant<'a, 'bump> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.fields.hash(state);
+    }
+}
+
+/// The `span` is deliberately ignored by `==` and `Hash` (see `HirEnumVariant`).
+#[derive(Debug, Clone, Copy)]
 pub struct HirField<'a, 'bump>
 where
     'bump: 'a,
@@ -462,6 +479,25 @@ where
     pub visibility: Visibility,
     pub manual: bool,
     pub span: SourceSpan<'a>,
+}
+
+impl<'a, 'bump> PartialEq for HirField<'a, 'bump> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.field_type == other.field_type
+            && self.visibility == other.visibility
+            && self.manual == other.manual
+    }
+}
+impl<'a, 'bump> Eq for HirField<'a, 'bump> {}
+
+impl<'a, 'bump> Hash for HirField<'a, 'bump> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.field_type.hash(state);
+        self.visibility.hash(state);
+        self.manual.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -642,6 +678,17 @@ where
         elem: &'a HirType<'a, 'bump>,
         inclusive: bool,
     },
+    /// `struct { a: i32, b: str }`. Structural: two anonymous structs with the same fields (in
+    /// the same order) are the same type, and generics are already substituted into the fields.
+    AnonStruct {
+        fields: &'bump [HirField<'a, 'bump>],
+    },
+    /// `enum { A, B { x: T } }` / `(A || B)`. Structural, like `AnonStruct`.
+    AnonEnum {
+        variants: &'bump [HirEnumVariant<'a, 'bump>],
+    },
+    /// `type`: the type of structs, enums, interfaces and type aliases.
+    Type,
 }
 
 /// A type plus where it was written. `span` is `SourceSpan::default()` for
@@ -1670,6 +1717,37 @@ impl<'a, 'bump> Display for HirTypeKind<'a, 'bump> {
                 )
             }
             K::Never => write!(f, "never"),
+            K::AnonStruct { fields } => {
+                f.write_str("struct { ")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, field.field_type)?;
+                }
+                f.write_str(" }")
+            }
+            K::AnonEnum { variants } => {
+                f.write_str("enum { ")?;
+                for (i, variant) in variants.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", variant.name)?;
+                    if !variant.fields.is_empty() {
+                        f.write_str(" { ")?;
+                        for (j, field) in variant.fields.iter().enumerate() {
+                            if j > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}: {}", field.name, field.field_type)?;
+                        }
+                        f.write_str(" }")?;
+                    }
+                }
+                f.write_str(" }")
+            }
+            K::Type => write!(f, "type"),
             K::Range { elem, inclusive } => {
                 write!(
                     f,
@@ -1988,6 +2066,30 @@ where
     pub const fn never(span: SourceSpan<'a>) -> Self {
         Self {
             kind: HirTypeKind::Never,
+            span,
+        }
+    }
+
+    pub const fn type_type(span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::Type,
+            span,
+        }
+    }
+
+    pub const fn anon_struct(fields: &'bump [HirField<'a, 'bump>], span: SourceSpan<'a>) -> Self {
+        Self {
+            kind: HirTypeKind::AnonStruct { fields },
+            span,
+        }
+    }
+
+    pub const fn anon_enum(
+        variants: &'bump [HirEnumVariant<'a, 'bump>],
+        span: SourceSpan<'a>,
+    ) -> Self {
+        Self {
+            kind: HirTypeKind::AnonEnum { variants },
             span,
         }
     }

@@ -304,6 +304,9 @@ fn lower_type_hir_inner(
             let elem_ssa = lower_type_hir_inner(elem, enums, structs, in_progress);
             SsaType::Tuple(vec![elem_ssa.clone(), elem_ssa])
         }
+        HirTypeKind::AnonStruct { fields } => todo!(),
+        HirTypeKind::AnonEnum { variants } => todo!(),
+        HirTypeKind::Type => todo!(),
     }
 }
 

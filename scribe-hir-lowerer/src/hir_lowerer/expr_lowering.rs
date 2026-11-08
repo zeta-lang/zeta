@@ -2062,10 +2062,69 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ),
                 span,
             },
-            TypeKind::AnonStruct { fields } => todo!(),
-            TypeKind::Type => todo!(),
-            TypeKind::AnonEnum { variants } => todo!(),
+            TypeKind::AnonStruct { fields } => HirType {
+                kind: HirTypeKind::AnonStruct {
+                    fields: self.lower_anon_fields(fields, "struct", span),
+                },
+                span,
+            },
+            TypeKind::AnonEnum { variants } => {
+                let mut seen: Vec<StrId> = Vec::with_capacity(variants.len());
+                let lowered: Vec<hir::HirEnumVariant<'a, 'bump>> = variants
+                    .iter()
+                    .map(|v| {
+                        if seen.contains(&v.name) {
+                            self.ctx.record_error(
+                                format!("duplicate variant `{}` in anonymous enum", v.name),
+                                v.span,
+                            );
+                        }
+                        seen.push(v.name);
+                        hir::HirEnumVariant {
+                            name: v.name,
+                            fields: self.lower_anon_fields(v.fields, "variant", v.span),
+                            span: v.span,
+                        }
+                    })
+                    .collect();
+                HirType {
+                    kind: HirTypeKind::AnonEnum {
+                        variants: self.ctx.bump.alloc_slice(&lowered),
+                    },
+                    span,
+                }
+            }
+            TypeKind::Type => HirType::type_type(span),
         }
+    }
+
+    /// Fields of an anonymous `struct { .. }` or of an anonymous enum variant. Field types are
+    /// lowered in the surrounding generic scope, so `x<T> :: func(): struct { v: T }` yields a
+    /// field of type `Generic(T)` that monomorphization substitutes like any other type.
+    fn lower_anon_fields(
+        &self,
+        fields: &[ast::Field<'a, 'bump>],
+        what: &'static str,
+        span: SourceSpan<'a>,
+    ) -> &'bump [hir::HirField<'a, 'bump>] {
+        let mut lowered: Vec<hir::HirField<'a, 'bump>> = Vec::with_capacity(fields.len());
+        for f in fields {
+            if lowered.iter().any(|prev| prev.name == f.name) {
+                self.ctx.record_error(
+                    format!("duplicate field `{}` in anonymous {}", f.name, what),
+                    f.span,
+                );
+            }
+            lowered.push(hir::HirField {
+                name: f.name,
+                field_type: self
+                    .lower_type(&f.field_type, if f.span.line != 0 { f.span } else { span }),
+                visibility: f.visibility,
+                manual: f.manual,
+                span: f.span,
+            });
+        }
+        self.ctx.bump.alloc_slice(&lowered)
     }
 
     fn lower_provenance_root(&self, root: ast::ProvenanceRoot) -> hir::ProvenanceRoot {
@@ -2405,8 +2464,45 @@ fn substitute_alias_generics<'a, 'bump>(
             },
             span: ty.span,
         },
+        HirTypeKind::AnonStruct { fields } => HirType {
+            kind: HirTypeKind::AnonStruct {
+                fields: substitute_alias_fields(fields, subs, bump),
+            },
+            span: ty.span,
+        },
+        HirTypeKind::AnonEnum { variants } => {
+            let new: Vec<_> = variants
+                .iter()
+                .map(|v| hir::HirEnumVariant {
+                    name: v.name,
+                    fields: substitute_alias_fields(v.fields, subs, bump),
+                    span: v.span,
+                })
+                .collect();
+            HirType {
+                kind: HirTypeKind::AnonEnum {
+                    variants: bump.alloc_slice(&new),
+                },
+                span: ty.span,
+            }
+        }
         _ => *ty, // primitives, Void, This, etc. carry no generics
     }
+}
+
+fn substitute_alias_fields<'a, 'bump>(
+    fields: &[hir::HirField<'a, 'bump>],
+    subs: &ir::ir_hasher::HashMap<StrId, HirType<'a, 'bump>>,
+    bump: &'bump GrowableBump,
+) -> &'bump [hir::HirField<'a, 'bump>] {
+    let new: Vec<_> = fields
+        .iter()
+        .map(|f| hir::HirField {
+            field_type: substitute_alias_generics(&f.field_type, subs, bump),
+            ..*f
+        })
+        .collect();
+    bump.alloc_slice(&new)
 }
 
 fn strip_decl_spans<'a, 'bump>(
@@ -2536,10 +2632,41 @@ fn strip_spans<'a, 'bump>(ty: HirType<'a, 'bump>, bump: &'bump GrowableBump) -> 
             unmangled_name,
             type_args: list(type_args),
         },
+        K::AnonStruct { fields } => K::AnonStruct {
+            fields: strip_fields(fields, bump),
+        },
+        K::AnonEnum { variants } => {
+            let new: Vec<_> = variants
+                .iter()
+                .map(|v| hir::HirEnumVariant {
+                    name: v.name,
+                    fields: strip_fields(v.fields, bump),
+                    span: SourceSpan::default(),
+                })
+                .collect();
+            K::AnonEnum {
+                variants: bump.alloc_slice(&new),
+            }
+        }
         other => other,
     };
     HirType {
         kind,
         span: SourceSpan::default(),
     }
+}
+
+fn strip_fields<'a, 'bump>(
+    fields: &[hir::HirField<'a, 'bump>],
+    bump: &'bump GrowableBump,
+) -> &'bump [hir::HirField<'a, 'bump>] {
+    let new: Vec<_> = fields
+        .iter()
+        .map(|f| hir::HirField {
+            field_type: strip_spans(f.field_type, bump),
+            span: SourceSpan::default(),
+            ..*f
+        })
+        .collect();
+    bump.alloc_slice(&new)
 }

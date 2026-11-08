@@ -6,6 +6,7 @@ use std::{
 };
 
 use ir::{hir::Visibility, ir_hasher::HashMap};
+use scribe_parser::parser::ParserDiagnostics;
 use smallvec::SmallVec;
 
 use ir::{hir::StrId, span::SourceSpan};
@@ -160,7 +161,7 @@ pub enum ItemRole {
     Static,
     Const,
     Type,
-    Trait,
+    Interface,
     Impl,
     FuncSig,
     FuncBody,
@@ -193,7 +194,7 @@ impl ItemRole {
             Self::FuncSig => "func_sig",
             Self::FuncBody => "func_body",
             Self::Type => "type",
-            Self::Trait => "trait",
+            Self::Interface => "interface",
             Self::Impl => "impl",
             Self::Const => "const",
         }
@@ -206,7 +207,7 @@ impl ItemRole {
             "func_sig" => Some(Self::FuncSig),
             "func_body" => Some(Self::FuncBody),
             "type" => Some(Self::Type),
-            "trait" => Some(Self::Trait),
+            "interface" => Some(Self::Interface),
             "impl" => Some(Self::Impl),
             "const" => Some(Self::Const),
             _ => None,
@@ -633,6 +634,15 @@ pub struct Indices {
     pub item_modules: HashMap<ItemKey, ModuleId>,
 }
 
+pub enum Loaded<'a, 'bump> {
+    Cached(ModuleFacts<'a, 'bump>), // thawed from the snapshot
+    Fresh {
+        facts: ModuleFacts<'a, 'bump>,
+        errors: Vec<ParserDiagnostics<'a>>,
+        hash: u128,
+    },
+}
+
 pub struct UnitIndices {
     pub packages: HashMap<UnitId, PackageIndex>,
     pub methods: HashMap<UnitId, MethodIndex>,
@@ -682,8 +692,16 @@ pub struct MethodName {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RefTarget {
     Name { name: StrId, kind: SymbolKind },
+    ValueName(StrId),
     Path(Vec<StrId>),
     Method { owner: TypeIdentity, name: StrId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResolvedItem {
+    Item(ItemKey),
+    Ambiguous(Vec<ItemKey>),
+    Missing(RefTarget),
 }
 
 pub struct UnitEntry {
@@ -744,6 +762,13 @@ pub enum ScanDiag<'a> {
     /// `dyn Trait` used by value.
     ByValueDyn {
         /// Location of the `dyn` type.
+        span: SourceSpan<'a>,
+    },
+
+    /// Struct fields/params that hold `this`.
+    /// `This` refers to a "type alias" to the type while `this` is accessing the current object via the pointer to that object.
+    StructFieldsContainsThis {
+        /// Location of the `this` type.
         span: SourceSpan<'a>,
     },
 
