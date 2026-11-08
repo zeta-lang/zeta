@@ -1,7 +1,7 @@
 use crate::parser::descent_parser::DescentParser;
 use ir::ast::{
-    ElseBranch, ErrorHandlerBranch, ErrorHandlerPattern, FieldInit, IfStmt, LambdaModifier,
-    LambdaParam, MatchStmt, RefKind, Type, UnsafeBlock,
+    ElseBranch, ErrorHandlerBranch, ErrorHandlerPattern, F64Bits, FieldInit, IfStmt,
+    LambdaModifier, LambdaParam, MatchStmt, RefKind, Type, UnsafeBlock,
 };
 use ir::hir::StrId;
 use ir::tokens::TokenKind;
@@ -615,7 +615,7 @@ where
                     .parse::<f64>()
                     .unwrap_or(0.0);
                 Ok(Expr::Decimal {
-                    value,
+                    value: F64Bits::new(value),
                     span: tok.span,
                 })
             }

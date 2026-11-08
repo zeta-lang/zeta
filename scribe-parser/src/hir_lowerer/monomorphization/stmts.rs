@@ -245,7 +245,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let (&struct_name, module_path) = acc.path.split_last().unwrap_or_else(|| {
             panic!(
                 "try_monomorphize_assoc_call: empty module path in static call `.{}` at {span}",
-                self.context.resolve_string(&acc.member)
+                acc.member
             )
         });
 

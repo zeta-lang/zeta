@@ -1,15 +1,16 @@
+use crate::ast::F64Bits;
 use crate::ast::LambdaModifier;
 use crate::ast::MutabilityState;
 pub use crate::ast::{FuncModifiers, Path, Visibility};
 use crate::hir::DropKind::Undroppable;
 use crate::span::SourceSpan;
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Deref;
+use std::str::pattern::Pattern;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 use zetaruntime::string_pool::VmString;
@@ -67,11 +68,11 @@ impl Default for StrId {
     }
 }
 
-pub struct Split<'s> {
-    inner: std::str::Split<'static, &'s str>,
+pub struct Split<P: Pattern> {
+    inner: std::str::Split<'static, P>,
 }
 
-impl<'s> Iterator for Split<'s> {
+impl<P: Pattern> Iterator for Split<P> {
     type Item = StrId;
 
     #[inline]
@@ -87,9 +88,9 @@ impl AsRef<str> for StrId {
 }
 
 impl StrId {
-    pub fn split<'s>(&self, sep: &'s str) -> Split<'s> {
+    pub fn split<P: std::str::pattern::Pattern>(&self, pat: P) -> Split<P> {
         Split {
-            inner: self.as_str().split(sep),
+            inner: self.as_str().split(pat),
         }
     }
 
@@ -166,6 +167,10 @@ impl StrId {
         self.0.as_str()
     }
 
+    pub fn as_bytes(&self) -> &'static [u8] {
+        self.0.as_bytes()
+    }
+
     pub fn len(&self) -> usize {
         self.0.length
     }
@@ -180,19 +185,11 @@ impl PartialEq<&StrId> for StrId {
     fn eq(&self, other: &&StrId) -> bool {
         self == *other
     }
-
-    fn ne(&self, other: &&StrId) -> bool {
-        self != *other
-    }
 }
 
 impl PartialEq<&str> for StrId {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
-    }
-
-    fn ne(&self, other: &&str) -> bool {
-        self.as_str() != *other
     }
 }
 
@@ -359,7 +356,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
 pub struct HirEnsures<'a, 'bump>
 where
     'bump: 'a,
@@ -636,7 +633,7 @@ where
         bounds: &'bump [HirType<'a, 'bump>],
     },
     Tuple(&'bump [HirType<'a, 'bump>]),
-    Array(&'a HirType<'a, 'bump>, usize),
+    Array(&'a HirType<'a, 'bump>, &'a HirExpr<'a, 'bump>),
     Slice(&'a HirType<'a, 'bump>),
     Usize,
     Isize,
@@ -677,7 +674,7 @@ impl<'a, 'bump> From<HirTypeKind<'a, 'bump>> for HirType<'a, 'bump> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -688,7 +685,7 @@ where
     pub visibility: Visibility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HirStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -743,7 +740,7 @@ where
     Package(Path<'a, 'bump>, SourceSpan<'a>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HirErrorHandlerPattern<'a, 'bump>
 where
     'bump: 'a,
@@ -758,7 +755,7 @@ where
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirErrorHandlerBranch<'a, 'bump>
 where
     'bump: 'a,
@@ -768,7 +765,7 @@ where
     pub body: &'bump [HirStmt<'a, 'bump>],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirMatchArm<'a, 'bump>
 where
     'bump: 'a,
@@ -778,7 +775,7 @@ where
     pub body: &'bump HirStmt<'a, 'bump>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HirPatternKind<'a, 'bump> {
     Ident(StrId, bool),
     Number(i64),
@@ -801,7 +798,7 @@ pub enum HirPatternKind<'a, 'bump> {
     Null,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirPattern<'a, 'bump> {
     pub kind: HirPatternKind<'a, 'bump>,
     pub span: SourceSpan<'a>,
@@ -916,7 +913,7 @@ pub struct HirFuncProto<'a, 'bump> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirFieldInit<'a, 'bump>
 where
     'bump: 'a,
@@ -926,7 +923,7 @@ where
     pub value: HirExpr<'a, 'bump>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HirExpr<'a, 'bump>
 where
     'bump: 'a,
@@ -958,7 +955,7 @@ where
     Boolean(bool, SourceSpan<'a>),
     Ident(StrId, SourceSpan<'a>),
     Tuple(&'bump [HirExpr<'a, 'bump>], SourceSpan<'a>),
-    Decimal(f64, SourceSpan<'a>),
+    Decimal(F64Bits, SourceSpan<'a>),
     Binary {
         left: &'bump HirExpr<'a, 'bump>,
         op: Operator,
@@ -1089,6 +1086,268 @@ where
     },
 }
 
+fn join<T: Display>(f: &mut Formatter<'_>, items: &[T]) -> fmt::Result {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{item}")?;
+    }
+    Ok(())
+}
+
+fn join_debug<T: std::fmt::Debug>(f: &mut Formatter<'_>, items: &[T]) -> fmt::Result {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{item:?}")?;
+    }
+    Ok(())
+}
+
+fn type_args<T: Display>(f: &mut Formatter<'_>, args: &[T]) -> fmt::Result {
+    if args.is_empty() {
+        return Ok(());
+    }
+    f.write_str("<")?;
+    join(f, args)?;
+    f.write_str(">")
+}
+
+impl<'a, 'bump> Display for HirExpr<'a, 'bump>
+where
+    'bump: 'a,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            HirExpr::OrElse {
+                value, else_body, ..
+            } => {
+                if else_body.is_empty() {
+                    write!(f, "{value} orelse {{}}")
+                } else {
+                    write!(f, "{value} orelse {{ ... }}")
+                }
+            }
+
+            HirExpr::Intrinsic {
+                kind,
+                type_args: targs,
+                args,
+                ..
+            } => {
+                write!(f, "${kind:?}")?;
+                type_args(f, targs)?;
+                f.write_str("(")?;
+                join(f, args)?;
+                f.write_str(")")
+            }
+
+            HirExpr::Cast {
+                expr, target_type, ..
+            } => write!(f, "({expr} as {target_type})"),
+
+            HirExpr::Uninit { ty, .. } => write!(f, "uninit<{ty}>"),
+            HirExpr::Undefined { ty, .. } => write!(f, "undefined<{ty}>"),
+
+            HirExpr::Null(_) => f.write_str("null"),
+            HirExpr::Number(n, _) => write!(f, "{n}"),
+            HirExpr::Char(c, _) => write!(f, "{c:?}"),
+            HirExpr::String(s, _) => write!(f, "{:?}", s.as_str()),
+            HirExpr::Boolean(b, _) => write!(f, "{b}"),
+            HirExpr::Ident(name, _) => write!(f, "{name}"),
+            HirExpr::Decimal(bits, _) => write!(f, "{:?}", bits.get()),
+
+            HirExpr::Tuple(values, _) => {
+                f.write_str("(")?;
+                join(f, values)?;
+                if values.len() == 1 {
+                    f.write_str(",")?;
+                }
+                f.write_str(")")
+            }
+
+            HirExpr::Binary {
+                left, op, right, ..
+            } => write!(f, "({left} {op} {right})"),
+            HirExpr::Comparison {
+                left, op, right, ..
+            } => write!(f, "({left} {op} {right})"),
+
+            HirExpr::Call {
+                callee,
+                args,
+                type_args: targs,
+                ..
+            } => {
+                write!(f, "{callee}")?;
+                if let Some(targs) = targs {
+                    type_args(f, targs)?;
+                }
+                f.write_str("(")?;
+                join(f, args)?;
+                f.write_str(")")
+            }
+
+            HirExpr::InterfaceCall {
+                callee,
+                args,
+                interface,
+                ..
+            } => {
+                write!(f, "{callee}(")?;
+                join(f, args)?;
+                write!(f, ") /* via {interface} */")
+            }
+
+            HirExpr::FieldAccess { object, field, .. } | HirExpr::Get { object, field, .. } => {
+                write!(f, "{object}.{field}")
+            }
+
+            HirExpr::Assignment {
+                target, op, value, ..
+            } => write!(f, "{target} {op} {value}"),
+
+            HirExpr::InterpolatedString(parts) => {
+                f.write_str("$\"")?;
+                for part in parts.iter() {
+                    write!(f, "{part:?}")?;
+                }
+                f.write_str("\"")
+            }
+
+            HirExpr::EnumInit {
+                enum_name,
+                variant,
+                args,
+                type_args: targs,
+                ..
+            } => {
+                write!(f, "{enum_name}")?;
+                if let Some(targs) = targs {
+                    type_args(f, targs)?;
+                }
+                write!(f, "::{variant}")?;
+                if !args.is_empty() {
+                    f.write_str("(")?;
+                    join(f, args)?;
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
+
+            HirExpr::ExprList { list, .. } => join(f, list),
+
+            HirExpr::StructInit {
+                name,
+                args,
+                type_args: targs,
+                ..
+            } => {
+                write!(f, "{name}")?;
+                if let Some(targs) = targs {
+                    type_args(f, targs)?;
+                }
+                f.write_str(" { ")?;
+                join_debug(f, args)?;
+                f.write_str(" }")
+            }
+
+            HirExpr::Deref { expr, .. } => write!(f, "*{expr}"),
+
+            HirExpr::Ref { expr, ref_kind, .. } => match ref_kind {
+                RefKind::Shared => write!(f, "&{expr}"),
+                RefKind::Alias => write!(f, "&alias {expr}"),
+                RefKind::Unique => write!(f, "&mut {expr}"),
+            },
+
+            HirExpr::This { .. } => f.write_str("this"),
+
+            HirExpr::ModuleAccess(access) => write!(f, "{access:?}"),
+
+            HirExpr::Lambda {
+                is_move,
+                modifier,
+                params,
+                return_type,
+                ensures,
+                ..
+            } => {
+                if *is_move {
+                    f.write_str("move ")?;
+                }
+                if let Some(modifier) = modifier {
+                    write!(f, "{modifier:?} ")?;
+                }
+                f.write_str("func(")?;
+                join_debug(f, params)?;
+                write!(f, "): {return_type}")?;
+                if !ensures.is_empty() {
+                    f.write_str(" ensures ")?;
+                    join_debug(f, ensures)?;
+                }
+                f.write_str(" { ... }")
+            }
+
+            HirExpr::Index { object, index, .. } => write!(f, "{object}[{index}]"),
+
+            HirExpr::ArrayLiteral { elements, .. } => {
+                f.write_str("[")?;
+                join(f, elements)?;
+                f.write_str("]")
+            }
+
+            HirExpr::UnknownIntrinsic { name, .. } => write!(f, "${name}"),
+
+            HirExpr::GenericIdent(name, args, _) => {
+                write!(f, "{name}")?;
+                type_args(f, args)
+            }
+
+            HirExpr::If { .. } => f.write_str("if ... { ... }"),
+
+            HirExpr::Match { expr, arms, .. } => {
+                write!(f, "match {expr} {{ ")?;
+                join_debug(f, arms)?;
+                f.write_str(" }")
+            }
+
+            HirExpr::Block {
+                body, is_unsafe, ..
+            } => {
+                if *is_unsafe {
+                    f.write_str("unsafe ")?;
+                }
+                if body.is_empty() {
+                    f.write_str("{}")
+                } else {
+                    f.write_str("{ ... }")
+                }
+            }
+
+            HirExpr::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => write!(f, "{start}{}{end}", if *inclusive { ".." } else { "..<" }),
+
+            HirExpr::Slice {
+                object,
+                start,
+                end,
+                inclusive,
+                ..
+            } => write!(
+                f,
+                "{object}[{start}{}{end}]",
+                if *inclusive { ".." } else { "..<" }
+            ),
+        }
+    }
+}
+
 impl<'a, 'bump> HirExpr<'a, 'bump>
 where
     'bump: 'a,
@@ -1143,7 +1402,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operator {
     Add,
     Subtract,
@@ -1182,7 +1441,7 @@ pub enum Operator {
     RefMut,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssignmentOperator {
     Assign,
     AddAssign,
@@ -1197,7 +1456,67 @@ pub enum AssignmentOperator {
     ShiftRightAssign,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl Display for Operator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Operator::Add => "+",
+            Operator::Subtract => "-",
+            Operator::Multiply => "*",
+            Operator::Divide => "/",
+            Operator::Modulo => "%",
+            Operator::BitAnd => "&",
+            Operator::BitOr => "|",
+            Operator::BitXor => "^",
+            Operator::ShiftLeft => "<<",
+            Operator::ShiftRight => ">>",
+            Operator::Assign => "=",
+            Operator::AddAssign => "+=",
+            Operator::SubtractAssign => "-=",
+            Operator::MultiplyAssign => "*=",
+            Operator::DivideAssign => "/=",
+            Operator::ModuloAssign => "%=",
+            Operator::BitAndAssign => "&=",
+            Operator::BitOrAssign => "|=",
+            Operator::BitXorAssign => "^=",
+            Operator::ShiftLeftAssign => "<<=",
+            Operator::ShiftRightAssign => ">>=",
+            Operator::BitNot => "~",
+            Operator::LogicalNot => "!",
+            Operator::LogicalOr => "||",
+            Operator::LogicalAnd => "&&",
+            Operator::Equals => "==",
+            Operator::NotEquals => "!=",
+            Operator::GreaterThan => ">",
+            Operator::LessThan => "<",
+            Operator::GreaterThanOrEqual => ">=",
+            Operator::LessThanOrEqual => "<=",
+            Operator::DerefUnsafe => "*",
+            Operator::Deref => "*",
+            Operator::Ref => "&",
+            Operator::RefMut => "&mut",
+        })
+    }
+}
+
+impl Display for AssignmentOperator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AssignmentOperator::Assign => "=",
+            AssignmentOperator::AddAssign => "+=",
+            AssignmentOperator::SubtractAssign => "-=",
+            AssignmentOperator::MultiplyAssign => "*=",
+            AssignmentOperator::DivideAssign => "/=",
+            AssignmentOperator::ModuloAssign => "%=",
+            AssignmentOperator::BitAndAssign => "&=",
+            AssignmentOperator::BitOrAssign => "|=",
+            AssignmentOperator::BitXorAssign => "^=",
+            AssignmentOperator::ShiftLeftAssign => "<<=",
+            AssignmentOperator::ShiftRightAssign => ">>=",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InterpolationPart<'a, 'bump>
 where
     'bump: 'a,
@@ -1319,8 +1638,7 @@ impl<'a, 'bump> Display for HirTypeKind<'a, 'bump> {
             K::Dyn { bounds } => {
                 write!(f, "dyn ")?;
                 let mut is_start = true;
-                let mut iter = bounds.into_iter();
-                while let Some(bound) = iter.next() {
+                for bound in *bounds {
                     write!(f, "{}", bound)?;
                     if !is_start {
                         write!(f, " + ")?;
@@ -1471,7 +1789,7 @@ where
                     DropKind::Array {
                         element: Box::new(element),
                         element_ty: *inner,
-                        len,
+                        len: *len,
                     }
                 } else {
                     DropKind::Undroppable
@@ -1713,7 +2031,11 @@ where
         }
     }
 
-    pub const fn array(elem: &'a HirType<'a, 'bump>, len: usize, span: SourceSpan<'a>) -> Self {
+    pub const fn array(
+        elem: &'a HirType<'a, 'bump>,
+        len: &'a HirExpr<'a, 'bump>,
+        span: SourceSpan<'a>,
+    ) -> Self {
         Self {
             kind: HirTypeKind::Array(elem, len),
             span,
@@ -1806,7 +2128,7 @@ pub enum DropKind<'a, 'bump> {
     Array {
         element: Box<DropKind<'a, 'bump>>,
         element_ty: HirType<'a, 'bump>,
-        len: usize,
+        len: HirExpr<'a, 'bump>,
     },
     OwnedPointer {
         pointee: Box<DropKind<'a, 'bump>>,
@@ -1833,43 +2155,17 @@ impl<'a, 'bump> DropKind<'a, 'bump> {
     }
 }
 
-pub struct HirSlice<'bump, T> {
-    inner: UnsafeCell<&'bump [T]>,
-}
-
-impl<'bump, T> HirSlice<'bump, T> {
-    pub fn new(inner: &'bump [T]) -> Self {
-        Self {
-            inner: UnsafeCell::new(inner),
-        }
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[T] {
-        // Safe because shared access doesn't mutate
-        unsafe { *self.inner.get() }
-    }
-
-    #[inline(always)]
-    #[allow(invalid_reference_casting)]
-    pub fn as_mut_slice(&self) -> &mut [T] {
-        // SAFETY: multiple mutable borrows would be UB,
-        // caller must guarantee exclusive access
-        unsafe { &mut *(*self.inner.get() as *const [T] as *mut [T]) }
-    }
-}
-
 /// A module-qualified access: `std::io.println` or `std::io.File`.
 /// `path` is the `::` separated module segments, `member` is the name
 /// after the first `.`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirModuleAccess<'a, 'bump> {
     pub path: &'bump [StrId], // ["std", "io"]
     pub member: StrId,        // "println" / "File" / "out"
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HirLambdaParam<'a, 'bump> {
     pub name: StrId,
     pub param_type: Option<HirType<'a, 'bump>>,
@@ -1978,7 +2274,7 @@ pub struct ClosureLowering<'a, 'bump> {
 pub fn static_effect_path<'x, 'bump>(
     expr: &HirExpr<'x, 'bump>,
     this_id: StrId,
-    bump: &GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> Option<(StrId, Vec<HirEffectSegment<'bump>>)> {
     match expr {
         HirExpr::Ident(name, _) => Some((*name, Vec::new())),
@@ -2001,7 +2297,7 @@ pub fn static_effect_path<'x, 'bump>(
 fn static_index_key<'x, 'bump>(
     index: &HirExpr<'x, 'bump>,
     this_id: StrId,
-    bump: &GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> Option<EffectIndexKey<'bump>> {
     match index {
         HirExpr::Number(n, _) => Some(EffectIndexKey::Const(*n)),
