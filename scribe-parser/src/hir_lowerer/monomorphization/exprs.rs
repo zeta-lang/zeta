@@ -422,7 +422,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                         let (&struct_name, module_path) = acc.path.split_last().unwrap_or_else(|| {
                         panic!(
                             "monomorphize_expr: empty module path in static call `.{}<...>` at {span}",
-                            self.context.resolve_string(&acc.member)
+                            acc.member
                         )
                     });
                         let target_key = if self.ctx.structs.borrow().contains_key(&struct_name) {
@@ -923,9 +923,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                              This means two different modules genuinely declare a generic function with \
                              the same name, and GenericIdent needs its own module context recorded at \
                              lowering time to disambiguate between them.",
-                            self.context.resolve_string(name),
+                            name,
                             candidates.len(),
-                            self.context.resolve_string(name),
+                            name,
                             candidates.iter().map(|f| f.declaring_module_idx).collect::<Vec<_>>(),
                         ),
                     }
@@ -950,8 +950,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
                      function in `self.functions`, by mangled name or by (unmangled_name, \
                      declaring_module_idx={}); this function may not exist in this module, or may \
                      be registered under a different declaring_module_idx than expected.",
-                    self.context.resolve_string(name),
-                    self.ctx.module_idx,
+                    name, self.ctx.module_idx,
                 );
             }
             _ => expr.clone(),

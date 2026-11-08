@@ -107,8 +107,7 @@ impl DropGlueRegistry {
         let mut glue_names: HashMap<StrId, StrId> = HashMap::default();
         for &name in &struct_names {
             if is_droppable.get(&name).copied().unwrap_or(false) {
-                let mangled_name = context.resolve_string(&name);
-                let glue_name = StrId(intern_fmt!(context, "{}_drop_glue", mangled_name));
+                let glue_name = StrId(intern_fmt!(context, "{}_drop_glue", name));
                 glue_names.insert(name, glue_name);
             }
         }
@@ -218,7 +217,7 @@ impl DropGlueBuilder {
         struct_names_owned_by_this_module: &[StrId],
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
     ) -> Vec<(StrId, Function)> {
         struct_names_owned_by_this_module
             .iter()
@@ -251,7 +250,7 @@ impl DropGlueBuilder {
         struct_name: StrId,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
     ) -> Option<(StrId, Function)> {
         let glue_name = glue_registry.glue_name_for(struct_name)?;
 

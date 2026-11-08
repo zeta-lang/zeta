@@ -31,14 +31,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 use zetaruntime::string_pool::{StringPool, VmString};
 
-/// Maps an IR SSA value directly to the Cranelift value that defines it.
-/// The IR is already in SSA form, so no `Variable`s (and therefore no
-/// on-the-fly SSA reconstruction by `cranelift-frontend`) are needed.
 type ValueMap = HashMap<Value, ClifValue, FxHashBuilder>;
 type BlockMap = HashMap<BlockId, ClifBlock, FxHashBuilder>;
 type BlockIdx = HashMap<BlockId, usize, FxHashBuilder>;
@@ -150,7 +147,7 @@ impl CraneliftBackend {
             if self.static_data.contains_key(name) {
                 continue;
             }
-            let sym = format!("__zeta_static_{}", self.context.resolve_string(name));
+            let sym = format!("__zeta_static_{}", name);
             let l = ir::layout::layout_of_ssa(&def.ty, self.target)
                 .unwrap_or_else(|e| panic!("static `{}`: no layout: {:?}", sym, e));
             let id = self
@@ -367,8 +364,6 @@ impl CraneliftBackend {
             return *fid;
         }
 
-        let func_name = self.context.resolve_string(&name_id);
-
         let mut sig = Signature::new(self.module.isa().default_call_conv());
         if let Some(param_tys) = self.func_param_types.get(&name_id) {
             for ty in param_tys {
@@ -383,8 +378,8 @@ impl CraneliftBackend {
 
         let fid = self
             .module
-            .declare_function(func_name, Linkage::Import, &sig)
-            .unwrap_or_else(|e| panic!("failed to declare function ref {}: {:?}", func_name, e));
+            .declare_function(name_id.as_str(), Linkage::Import, &sig)
+            .unwrap_or_else(|e| panic!("failed to declare function ref {}: {:?}", name_id, e));
 
         self.func_ids.insert(name_id, fid);
         fid
@@ -395,11 +390,10 @@ impl CraneliftBackend {
             return *id;
         }
 
-        let name = self.context.resolve_string(&name_id);
         let id = self
             .module
-            .declare_data(name, Linkage::Import, true, false)
-            .unwrap_or_else(|e| panic!("failed to declare global {}: {:?}", name, e));
+            .declare_data(name_id.as_str(), Linkage::Import, true, false)
+            .unwrap_or_else(|e| panic!("failed to declare global {}: {:?}", name_id, e));
 
         self.global_data.insert(name_id, id);
         id
@@ -1153,7 +1147,6 @@ impl CraneliftBackend {
                         "Call target must be a FunctionRef in current lowering but got {called_func:?}"
                     ),
                 };
-                let func_name = self.context.resolve_string(func_name_id);
 
                 let (ret_is_aggregate, ret_size) = match self.func_ret_types.get(func_name_id) {
                     Some(t) if Self::is_aggregate_ty(t) => (
@@ -1214,11 +1207,17 @@ impl CraneliftBackend {
                     }
                     let fid = ObjectModule::declare_function(
                         &mut self.module,
-                        func_name,
+                        func_name_id.as_str(),
                         Linkage::Import,
                         &sig,
                     )
-                    .unwrap_or_else(|e| panic!("failed to declare import {}: {:?}", func_name, e));
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to declare import {}: {:?}",
+                            func_name_id.as_str(),
+                            e
+                        )
+                    });
                     self.func_ids.insert(*func_name_id, fid);
                     fid
                 };
@@ -1773,7 +1772,7 @@ impl CraneliftBackend {
             return id.0;
         }
         let n = self.string_data.len();
-        let bytes = self.context.resolve_bytes(s);
+        let bytes = s.as_bytes();
 
         // raw bytes
         let bytes_id = self
@@ -1808,7 +1807,7 @@ impl CraneliftBackend {
             return *id;
         }
         let n = self.string_bytes.len();
-        let bytes = self.context.resolve_bytes(s);
+        let bytes = s.as_bytes();
         let id = self
             .module
             .declare_data(&format!("t_sstrb_{n}"), Linkage::Local, false, false)
@@ -1998,8 +1997,6 @@ impl Backend for CraneliftBackend {
                 sig.returns.push(AbiParam::new(ret_clif_ty));
             }
 
-            let resolved_name = self.context.resolve_string(&*name);
-
             let has_body = !func.blocks.is_empty()
                 && !(func.blocks.len() == 1 && func.blocks[0].instructions.is_empty());
             let is_extern_abi = matches!(
@@ -2012,13 +2009,13 @@ impl Backend for CraneliftBackend {
                 (false, _) => Linkage::Local,
             };
 
-            let (actual_name, linkage) = if resolved_name == "main" && !self.main_emitted {
+            let (actual_name, linkage) = if name == "main" && !self.main_emitted {
                 zeta_main_fid = Some(name.clone());
                 ("_zeta_main", Linkage::Local)
-            } else if resolved_name == "main" && self.main_emitted {
+            } else if name == "main" && self.main_emitted {
                 continue;
             } else {
-                (resolved_name, linkage)
+                (name.as_str(), linkage)
             };
 
             let fid = self
@@ -2235,15 +2232,11 @@ impl Backend for CraneliftBackend {
         }
 
         self.module
-            .declare_function(
-                self.context.resolve_string(&*func.name),
-                Linkage::Import,
-                &sig,
-            )
+            .declare_function(func.name.as_str(), Linkage::Import, &sig)
             .unwrap();
     }
 
-    fn finish(self, out_dir: &PathBuf) -> Result<PathBuf, EmitError> {
+    fn finish(self, out_dir: &Path) -> Result<PathBuf, EmitError> {
         let obj: ObjectProduct = self.module.finish();
 
         let data: Vec<u8> = obj.emit().map_err(|e| EmitError::Emit(e))?;

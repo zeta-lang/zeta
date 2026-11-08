@@ -1,4 +1,4 @@
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::hir::{HirExpr, StrId};
 use ir::ir_hasher::HashMap;
 

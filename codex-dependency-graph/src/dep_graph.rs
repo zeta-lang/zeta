@@ -270,19 +270,20 @@ impl<'a> DepGraph<'a> {
     }
 
     pub fn add_edge(&mut self, a: NodeIdx, b: NodeIdx, kind: EdgeKind, span: SourceSpan<'a>) {
-        if a.0 >= self.nodes.len() || b.0 >= self.nodes.len() {
-            return;
-        }
-        if !self.nodes[a]
-            .deps
-            .iter()
-            .any(|e| e.to == b && e.kind == kind)
-        {
-            self.nodes[a].deps.push(Edge { to: b, kind, span });
-        }
-        if !self.nodes[b].rev_deps.contains(&a) {
-            self.nodes[b].rev_deps.push(a);
-        }
+        // if a.0 >= self.nodes.len() || b.0 >= self.nodes.len() {
+        //     return;
+        // }
+        // if !self.nodes[a]
+        //     .deps
+        //     .iter()
+        //     .any(|e| e.to == b && e.kind == kind)
+        // {
+        //     self.nodes[a].deps.push(Edge { to: b, kind, span });
+        // }
+        // if !self.nodes[b].rev_deps.contains(&a) {
+        //     self.nodes[b].rev_deps.push(a);
+        // }
+        todo!()
     }
 
     pub fn nodes(&self) -> &[DepNode<'a>] {
@@ -340,7 +341,8 @@ impl<'a> DepGraph<'a> {
     }
 
     pub fn find_sccs_of_nodes(&self) -> Vec<Vec<NodeIdx>> {
-        sccs::find_sccs_of_nodes(&self.nodes)
+        //sccs::find_sccs_of_nodes(&self.nodes)
+        todo!()
     }
 
     pub fn get_module_compilation_order(&self) -> Vec<usize> {

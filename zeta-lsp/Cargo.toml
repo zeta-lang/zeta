@@ -9,7 +9,9 @@ anyhow = "1.0.103"
 lsp-server = "0.9.0"
 lsp-types = "0.97.0"
 serde_json = "1.0.150"
-zeta-compiler-api = { path = "../zeta-compiler-api"}
-sentinel-typechecker = { path = "../sentinel-typechecker"}
+zeta-compiler-api = { path = "../zeta-compiler-api" }
+sentinel-typechecker = { path = "../sentinel-typechecker" }
+codex-dependency-graph = { path = "../codex-dependency-graph" }
+zetaruntime = { path = "../zeta_utilities" }
 ir = { path = "../ir"}
 url = "2.5.8"

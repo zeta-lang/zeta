@@ -426,7 +426,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         field: StrId,
     ) -> Option<(usize, SsaType)> {
         let is_owned = self.slice_kind(ty)?;
-        match self.context.resolve_string(&field) {
+        match field.as_str() {
             "len" => Some((8, SsaType::Usize)),
             "cap" if is_owned => Some((16, SsaType::Usize)),
             _ => None,
@@ -489,7 +489,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
     }
 
     pub(super) fn slice_primitive_of(&self, field: StrId) -> Option<SlicePrimitive> {
-        match self.context.resolve_string(&field) {
+        match field.as_str() {
             "write_uninit" => Some(SlicePrimitive::WriteUninit),
             "write_uninit_all" => Some(SlicePrimitive::WriteUninitAll),
             "get_unchecked" => Some(SlicePrimitive::GetUnchecked),

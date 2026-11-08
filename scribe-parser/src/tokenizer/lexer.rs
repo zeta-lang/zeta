@@ -5,7 +5,6 @@ use smallvec::SmallVec;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read};
 use std::sync::Arc;
-use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 // Maps ASCII bytes 0..128 to a dispatch category.
@@ -125,11 +124,7 @@ impl Lexer {
         Self { context }
     }
 
-    pub fn tokenize_file<'a, 'bump>(
-        &self,
-        file_name: &'a str,
-        bump: &'bump GrowableBump<'bump>,
-    ) -> std::io::Result<Tokens<'a, 'bump>>
+    pub fn tokenize_file<'a, 'bump>(&self, file_name: &'a str) -> std::io::Result<Tokens<'a>>
     where
         'bump: 'a,
     {
@@ -139,15 +134,10 @@ impl Lexer {
         let bytes_read = file.read_to_end(&mut buf)?;
         let src = std::str::from_utf8(&buf[..bytes_read])
             .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid UTF-8"))?;
-        Ok(self.tokenize(src, file_name, bump))
+        Ok(self.tokenize(src, file_name))
     }
 
-    pub fn tokenize<'a, 'bump>(
-        &self,
-        src: &str,
-        file_name: &'a str,
-        bump: &'bump GrowableBump<'bump>,
-    ) -> Tokens<'a, 'bump>
+    pub fn tokenize<'a, 'bump>(&self, src: &str, file_name: &'a str) -> Tokens<'a>
     where
         'a: 'bump,
         'bump: 'a,
@@ -620,7 +610,7 @@ impl Lexer {
 
         push!(TokenKind::EOF, line, column);
 
-        Tokens::new(bump, tokens)
+        Tokens::new(tokens)
     }
 }
 

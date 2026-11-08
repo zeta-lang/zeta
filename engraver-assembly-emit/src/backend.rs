@@ -1,6 +1,6 @@
 use crate::cranelift::cranelift_backend::EmitError;
 use ir::ssa_ir::{Function, Module};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Trait defining code generation interface
 pub trait Backend {
@@ -14,5 +14,5 @@ pub trait Backend {
     fn emit_extern(&mut self, function: &Function);
 
     /// Finish the module
-    fn finish(self, out_dir: &PathBuf) -> Result<PathBuf, EmitError>;
+    fn finish(self, out_dir: &Path) -> Result<PathBuf, EmitError>;
 }

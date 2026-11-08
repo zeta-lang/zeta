@@ -1,8 +1,9 @@
 use crate::errors::error::{DiagnosticError, ParseErrorKind};
 use crate::hir::StrId;
+use crate::ir_hasher::FpHasher;
 use crate::span::SourceSpan;
 use std::fmt;
-use zetaruntime::bump::GrowableBump;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Token<'a> {
@@ -11,37 +12,63 @@ pub struct Token<'a> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Clone, Copy)]
-pub struct Tokens<'a, 'bump> {
-    pub slice: &'bump [Token<'a>],
+#[derive(Clone)]
+pub struct Tokens<'a> {
+    pub tokens: Vec<Token<'a>>,
 }
 
-impl<'a, 'bump> Tokens<'a, 'bump> {
-    pub fn new(bump: &'bump GrowableBump<'bump>, tokens: Vec<Token<'a>>) -> Self {
-        let slice = bump.alloc_slice(&tokens);
-        Self { slice }
+impl<'a> Tokens<'a> {
+    pub fn new(tokens: Vec<Token<'a>>) -> Self {
+        Self { tokens }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.slice.len()
+        self.tokens.len()
     }
 
     #[inline]
     pub fn get(&self, i: usize) -> Token<'a> {
-        self.slice[i]
+        self.tokens[i]
+    }
+
+    pub fn stable_hash_range(&self, range: Range<usize>, h: &mut FpHasher) {
+        for tok in &self.tokens[range] {
+            if matches!(tok.kind, TokenKind::LineComment | TokenKind::DocComment) {
+                continue;
+            }
+            h.u8(tok.kind.stable_tag());
+            match tok.text {
+                Some(id) => {
+                    h.u8(1);
+                    h.str(id.as_str());
+                }
+                None => h.u8(0),
+            }
+        }
+    }
+
+    pub fn stable_hash(&self, h: &mut FpHasher) {
+        self.stable_hash_range(0..self.tokens.len(), h);
+    }
+}
+
+impl TokenKind {
+    #[inline]
+    pub fn stable_tag(self) -> u8 {
+        self as u8
     }
 }
 
 #[derive(Clone)]
-pub struct Cursor<'a, 'bump> {
-    tokens: &'bump Tokens<'a, 'bump>,
+pub struct Cursor<'a> {
+    tokens: Tokens<'a>,
     index: usize,
 }
 
-impl<'a, 'bump> Cursor<'a, 'bump> {
+impl<'a> Cursor<'a> {
     #[inline]
-    pub fn new(tokens: &'bump Tokens<'a, 'bump>, index: usize) -> Self {
+    pub fn new(tokens: Tokens<'a>, index: usize) -> Self {
         Self { tokens, index }
     }
 

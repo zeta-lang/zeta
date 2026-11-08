@@ -1,13 +1,15 @@
-use std::path::PathBuf;
-use std::process::Command;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
-use clap::{ArgMatches, CommandFactory, Error, FromArgMatches, Parser, Subcommand};
+use clap::{Parser, Subcommand};
+use codex_dependency_graph::dep_graph::DepGraph;
 use mimalloc::MiMalloc;
 use zeta_compiler_api::Compiler;
 
 use zeta_compiler_api::file_handling::compiler_lib_path;
 use zeta_compiler_api::file_loader::choose_file_loader;
-use zeta_compiler_api::main_structs::CompilerError;
+use zetaruntime::bump::GrowableBump;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -56,63 +58,50 @@ enum Commands {
     Check { path: Option<PathBuf> },
 }
 
-fn main() -> Result<(), CompilerError<'static>> {
-    let mut matches: ArgMatches = Cli::command().get_matches();
-    let cli_result: Result<Cli, Error> =
-        Cli::from_arg_matches_mut(&mut matches).map_err(|err: clap::error::Error| {
-            let mut cmd = Cli::command();
-            err.format(&mut cmd)
-        });
+fn main() -> ExitCode {
+    let cli = Cli::parse();
 
-    let cli: Cli = match cli_result {
-        Ok(cli) => cli,
-        Err(error) => {
-            error.print().expect("failed to print error message");
-            std::process::exit(error.exit_code());
+    match run(cli) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
         }
-    };
+    }
+}
 
+fn run(cli: Cli) -> Result<ExitCode, String> {
     let verbose = cli.verbose;
+    let lib_override = cli.lib;
 
-    let lib_override = cli.lib.clone();
-
-    let result = match cli.command {
+    match cli.command {
         Commands::Build {
             path,
             out_dir,
             optimize,
             emit_obj,
         } => {
-            let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
             if verbose {
+                let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
                 println!("Building from: {}", source_path.display());
                 println!("Output directory: {}", out_dir.display());
                 println!("Optimization: {}", optimize);
             }
-
             run_compiler(path, &out_dir, optimize, verbose, emit_obj, lib_override)?;
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
+
         Commands::Run { path, args } => {
-            let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
             let out_dir = PathBuf::from("./build");
-
             if verbose {
+                let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
                 println!("Running from: {}", source_path.display());
-
                 if !args.is_empty() {
                     println!("Arguments: {:?}", args);
                 }
             }
 
-            let program_path = run_compiler(
-                path,
-                &out_dir,
-                false,
-                verbose,
-                false, // always link for `run`
-                lib_override,
-            )?;
+            let program_path = run_compiler(path, &out_dir, false, verbose, false, lib_override)?;
 
             if verbose {
                 println!("Executing: {}", program_path.display());
@@ -121,59 +110,45 @@ fn main() -> Result<(), CompilerError<'static>> {
             let status = Command::new(&program_path)
                 .args(&args)
                 .status()
-                .expect("failed to execute compiled Zeta program");
+                .map_err(|e| format!("failed to execute {}: {e}", program_path.display()))?;
 
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-
-            return Ok(());
+            Ok(if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                // Propagate the program's exit code; a signal kill has no code, so use 1.
+                ExitCode::from(
+                    status
+                        .code()
+                        .and_then(|c| u8::try_from(c).ok())
+                        .unwrap_or(1),
+                )
+            })
         }
+
         Commands::Check { path } => {
-            let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
             if verbose {
+                let source_path = path.clone().unwrap_or_else(|| PathBuf::from("./src"));
                 println!("Checking: {}", source_path.display());
             }
-
-            check_compiler(path, verbose, lib_override)?;
-            Ok(())
-        }
-    };
-
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            Err(e)
+            check_compiler(path, lib_override)?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
 
-fn installed_stdlib_path() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-
-    let stdlib = home.join(".local").join("share").join("zeta").join("lib");
-
-    stdlib.is_dir().then_some(stdlib)
-}
-
-fn resolve_stdlib_path(lib_override: Option<PathBuf>) -> Result<PathBuf, CompilerError<'static>> {
+fn resolve_stdlib_path(lib_override: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(custom) = lib_override {
         Ok(custom)
-    } else if let Some(installed) = installed_stdlib_path() {
-        Ok(installed)
     } else {
-        compiler_lib_path()
+        compiler_lib_path().map_err(|e| e.to_string())
     }
 }
 
-/// Loads the stdlib and the user's sources, running parsing, lowering and
-/// type/borrow checking. Prints diagnostics and returns Err on failure.
 fn load_and_check<'a, 'bump>(
     compiler: &mut Compiler<'a, 'bump>,
     path: Option<PathBuf>,
     lib_override: Option<PathBuf>,
-) -> Result<(), CompilerError<'a>>
+) -> Result<(), String>
 where
     'bump: 'a,
     'a: 'bump,
@@ -184,55 +159,55 @@ where
 
     let stdlib_diags = compiler
         .load_directory(&file_loader, &stdlib_path, true)
-        .unwrap_or_else(|e| panic!("Could not load stdlib because of {e}"));
-
+        .map_err(|e| format!("could not load the standard library: {e}"))?;
     if stdlib_diags.has_errors() {
         stdlib_diags.report_all();
-        return Err(CompilerError::ParserError(vec![]));
+        return Err("the standard library has errors".into());
     }
 
-    let user_diags = compiler.load_directory(&file_loader, &source_path, false)?;
-
+    let user_diags = compiler
+        .load_directory(&file_loader, &source_path, false)
+        .map_err(|e| e.to_string())?;
     if user_diags.has_errors() {
         user_diags.report_all();
-        return Err(CompilerError::TypeCheckError);
+        return Err("type checking failed".into());
     }
 
     Ok(())
 }
 
-fn run_compiler<'a, 'bump>(
+// No lifetime parameters: 'a and 'bump are now the local borrows, and no error leaves with them.
+fn run_compiler(
     path: Option<PathBuf>,
-    out_dir: &PathBuf,
+    out_dir: &Path,
     optimize: bool,
     verbose: bool,
     emit_obj: bool,
     lib_override: Option<PathBuf>,
-) -> Result<PathBuf, CompilerError<'a>>
-where
-    'bump: 'a,
-    'a: 'bump,
-{
-    let mut compiler = Compiler::new()?;
+) -> Result<PathBuf, String> {
+    // Arena first: locals drop in reverse order, so it outlives everything below.
+    let bump = GrowableBump::new(4096, 8);
+    let dep_graph = RefCell::new(DepGraph::new());
+
+    let mut compiler = Compiler::new(&bump, &dep_graph)
+        .map_err(|e| format!("failed to start the compiler: {e}"))?;
+
     load_and_check(&mut compiler, path, lib_override)?;
-    compiler.emit(out_dir, optimize, verbose, emit_obj)
+    compiler
+        .emit(out_dir, optimize, verbose, emit_obj)
+        .map_err(|e| e.to_string())
 }
 
-fn check_compiler<'a, 'bump>(
-    path: Option<PathBuf>,
-    verbose: bool,
-    lib_override: Option<PathBuf>,
-) -> Result<(), CompilerError<'a>>
-where
-    'bump: 'a,
-    'a: 'bump,
-{
-    let mut compiler = Compiler::new()?;
+fn check_compiler(path: Option<PathBuf>, lib_override: Option<PathBuf>) -> Result<(), String> {
+    let bump = GrowableBump::new(4096, 8);
+    let dep_graph = RefCell::new(DepGraph::new());
+
+    let mut compiler = Compiler::new(&bump, &dep_graph)
+        .map_err(|e| format!("failed to start the compiler: {e}"))?;
+
     load_and_check(&mut compiler, path, lib_override)?;
 
-    if verbose {
-        compiler.report_check_timings();
-    }
+    compiler.report_check_timings();
     println!("No errors found.");
     Ok(())
 }

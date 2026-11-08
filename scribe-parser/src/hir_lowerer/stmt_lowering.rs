@@ -163,13 +163,6 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 );
             }
 
-            Stmt::StateMachineDecl(a) => {
-                panic!(
-                    "Declaration statements should not appear in function bodies at {}",
-                    a.span
-                );
-            }
-
             Stmt::TypeAliasDecl(a) => {
                 panic!(
                     "Declaration statements should not appear in function bodies at {}",

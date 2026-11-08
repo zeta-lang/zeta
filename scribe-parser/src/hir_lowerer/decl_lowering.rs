@@ -135,7 +135,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
             ir::ast::ExternModifier::Abi(_)
         );
         let unmangled_name = func.name;
-        let is_main = self.ctx.context.resolve_string(&unmangled_name) == "main";
+        let is_main = unmangled_name == "main";
         let lookup_name = if is_extern || is_main {
             unmangled_name
         } else {
@@ -533,12 +533,11 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     span,
                 }
             }
-            ImplTargetKind::Primitive => primitive_hir_type(target_key, &self.ctx.context, span)
+            ImplTargetKind::Primitive => primitive_hir_type(target_key, span)
                 .expect("registered primitive impl target must map to a primitive HirType"),
             ImplTargetKind::Slice { element } => {
                 let elem_ty = match element {
-                    Some(e) => primitive_hir_type(e, &self.ctx.context, span)
-                        .unwrap_or(HirType::generic(e, span)),
+                    Some(e) => primitive_hir_type(e, span).unwrap_or(HirType::generic(e, span)),
 
                     None => HirType::void(span),
                 };
@@ -565,7 +564,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     fn merge_generics<'x>(
         impl_generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
         method_generics: Option<&'bump [HirGeneric<'a, 'bump>]>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
     ) -> Option<&'bump [HirGeneric<'a, 'bump>]> {
         match (impl_generics, method_generics) {
             (None, m) => m,

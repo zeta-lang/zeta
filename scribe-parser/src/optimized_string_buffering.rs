@@ -1,5 +1,6 @@
 use arrayvec::ArrayVec;
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
+use ir::hir::JoinStr;
 use ir::hir::StrId;
 use smallvec::SmallVec;
 use std::ptr;
@@ -17,8 +18,7 @@ pub fn mangle_method_name(
     segments.push(struct_name);
 
     if let Some(pkg) = dep_graph.get_module_package(module_idx) {
-        let pkg_str = context.resolve_string(&pkg);
-        segments.extend(pkg_str.split("::").map(|seg| StrId(context.intern(seg))));
+        segments.extend(pkg.split("::"));
     }
 
     build_module_scoped_name(&segments, method_name, None, context)
@@ -27,8 +27,6 @@ pub fn mangle_method_name(
 const VTABLE_LEN: usize = 8;
 
 pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
-    let name = string_pool.resolve_string(&*name);
-
     let vtable = b"vtable::";
     let nlen = name.len();
     let total_len = VTABLE_LEN + nlen;
@@ -38,7 +36,7 @@ pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
     unsafe {
         let dst = string.as_mut_ptr();
         ptr::copy_nonoverlapping(vtable.as_ptr(), dst, VTABLE_LEN);
-        ptr::copy_nonoverlapping(name.as_ptr(), dst.add(VTABLE_LEN), nlen);
+        ptr::copy_nonoverlapping(name.as_str().as_ptr(), dst.add(VTABLE_LEN), nlen);
         string.set_len(total_len);
     }
 
@@ -47,12 +45,9 @@ pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
 
 pub fn get_type(name: StrId, string_pool: Arc<StringPool>) -> StrId {
     let mut parts: ArrayVec<&str, 2> = ArrayVec::<&str, 2>::new();
-    for part in string_pool.resolve_string(&*name).split('_') {
-        if parts.try_push(part).is_err() {
-            panic!(
-                "Unexpected type name with too many parts: {}",
-                string_pool.resolve_string(&*name)
-            );
+    for part in name.split('_') {
+        if parts.try_push(part.as_str()).is_err() {
+            panic!("Unexpected type name with too many parts: {}", name);
         }
     }
 
@@ -73,13 +68,10 @@ pub fn build_module_scoped_name(
     extra: Option<StrId>,
     context: Arc<StringPool>,
 ) -> StrId {
-    let mut parts: Vec<String> = path
-        .iter()
-        .map(|s| context.resolve_string(s).to_string())
-        .collect();
-    parts.push(context.resolve_string(&member).to_string());
+    let mut parts: Vec<StrId> = path.iter().copied().collect();
+    parts.push(member);
     if let Some(e) = extra {
-        parts.push(context.resolve_string(&e).to_string());
+        parts.push(e);
     }
     let joined = parts.join("_");
     StrId(context.intern(&joined))

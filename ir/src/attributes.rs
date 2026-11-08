@@ -32,13 +32,15 @@ pub enum Arity {
     AtMost(usize),
 }
 
+type ValidateFn = Option<fn(&HirAttribute<'_, '_>) -> Result<(), String>>;
+
 pub struct AttrSpec {
     pub name: &'static str,
     pub targets: Targets,
     pub arity: Arity,
     pub repeatable: bool,
     /// Extra argument checks beyond arity. `Err(msg)` becomes a type error.
-    pub validate: Option<fn(&HirAttribute<'_, '_>) -> Result<(), String>>,
+    pub validate: ValidateFn,
 }
 
 fn validate_known(a: &HirAttribute<'_, '_>) -> Result<(), String> {
@@ -101,7 +103,6 @@ pub enum AttrTarget {
     Struct(StrId),
     Enum(StrId),
     Interface(StrId),
-    /// Statements / expressions: keyed by address of the bump node
     Node(usize),
 }
 

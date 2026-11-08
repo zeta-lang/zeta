@@ -106,7 +106,7 @@ impl<'a, 'bump> ParserDiagnosticsContext<'a, 'bump> {
     ///
     /// Returns the `TokenKind` we stopped at so the caller can decide whether
     /// to consume it (e.g. consume `}`) or leave it (e.g. leave `fn`).
-    pub fn synchronize(&self, cursor: &mut Cursor<'a, 'bump>) -> TokenKind {
+    pub fn synchronize(&self, cursor: &mut Cursor<'a>) -> TokenKind {
         // Always consume at least one token so the caller can't get stuck
         // re-entering recovery on the same position forever.
         if cursor.peek() != TokenKind::EOF {
@@ -131,7 +131,7 @@ impl<'a, 'bump> ParserDiagnosticsContext<'a, 'bump> {
     pub fn record_and_recover(
         &mut self,
         err: DiagnosticError<'a>,
-        cursor: &mut Cursor<'a, 'bump>,
+        cursor: &mut Cursor<'a>,
     ) -> TokenKind {
         self.record(err);
         self.synchronize(cursor)

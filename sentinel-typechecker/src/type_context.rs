@@ -1,4 +1,4 @@
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::hir::JoinStr;
 use ir::{
     hir::{HirEnum, HirFunc, HirInterface, HirStruct, HirType, StrId},
@@ -463,7 +463,7 @@ pub struct Globals<'a, 'bump> {
         )>,
     >,
     pub dep_graph: &'a RefCell<DepGraph<'a>>,
-    pub bump: &'bump GrowableBump<'bump>,
+    pub bump: &'bump GrowableBump,
     pub string_pool: Arc<StringPool>,
 }
 
@@ -488,14 +488,14 @@ pub struct GlobalsBuilder<'a, 'bump> {
         )>,
     >,
     pub dep_graph: &'a RefCell<DepGraph<'a>>,
-    pub bump: &'bump GrowableBump<'bump>,
+    pub bump: &'bump GrowableBump,
     pub string_pool: Arc<StringPool>,
 }
 
 impl<'a, 'bump> GlobalsBuilder<'a, 'bump> {
     pub fn new(
         dep_graph: &'a RefCell<DepGraph<'a>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         string_pool: Arc<StringPool>,
     ) -> Self {
         Self {
@@ -610,7 +610,7 @@ impl<'a, 'bump> GlobalsBuilder<'a, 'bump> {
 impl<'a, 'bump> Globals<'a, 'bump> {
     pub fn new(
         dep_graph: &'a RefCell<DepGraph<'a>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         string_pool: Arc<StringPool>,
     ) -> Self {
         GlobalsBuilder::new(dep_graph, bump, string_pool).freeze_direct()
@@ -798,7 +798,7 @@ impl<'a, 'bump> std::ops::Deref for TypeContext<'a, 'bump> {
 impl<'a, 'bump> TypeContext<'a, 'bump> {
     pub fn new(
         dep_graph: &'a RefCell<DepGraph<'a>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         string_pool: Arc<StringPool>,
     ) -> Self {
         let globals = Arc::new(Globals::new(dep_graph, bump, string_pool.clone()));

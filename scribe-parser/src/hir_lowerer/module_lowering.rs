@@ -14,7 +14,6 @@ use ir::hir::{HirParam, HirType};
 use ir::ir_hasher::FxHashMap;
 use ir::span::SourceSpan;
 use zetaruntime::intern_fmt;
-use zetaruntime::string_pool::StringPool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImplTargetKind {
@@ -52,10 +51,9 @@ pub fn primitive_canonical_name(kind: &ir::ast::TypeKind) -> Option<&'static str
 
 pub fn primitive_hir_type<'a, 'bump>(
     name: StrId,
-    pool: &StringPool,
     span: SourceSpan<'a>,
 ) -> Option<HirType<'a, 'bump>> {
-    Some(match pool.resolve_string(&name) {
+    Some(match name.as_str() {
         "i8" => HirType::i8(span),
         "i16" => HirType::i16(span),
         "i32" => HirType::i32(span),
@@ -555,9 +553,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
         let mut proto: HirFuncProto = self.lower_func_proto(f);
         let is_extern = matches!(
             proto.function_metadata.extern_modifier,
-            ir::ast::ExternModifier::Abi(interned) if self.ctx.context.resolve_string(&interned) == "C"
+            ir::ast::ExternModifier::Abi(interned) if interned == "C"
         );
-        let is_main = self.ctx.context.resolve_string(&proto.name) == "main";
+        let is_main = proto.name == "main";
         if !is_extern && !is_main {
             proto.name = self.mangle_function_name(self.ctx.module_idx, struct_name, proto.name);
         }
@@ -778,7 +776,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     f.function_metadata.extern_modifier,
                     ir::ast::ExternModifier::Abi(_)
                 );
-                let is_main = self.ctx.context.resolve_string(&f.name) == "main";
+                let is_main = f.name == "main";
 
                 let lookup_name = if is_extern || is_main {
                     f.name

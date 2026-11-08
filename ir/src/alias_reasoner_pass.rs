@@ -38,17 +38,18 @@ impl AliasReasoner {
     fn check_not_equal_chains(&self, places: &[Place], lhs: PlaceId, rhs: PlaceId) -> bool {
         let mut l = Some(lhs);
         while let Some(lid) = l {
-            if let Some(set) = self.place_not_equal.get(&lid) {
-                if !set.is_empty() {
-                    let mut r = Some(rhs);
-                    while let Some(rid) = r {
-                        if set.contains(&rid) {
-                            return true;
-                        }
-                        r = get_place(places, rid).and_then(|p| p.parent);
+            if let Some(set) = self.place_not_equal.get(&lid)
+                && !set.is_empty()
+            {
+                let mut r = Some(rhs);
+                while let Some(rid) = r {
+                    if set.contains(&rid) {
+                        return true;
                     }
+                    r = get_place(places, rid).and_then(|p| p.parent);
                 }
             }
+
             l = get_place(places, lid).and_then(|p| p.parent);
         }
         false
@@ -67,10 +68,8 @@ impl AliasReasoner {
             return MemoryRelation::Disjoint;
         }
 
-        if !self.place_not_equal.is_empty() {
-            if self.check_not_equal_chains(places, lhs, rhs) {
-                return MemoryRelation::Disjoint;
-            }
+        if !self.place_not_equal.is_empty() && self.check_not_equal_chains(places, lhs, rhs) {
+            return MemoryRelation::Disjoint;
         }
 
         match self.find_divergence_fast(places, lhs, rhs) {

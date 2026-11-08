@@ -239,9 +239,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         } else {
             panic!(
                 "lower_expr: variable `{}` (StrId {:?}) referenced before definition at span {}",
-                self.context.resolve_string(name),
-                name,
-                span
+                name, name, span
             )
         }
     }

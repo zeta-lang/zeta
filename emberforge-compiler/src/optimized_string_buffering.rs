@@ -1,4 +1,4 @@
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::hir::JoinStr;
 use ir::hir::StrId;
 use smallvec::SmallVec;
@@ -10,8 +10,6 @@ use zetaruntime::string_pool::StringPool;
 const VTABLE_LEN: usize = 8;
 
 pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
-    let name = string_pool.resolve_string(&*name);
-
     let vtable = b"vtable::";
     let nlen = name.len();
     let total_len = VTABLE_LEN + nlen;
@@ -21,7 +19,7 @@ pub fn make_vtable_name(name: StrId, string_pool: Arc<StringPool>) -> StrId {
     unsafe {
         let dst = string.as_mut_ptr();
         ptr::copy_nonoverlapping(vtable.as_ptr(), dst, VTABLE_LEN);
-        ptr::copy_nonoverlapping(name.as_ptr(), dst.add(VTABLE_LEN), nlen);
+        ptr::copy_nonoverlapping(name.as_str().as_ptr(), dst.add(VTABLE_LEN), nlen);
         string.set_len(total_len);
     }
 

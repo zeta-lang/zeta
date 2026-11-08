@@ -7,18 +7,23 @@ mod tests {
     use crate::doc_comments::{doc_comment_above, format_as_zeta_comments};
     use crate::state::{CompletionCache, Document, ServerState};
     use crate::urls::path_to_uri;
+    use codex_dependency_graph::dep_graph::DepGraph;
     use ir::ast::{
         ExternModifier, FuncModifiers, FuncSafety, InlineModifier, MutabilityState, Visibility,
     };
-    use ir::hir::{HirEnum, HirField, HirFunc, HirParam, HirStruct, HirType, HirTypeKind, StrId};
+    use ir::hir::{
+        HirEnum, HirExpr, HirField, HirFunc, HirParam, HirStruct, HirType, HirTypeKind, StrId,
+    };
     use ir::span::SourceSpan;
     use lsp_types::{
         GotoDefinitionParams, HoverContents, HoverParams, Position, TextDocumentIdentifier,
         TextDocumentPositionParams,
     };
+    use std::cell::RefCell;
     use std::path::PathBuf;
     use zeta_compiler_api::file_handling::compiler_lib_path;
     use zeta_compiler_api::file_loader::choose_file_loader;
+    use zetaruntime::bump::GrowableBump;
 
     static HIR_I32: HirType<'static, 'static> = HirType::i32(SourceSpan::nothing());
     static HIR_U64: HirType<'static, 'static> = HirType::u64(SourceSpan::nothing());
@@ -46,6 +51,7 @@ mod tests {
                 extern_modifier: ExternModifier::Abi(StrId::from_static("C")),
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Safe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(params),
@@ -83,6 +89,7 @@ mod tests {
                 extern_modifier: ExternModifier::None,
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Safe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(params),
@@ -111,6 +118,7 @@ mod tests {
                 extern_modifier: ExternModifier::None,
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Safe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(&[]),
@@ -139,6 +147,7 @@ mod tests {
                 extern_modifier: ExternModifier::None,
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Unsafe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(&[]),
@@ -199,7 +208,11 @@ mod tests {
     #[test]
     fn test_format_struct_signature_with_array_field() {
         // struct Buffer { data: &[8]u64, }
-        let field_type = HirType::array(&HIR_U64, 8, SourceSpan::default());
+        let field_type = HirType::array(
+            &HIR_U64,
+            &HirExpr::Number(8, SourceSpan::default()),
+            SourceSpan::default(),
+        );
         let fields: &[HirField<'static, 'static>] = &[HirField {
             name: StrId::from_static("data"),
             field_type,
@@ -339,7 +352,10 @@ mod tests {
 
     #[test]
     fn test_lsp_hover_and_goto() {
-        let compiler = match zeta_compiler_api::Compiler::new() {
+        let dep_graph = RefCell::new(DepGraph::new());
+
+        let lowerer_bump = GrowableBump::new(4096, 8);
+        let compiler = match zeta_compiler_api::Compiler::new(&lowerer_bump, &dep_graph) {
             Ok(c) => c,
             Err(_) => return,
         };

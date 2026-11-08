@@ -753,6 +753,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 *span,
             ),
             Expr::Attributed { expr, .. } => self.lower_expr(expr),
+            Expr::ComptimeBlock(block) => todo!(),
         }
     }
 
@@ -978,12 +979,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 continue;
             };
 
-            let pkg_str = self.ctx.context.resolve_string(&pkg);
-
-            let segments: Vec<StrId> = pkg_str
-                .split("::")
-                .map(|s| StrId(self.ctx.context.intern(s)))
-                .collect();
+            let segments: Vec<StrId> = pkg.split("::").collect();
 
             let mangled = build_module_scoped_name(&segments, name, None, self.ctx.context.clone());
 
@@ -1706,7 +1702,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             self.ctx.record_error(
                                 format!(
                                     "type `{}` expects at least {} generic argument(s), found {}",
-                                    self.ctx.context.resolve_string(name),
+                                    name,
                                     declared
                                         .iter()
                                         .take_while(|g| g.default_type.is_none())
@@ -1757,7 +1753,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             self.ctx.record_error(
                                 format!(
                                     "interface `{}` expects at least {} generic argument(s), found {}",
-                                    self.ctx.context.resolve_string(name),
+                                    name,
                                     declared.iter().take_while(|g| g.default_type.is_none()).count(),
                                     type_args.len(),
                                 ),
@@ -1786,7 +1782,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             self.ctx.record_error(
                                 format!(
                                     "enum `{}` expects at least {} generic argument(s), found {}",
-                                    self.ctx.context.resolve_string(name),
+                                    name,
                                     declared
                                         .iter()
                                         .take_while(|g| g.default_type.is_none())
@@ -1853,7 +1849,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                             format!(
                                 "type alias `{}` is recursive (aliases cannot refer to themselves, \
                                  directly or indirectly)",
-                                self.ctx.context.resolve_string(name),
+                                name,
                             ),
                             span,
                         );
@@ -1883,7 +1879,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                         self.ctx.record_error(
                             format!(
                                 "type alias `{}` expects at most {} generic argument(s), found {}",
-                                self.ctx.context.resolve_string(name),
+                                name,
                                 declared.len(),
                                 lowered_type_args.len(),
                             ),
@@ -2015,7 +2011,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                     self.ctx
                         .bump
                         .alloc_value_immutable(self.lower_type(inner, span)),
-                    *length,
+                    self.ctx.bump.alloc_value_immutable(self.lower_expr(length)),
                 ),
                 span,
             },
@@ -2066,6 +2062,9 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 ),
                 span,
             },
+            TypeKind::AnonStruct { fields } => todo!(),
+            TypeKind::Type => todo!(),
+            TypeKind::AnonEnum { variants } => todo!(),
         }
     }
 
@@ -2187,7 +2186,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
     pub(crate) fn fill_default_type_args(
         declared: &[ir::hir::HirGeneric<'a, 'bump>],
         type_args: &mut Vec<HirType<'a, 'bump>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
     ) -> bool {
         if type_args.len() >= declared.len() {
             return true;
@@ -2233,7 +2232,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
 fn substitute_alias_generics<'a, 'bump>(
     ty: &HirType<'a, 'bump>,
     subs: &ir::ir_hasher::HashMap<StrId, HirType<'a, 'bump>>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> HirType<'a, 'bump> {
     match ty.kind {
         HirTypeKind::Generic(name) => subs.get(&name).copied().unwrap_or(*ty),
@@ -2412,7 +2411,7 @@ fn substitute_alias_generics<'a, 'bump>(
 
 fn strip_decl_spans<'a, 'bump>(
     ty: HirType<'a, 'bump>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> HirType<'a, 'bump> {
     let strip = |args: &'bump [HirType<'a, 'bump>]| -> &'bump [HirType<'a, 'bump>] {
         let v: Vec<_> = args.iter().map(|a| strip_decl_spans(*a, bump)).collect();
@@ -2458,10 +2457,7 @@ fn strip_decl_spans<'a, 'bump>(
     }
 }
 
-fn strip_spans<'a, 'bump>(
-    ty: HirType<'a, 'bump>,
-    bump: &'bump GrowableBump<'bump>,
-) -> HirType<'a, 'bump> {
+fn strip_spans<'a, 'bump>(ty: HirType<'a, 'bump>, bump: &'bump GrowableBump) -> HirType<'a, 'bump> {
     use HirTypeKind as K;
     let list = |ts: &[HirType<'a, 'bump>]| -> &'bump [HirType<'a, 'bump>] {
         let v: Vec<_> = ts.iter().map(|t| strip_spans(*t, bump)).collect();

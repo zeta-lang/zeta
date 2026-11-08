@@ -12,7 +12,6 @@ use crate::{
     urls::path_to_uri,
 };
 
-/// An `impl` block, flattened to what the LSP needs so nothing else has to name `ImplDecl`.
 struct ImplSite<'a, 'bump> {
     span: SourceSpan<'a>,
     target_name: Option<StrId>,

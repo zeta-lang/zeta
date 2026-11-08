@@ -266,19 +266,19 @@ impl BorrowChecker {
                 continue;
             }
 
-            if let MemoryRelation::Overlap = self.overlaps(place, loan.place)? {
-                if !kind.compatible_with(loan.kind) {
-                    return Err(match (kind, loan.kind) {
-                        (BorrowKind::Mutable, BorrowKind::Mutable) => {
-                            BorrowError::AlreadyMutablyBorrowed { place: loan.place }
-                        }
-                        (BorrowKind::Mutable, _) | (_, BorrowKind::Mutable) => {
-                            BorrowError::MutablyBorrowed { place: loan.place }
-                        }
-                        // remaining incompatible case: Alias vs Shared, either direction
-                        _ => BorrowError::AliasConflict { place: loan.place },
-                    });
-                }
+            if let MemoryRelation::Overlap = self.overlaps(place, loan.place)?
+                && !kind.compatible_with(loan.kind)
+            {
+                return Err(match (kind, loan.kind) {
+                    (BorrowKind::Mutable, BorrowKind::Mutable) => {
+                        BorrowError::AlreadyMutablyBorrowed { place: loan.place }
+                    }
+                    (BorrowKind::Mutable, _) | (_, BorrowKind::Mutable) => {
+                        BorrowError::MutablyBorrowed { place: loan.place }
+                    }
+                    // remaining incompatible case: Alias vs Shared, either direction
+                    _ => BorrowError::AliasConflict { place: loan.place },
+                });
             }
         }
         Ok(())
@@ -290,10 +290,10 @@ impl BorrowChecker {
         kind: BorrowKind,
         access_provenance: Option<ProvenanceId>,
     ) -> BorrowResult<()> {
-        if let Some(prov) = access_provenance {
-            if !self.provenance_is_valid(prov) {
-                return Err(BorrowError::InvalidatedReference { place });
-            }
+        if let Some(prov) = access_provenance
+            && !self.provenance_is_valid(prov)
+        {
+            return Err(BorrowError::InvalidatedReference { place });
         }
 
         let root = self.place_roots[&place];
@@ -342,10 +342,10 @@ impl BorrowChecker {
         kind: BorrowKind,
         access_provenance: Option<ProvenanceId>,
     ) -> BorrowResult<()> {
-        if let Some(prov) = access_provenance {
-            if !self.provenance_is_valid(prov) {
-                return Err(BorrowError::InvalidatedReference { place });
-            }
+        if let Some(prov) = access_provenance
+            && !self.provenance_is_valid(prov)
+        {
+            return Err(BorrowError::InvalidatedReference { place });
         }
 
         match self.place_init_status(place) {
@@ -449,15 +449,16 @@ impl BorrowChecker {
             children: SmallVec::new(),
             root: place_id,
             depth: 1,
-            storage: storage,
+            storage,
         });
 
         self.place_storage.insert(place_id, storage);
-        if let Some(prev) = self.local_places.insert(local, place_id) {
-            if let Some(scope) = self.scopes.last_mut() {
-                scope.shadowed.push((local, prev));
-            }
+        if let Some(prev) = self.local_places.insert(local, place_id)
+            && let Some(scope) = self.scopes.last_mut()
+        {
+            scope.shadowed.push((local, prev));
         }
+
         self.place_to_local.insert(place_id, local);
 
         // A local is its own root.
@@ -592,8 +593,7 @@ impl BorrowChecker {
             self.index_places.insert(new_key, id);
         }
 
-        // Pointer pointee offsets (`record_pointee`).
-        for (_, (_, iv)) in self.pointee_origin.iter_mut() {
+        for (_, iv) in self.pointee_origin.values_mut() {
             let mut syms: SmallVec<StrId, 4> = SmallVec::new();
             collect_symbols(&iv.lower, &mut syms);
             collect_symbols(&iv.upper, &mut syms);
@@ -984,10 +984,10 @@ impl BorrowChecker {
                 return false;
             };
 
-            if let Some(&storage) = self.provenance_storage.get(&id) {
-                if !self.storage_is_valid(storage) {
-                    return false;
-                }
+            if let Some(&storage) = self.provenance_storage.get(&id)
+                && !self.storage_is_valid(storage)
+            {
+                return false;
             }
 
             stack.extend(prov.parents.iter().copied());
@@ -1203,11 +1203,12 @@ impl BorrowChecker {
         if let Some(status) = self.place_init.get(&place) {
             return *status;
         }
-        if let Some(p) = self.try_place(place) {
-            if let Some(parent) = p.parent {
-                return self.place_init_status(parent);
-            }
+        if let Some(p) = self.try_place(place)
+            && let Some(parent) = p.parent
+        {
+            return self.place_init_status(parent);
         }
+
         PlaceInitStatus::Init
     }
 
@@ -1221,7 +1222,7 @@ impl BorrowChecker {
         self.reasoning
             .less_than
             .get(lhs)
-            .map_or(false, |set| set.contains(rhs))
+            .is_some_and(|set| set.contains(rhs))
     }
 
     fn bound_is_pure(b: &Bound) -> bool {
@@ -1290,10 +1291,9 @@ impl BorrowChecker {
     pub fn proves_not_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
         if let (Some((bl, ol)), Some((br, o_r))) =
             (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
+            && bl == br
         {
-            if bl == br {
-                return ol != o_r;
-            }
+            return ol != o_r;
         }
         Self::implied_by_fact(lhs, rhs, &self.reasoning.not_equal)
     }
@@ -1301,10 +1301,10 @@ impl BorrowChecker {
     pub fn proves_equal(&self, lhs: &Bound, rhs: &Bound) -> bool {
         if let (Some((bl, ol)), Some((br, o_r))) =
             (Self::split_const_offset(lhs), Self::split_const_offset(rhs))
+            && bl == br
+            && ol == o_r
         {
-            if bl == br && ol == o_r {
-                return true;
-            }
+            return true;
         }
         Self::implied_by_fact(lhs, rhs, &self.reasoning.equal)
     }

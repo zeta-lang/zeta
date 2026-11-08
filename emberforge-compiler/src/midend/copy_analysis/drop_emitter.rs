@@ -2,7 +2,7 @@ use crate::midend::copy_analysis::drop_glue::DropGlueRegistry;
 use crate::midend::copy_analysis::drop_tracking::DropMoveState;
 use crate::midend::ir::block_data::CurrentBlockData;
 use crate::midend::ir::mir_lowering::lowerer::fun_name;
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::hir::{
     self, DropKind, HirEnum, HirStruct, HirType, HirTypeKind, ProvenanceAnnotation, StrId,
 };
@@ -69,13 +69,7 @@ impl<'a, 'r> AllocatorResolver for FnAllocatorResolver<'a, 'r> {
     fn lower_global_ref(&mut self, module_idx: usize, name: StrId) -> StrId {
         let pkg = self.dep_graph.borrow().get_module_package(module_idx);
         let segments: Vec<StrId> = match pkg {
-            Some(pkg) => {
-                let pkg_str = self.context.resolve_string(&pkg);
-                pkg_str
-                    .split("::")
-                    .map(|s| StrId(self.context.intern(s)))
-                    .collect()
-            }
+            Some(pkg) => pkg.split("::").collect(),
             None => Vec::new(),
         };
         crate::optimized_string_buffering::build_module_scoped_name(
@@ -286,7 +280,7 @@ pub struct DropEmitter<'x, 'a, 'bump, 'f> {
     pub glue_registry: &'x DropGlueRegistry,
     pub instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     pub instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
-    pub bump: &'bump GrowableBump<'bump>,
+    pub bump: &'bump GrowableBump,
     pub move_prefix: Vec<StrId>,
 }
 
@@ -302,7 +296,7 @@ impl<'x, 'a, 'bump, 'f> DropEmitter<'x, 'a, 'bump, 'f> {
         glue_registry: &'x DropGlueRegistry,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
     ) -> Self {
         Self {
             current_block_data,

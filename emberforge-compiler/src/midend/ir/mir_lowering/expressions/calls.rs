@@ -263,7 +263,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                         unreachable!(
                             "lower_method_call (static): resolved `{}` via struct_mangled_map but \
                              it isn't in funcs or global_funcs; registry inconsistency",
-                            self.context.resolve_string(&direct_name)
+                            direct_name
                         )
                     });
                 self.current_block_data.value_types.insert(dest, ret_ty);
@@ -407,9 +407,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
 
         panic!(
             "[lower_method_call] no mangled mapping or vtable slot found for method `{}` on struct `{:?}` at span {}.",
-            self.context.resolve_string(&field),
-            cls_name_id,
-            span
+            field, cls_name_id, span
         );
     }
 
@@ -463,12 +461,13 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                     }
                 }
 
-                let bare = self.context.resolve_string(&type_name);
+                let bare = type_name.as_str();
 
                 instantiated.iter().find_map(|(key, mmap)| {
-                    let key_str = self.context.resolve_string(key);
+                    let key_str = key.as_str();
 
-                    let matches_type = key_str == bare
+                    // TODO: remove this AI slop garbage
+                    let matches_type = *key == type_name
                         || key_str.starts_with(&format!("{bare}_"))
                         || key_str.ends_with(&format!("_{bare}"))
                         || key_str.contains(&format!("_{bare}_"));
@@ -542,11 +541,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         };
 
         let mangled_name = self.lookup_method_mangled(cls_name, field).or_else(|| {
-            let field_str = self.context.resolve_string(&field);
-            self.struct_mangled_map.get(&cls_name).and_then(|mmap| {
-                mmap.iter()
-                    .find_map(|(k, v)| (self.context.resolve_string(k) == field_str).then_some(*v))
-            })
+            self.struct_mangled_map
+                .get(&cls_name)
+                .and_then(|mmap| mmap.iter().find_map(|(k, v)| (*k == field).then_some(*v)))
         });
 
         if let Some(mangled_name) = mangled_name {
@@ -681,30 +678,19 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             operands.push(Operand::Value(self.lower_expr(a)));
         }
 
-        let iface_id = *self.interface_id_map.get(&interface).unwrap_or_else(|| {
-            panic!(
-                "Unknown interface {} in InterfaceCall",
-                self.context.resolve_string(&*interface)
-            )
-        });
+        let iface_id = *self
+            .interface_id_map
+            .get(&interface)
+            .unwrap_or_else(|| panic!("Unknown interface {} in InterfaceCall", interface));
 
         let iface_slot_map = self
             .interface_method_slots
             .get(&interface)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Interface {} has no method slots",
-                    self.context.resolve_string(&*interface)
-                )
-            });
+            .unwrap_or_else(|| panic!("Interface {} has no method slots", interface));
 
-        let method_slot_in_iface = iface_slot_map.get(field).unwrap_or_else(|| {
-            panic!(
-                "Interface {} has no method {}",
-                self.context.resolve_string(&*interface),
-                self.context.resolve_string(&*field)
-            )
-        });
+        let method_slot_in_iface = iface_slot_map
+            .get(field)
+            .unwrap_or_else(|| panic!("Interface {} has no method {}", interface, field));
 
         let interface_val = match self.current_block_data.value_types.get(&obj_val).cloned() {
             Some(SsaType::User(ref _name, _, _args)) => {

@@ -16,7 +16,7 @@ use crate::move_state::MoveState;
 use crate::naming::type_to_string;
 use crate::type_context::TypeContext;
 use crate::{closures, statics};
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::analysis_context::CopyAnalysisCtx;
 use ir::ast::FuncSafety;
 use ir::attributes::{self, Arity, AttrTable};
@@ -300,7 +300,7 @@ pub struct TypeChecker<'a, 'bump> {
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn new(
         dep_graph: &'a RefCell<DepGraph<'a>>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         copy_analysis: Rc<RefCell<CopyAnalysisCtx<'a, 'bump>>>,
         string_pool: Arc<StringPool>,
         auto_imports: Rc<RefCell<AutoImportRegistry>>,

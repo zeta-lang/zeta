@@ -4,5 +4,3 @@ pub mod nodes;
 pub mod sccs;
 pub mod symbol_table;
 pub mod topo;
-
-pub use dep_graph::DepGraph;

@@ -196,6 +196,7 @@ name = "codex-dependency-graph"
 version = "0.1.0"
 dependencies = [
  "ir",
+ "smallvec 2.0.0-alpha.12",
  "thiserror",
  "zetaruntime",
 ]
@@ -817,7 +818,9 @@ dependencies = [
  "owo-colors",
  "rstest",
  "smallvec 2.0.0-alpha.12",
+ "stable-hash-proc-macro",
  "thiserror",
+ "xxhash-rust",
  "zetaruntime",
 ]
 
@@ -1194,9 +1197,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -1218,9 +1221,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -1352,6 +1355,15 @@ name = "smallvec"
 version = "2.0.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
+
+[[package]]
+name = "stable-hash-proc-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "stable_deref_trait"
@@ -1738,6 +1750,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1841,10 +1859,12 @@ name = "zeta-lang"
 version = "0.3.1-alpha"
 dependencies = [
  "clap",
+ "codex-dependency-graph",
  "mimalloc",
  "thiserror",
  "walkdir",
  "zeta-compiler-api",
+ "zetaruntime",
 ]
 
 [[package]]
@@ -1853,6 +1873,7 @@ version = "0.3.1-alpha"
 dependencies = [
  "anyhow",
  "clap",
+ "codex-dependency-graph",
  "ir",
  "lsp-server",
  "lsp-types",
@@ -1860,6 +1881,7 @@ dependencies = [
  "serde_json",
  "url",
  "zeta-compiler-api",
+ "zetaruntime",
 ]
 
 [[package]]

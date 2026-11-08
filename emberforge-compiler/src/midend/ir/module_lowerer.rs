@@ -2,7 +2,7 @@ use crate::midend::copy_analysis::drop_glue::{DropGlueBuilder, DropGlueRegistry}
 use crate::midend::ir::mir_lowering::FunctionLowerer;
 use crate::midend::ir::mir_lowering::const_table::ConstTable;
 use crate::midend::ir::mir_lowering::lowerer::CalleeSig;
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::hir::{
     Hir, HirEnum, HirExpr, HirFunc, HirInterface, HirModule, HirParam, HirStmt, HirStruct, HirType,
     HirTypeKind, Operator, StrId, ThisPassingKind,
@@ -54,7 +54,7 @@ where
     g_phantom_data: PhantomData<&'g ()>,
     glue_registry: DropGlueRegistry,
     allocator_kind: HashMap<StrId, AllocatorKind>,
-    bump: GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
     interface_default_methods: HashMap<StrId, HashMap<StrId, HirFunc<'a, 'bump>>>,
     module_import_aliases: HashMap<usize, HashMap<StrId, usize>>,
     module_named_imports: HashMap<usize, HashMap<StrId, usize>>,
@@ -68,7 +68,7 @@ where
 
 impl<'a, 'cx, 'r, 'bump, 'g> MirModuleLowerer<'a, 'cx, 'r, 'bump, 'g>
 where
-    'bump: 'a,
+    'a: 'bump,
     'bump: 'cx,
     'cx: 'a,
     'r: 'a,
@@ -81,6 +81,7 @@ where
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
         instantiated_struct_methods: Rc<RefCell<FxHashMap<StrId, FxHashMap<StrId, StrId>>>>,
         registry: GlobalRegistry<'r, 'bump>,
+        bump: &'bump GrowableBump,
     ) -> Self {
         let mut enum_variant_tags: HashMap<StrId, HashMap<StrId, usize>> = HashMap::default();
 
@@ -120,7 +121,7 @@ where
             g_phantom_data: PhantomData,
             allocator_kind: HashMap::default(),
             glue_registry,
-            bump: GrowableBump::new(4096, 8),
+            bump,
             instantiated_functions,
             instantiated_struct_methods,
             registry,
@@ -621,7 +622,7 @@ where
 
             // str = { ptr, len }; ptr is a relocation to the raw bytes
             (SsaType::String, HirExpr::String(s, _)) if out.len() == 16 => {
-                let len = self.context.resolve_bytes(s).len();
+                let len = s.as_bytes().len();
                 out[8..16].copy_from_slice(&(len as u64).to_le_bytes());
                 relocs.push(StaticReloc {
                     offset: base,

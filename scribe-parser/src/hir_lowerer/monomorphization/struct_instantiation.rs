@@ -17,8 +17,8 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
     instantiated_enum_origins: &Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
     base_id: StrId,
     concrete_args: &[HirType<'a, 'bump>],
-    bump: &'bump GrowableBump<'bump>,
-) -> Option<&'bump HirEnum<'a, 'bump>> {
+    bump: &'bump GrowableBump,
+) -> Option<HirEnum<'a, 'bump>> {
     if concrete_args
         .iter()
         .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
@@ -27,11 +27,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
     }
 
     if concrete_args.is_empty() {
-        return ctx
-            .enums
-            .borrow()
-            .get(&base_id)
-            .map(|c| unsafe { std::mem::transmute::<_, &'bump _>(c) });
+        return ctx.enums.borrow().get(&base_id).copied();
     }
 
     if concrete_args
@@ -58,11 +54,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
     {
         let cache = instantiated_enums.borrow();
         if let Some(cached) = cache.get(&key) {
-            let ptr = ctx
-                .enums
-                .borrow()
-                .get(cached)
-                .map(|c| unsafe { std::mem::transmute::<_, &'bump _>(c) });
+            let ptr = ctx.enums.borrow().get(cached).copied();
             if ptr.is_some() {
                 return ptr;
             }
@@ -106,13 +98,10 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
         new_enum.generics = None;
     }
 
-    let new_enum_ptr = bump.alloc_value(new_enum);
     {
         let mut enums = ctx.enums.borrow_mut();
-        enums.insert(interned, *new_enum_ptr);
-        instantiated_enums
-            .borrow_mut()
-            .insert(key, new_enum_ptr.name);
+        enums.insert(interned, new_enum);
+        instantiated_enums.borrow_mut().insert(key, new_enum.name);
         instantiated_enum_origins
             .borrow_mut()
             .insert(interned, (base_id, concrete_args.to_vec()));
@@ -129,7 +118,7 @@ pub fn instantiate_enum_for_types<'a, 'bump>(
         ctx.struct_methods.borrow_mut().insert(interned, methods);
     }
 
-    Some(new_enum_ptr)
+    Some(new_enum)
 }
 
 pub fn instantiate_struct_for_types<'a, 'bump>(
@@ -140,8 +129,8 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
     instantiated_enum_origins: &Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
     base_id: StrId,
     concrete_args: &[HirType<'a, 'bump>],
-    bump: &'bump GrowableBump<'bump>,
-) -> Option<&'bump HirStruct<'a, 'bump>> {
+    bump: &'bump GrowableBump,
+) -> Option<HirStruct<'a, 'bump>> {
     if concrete_args
         .iter()
         .any(|t| matches!(t.kind, HirTypeKind::Generic(_)) || hir_contains_this(t))
@@ -150,11 +139,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
     }
 
     if concrete_args.is_empty() {
-        return ctx
-            .structs
-            .borrow()
-            .get(&base_id)
-            .map(|c| unsafe { std::mem::transmute::<_, &'bump _>(c) });
+        return ctx.structs.borrow().get(&base_id).copied();
     }
 
     if concrete_args
@@ -199,11 +184,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
     {
         let cache = instantiated_structs.borrow();
         if let Some(cached) = cache.get(&key) {
-            let ptr = ctx
-                .structs
-                .borrow()
-                .get(cached)
-                .map(|c| unsafe { std::mem::transmute::<_, &'bump _>(c) });
+            let ptr = ctx.structs.borrow().get(cached).copied();
             if ptr.is_some() {
                 return ptr;
             }
@@ -266,7 +247,7 @@ pub fn instantiate_struct_for_types<'a, 'bump>(
         new_struct.generics = None;
     }
 
-    let new_struct_ptr = bump.alloc_value(new_struct.clone());
+    let new_struct_ptr = new_struct.clone();
     ctx.structs.borrow_mut().insert(interned, new_struct);
 
     Some(new_struct_ptr)
@@ -281,7 +262,7 @@ pub fn direct_method_lookup<'a, 'bump>(
     struct_name: &StrId,
     struct_args: &[HirType<'a, 'bump>],
     method_name: &StrId,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> Option<StrId> {
     let concrete_name = if struct_args.is_empty() {
         *struct_name
@@ -310,7 +291,7 @@ fn instantiate_type_recursively_ctx<'a, 'bump>(
     instantiated_enums: &Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
     instantiated_enum_origins: &Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
     ty: HirType<'a, 'bump>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> HirType<'a, 'bump> {
     let span = ty.span;
     match ty.kind {

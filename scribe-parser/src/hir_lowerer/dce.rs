@@ -95,7 +95,7 @@ enum Work {
 
 pub struct DeadCodeEliminator<'a, 'bump, 'cfg> {
     cfg: &'cfg DceConfig,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 
     funcs: Vec<FuncEntry<'a, 'bump>>,
     types: Vec<TypeEntry<'a, 'bump>>,
@@ -140,7 +140,7 @@ impl<'a, 'bump, 'cfg> DeadCodeEliminator<'a, 'bump, 'cfg>
 where
     'bump: 'a,
 {
-    pub fn new(cfg: &'cfg DceConfig, bump: &'bump GrowableBump<'bump>) -> Self {
+    pub fn new(cfg: &'cfg DceConfig, bump: &'bump GrowableBump) -> Self {
         Self {
             cfg,
             bump,

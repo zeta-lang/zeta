@@ -6,7 +6,7 @@ version = "0.3.1-alpha"
 edition = "2024"
 
 [profile.release]
-opt-level = 3
+opt-level = 2
 debug = "line-tables-only"
 strip = "debuginfo"
 lto = "thin"
@@ -24,12 +24,15 @@ members = [
     "iris-math",
     "zeta-lsp",
     "zeta-compiler-api",
-    "zetaup"
+    "zetaup",
+    "stable-hash-proc-macro"
 ]
 
 [dependencies]
 mimalloc = "0.1.52"
 zeta-compiler-api = { path = "./zeta-compiler-api" }
+codex-dependency-graph = { path = "./codex-dependency-graph" }
+zetaruntime = { path = "./zeta_utilities" }
 walkdir = "2.5.0"
 thiserror = "2.0.17"
 clap = { version = "4.5.53", features = ["derive"] }

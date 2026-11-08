@@ -21,7 +21,7 @@ pub fn suffix_for_subs(pool: Arc<StringPool>, subs: &HashMap<StrId, HirType>) ->
         if i > 0 {
             buf.push(b'_');
         }
-        buf.extend_from_slice(pool.resolve_bytes(&*v));
+        buf.extend_from_slice(v.as_bytes());
     }
     let s = std::str::from_utf8(&buf).expect("Generated string should be valid UTF-8");
     StrId(pool.intern(s))
@@ -48,11 +48,11 @@ pub fn instantiate_struct_name(
     pool: Arc<StringPool>,
 ) -> StrId {
     let mut buf: SmallVec<u8, 128> = SmallVec::new();
-    buf.extend_from_slice(pool.resolve_bytes(&*base.name));
+    buf.extend_from_slice(base.name.as_bytes());
     for arg in concrete_args {
         buf.push(b'_');
         let suf = type_suffix_with_pool(pool.clone(), arg);
-        buf.extend_from_slice(pool.resolve_bytes(&*suf));
+        buf.extend_from_slice(suf.as_bytes());
     }
     let s = std::str::from_utf8(&buf).expect("Generated string should be valid UTF-8");
     let interned = StrId(pool.intern(s));
