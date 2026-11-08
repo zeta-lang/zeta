@@ -5,7 +5,7 @@ use is_terminal::IsTerminal;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum DiagnosticLevel {
     Error,
     Warning,

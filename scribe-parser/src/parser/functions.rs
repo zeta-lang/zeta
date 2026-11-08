@@ -1,9 +1,11 @@
 use crate::parser::descent_parser::{BinderCtx, DescentParser};
 use ir::ast::{
-    EnsuresClause, ExternModifier, FuncDecl, FuncModifiers, FuncSafety, InlineModifier,
+    EnsuresClause, ExternModifier, FuncDecl, FuncModifiers, FuncSafety, Generic, InlineModifier,
     ReturnBinder, Stmt, Type, Visibility,
 };
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
+use ir::hir::StrId;
+use ir::span::SourceSpan;
 use ir::tokens::{Cursor, TokenKind};
 
 impl<'a, 'bump> DescentParser<'a, 'bump>
@@ -13,40 +15,13 @@ where
     pub fn parse_function_signature(
         &mut self,
         visibility: Visibility,
+        name: StrId,
+        name_span: SourceSpan<'a>,
+        generics: Option<&'bump [Generic<'a, 'bump>]>,
     ) -> Result<FuncDecl<'a, 'bump>, DiagnosticError<'a>> {
         let attrs = std::mem::take(&mut self.pending_attrs);
         let function_metadata = Self::get_func_metadata(&mut self.cursor, visibility)?;
         let fn_token = self.cursor.expect(TokenKind::Func)?;
-
-        let name_token = self.cursor.bump();
-        let name_span = name_token.span;
-        let name = match name_token.kind {
-            TokenKind::Ident => match name_token.text {
-                Some(text) if text.is_empty() => {
-                    return Err(DiagnosticError::new(
-                        ParseErrorKind::EmptyIdent,
-                        name_token.span,
-                    ));
-                }
-                Some(text) => text,
-                None => {
-                    return Err(DiagnosticError::new(
-                        ParseErrorKind::EmptyIdent,
-                        name_token.span,
-                    ));
-                }
-            },
-            _ => {
-                return Err(DiagnosticError::new(
-                    ParseErrorKind::InvalidFunctionName {
-                        found: name_token.kind,
-                    },
-                    name_token.span,
-                ));
-            }
-        };
-
-        let generics = self.parse_generics()?;
 
         let params = self.parse_params()?;
 
@@ -133,11 +108,14 @@ where
         }
     }
 
-    pub fn parse_function_with_visibility(
+    pub fn parse_function_decl(
         &mut self,
         visibility: Visibility,
+        name: StrId,
+        name_span: SourceSpan<'a>,
+        generics: Option<&'bump [Generic<'a, 'bump>]>,
     ) -> Result<Stmt<'a, 'bump>, DiagnosticError<'a>> {
-        let func = self.parse_function_signature(visibility)?;
+        let func = self.parse_function_signature(visibility, name, name_span, generics)?;
 
         let is_extern = !matches!(func.function_metadata.extern_modifier, ExternModifier::None);
 
@@ -152,7 +130,7 @@ where
     }
 
     pub fn get_func_metadata(
-        cursor: &mut Cursor<'a, 'bump>,
+        cursor: &mut Cursor<'a>,
         visibility: Visibility,
     ) -> Result<FuncModifiers, DiagnosticError<'a>> {
         let mut inline_modifier = InlineModifier::None;
@@ -233,6 +211,7 @@ where
             extern_modifier,
             inline_modifier,
             func_safety,
+            execution_mode: ir::ast::AstExecutionMode::Runtime,
         })
     }
 }

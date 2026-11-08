@@ -3,10 +3,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use crate::io_uring_file_loader::IoUringFileLoader;
 
-#[cfg(target_os = "windows")]
-use crate::iocp_file_loader::IocpFileLoader;
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux")))]
 use crate::std_file_loader::StdFileLoader;
 
 pub trait FileLoader {
@@ -22,11 +19,11 @@ pub struct SourceFile {
 pub fn choose_file_loader() -> impl FileLoader {
     #[cfg(target_os = "linux")]
     {
-        return IoUringFileLoader::new(256);
+        IoUringFileLoader::new(256)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux")))]
     {
-        return StdFileLoader;
+        StdFileLoader
     }
 }

@@ -12,7 +12,6 @@ use crate::{
     urls::path_to_uri,
 };
 
-/// An `impl` block, flattened to what the LSP needs so nothing else has to name `ImplDecl`.
 struct ImplSite<'a, 'bump> {
     span: SourceSpan<'a>,
     target_name: Option<StrId>,
@@ -93,7 +92,7 @@ fn resolve_interface_ref<'a, 'bump>(
     name: StrId,
     path: &[StrId],
 ) -> Option<(usize, usize)> {
-    let is_interface = |hit: &(usize, usize, &'static str)| hit.2 == "trait";
+    let is_interface = |hit: &(usize, usize, &'static str)| hit.2 == "interface";
 
     if !path.is_empty() {
         let is_iface = |m: usize, idx: usize| {

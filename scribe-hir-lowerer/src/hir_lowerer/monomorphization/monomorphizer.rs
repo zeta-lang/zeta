@@ -34,7 +34,7 @@ pub struct Monomorphizer<'a, 'bump, 'ctx> {
         Rc<RefCell<FxHashMap<StrId, (StrId, Vec<HirType<'a, 'bump>>)>>>,
     pub(crate) current_return_type: RefCell<Option<HirType<'a, 'bump>>>,
     pub(crate) functions: Rc<RefCell<FxHashMap<StrId, HirFunc<'a, 'bump>>>>,
-    pub(crate) bump: &'bump GrowableBump<'bump>,
+    pub(crate) bump: &'bump GrowableBump,
     pub(crate) context: Arc<StringPool>,
     pub(crate) ctx: &'ctx mut LoweringCtx<'a, 'bump>,
     pub(crate) current_this: RefCell<Option<HirType<'a, 'bump>>>,
@@ -45,7 +45,7 @@ pub struct Monomorphizer<'a, 'bump, 'ctx> {
 impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
     pub fn new(
         context: Arc<StringPool>,
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         functions: Rc<RefCell<FxHashMap<StrId, HirFunc<'a, 'bump>>>>,
         ctx: &'ctx mut LoweringCtx<'a, 'bump>,
         instantiated_functions: Rc<RefCell<FxHashMap<(StrId, StrId), StrId>>>,
@@ -564,9 +564,9 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
         let mut small_vec: SmallVec<u8, 32> =
             SmallVec::with_capacity(orig_name.len() + UNDERSCORE_LEN + suffix.len());
 
-        small_vec.extend_from_slice(self.context.resolve_bytes(&*orig_name));
+        small_vec.extend_from_slice(orig_name.as_bytes());
         small_vec.push(b'_');
-        small_vec.extend_from_slice(self.context.resolve_bytes(&*suffix));
+        small_vec.extend_from_slice(suffix.as_bytes());
 
         let new_name = StrId(self.context.intern_bytes(small_vec.as_slice()));
 
@@ -646,7 +646,7 @@ impl<'a, 'bump, 'ctx> Monomorphizer<'a, 'bump, 'ctx> {
 pub fn replace_this<'a, 'bump>(
     ty: &HirType<'a, 'bump>,
     self_ty: &HirType<'a, 'bump>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
     span: SourceSpan<'a>,
 ) -> HirType<'a, 'bump> {
     if !hir_contains_this(ty) {

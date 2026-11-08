@@ -165,10 +165,9 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         }
 
         let pkg = self.dep_graph.borrow().get_module_package(self.module_idx);
-        let bare_str = self.context.resolve_string(&bare_name);
         let candidate = pkg.map(|p| {
-            let pkg_str = self.context.resolve_string(&p).replace("::", "_");
-            StrId(intern_fmt!(self.context, "{}_{}", pkg_str, bare_str))
+            let pkg_str = p.as_str().replace("::", "_");
+            StrId(intern_fmt!(self.context, "{}_{}", pkg_str, bare_name))
         });
 
         if let Some(cand) = candidate {

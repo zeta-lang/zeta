@@ -3,7 +3,7 @@ use crate::midend::copy_analysis::drop_tracking::{DropMoveState, DropScope};
 use crate::midend::ir::block_data::CurrentBlockData;
 use crate::midend::ir::mir_lowering::const_table::ConstTable;
 use crate::midend::ir::mir_lowering::control_flow::LoopCtx;
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::ast::FuncSafety;
 use ir::attributes::{AttrTarget, KnownKind};
 use ir::hir::{
@@ -106,7 +106,7 @@ where
     pub(super) enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
     pub(super) context: Arc<StringPool>,
     pub(super) extern_c_names: &'s HashSet<StrId>,
-    pub(super) dep_graph: &'s RefCell<DepGraph>,
+    pub(super) dep_graph: &'s RefCell<DepGraph<'a>>,
     pub(super) module_idx: usize,
     pub(super) return_type: Option<HirType<'a, 'bump>>,
     pub(super) global_funcs: &'s HashMap<StrId, Function>,
@@ -115,7 +115,7 @@ where
     pub(super) glue_registry: &'s DropGlueRegistry,
     pub(super) allocator_kind: &'s HashMap<StrId, AllocatorKind>,
     pub(super) interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-    pub(super) bump: &'s GrowableBump<'bump>,
+    pub(super) bump: &'bump GrowableBump,
     pub(super) module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
     pub(super) module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
     pub(super) constants: &'s ConstTable<'a, 'bump>,
@@ -157,12 +157,12 @@ where
         enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'s HashSet<StrId>,
-        dep_graph: &'s RefCell<DepGraph>,
+        dep_graph: &'s RefCell<DepGraph<'a>>,
         module_idx: usize,
         glue_registry: &'s DropGlueRegistry,
         allocator_kind: &'s HashMap<StrId, AllocatorKind>,
         interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'s GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
@@ -219,12 +219,12 @@ where
         enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'s HashSet<StrId>,
-        dep_graph: &'s RefCell<DepGraph>,
+        dep_graph: &'s RefCell<DepGraph<'a>>,
         module_idx: usize,
         glue_registry: &'s DropGlueRegistry,
         allocator_kind: &'s HashMap<StrId, AllocatorKind>,
         interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'s GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
@@ -281,12 +281,12 @@ where
         enum_variant_tags: &'s HashMap<StrId, HashMap<StrId, usize>>,
         context: Arc<StringPool>,
         extern_c_names: &'s HashSet<StrId>,
-        dep_graph: &'s RefCell<DepGraph>,
+        dep_graph: &'s RefCell<DepGraph<'a>>,
         module_idx: usize,
         glue_registry: &'s DropGlueRegistry,
         allocator_kind: &'s HashMap<StrId, AllocatorKind>,
         interface_methods: &'s HashMap<StrId, Vec<(StrId, Vec<SsaType>, SsaType)>>,
-        bump: &'s GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         enums: &'s HashMap<StrId, HirEnum<'a, 'bump>>,
         module_import_aliases: &'s HashMap<usize, HashMap<StrId, usize>>,
         module_named_imports: &'s HashMap<usize, HashMap<StrId, usize>>,
@@ -924,7 +924,7 @@ where
 
             HirExpr::Boolean(b, _) => self.lower_bool_expr(b),
 
-            HirExpr::Decimal(d, _) => self.lower_decimal_expr(d),
+            HirExpr::Decimal(d, _) => self.lower_decimal_expr(&d.get()),
 
             HirExpr::Tuple(elements, _) => self.lower_tuple_expr(elements),
 

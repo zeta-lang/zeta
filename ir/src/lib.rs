@@ -1,3 +1,7 @@
+#![feature(pattern)]
+
+extern crate self as ir;
+
 pub mod alias_reasoner_pass;
 pub mod analysis_context;
 pub mod ast;

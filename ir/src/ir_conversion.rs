@@ -1,5 +1,5 @@
 use crate::{
-    hir::{AssignmentOperator, HirEnum, HirStruct, HirType, HirTypeKind, Operator, StrId},
+    hir::{AssignmentOperator, HirEnum, HirExpr, HirStruct, HirType, HirTypeKind, Operator, StrId},
     ir_hasher::HashMap,
     ssa_ir::{BinOp, SsaType},
 };
@@ -99,8 +99,8 @@ fn lower_type_hir_inner(
             if in_progress.contains(&name) {
                 // Behind a pointer; the layout never looks at the payload.
                 return SsaType::Enum {
-                    name: name,
-                    unmangled_name: unmangled_name,
+                    name,
+                    unmangled_name,
                     variants: Vec::new(),
                 };
             }
@@ -282,10 +282,15 @@ fn lower_type_hir_inner(
                 .map(|arg| lower_type_hir_inner(arg, enums, structs, in_progress))
                 .collect(),
         ),
-        HirTypeKind::Array(hir_type, length) => SsaType::Array(
-            Box::new(lower_type_hir_inner(hir_type, enums, structs, in_progress)),
-            length,
-        ),
+        HirTypeKind::Array(hir_type, length) => {
+            let HirExpr::Number(len, _) = length else {
+                unreachable!()
+            };
+            SsaType::Array(
+                Box::new(lower_type_hir_inner(hir_type, enums, structs, in_progress)),
+                *len as usize,
+            )
+        }
         HirTypeKind::Slice(hir_type) => SsaType::Slice(Box::new(lower_type_hir_inner(
             hir_type,
             enums,
@@ -299,6 +304,9 @@ fn lower_type_hir_inner(
             let elem_ssa = lower_type_hir_inner(elem, enums, structs, in_progress);
             SsaType::Tuple(vec![elem_ssa.clone(), elem_ssa])
         }
+        HirTypeKind::AnonStruct { fields } => todo!(),
+        HirTypeKind::AnonEnum { variants } => todo!(),
+        HirTypeKind::Type => todo!(),
     }
 }
 

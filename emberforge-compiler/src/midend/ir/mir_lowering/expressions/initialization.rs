@@ -18,13 +18,10 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
         variant: &StrId,
     ) -> Option<Value> {
         let hir_enum = self.enums.get(enum_name).or_else(|| {
-            let base_str = self.context.resolve_string(enum_name);
             let candidates: Vec<&HirEnum> = self
                 .enums
                 .values()
-                .filter(|e| {
-                    e.name.as_str() == base_str && e.variants.iter().any(|v| v.name == *variant)
-                })
+                .filter(|e| e.name == enum_name && e.variants.iter().any(|v| v.name == *variant))
                 .collect();
             if candidates.len() == 1 {
                 Some(candidates[0])

@@ -53,8 +53,7 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
                 panic!(
                     "lower_field_access: `.{}` is not a valid slice field on {:?} \
                  (only `.len`, and `.cap`/`.capacity` on *owned* slices, are supported)",
-                    self.context.resolve_string(&field),
-                    obj_ty
+                    field, obj_ty
                 );
             }
         }
@@ -411,12 +410,6 @@ impl<'f, 's, 'a, 'bump, 'r> FunctionLowerer<'f, 's, 'a, 'bump, 'r> {
             .unwrap_or_else(|| panic!("Unknown struct {} in FieldAccess", cls_name))
             .get(&field)
             .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "Unknown field {} on struct {}",
-                    self.context.resolve_string(&*field),
-                    self.context.resolve_string(&*cls_name)
-                )
-            })
+            .unwrap_or_else(|| panic!("Unknown field {} on struct {}", field, cls_name))
     }
 }

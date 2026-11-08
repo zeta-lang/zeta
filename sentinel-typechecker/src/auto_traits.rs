@@ -176,7 +176,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                     def.generics.unwrap_or(&[]).iter().map(|g| g.name).collect(),
                     def.variants
                         .iter()
-                        .flat_map(|v| v.fields.iter())
+                        .flat_map(|v| v.fields)
                         .map(|f| f.field_type)
                         .collect(),
                 )

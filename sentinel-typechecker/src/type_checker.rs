@@ -16,7 +16,7 @@ use crate::move_state::MoveState;
 use crate::naming::type_to_string;
 use crate::type_context::TypeContext;
 use crate::{closures, statics};
-use codex_dependency_graph::DepGraph;
+use codex_dependency_graph::dep_graph::DepGraph;
 use ir::analysis_context::CopyAnalysisCtx;
 use ir::ast::FuncSafety;
 use ir::attributes::{self, Arity, AttrTable};
@@ -299,8 +299,8 @@ pub struct TypeChecker<'a, 'bump> {
 
 impl<'a, 'bump> TypeChecker<'a, 'bump> {
     pub fn new(
-        dep_graph: &'a RefCell<DepGraph>,
-        bump: &'bump GrowableBump<'bump>,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
+        bump: &'bump GrowableBump,
         copy_analysis: Rc<RefCell<CopyAnalysisCtx<'a, 'bump>>>,
         string_pool: Arc<StringPool>,
         auto_imports: Rc<RefCell<AutoImportRegistry>>,
@@ -2545,7 +2545,7 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         self.borrow_checker
             .kill_facts_where(&|s| names.contains(&s));
         for &n in &names {
-            self.kill_facts_about(n); // whatever else the checker tracks per variable
+            self.kill_facts_about(n);
         }
     }
 }

@@ -1,9 +1,13 @@
-use crate::parser::descent_parser::{BinderCtx, DescentParser};
-use ir::ast::{
-    Block, EffectAccess, EffectSegment, Generic, MatchArm, MutabilityState, NormalParam, Param,
-    ParamPassingKind, ProvenanceAnnotation, ProvenancePathSegment, ProvenanceRoot, RefKind,
-    ReturnBinder, ThisParam, Type, TypeKind, Visibility,
+use crate::parser::descent_parser::{
+    BinderCtx, DescentParser, active_string_pool, at_decl_sep, token_to_visibility,
 };
+use ir::ast::{
+    Block, EffectAccess, EffectSegment, EnumVariant, Expr, Field, Generic, MatchArm,
+    MutabilityState, NormalParam, Param, ParamPassingKind, ProvenanceAnnotation,
+    ProvenancePathSegment, ProvenanceRoot, RefKind, ReturnBinder, ThisParam, Type, TypeKind,
+    Visibility,
+};
+use ir::diagnostics_context::ParserDiagnosticsContext;
 use ir::errors::error::{DiagnosticError, ParseErrorKind};
 
 use ir::tokens::TokenKind::LBracket;
@@ -338,7 +342,7 @@ where
         Ok(Some(self.bump.alloc_slice(&params)))
     }
 
-    pub fn try_consume_close_angle(cursor: &mut Cursor<'a, 'bump>, pending: &mut u8) -> bool {
+    pub fn try_consume_close_angle(cursor: &mut Cursor<'a>, pending: &mut u8) -> bool {
         if *pending > 0 {
             *pending -= 1;
             return true;
@@ -418,8 +422,8 @@ where
     }
 
     pub fn parse_type_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         pending: &mut u8,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
         Self::parse_type_in(bump, cursor, pending, &mut None)
@@ -435,8 +439,8 @@ where
     }
 
     pub(crate) fn try_binder_in(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<(), DiagnosticError<'a>> {
         let Some(ctx) = binders.as_mut() else {
@@ -479,8 +483,8 @@ where
     }
 
     pub(crate) fn parse_type_in(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         pending: &mut u8,
         binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
@@ -658,8 +662,8 @@ where
 
     /// Assumes `[` has already been consumed. Parses `]inner`, `N]inner`, or `*]mut/const inner`.
     fn parse_bracket_type_kind_inner_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         pending: &mut u8,
         binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
@@ -670,21 +674,9 @@ where
             let inner = Self::parse_type_impl(bump, cursor, pending)?;
             let inner_ref = bump.alloc_value(inner);
             return Ok(TypeKind::Slice { inner: inner_ref });
-        } else if token.kind == TokenKind::Number {
-            cursor.advance();
+        } else if token.kind != TokenKind::Mul {
+            let length = Self::parse_array_length_impl(bump, cursor)?;
             cursor.expect(TokenKind::RBracket)?;
-
-            // SAFETY: a token with kind TokenKind::Number always comes with text.
-            let number_unparsed = unsafe { token.text.unwrap_unchecked() };
-            let length = number_unparsed.as_str().parse::<usize>().map_err(|_| {
-                DiagnosticError::new(
-                    ParseErrorKind::UnexpectedToken {
-                        expected: TokenKind::Number,
-                        found: token.kind,
-                    },
-                    cursor.peek_token().span,
-                )
-            })?;
 
             let inner = Self::parse_core_type_impl(bump, cursor, pending, binders)?;
             let inner_ref = bump.alloc_value(inner);
@@ -692,7 +684,7 @@ where
                 inner: inner_ref,
                 length,
             });
-        } else if token.kind == TokenKind::Mul {
+        } else {
             cursor.advance(); // consume *
             cursor.expect(TokenKind::RBracket)?; // consume ]
 
@@ -708,14 +700,6 @@ where
                 inner: inner_ref,
                 mutability_state,
             });
-        } else {
-            return Err(DiagnosticError::new(
-                ParseErrorKind::UnexpectedToken {
-                    expected: TokenKind::Mul,
-                    found: cursor.peek_token().kind,
-                },
-                cursor.peek_token().span,
-            ));
         }
     }
 
@@ -723,8 +707,8 @@ where
     /// followed by a provenance and then the end of the bound (`+`, `,`, `>`, `>>`, `=`).
     /// Anything else (`&Trait`, `&[T]`) is left for `parse_type`; the cursor is restored.
     fn parse_min_provenance_bound_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
     ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
         if cursor.peek() != TokenKind::BitAnd {
             return Ok(None);
@@ -732,7 +716,7 @@ where
         let save = cursor.pos();
         cursor.advance();
 
-        let ends_bound = |c: &Cursor<'a, 'bump>| {
+        let ends_bound = |c: &Cursor<'a>| {
             matches!(
                 c.peek(),
                 TokenKind::Add
@@ -787,8 +771,8 @@ where
     }
 
     fn parse_optional_provenance_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
     ) -> Result<Option<ProvenanceAnnotation<'bump>>, DiagnosticError<'a>> {
         // &static Player: the referent lives forever.
         if cursor.peek() == TokenKind::Static {
@@ -862,7 +846,7 @@ where
         Ok(None)
     }
 
-    fn starts_type_impl(cursor: &Cursor<'a, 'bump>) -> bool {
+    fn starts_type_impl(cursor: &Cursor<'a>) -> bool {
         matches!(
             cursor.peek(),
             TokenKind::Ident | TokenKind::This | TokenKind::LBracket
@@ -871,8 +855,8 @@ where
 
     /// Consumes `[` itself, then delegates. Use this when `[` hasn't been consumed yet.
     fn parse_bracket_type_kind_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         pending: &mut u8,
         binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
@@ -880,9 +864,194 @@ where
         Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending, binders)
     }
 
+    fn parse_array_length_impl(
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
+    ) -> Result<&'bump Expr<'a, 'bump>, DiagnosticError<'a>> {
+        let string_pool = active_string_pool()
+            .expect("array lengths are only parsed while a DescentParser is running");
+        let mut sub = DescentParser {
+            cursor: cursor.clone(),
+            bump,
+            string_pool,
+            diag: ParserDiagnosticsContext::new(false),
+            pending_attrs: &[],
+            pending_close_angle: 0,
+            binder_ctx: None,
+        };
+        let length = sub.parse_expr_inner(0, false)?;
+        cursor.reset(sub.cursor.pos());
+        Ok(bump.alloc_value_immutable(length))
+    }
+
+    fn parse_anon_enum_type_impl(
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
+    ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
+        cursor.expect(TokenKind::LBrace)?;
+
+        let mut variants = Vec::new();
+        while cursor.peek() != TokenKind::RBrace && cursor.peek() != TokenKind::EOF {
+            let (name, span) = cursor.expect_ident()?;
+
+            let fields: &'bump [Field<'a, 'bump>] = match cursor.peek() {
+                TokenKind::LParen => {
+                    return Err(DiagnosticError::new(
+                        ParseErrorKind::UnexpectedToken {
+                            expected: TokenKind::LBrace,
+                            found: TokenKind::LParen,
+                        },
+                        cursor.peek_token().span,
+                    )
+                    .with_note(
+                        "Zeta enum variants don't support tuple syntax `Name(Type)`. \
+                         Use named fields instead: `Name { field: Type }`.",
+                    ));
+                }
+                TokenKind::LBrace => {
+                    cursor.advance();
+                    let mut fields = Vec::new();
+                    while cursor.peek() != TokenKind::RBrace && cursor.peek() != TokenKind::EOF {
+                        let visibility = match token_to_visibility(cursor.peek()) {
+                            Some(vis) => {
+                                cursor.advance();
+                                vis
+                            }
+                            None => Visibility::Public,
+                        };
+                        let manual = cursor.consume(TokenKind::Manual);
+                        let (field_name, field_span) = cursor.expect_ident()?;
+                        cursor.expect(TokenKind::Colon)?;
+                        let mut inner_pending = 0u8;
+                        let field_type = Self::parse_type_impl(bump, cursor, &mut inner_pending)?;
+                        fields.push(Field {
+                            name: field_name,
+                            field_type,
+                            visibility,
+                            span: field_span,
+                            manual,
+                        });
+                        if !cursor.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    cursor.expect(TokenKind::RBrace)?;
+                    bump.alloc_slice(&fields)
+                }
+                _ => &[],
+            };
+
+            variants.push(EnumVariant { name, fields, span });
+
+            if !cursor.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        cursor.expect(TokenKind::RBrace)?;
+
+        Ok(TypeKind::AnonEnum {
+            variants: bump.alloc_slice(&variants),
+        })
+    }
+
+    fn parse_variant_union_impl(
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
+        pending: &mut u8,
+        first: Type<'a, 'bump>,
+    ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
+        let mut members = vec![first];
+        while cursor.consume(TokenKind::OrOr) {
+            members.push(Self::parse_type_impl(bump, cursor, pending)?);
+        }
+        cursor.expect(TokenKind::RParen)?;
+
+        let mut variants = Vec::with_capacity(members.len());
+        for member in members {
+            match member.kind {
+                TypeKind::Struct {
+                    name,
+                    path,
+                    generics,
+                } if path.is_empty() && generics.is_empty() && !member.nullable => {
+                    variants.push(EnumVariant {
+                        name,
+                        fields: &[],
+                        span: member.span,
+                    });
+                }
+                _ => {
+                    return Err(DiagnosticError::new(
+                        ParseErrorKind::UnexpectedToken {
+                            expected: TokenKind::Ident,
+                            found: TokenKind::OrOr,
+                        },
+                        member.span,
+                    )
+                    .with_note(
+                        "`(A || B)` is shorthand for `enum { A, B }`, so each member must be a \
+                         plain variant name.",
+                    ));
+                }
+            }
+        }
+
+        Ok(TypeKind::AnonEnum {
+            variants: bump.alloc_slice(&variants),
+        })
+    }
+
+    fn parse_anon_struct_type_impl(
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
+    ) -> Result<TypeKind<'a, 'bump>, DiagnosticError<'a>> {
+        cursor.expect(TokenKind::LBrace)?;
+
+        let mut fields = Vec::new();
+        while cursor.peek() != TokenKind::RBrace && cursor.peek() != TokenKind::EOF {
+            let visibility = match token_to_visibility(cursor.peek()) {
+                Some(vis) => {
+                    cursor.advance();
+                    vis
+                }
+                None => Visibility::Private,
+            };
+            let manual = cursor.consume(TokenKind::Manual);
+            let (name, span) = cursor.expect_ident()?;
+            cursor.expect(TokenKind::Colon)?;
+
+            // Field types get their own `>>` bookkeeping, the struct body is a fresh scope.
+            let mut inner_pending = 0u8;
+            let field_type = Self::parse_type_impl(bump, cursor, &mut inner_pending)?;
+
+            if cursor.peek() == TokenKind::Dot {
+                return Err(DiagnosticError::unsupported_disjoint_borrow(
+                    cursor.peek_token().span,
+                ));
+            }
+
+            fields.push(Field {
+                name,
+                field_type,
+                visibility,
+                span,
+                manual,
+            });
+
+            if !cursor.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        cursor.expect(TokenKind::RBrace)?;
+
+        Ok(TypeKind::AnonStruct {
+            fields: bump.alloc_slice(&fields),
+        })
+    }
+
     fn parse_core_type_impl(
-        bump: &'bump GrowableBump<'bump>,
-        cursor: &mut Cursor<'a, 'bump>,
+        bump: &'bump GrowableBump,
+        cursor: &mut Cursor<'a>,
         pending: &mut u8,
         binders: &mut Option<BinderCtx<'a, 'bump>>,
     ) -> Result<Type<'a, 'bump>, DiagnosticError<'a>> {
@@ -912,6 +1081,12 @@ where
             TokenKind::Never => return Ok(Type::never(sp)),
 
             TokenKind::Underscore => return Ok(Type::infer(sp)),
+
+            TokenKind::Type => TypeKind::Type,
+
+            TokenKind::Struct => Self::parse_anon_struct_type_impl(bump, cursor)?,
+
+            TokenKind::Enum => Self::parse_anon_enum_type_impl(bump, cursor)?,
 
             TokenKind::LBracket => {
                 Self::parse_bracket_type_kind_inner_impl(bump, cursor, pending, binders)?
@@ -983,6 +1158,16 @@ where
                 if cursor.peek() != TokenKind::RParen {
                     loop {
                         types.push(Self::parse_type_impl(bump, cursor, pending)?);
+                        if types.len() == 1 && cursor.peek() == TokenKind::OrOr {
+                            let first = types.pop().unwrap();
+                            let kind =
+                                Self::parse_variant_union_impl(bump, cursor, pending, first)?;
+                            return Ok(Type {
+                                kind,
+                                nullable: false,
+                                span: sp,
+                            });
+                        }
                         #[allow(unused_assignments)]
                         if cursor.peek() == TokenKind::Comma {
                             cursor.advance();
@@ -1010,7 +1195,8 @@ where
 
                 let mut path = Vec::new();
 
-                while cursor.peek() == TokenKind::ColonColon {
+                while cursor.peek() == TokenKind::ColonColon && !at_decl_sep(cursor.pos() as usize)
+                {
                     cursor.advance(); // ::
 
                     path.push(name);

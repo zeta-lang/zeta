@@ -94,7 +94,9 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
 
         HirType::synthetic(HirTypeKind::Array(
             self.context.bump.alloc_value(first_ty),
-            elements.len(),
+            self.context
+                .bump
+                .alloc_value(HirExpr::Number(elements.len() as i64, self.current_span)),
         ))
     }
 

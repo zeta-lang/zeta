@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0.12"
 zetaruntime = { path = "../zeta_utilities" }
+scribe-parser = { path = "../scribe-parser" }
 ir = { path = "../ir" }
+smallvec = "2.0.0-alpha.12"

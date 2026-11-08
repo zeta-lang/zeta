@@ -22,7 +22,7 @@ pub fn link<'a>(objects: &[&str], output: &str, link_libc: bool) -> Result<(), C
             .join(".local")
             .join("share")
             .join("zeta");
-        
+
         let compiled_rt = zeta_share.as_path().join("zeta_rt.o");
         if compiled_rt.is_file() {
             cmd.arg(compiled_rt);

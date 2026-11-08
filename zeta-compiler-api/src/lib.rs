@@ -15,10 +15,10 @@ use ir::errors::type_error::{TypeError, TypeErrorKind};
 use ir::hir::{Hir, HirEnum, HirModule, HirStruct, StrId};
 use ir::ir_hasher::{FxHashMap, HashMap, HashSet};
 use ir::registry::global_registry::GlobalRegistry;
-use scribe_parser::hir_lowerer::HirLowerer;
-use scribe_parser::hir_lowerer::dce::{DceConfig, DeadCodeEliminator};
-use scribe_parser::hir_lowerer::lambda_hoisting::LambdaHoister;
-use scribe_parser::hir_lowerer::monomorphization::Monomorphizer;
+use scribe_hir_lowerer::hir_lowerer::HirLowerer;
+use scribe_hir_lowerer::hir_lowerer::dce::{DceConfig, DeadCodeEliminator};
+use scribe_hir_lowerer::hir_lowerer::lambda_hoisting::LambdaHoister;
+use scribe_hir_lowerer::hir_lowerer::monomorphization::Monomorphizer;
 use sentinel_typechecker::TypeChecker;
 use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
@@ -137,9 +137,7 @@ pub struct Compiler<'a, 'bump> {
     registry: GlobalRegistry<'a, 'bump>,
     auto_imports: Rc<RefCell<AutoImportRegistry>>,
 
-    dep_graph: &'a RefCell<DepGraph>,
-    #[allow(unused)] // Avoids a UB
-    dep_graph_storage: Box<RefCell<DepGraph>>,
+    dep_graph: &'a RefCell<DepGraph<'a>>,
     type_checker: Rc<RefCell<TypeChecker<'a, 'bump>>>,
     cpy_ctx: Rc<RefCell<CopyAnalysisCtx<'a, 'bump>>>,
 
@@ -150,8 +148,7 @@ pub struct Compiler<'a, 'bump> {
     hir_modules: HashMap<usize, HirModule<'a, 'bump>>, // pre-monomorphization
     codegen_hir_modules: HashMap<usize, HirModule<'a, 'bump>>, // post-monomorphization
     loaded_sources: HashMap<String, String>,
-    #[allow(unused)] // Avoids a UB
-    lowerer_bump: Box<GrowableBump<'bump>>,
+    lowerer_bump: &'bump GrowableBump,
     source_roots: Vec<PathBuf>,
     env_structs: FxHashMap<StrId, StrId>,
     /// Modules that passed type checking, in the order they must be monomorphized.
@@ -170,32 +167,19 @@ where
     'bump: 'a,
     'a: 'bump,
 {
-    pub fn new() -> Result<Self, BuildError<'a>> {
+    pub fn new(
+        bump: &'bump GrowableBump,
+        dep_graph: &'a RefCell<DepGraph<'a>>,
+    ) -> Result<Self, BuildError<'a>> {
         let pool = Arc::new(StringPool::new().map_err(|_| BuildError::FailedToAllocateStringPool)?);
         let registry = GlobalRegistry::new();
-
-        let dep_graph_storage = Box::new(RefCell::new(DepGraph::new()));
-        // SAFETY: Box's heap allocation is stable across Compiler moves.
-        // dep_graph_storage's contents are only ever mutated through
-        // `.borrow_mut()` on this erased reference or on the boxed value
-        // directly, never replaced wholesale. RefCell's runtime borrow
-        // tracking is what makes this genuinely sound (not just
-        // borrow-checker-satisfied): any illegal aliasing that would occur
-        // panics at the .borrow()/.borrow_mut() call site instead of
-        // silently producing UB
-        let dep_graph: &'a RefCell<DepGraph> =
-            unsafe { &*(dep_graph_storage.as_ref() as *const RefCell<DepGraph>) };
-
-        let lowerer_bump = Box::new(GrowableBump::new(4096, 8));
-        let lowerer_bump_ref: &'bump GrowableBump<'bump> =
-            unsafe { &*(lowerer_bump.as_ref() as *const GrowableBump<'bump>) };
 
         let auto_imports = Rc::new(RefCell::new(AutoImportRegistry::new()));
 
         let cpy_ctx = Rc::new(RefCell::new(CopyAnalysisCtx::new(&[], registry.clone())));
         let type_checker = Rc::new(RefCell::new(TypeChecker::new(
             dep_graph,
-            lowerer_bump_ref,
+            &bump,
             cpy_ctx.clone(),
             pool.clone(),
             auto_imports.clone(),
@@ -206,10 +190,9 @@ where
             registry,
             auto_imports,
             dep_graph,
-            dep_graph_storage,
             type_checker,
             cpy_ctx,
-            lowerer_bump,
+            lowerer_bump: bump,
             module_ids: HashMap::default(),
             next_module_idx: 0,
             stdlib_module_ids: HashSet::default(),
@@ -236,7 +219,7 @@ where
         self.dce_enabled = enabled;
     }
 
-    pub fn dep_graph(&self) -> &'a RefCell<DepGraph> {
+    pub fn dep_graph(&self) -> &'a RefCell<DepGraph<'a>> {
         self.dep_graph
     }
 
@@ -267,7 +250,7 @@ where
         self.type_checker.clone()
     }
 
-    pub fn dep_graph_ref(&self) -> &'a RefCell<DepGraph> {
+    pub fn dep_graph_ref(&self) -> &'a RefCell<DepGraph<'a>> {
         self.dep_graph
     }
 
@@ -300,6 +283,7 @@ where
                 self.pool.clone(),
                 file.path,
                 file.source,
+                self.lowerer_bump,
             )?;
 
             self.loaded_sources
@@ -439,7 +423,7 @@ where
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
                 kind: TypeErrorKind::Generic(err.0.clone()),
-                span: err.1.clone(),
+                span: err.1,
             });
         }
 
@@ -454,8 +438,10 @@ where
     }
 
     fn finalize_monomorphization(&mut self) {
+        let scratch = self.scratch_bump_ref();
+
         let mut emitted: HashSet<StrId> = HashSet::default();
-        let mut by_module: FxHashMap<usize, Vec<Hir<'a, 'bump>>> = FxHashMap::default();
+        let mut by_module: FxHashMap<usize, Vec<Hir<'_, '_>>> = FxHashMap::default();
 
         loop {
             let before = self.registry.instantiated_functions.borrow().len()
@@ -482,9 +468,7 @@ where
                 by_module
                     .entry(func.declaring_module_idx)
                     .or_default()
-                    .push(Hir::Func(
-                        self.lowerer_bump.alloc_value_immutable(func.clone()),
-                    ));
+                    .push(Hir::Func(scratch.alloc_value_immutable(func.clone())));
             }
         }
 
@@ -507,9 +491,10 @@ where
             let Some(&owner) = self.registry.struct_owner_module.borrow().get(&origin_name) else {
                 continue;
             };
-            by_module.entry(owner).or_default().push(Hir::Struct(
-                self.lowerer_bump.alloc_value_immutable(new_struct),
-            ));
+            by_module
+                .entry(owner)
+                .or_default()
+                .push(Hir::Struct(scratch.alloc_value_immutable(new_struct)));
         }
 
         for new_enum_name in self.registry.instantiated_enums.borrow().values() {
@@ -534,19 +519,19 @@ where
             by_module
                 .entry(owner)
                 .or_default()
-                .push(Hir::Enum(self.lowerer_bump.alloc_value_immutable(new_enum)));
+                .push(Hir::Enum(scratch.alloc_value_immutable(new_enum)));
         }
 
         for (module_idx, extra_items) in by_module {
             let Some(existing) = self.codegen_hir_modules.get(&module_idx) else {
                 continue;
             };
-            let mut merged: Vec<Hir<'a, 'bump>> = existing.items.to_vec();
+            let mut merged: Vec<Hir<'_, '_>> = existing.items.to_vec();
             merged.extend(extra_items);
             let bump = self
                 .modules
                 .get(&module_idx)
-                .map(|m| &m.bump)
+                .map(|m| m.bump_ref())
                 .expect("Expected module idx to exist");
             let new_module = HirModule {
                 name: existing.name,
@@ -650,7 +635,7 @@ where
         for err in lowerer.lowering_errors().iter() {
             reporter.add_type_error(TypeError {
                 kind: TypeErrorKind::Generic(err.0.clone()),
-                span: err.1.clone(),
+                span: err.1,
             });
         }
 
@@ -866,27 +851,6 @@ where
             });
         }
 
-        let mismatches = self
-            .dep_graph
-            .borrow()
-            .check_package_paths(&self.source_roots);
-        if !mismatches.is_empty() {
-            return Err(BuildError::CompilationAborted {
-                reason: mismatches
-                    .iter()
-                    .map(|m| m.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            });
-        }
-
-        let unresolved = self.dep_graph.borrow().unresolved_import_messages();
-        if !unresolved.is_empty() {
-            return Err(BuildError::CompilationAborted {
-                reason: unresolved.join("\n"),
-            });
-        }
-
         let compilation_order = self.dep_graph.borrow().get_module_compilation_order();
 
         let ordered_hir: Vec<HirModule<'a, 'bump>> = (0..self.next_module_idx)
@@ -902,9 +866,10 @@ where
             self.registry.clone(),
             optimize,
             verbose,
+            self.scratch_bump_ref(),
         );
 
-        let out_obj = match backend.finish(&out_dir.to_path_buf()) {
+        let out_obj = match backend.finish(&out_dir) {
             Ok(path) => path,
             Err(e) => {
                 self.timings.codegen += codegen_start.elapsed();
@@ -959,16 +924,18 @@ where
         let canonical_name = self.canonical_key(path);
         let module_idx = self.module_idx_for(canonical_name);
 
-        if let Some(m) = self.modules.get(&module_idx) {
-            if &m.source == &source && self.hir_modules.contains_key(&module_idx) {
-                return self.make_reporter();
-            }
+        if let Some(m) = self.modules.get(&module_idx)
+            && m.source == source
+            && self.hir_modules.contains_key(&module_idx)
+        {
+            return self.make_reporter();
         }
 
         let parsed = match crate::file_handling::parse_single_file_from_source(
             self.pool.clone(),
             PathBuf::from(canonical_name.as_str()),
             source,
+            self.lowerer_bump,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -1111,6 +1078,7 @@ where
                 self.pool.clone(),
                 PathBuf::from(canonical_name.as_str()),
                 contents,
+                self.lowerer_bump,
             )?;
             self.loaded_sources
                 .insert(canonical_name.to_string(), parsed.source.to_string());
@@ -1304,7 +1272,7 @@ where
 
         let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            &scratch_bump,
+            scratch_bump,
             self.registry.functions.clone(),
             &mut scratch_lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -1331,7 +1299,7 @@ where
 
         let mut monomorphizer = Monomorphizer::new(
             self.pool.clone(),
-            &scratch_lowerer.ctx.bump,
+            scratch_lowerer.ctx.bump,
             self.registry.functions.clone(),
             &mut scratch_lowerer.ctx,
             self.registry.instantiated_functions.clone(),
@@ -1348,7 +1316,7 @@ where
     /// SAFETY: the Box's heap allocation is stable across moves of `Compiler`, and
     /// `GrowableBump` only mutates through its own interior mutability, so
     /// handing out a `&'bump` ref derived from `&self` is sound.
-    fn scratch_bump_ref(&self) -> &'bump GrowableBump<'bump> {
-        unsafe { &*(self.lowerer_bump.as_ref() as *const GrowableBump<'bump>) }
+    fn scratch_bump_ref(&self) -> &'bump GrowableBump {
+        self.lowerer_bump
     }
 }

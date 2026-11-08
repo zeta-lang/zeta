@@ -12,10 +12,12 @@ pub mod implementations;
 #[cfg(test)]
 mod tests;
 
-use std::error::Error;
+use std::{cell::RefCell, error::Error};
 
 use clap::{Parser, Subcommand};
+use codex_dependency_graph::dep_graph::DepGraph;
 pub use server::Server;
+use zetaruntime::bump::GrowableBump;
 
 #[derive(Parser)]
 #[command(
@@ -38,12 +40,6 @@ pub enum Commands {
     /// Index documentation for Zed
     IndexDocs,
 
-    /// Type-check a project
-    Check {
-        /// Project directory
-        path: Option<std::path::PathBuf>,
-    },
-
     /// Format source files
     Format {
         /// File or directory
@@ -56,18 +52,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli.command.unwrap_or(Commands::Lsp) {
         Commands::Lsp => {
-            let compiler = zeta_compiler_api::Compiler::new().map_err(|e| Box::new(e))?;
+            let dep_graph = RefCell::new(DepGraph::new());
+
+            let lowerer_bump = GrowableBump::new(4096, 8);
+
+            let compiler = zeta_compiler_api::Compiler::new(&lowerer_bump, &dep_graph)
+                .map_err(|e| Box::new(e))
+                .unwrap_or_else(|e| {
+                    panic!("error while starting up compiler process for LSP: {e}")
+                });
             let server = Server::new(compiler)?;
             server.run()?;
         }
 
         Commands::IndexDocs => {
             docs::index()?;
-        }
-
-        Commands::Check { path } => {
-            println!("Checking {:?}", path);
-            // TODO
         }
 
         Commands::Format { path } => {

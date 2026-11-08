@@ -2,6 +2,7 @@ use crate::{
     ast::{self, MutabilityState},
     hir::{HirFunc, HirParam, HirType, HirTypeKind, Operator, RefKind, StrId},
 };
+use ir::hir::JoinStr;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use zetaruntime::{
@@ -39,13 +40,13 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             } else {
                 // only real generic params recurse
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
-                buf.extend_from_slice(pool.resolve_bytes(&*name));
+                buf.extend_from_slice(name.as_bytes());
                 for arg in type_args.iter() {
                     buf.push(b'_');
                     let suf = type_suffix_with_pool(pool.clone(), arg);
-                    buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                    buf.extend_from_slice(suf.as_bytes());
                 }
-                let s = std::str::from_utf8(&buf).expect("valid utf8");
+                let s = unsafe { std::str::from_utf8_unchecked(&buf) };
                 pool.intern(s)
             }
         }
@@ -71,7 +72,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             } else {
                 "ptrconst"
             };
-            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "{}_{}", tag, inner_suf)
         }
 
         HirTypeKind::UnsafePointer {
@@ -84,7 +85,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             } else {
                 "uptrconst"
             };
-            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "{}_{}", tag, inner_suf)
         }
 
         HirTypeKind::Ref {
@@ -100,12 +101,12 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             } else {
                 "refconst"
             };
-            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "{}_{}", tag, inner_suf)
         }
 
         HirTypeKind::OwnedPointer { inner, .. } => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            let s = format!("own_{}", pool.resolve_string(&inner_suf));
+            let s = format!("own_{}", inner_suf);
             pool.intern(&s)
         }
 
@@ -118,11 +119,11 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             for p in params.iter() {
                 buf.push(b'_');
                 let suf = type_suffix_with_pool(pool.clone(), p);
-                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                buf.extend_from_slice(suf.as_bytes());
             }
             buf.extend_from_slice(b"_ret_");
             let ret_suf = type_suffix_with_pool(pool.clone(), return_type);
-            buf.extend_from_slice(pool.resolve_bytes(&*ret_suf));
+            buf.extend_from_slice(ret_suf.as_bytes());
             pool.intern_bytes(buf.as_slice())
         }
 
@@ -142,7 +143,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
 
         HirTypeKind::Nullable(inner) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            intern_fmt!(pool, "opt_{}", pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "opt_{}", inner_suf)
         }
 
         HirTypeKind::Dyn { bounds } => {
@@ -151,7 +152,7 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             for b in bounds.iter() {
                 buf.push(b'_');
                 let suf = type_suffix_with_pool(pool.clone(), b);
-                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                buf.extend_from_slice(suf.as_bytes());
             }
             pool.intern_bytes(buf.as_slice())
         }
@@ -162,19 +163,19 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
             for t in hir_types.iter() {
                 buf.push(b'_');
                 let suf = type_suffix_with_pool(pool.clone(), t);
-                buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                buf.extend_from_slice(suf.as_bytes());
             }
             pool.intern_bytes(buf.as_slice())
         }
 
         HirTypeKind::Array(inner, len) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            intern_fmt!(pool, "arr{}_{}", len, pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "arr{}_{}", len, inner_suf)
         }
 
         HirTypeKind::Slice(inner) => {
             let inner_suf = type_suffix_with_pool(pool.clone(), inner);
-            intern_fmt!(pool, "slice_{}", pool.resolve_string(&inner_suf))
+            intern_fmt!(pool, "slice_{}", inner_suf)
         }
 
         HirTypeKind::Usize => VmString::from_static("usize"),
@@ -187,11 +188,11 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
                 *name
             } else {
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
-                buf.extend_from_slice(pool.resolve_bytes(&*name));
+                buf.extend_from_slice(name.as_bytes());
                 for arg in type_args.iter() {
                     buf.push(b'_');
                     let suf = type_suffix_with_pool(pool.clone(), arg);
-                    buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                    buf.extend_from_slice(suf.as_bytes());
                 }
                 pool.intern_bytes(buf.as_slice())
             }
@@ -206,11 +207,11 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
                 *name
             } else {
                 let mut buf: SmallVec<u8, 64> = SmallVec::new();
-                buf.extend_from_slice(pool.resolve_bytes(&*name));
+                buf.extend_from_slice(name.as_bytes());
                 for arg in type_args.iter() {
                     buf.push(b'_');
                     let suf = type_suffix_with_pool(pool.clone(), arg);
-                    buf.extend_from_slice(pool.resolve_bytes(&*suf));
+                    buf.extend_from_slice(suf.as_bytes());
                 }
                 pool.intern_bytes(buf.as_slice())
             }
@@ -221,8 +222,32 @@ pub fn type_suffix_with_pool(pool: Arc<StringPool>, ty: &HirType) -> StrId {
         HirTypeKind::Range { elem, inclusive } => {
             let elem_suf = type_suffix_with_pool(pool.clone(), elem);
             let tag = if inclusive { "rangeincl" } else { "range" };
-            intern_fmt!(pool, "{}_{}", tag, pool.resolve_string(&elem_suf))
+            intern_fmt!(pool, "{}_{}", tag, elem_suf)
         }
+        HirTypeKind::AnonStruct { fields } => {
+            intern_fmt!(
+                pool,
+                "anon_struct_{}",
+                fields
+                    .iter()
+                    .map(|t| type_suffix_with_pool(pool.clone(), &t.field_type))
+                    .collect::<Vec<StrId>>()
+                    .join("_")
+            )
+        }
+        HirTypeKind::AnonEnum { variants } => {
+            intern_fmt!(
+                pool,
+                "anon_enum_{}",
+                variants
+                    .iter()
+                    .flat_map(|v| v.fields)
+                    .map(|t| type_suffix_with_pool(pool.clone(), &t.field_type))
+                    .collect::<Vec<StrId>>()
+                    .join("_")
+            )
+        }
+        HirTypeKind::Type => todo!(),
     })
 }
 

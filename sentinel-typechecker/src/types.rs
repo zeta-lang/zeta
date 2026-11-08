@@ -230,20 +230,18 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             return Ok(());
         }
 
-        if let HirTypeKind::Ref { inner, .. } = &expected.kind {
-            if matches!(inner.kind, HirTypeKind::String)
-                && matches!(found.kind, HirTypeKind::String)
-            {
-                return Ok(());
-            }
+        if let HirTypeKind::Ref { inner, .. } = &expected.kind
+            && matches!(inner.kind, HirTypeKind::String)
+            && matches!(found.kind, HirTypeKind::String)
+        {
+            return Ok(());
         }
 
-        if matches!(expected.kind, HirTypeKind::String) {
-            if let HirTypeKind::Ref { inner, .. } = &found.kind {
-                if matches!(inner.kind, HirTypeKind::String) {
-                    return Ok(());
-                }
-            }
+        if matches!(expected.kind, HirTypeKind::String)
+            && let HirTypeKind::Ref { inner, .. } = &found.kind
+            && matches!(inner.kind, HirTypeKind::String)
+        {
+            return Ok(());
         }
 
         if self.owned_ref_coerces(expected, found) {
@@ -255,36 +253,34 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
             ref_kind: erk,
             ..
         } = &expected.kind
+            && let HirTypeKind::Slice(es) = &ei.kind
         {
-            if let HirTypeKind::Slice(es) = &ei.kind {
-                match &found.kind {
-                    HirTypeKind::Slice(fs) if self.types_structurally_equal(es, fs) => {
+            match &found.kind {
+                HirTypeKind::Slice(fs) if self.types_structurally_equal(es, fs) => {
+                    return Ok(());
+                }
+                HirTypeKind::Ref {
+                    inner: fi,
+                    ref_kind: frk,
+                    ..
+                } => {
+                    if let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind
+                        && self.types_structurally_equal(es, fe)
+                        && frk.coerces_to(*erk)
+                    {
                         return Ok(());
                     }
-                    HirTypeKind::Ref {
-                        inner: fi,
-                        ref_kind: frk,
-                        ..
-                    } => {
-                        if let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind {
-                            if self.types_structurally_equal(es, fe) && frk.coerces_to(*erk) {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
 
-        if let HirTypeKind::Slice(es) = &expected.kind {
-            if let HirTypeKind::Ref { inner: fi, .. } = &found.kind {
-                if let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind {
-                    if self.types_structurally_equal(es, fe) {
-                        return Ok(());
-                    }
-                }
-            }
+        if let HirTypeKind::Slice(es) = &expected.kind
+            && let HirTypeKind::Ref { inner: fi, .. } = &found.kind
+            && let HirTypeKind::Array(fe, _) | HirTypeKind::Slice(fe) = &fi.kind
+            && self.types_structurally_equal(es, fe)
+        {
+            return Ok(());
         }
 
         if let (
@@ -340,10 +336,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
                 ..
             },
         ) = (&expected.kind, &found.kind)
+            && self.types_structurally_equal(ei, fi)
+            && frk.coerces_to(*erk)
         {
-            if self.types_structurally_equal(ei, fi) && frk.coerces_to(*erk) {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         if self.types_structurally_equal(expected, found) {
@@ -361,10 +357,10 @@ impl<'a, 'bump> TypeChecker<'a, 'bump> {
         }
 
         match expected.kind {
-            HirTypeKind::UnsafePointer { .. } | HirTypeKind::Nullable(_) => {
-                if found.kind == HirTypeKind::Null {
-                    return Ok(());
-                }
+            HirTypeKind::UnsafePointer { .. } | HirTypeKind::Nullable(_)
+                if found.kind == HirTypeKind::Null =>
+            {
+                return Ok(());
             }
             _ => {}
         }

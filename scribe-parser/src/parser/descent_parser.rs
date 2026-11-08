@@ -14,12 +14,9 @@ pub(crate) struct BinderCtx<'a, 'bump> {
     pub(crate) found: Vec<ReturnBinder<'a, 'bump>>,
 }
 
-pub struct DescentParser<'a, 'bump>
-where
-    'bump: 'a,
-{
-    pub(crate) cursor: Cursor<'a, 'bump>,
-    pub(crate) bump: &'bump GrowableBump<'bump>,
+pub struct DescentParser<'a, 'bump> {
+    pub(crate) cursor: Cursor<'a>,
+    pub(crate) bump: &'bump GrowableBump,
     pub(crate) string_pool: Arc<StringPool>,
     pub(crate) diag: ParserDiagnosticsContext<'a, 'bump>,
     pub(crate) pending_attrs: &'bump [Attribute<'a, 'bump>],
@@ -27,16 +24,61 @@ where
     pub(crate) binder_ctx: Option<BinderCtx<'a, 'bump>>,
 }
 
+pub(crate) fn token_to_visibility(token_kind: TokenKind) -> Option<Visibility> {
+    match token_kind {
+        TokenKind::Public => Some(Visibility::Public),
+        TokenKind::Private => Some(Visibility::Private),
+        TokenKind::Module => Some(Visibility::Module),
+        TokenKind::Internal => Some(Visibility::Internal),
+        _ => None,
+    }
+}
+
+thread_local! {
+    static DECL_SEP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static ACTIVE_STRING_POOL: std::cell::RefCell<Option<Arc<StringPool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_active_string_pool(pool: Option<Arc<StringPool>>) {
+    ACTIVE_STRING_POOL.with(|p| *p.borrow_mut() = pool);
+}
+
+pub(crate) fn active_string_pool() -> Option<Arc<StringPool>> {
+    ACTIVE_STRING_POOL.with(|p| p.borrow().clone())
+}
+
+pub(crate) fn set_decl_sep(pos: Option<usize>) {
+    DECL_SEP.with(|d| d.set(pos));
+}
+
+pub(crate) fn at_decl_sep(pos: usize) -> bool {
+    DECL_SEP.with(|d| d.get() == Some(pos))
+}
+
+pub type TopLevelParseResult<'a, 'bump> = Result<
+    (
+        Vec<Stmt<'a, 'bump>>,
+        Vec<DiagnosticError<'a>>,
+        Vec<DiagnosticWarning<'a>>,
+    ),
+    DiagnosticError<'a>,
+>;
+
 impl<'a, 'bump> DescentParser<'a, 'bump>
 where
     'bump: 'a,
 {
     pub fn parse(
         string_pool: Arc<StringPool>,
-        bump: &'bump GrowableBump<'bump>,
-        tokens: &'bump Tokens<'a, 'bump>,
-    ) -> Result<Vec<Stmt<'a, 'bump>>, DiagnosticError<'a>> {
-        let mut parser = DescentParser {
+        bump: &'bump GrowableBump,
+        tokens: Tokens<'a>,
+    ) -> TopLevelParseResult<'a, 'bump> {
+        set_active_string_pool(Some(string_pool.clone()));
+        let parser = DescentParser {
             cursor: Cursor::new(tokens, 0),
             string_pool,
             bump,
@@ -46,10 +88,12 @@ where
             binder_ctx: None,
         };
 
-        parser.parse_toplevel()
+        let result = parser.parse_toplevel();
+        set_active_string_pool(None);
+        result
     }
 
-    fn parse_toplevel(&mut self) -> Result<Vec<Stmt<'a, 'bump>>, DiagnosticError<'a>> {
+    fn parse_toplevel(mut self) -> TopLevelParseResult<'a, 'bump> {
         let mut stmts = Vec::new();
 
         while self.cursor.peek() != TokenKind::EOF {
@@ -65,7 +109,8 @@ where
             }
         }
 
-        Ok(stmts)
+        let (errors, warnings) = self.diag.into_diagnostics();
+        Ok((stmts, errors, warnings))
     }
 
     pub(crate) fn parse_stmt(
@@ -77,14 +122,12 @@ where
             TokenKind::Let => self.parse_let_stmt(visibility),
             TokenKind::Import => self.parse_import(),
             TokenKind::Package => self.parse_package(),
-            TokenKind::Const => self.parse_const_stmt(visibility),
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Defer => self.parse_defer_stmt(),
             TokenKind::Static => {
                 self.cursor.advance(); // consume 'static'
                 self.parse_static_let_stmt(visibility)
             }
-            TokenKind::Func => self.parse_function_with_visibility(visibility),
             TokenKind::If => self.parse_if_stmt(),
             TokenKind::While => self.parse_while_stmt(),
             TokenKind::For => self.parse_for_stmt(),
@@ -121,7 +164,7 @@ where
             TokenKind::Module => {
                 self.cursor.advance();
                 // `module Name { ... }` is a module *declaration*.
-                // `module fn foo()` / `module struct Bar {}` is a visibility modifier.
+                // `module NAME :: struct {}` / `module NAME :: func() {}` is a visibility modifier.
                 if self.cursor.peek() == TokenKind::Ident
                     && self.cursor.peek_n_kind(1) == TokenKind::LBrace
                 {
@@ -137,14 +180,10 @@ where
             }
 
             TokenKind::Unsafe => {
-                // `unsafe { ... }` is a statement-level unsafe block.
-                // `unsafe func` / `unsafe extern` are function modifiers.
-                if self.cursor.peek_n_kind(1) == TokenKind::LBrace {
-                    self.parse_unsafe_block_stmt()
-                } else if self.cursor.peek_n_kind(1) == TokenKind::Impl {
+                if self.cursor.peek_n_kind(1) == TokenKind::Impl {
                     self.parse_impl_decl(visibility)
                 } else {
-                    self.parse_function_with_visibility(visibility)
+                    self.parse_unsafe_block_stmt()
                 }
             }
 
@@ -153,29 +192,20 @@ where
                 Ok(Stmt::Block(self.bump.alloc_value_immutable(block)))
             }
 
-            TokenKind::Inline | TokenKind::Noinline | TokenKind::Extern => {
-                self.parse_function_with_visibility(visibility)
-            }
-            TokenKind::Struct => self.parse_struct_decl(visibility),
-            TokenKind::Enum => self.parse_enum_decl(visibility),
             TokenKind::Impl => self.parse_impl_decl(visibility),
-            TokenKind::Interface => self.parse_interface_decl(visibility, false),
-            TokenKind::Sealed => {
-                // sealed interface Name permits X, Y, Z { ... }
-                self.cursor.advance();
-                self.parse_interface_decl(visibility, true)
-            }
 
             TokenKind::Ident => {
-                // Check for shorthand let (ident := expr)
-                if self.cursor.peek_n_kind(1) == TokenKind::ColonAssign {
+                if self.at_decl() {
+                    // `NAME :: ..`, `NAME: T :: ..`, `NAME<T> :: ..`: const, struct, enum,
+                    // interface, type alias or function.
+                    self.parse_decl_stmt(visibility)
+                } else if self.cursor.peek_n_kind(1) == TokenKind::ColonAssign {
+                    // Shorthand let (ident := expr)
                     self.parse_shorthand_let_stmt(visibility)
                 } else {
                     self.parse_expr_stmt()
                 }
             }
-
-            TokenKind::Type => self.parse_type_alias_decl(visibility),
 
             TokenKind::Mut => {
                 // Check for shorthand let (ident := expr)
@@ -331,34 +361,30 @@ pub struct ParseResult<'a, 'bump> {
 
 pub fn parse_program<'a, 'bump>(
     src: &str,
-    file_name: &'bump str,
+    file_name: &'static str,
     context: Arc<StringPool>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> ParseResult<'a, 'bump> {
     let lexer: Lexer = Lexer::new(context.clone());
-    let tokens: Tokens<'a, 'bump> = lexer.tokenize(src, file_name, bump);
+    let tokens: Tokens<'a> = lexer.tokenize(src, file_name);
 
-    let tokenized_source = bump.alloc_value(tokens);
-
-    let mut parser = DescentParser {
-        cursor: Cursor::new(tokenized_source, 0),
+    set_active_string_pool(Some(context.clone()));
+    let parser = DescentParser {
+        cursor: Cursor::new(tokens, 0),
         string_pool: context,
-        bump: bump,
+        bump: &bump,
         diag: ParserDiagnosticsContext::new(false),
         pending_close_angle: 0,
         pending_attrs: &[],
         binder_ctx: None,
     };
 
-    let stmts: Vec<Stmt<'_, '_>> = match parser.parse_toplevel() {
+    let toplevel = parser.parse_toplevel();
+    set_active_string_pool(None);
+    let (stmts, errors, warnings) = match toplevel {
         Ok(s) => s,
-        Err(e) => {
-            parser.diag.record(e);
-            Vec::new()
-        }
+        Err(e) => (Vec::new(), vec![e], Vec::new()),
     };
-
-    let (errors, warnings) = parser.diag.into_diagnostics();
 
     ParseResult {
         statements: stmts,

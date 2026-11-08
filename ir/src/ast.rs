@@ -1,9 +1,11 @@
 use crate::hir::StrId;
+use crate::ir_hasher::{FpHasher, HashCtx, StableHash};
 use crate::span::SourceSpan;
 use std::fmt;
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash, Hash)]
 pub enum Stmt<'a, 'bump>
 where
     'bump: 'a,
@@ -24,7 +26,6 @@ where
     InterfaceDecl(&'bump InterfaceDecl<'a, 'bump>),
     ImplDecl(&'bump ImplDecl<'a, 'bump>),
     EnumDecl(&'bump EnumDecl<'a, 'bump>),
-    StateMachineDecl(&'bump StateMachineDecl<'a, 'bump>),
     Defer(&'bump DeferStmt<'a, 'bump>),
     Module(&'bump ModuleDecl<'a, 'bump>),
     ExprStmt(&'bump InternalExprStmt<'a, 'bump>),
@@ -35,6 +36,36 @@ where
 }
 
 impl<'a, 'bump> Stmt<'a, 'bump> {
+    pub fn get_span(&self) -> SourceSpan<'a> {
+        match self {
+            Stmt::Import(s) => s.span,
+            Stmt::Package(s) => s.span,
+            Stmt::Let(s) => s.span,
+            Stmt::Const(s) => s.span,
+            Stmt::Return(s) => s.span,
+            Stmt::If(s) => s.span,
+            Stmt::While(s) => s.span,
+            Stmt::For(s) => s.span,
+            Stmt::Match(s) => s.span,
+            Stmt::UnsafeBlock(s) => s.span,
+            Stmt::Block(s) => s.span,
+            Stmt::FuncDecl(s) => s.span,
+            Stmt::StructDecl(s) => s.span,
+            Stmt::InterfaceDecl(s) => s.span,
+            Stmt::ImplDecl(s) => s.span,
+            Stmt::EnumDecl(s) => s.span,
+            Stmt::Defer(s) => s.span,
+            Stmt::Module(s) => s.span,
+            Stmt::ExprStmt(s) => s.span,
+            Stmt::TypeAliasDecl(s) => s.span,
+
+            Stmt::Break(_, span) | Stmt::Continue(span) => *span,
+
+            // `AttributedStmt` has no span of its own, so use the wrapped statement's.
+            Stmt::Attributed(a) => a.inner.get_span(),
+        }
+    }
+
     /// Strips Attributed wrappers (any depth) -> (attrs, real stmt).
     pub fn peel(self) -> (Vec<Attribute<'a, 'bump>>, Stmt<'a, 'bump>) {
         let mut attrs = Vec::new();
@@ -47,13 +78,58 @@ impl<'a, 'bump> Stmt<'a, 'bump> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl<'a, 'bump> Expr<'a, 'bump> {
+    pub fn get_span(&self) -> SourceSpan<'a> {
+        match self {
+            Expr::OrElse { span, .. }
+            | Expr::Attributed { span, .. }
+            | Expr::Intrinsic { span, .. }
+            | Expr::Null { span }
+            | Expr::Cast { span, .. }
+            | Expr::Number { span, .. }
+            | Expr::Decimal { span, .. }
+            | Expr::String { span, .. }
+            | Expr::Ident { span, .. }
+            | Expr::GenericIdent { span, .. }
+            | Expr::Boolean { span, .. }
+            | Expr::Comparison { span, .. }
+            | Expr::StructInit { span, .. }
+            | Expr::FieldAccess { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::Call { span, .. }
+            | Expr::Get { span, .. }
+            | Expr::If { span, .. }
+            | Expr::Match { span, .. }
+            | Expr::Assignment { span, .. }
+            | Expr::ExprList { span, .. }
+            | Expr::Char { span, .. }
+            | Expr::Unary { span, .. }
+            | Expr::ArrayIndex { span, .. }
+            | Expr::Deref { span, .. }
+            | Expr::This { span }
+            | Expr::Ref { span, .. }
+            | Expr::Lambda { span, .. }
+            | Expr::Tuple { span, .. }
+            | Expr::ModulePath { span, .. }
+            | Expr::ModuleAccess { span, .. }
+            | Expr::ArrayLiteral { span, .. }
+            | Expr::Undefined { span }
+            | Expr::Uninit { span } => *span,
+
+            Expr::Block(b) => b.span,
+            Expr::UnsafeBlock(b) => b.span,
+            Expr::ComptimeBlock(b) => b.span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct AttributedStmt<'a, 'bump> {
     pub attrs: &'bump [Attribute<'a, 'bump>],
     pub inner: Stmt<'a, 'bump>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct TypeAliasDecl<'a, 'bump> {
     pub visibility: Visibility,
     pub name: StrId,
@@ -63,19 +139,19 @@ pub struct TypeAliasDecl<'a, 'bump> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ImportStmt<'a, 'bump> {
     pub path: &'bump Path<'a, 'bump>,
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, StableHash, Eq)]
 pub struct PackageStmt<'a, 'bump> {
     pub path: &'bump Path<'a, 'bump>,
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub struct Path<'a, 'bump> {
     pub path: &'bump [StrId],
     pub member: Option<StrId>,
@@ -95,7 +171,7 @@ impl<'a, 'bump> Display for Path<'a, 'bump> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct LetStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -111,19 +187,38 @@ where
     pub visibility: Visibility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl<'a, 'bump> LetStmt<'a, 'bump> {
+    pub fn stable_hash_signature(&self, cx: &HashCtx<'_>, h: &mut FpHasher) {
+        self.ident.stable_hash(cx, h);
+        self.type_annotation.stable_hash(cx, h);
+        self.mutable.stable_hash(cx, h);
+        self.is_static.stable_hash(cx, h);
+        self.catch_pattern.stable_hash(cx, h);
+        self.manual.stable_hash(cx, h);
+        self.visibility.stable_hash(cx, h);
+    }
+
+    pub fn stable_hash_body(&self, cx: &HashCtx<'_>, h: &mut FpHasher) {
+        self.value.stable_hash(cx, h);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ConstStmt<'a, 'bump>
 where
     'bump: 'a,
 {
     pub ident: StrId,
+    /// `NAME<T> :: ...`
+    pub generics: Option<&'bump [Generic<'a, 'bump>]>,
+    /// `TypeKind::Infer` for `NAME :: x`.
     pub type_annotation: Type<'a, 'bump>,
     pub value: &'bump Expr<'a, 'bump>,
     pub span: SourceSpan<'a>,
     pub visibility: Visibility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ImplDecl<'a, 'bump>
 where
     'bump: 'a,
@@ -137,7 +232,7 @@ where
     pub is_unsafe: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct InterfaceDecl<'a, 'bump>
 where
     'bump: 'a,
@@ -152,7 +247,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct EnumDecl<'a, 'bump> {
     pub name: StrId,
     pub visibility: Visibility,
@@ -162,14 +257,14 @@ pub struct EnumDecl<'a, 'bump> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct EnumVariant<'a, 'bump> {
     pub name: StrId,
     pub fields: &'bump [Field<'a, 'bump>],
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct Field<'a, 'bump>
 where
     'bump: 'a,
@@ -181,7 +276,7 @@ where
     pub manual: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ReturnStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -190,7 +285,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct IfStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -201,7 +296,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum ElseBranch<'a, 'bump>
 where
     'bump: 'a,
@@ -210,7 +305,7 @@ where
     Else(&'bump Block<'a, 'bump>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy, StableHash, Eq, Hash)]
 pub struct WhileStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -220,7 +315,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy, StableHash, Eq, Hash)]
 pub struct ForStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -230,7 +325,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy, StableHash, Eq, Hash)]
 pub enum ForKind<'a, 'bump>
 where
     'bump: 'a,
@@ -248,7 +343,7 @@ where
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct MatchStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -258,7 +353,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct MatchArm<'a, 'bump>
 where
     'bump: 'a,
@@ -269,7 +364,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum PatternKind<'a, 'bump> {
     Ident(StrId, bool),
     Number(i64),
@@ -292,7 +387,7 @@ pub enum PatternKind<'a, 'bump> {
     Null,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct Pattern<'a, 'bump> {
     pub kind: PatternKind<'a, 'bump>,
     pub span: SourceSpan<'a>,
@@ -395,7 +490,7 @@ impl<'a, 'bump> Pattern<'a, 'bump> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy, StableHash, Eq, Hash)]
 pub struct UnsafeBlock<'a, 'bump>
 where
     'bump: 'a,
@@ -404,7 +499,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ReturnBinder<'a, 'bump>
 where
     'bump: 'a,
@@ -416,7 +511,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct EnsuresClause<'a, 'bump>
 where
     'bump: 'a,
@@ -427,7 +522,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct FuncDecl<'a, 'bump>
 where
     'bump: 'a,
@@ -445,7 +540,41 @@ where
     pub attrs: &'bump [Attribute<'a, 'bump>],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl<'a, 'bump> FuncDecl<'a, 'bump>
+where
+    'bump: 'a,
+{
+    pub fn stable_hash_signature(&self, cx: &HashCtx<'_>, h: &mut FpHasher) {
+        let FuncDecl {
+            function_metadata,
+            name,
+            generics,
+            params,
+            return_type,
+            return_binders,
+            ensures,
+            attrs,
+            body: _,
+            name_span: _,
+            span: _,
+        } = self;
+
+        function_metadata.stable_hash(cx, h);
+        name.stable_hash(cx, h);
+        generics.stable_hash(cx, h);
+        params.stable_hash(cx, h);
+        return_type.stable_hash(cx, h);
+        return_binders.stable_hash(cx, h);
+        ensures.stable_hash(cx, h);
+        attrs.stable_hash(cx, h);
+    }
+
+    pub fn stable_hash_body(&self, cx: &HashCtx<'_>, h: &mut FpHasher) {
+        self.body.stable_hash(cx, h);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct StructDecl<'a, 'bump>
 where
     'bump: 'a,
@@ -458,7 +587,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum Param<'a, 'bump>
 where
     'bump: 'a,
@@ -467,14 +596,14 @@ where
     This(&'bump ThisParam<'a, 'bump>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ThisParam<'a, 'bump> {
     pub passing_kind: ParamPassingKind,
     pub multi_place: Option<&'bump [EffectAccess<'a, 'bump>]>,
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub struct NormalParam<'a, 'bump>
 where
     'bump: 'a,
@@ -489,7 +618,7 @@ where
     pub manual: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Copy, Default)]
+#[derive(Debug, Clone, PartialEq, Copy, Default, Eq, Hash, StableHash)]
 pub struct Block<'a, 'bump>
 where
     'bump: 'a,
@@ -510,7 +639,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct Generic<'a, 'bump> {
     pub type_name: StrId,
     pub span: SourceSpan<'a>,
@@ -521,7 +650,7 @@ pub struct Generic<'a, 'bump> {
     pub min_provenance: Option<ProvenanceAnnotation<'bump>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, StableHash, Eq, Hash)]
 pub struct InternalExprStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -530,14 +659,14 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct FieldInit<'a, 'bump> {
     pub name: StrId,
     pub name_span: SourceSpan<'a>,
     pub value: Expr<'a, 'bump>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, StableHash)]
 pub enum Expr<'a, 'bump>
 where
     'bump: 'a,
@@ -571,7 +700,7 @@ where
         span: SourceSpan<'a>,
     },
     Decimal {
-        value: f64,
+        value: F64Bits,
         span: SourceSpan<'a>,
     },
     String {
@@ -707,11 +836,13 @@ where
     },
     Block(&'bump Block<'a, 'bump>),
     UnsafeBlock(&'bump UnsafeBlock<'a, 'bump>),
+    /// `NAME :: comptime { ... };`, the only place a const may run code (including calls).
+    ComptimeBlock(&'bump Block<'a, 'bump>),
 }
 
 /// A closure/anonymous-function parameter. Unlike `NormalParam`, the type
 /// annotation is optional since closures can omit param types.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub struct LambdaParam<'a, 'bump> {
     pub name: StrId,
     pub type_annotation: Option<Type<'a, 'bump>>,
@@ -719,14 +850,14 @@ pub struct LambdaParam<'a, 'bump> {
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Hash, Eq)]
 pub enum LambdaModifier {
     Suspend,
     Nosuspend,
     Blocking,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash, Hash)]
 pub enum ErrorHandlerPattern<'a, 'bump>
 where
     'bump: 'a,
@@ -743,7 +874,7 @@ where
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub struct ErrorHandlerBranch<'a, 'bump>
 where
     'bump: 'a,
@@ -754,7 +885,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, StableHash, Hash, Eq)]
 pub struct Type<'a, 'bump>
 where
     'bump: 'a,
@@ -786,7 +917,7 @@ impl<'a, 'bump> Type<'a, 'bump> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, StableHash, Hash)]
 pub enum ProvenanceRoot {
     Var(StrId),
     ThisRoot,
@@ -795,13 +926,13 @@ pub enum ProvenanceRoot {
     Static,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, StableHash, Hash)]
 pub enum ProvenancePathSegment {
     Field(StrId),
     Deref,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash, Hash)]
 pub struct ProvenanceAnnotation<'bump> {
     pub root: ProvenanceRoot,
     pub path: &'bump [ProvenancePathSegment],
@@ -847,7 +978,7 @@ impl<'bump> fmt::Display for ProvenanceAnnotation<'bump> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum TypeKind<'a, 'bump>
 where
     'bump: 'a,
@@ -880,7 +1011,7 @@ where
     },
     Array {
         inner: &'a Type<'a, 'bump>,
-        length: usize,
+        length: &'bump Expr<'a, 'bump>,
     },
     Tuple {
         values: &'bump [Type<'a, 'bump>],
@@ -915,19 +1046,19 @@ where
     Isize,
     Never,
     AnySlice,
+    /// `struct { a: i32, b: str }` used as a type.
+    AnonStruct {
+        fields: &'bump [Field<'a, 'bump>],
+    },
+    /// `enum { HelloWorld, X }` used as a type, also spelled `(HelloWorld || X)`.
+    AnonEnum {
+        variants: &'bump [EnumVariant<'a, 'bump>],
+    },
+    /// `type`: the type of structs, enums, interfaces and type aliases.
+    Type,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StateMachineDecl<'a, 'bump>
-where
-    'bump: 'a,
-{
-    pub name: StrId,
-    pub transitions: &'bump [Transition<'a, 'bump>],
-    pub span: SourceSpan<'a>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct Transition<'a, 'bump>
 where
     'bump: 'a,
@@ -938,13 +1069,13 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum StateRef {
     Named(StrId),
     Wildcard, // *
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct DeferStmt<'a, 'bump>
 where
     'bump: 'a,
@@ -953,7 +1084,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum DeferAction<'a, 'bump>
 where
     'bump: 'a,
@@ -962,7 +1093,7 @@ where
     Stmt(&'bump Stmt<'a, 'bump>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct ModuleDecl<'a, 'bump>
 where
     'bump: 'a,
@@ -973,7 +1104,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub struct PermitsExpr<'a, 'bump>
 where
     'bump: 'a,
@@ -982,7 +1113,7 @@ where
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum ParamPassingKind {
     MoveMut,
     Move,
@@ -1006,22 +1137,32 @@ impl fmt::Display for MutabilityState {
 }
 
 // Function Metadata
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, StableHash, Eq, Hash)]
 pub struct FuncModifiers {
     pub visibility: Visibility,
     pub extern_modifier: ExternModifier,
     pub inline_modifier: InlineModifier,
     pub func_safety: FuncSafety,
+    pub execution_mode: AstExecutionMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Eq, Copy, Hash, Clone, PartialEq, Default, StableHash, Debug)]
+pub enum AstExecutionMode {
+    /// the item is evaluated/executed in ordinary program execution.
+    #[default]
+    Runtime,
+    /// the item participates in compile-time evaluation/metaprogramming.
+    Comptime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, StableHash, Eq, Hash)]
 pub enum ExternModifier {
     #[default]
     None,
     Abi(StrId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, StableHash, Eq, Hash)]
 pub enum InlineModifier {
     Inline,
     Noinline,
@@ -1029,20 +1170,20 @@ pub enum InlineModifier {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, StableHash, Eq, Hash)]
 pub enum FuncSafety {
     #[default]
     Safe,
     Unsafe,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub enum MutabilityState {
     Mut,
     Const,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Default, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Default, Eq, StableHash)]
 pub enum Visibility {
     Public,
     #[default]
@@ -1063,7 +1204,7 @@ impl fmt::Display for Visibility {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum Op {
     Add,
     Sub,
@@ -1134,10 +1275,10 @@ impl Op {
     }
 }
 
-impl TryFrom<&str> for Op {
-    type Error = &'static str;
+impl FromStr for Op {
+    type Err = &'static str;
 
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "+" => Op::Add,
             "-" => Op::Sub,
@@ -1176,14 +1317,14 @@ impl TryFrom<&str> for Op {
 
 impl Op {
     pub fn is_math_op(&self) -> bool {
-        match self {
-            Op::Assign | Op::Eq | Op::Neq | Op::Lt | Op::Lte | Op::Gt | Op::Gte => false,
-            _ => true,
-        }
+        !matches!(
+            self,
+            Op::Assign | Op::Eq | Op::Neq | Op::Lt | Op::Lte | Op::Gt | Op::Gte
+        )
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy, StableHash, Eq, Hash)]
 pub enum ComparisonOp {
     Equal,
     NotEqual,
@@ -1193,7 +1334,7 @@ pub enum ComparisonOp {
     GreaterThanOrEqual,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum ErrorHandlerKind {
     Error,
     Null,
@@ -1480,13 +1621,12 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                 inner,
                 mutability_state,
             } => write!(f, "[*]{} {}", mutability_state, inner),
-            TypeKind::Array { inner, length } => write!(f, "[{}]{}", length, inner),
+            TypeKind::Array { inner, length } => write!(f, "[]{}", inner),
             TypeKind::Slice { inner } => write!(f, "[]{}", inner),
             TypeKind::Dyn { bounds } => {
                 write!(f, "dyn ")?;
                 let mut is_start = true;
-                let mut iter = bounds.into_iter();
-                while let Some(bound) = iter.next() {
+                for bound in *bounds {
                     write!(f, "{}", bound)?;
                     if !is_start {
                         write!(f, " + ")?;
@@ -1503,6 +1643,37 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
                 write!(f, "{}", inner)
             }
             TypeKind::Never => f.write_str("never"),
+            TypeKind::Type => f.write_str("type"),
+            TypeKind::AnonStruct { fields } => {
+                f.write_str("struct { ")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, field.field_type)?;
+                }
+                f.write_str(" }")
+            }
+            TypeKind::AnonEnum { variants } => {
+                f.write_str("enum { ")?;
+                for (i, variant) in variants.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", variant.name)?;
+                    if !variant.fields.is_empty() {
+                        f.write_str(" { ")?;
+                        for (j, field) in variant.fields.iter().enumerate() {
+                            if j > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}: {}", field.name, field.field_type)?;
+                        }
+                        f.write_str(" }")?;
+                    }
+                }
+                f.write_str(" }")
+            }
             TypeKind::Tuple { values: _ } => todo!(),
         }?;
 
@@ -1514,20 +1685,20 @@ impl<'a, 'bump> Display for Type<'a, 'bump> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, StableHash)]
 pub struct EffectAccess<'a, 'bump> {
     pub ref_kind: RefKind,
     pub path: &'bump [EffectSegment<'a, 'bump>],
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum EffectSegment<'a, 'bump> {
     Field(StrId),
     Index(&'bump Expr<'a, 'bump>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub enum RefKind {
     Shared, // &
     Alias,  // &alias
@@ -1550,14 +1721,14 @@ impl RefKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, StableHash)]
 pub struct Attribute<'a, 'bump> {
     pub name: StrId,
     pub args: &'bump [AttrArg<'bump>],
     pub span: SourceSpan<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, StableHash, Eq, Hash)]
 pub enum AttrArg<'bump> {
     Ident(StrId),
     Str(StrId),
@@ -1571,4 +1742,34 @@ pub enum AttrArg<'bump> {
         name: StrId,
         args: &'bump [AttrArg<'bump>],
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
+#[repr(transparent)]
+pub struct F64Bits(u64);
+
+impl F64Bits {
+    #[inline]
+    pub const fn new(value: f64) -> Self {
+        Self(value.to_bits())
+    }
+
+    #[inline]
+    pub const fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+impl From<f64> for F64Bits {
+    #[inline]
+    fn from(value: f64) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<F64Bits> for f64 {
+    #[inline]
+    fn from(value: F64Bits) -> Self {
+        value.get()
+    }
 }

@@ -12,9 +12,6 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 
 /// Cached analysis of one method.
-///
-/// We analyze every method at most once. Recursive analysis is guarded by
-/// `InProgress`; recursive cycles simply become `Opaque`.
 pub enum MethodAnalysisState {
     InProgress,
 
@@ -49,6 +46,7 @@ pub struct MethodSummary {
     pub fresh_per_call: bool,
 }
 
+#[derive(Default)]
 pub struct IndexDisjointCtx<'a, 'bump> {
     analyses: RefCell<FxHashMap<StrId, MethodAnalysisState>>,
 
@@ -209,9 +207,9 @@ impl<'a, 'bump> IndexDisjointCtx<'a, 'bump> {
     }
 
     fn is_fresh_per_call_pattern(method: &HirFunc<'a, 'bump>) -> bool {
-        let has_normal_params = method.params.map_or(false, |params| {
-            params.iter().any(|p| matches!(p, HirParam::Normal { .. }))
-        });
+        let has_normal_params = method
+            .params
+            .is_some_and(|params| params.iter().any(|p| matches!(p, HirParam::Normal { .. })));
 
         if has_normal_params {
             return false;
@@ -719,6 +717,14 @@ impl<'a, 'bump> CopyAnalysisCtx<'a, 'bump> {
             HirTypeKind::OwnedPointer { .. } => false,
             HirTypeKind::Usize => true,
             HirTypeKind::Isize => true,
+            HirTypeKind::AnonStruct { fields } => {
+                fields.iter().all(|f| self.type_is_copy(&f.field_type))
+            }
+            HirTypeKind::AnonEnum { variants } => variants
+                .iter()
+                .flat_map(|v| v.fields)
+                .all(|f| self.type_is_copy(&f.field_type)),
+            HirTypeKind::Type => false, // unknown
         }
     }
 

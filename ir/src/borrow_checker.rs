@@ -14,11 +14,11 @@ use crate::{
 ///     player.inventory
 ///     world.players[0]
 ///
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct PlaceId(pub u32);
 
 /// Stable identifier for one active borrow.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct LoanId(pub u32);
 
 #[derive(Debug, Clone, Default)]
@@ -47,7 +47,7 @@ pub enum ReadTemplate {
 /// Unlike loans, provenances may outlive any individual borrow because they
 /// describe *where a reference originated*, not whether the borrow is still
 /// active.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct ProvenanceId(pub u32);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -181,7 +181,7 @@ pub enum ProvenanceOrigin {
     Merge,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct StorageId(pub u32);
 
 pub struct Storage {
@@ -197,7 +197,7 @@ pub struct Storage {
 ///  - may this place be written?
 ///  - may this place be moved?
 ///  - what provenance does this reference carry?
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct BorrowChecker {
     pub(super) next_place: PlaceId,
     pub(super) next_loan: LoanId,
@@ -281,7 +281,7 @@ pub enum IndexTemplate {
     Opaque,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AliasReasoner {
     pub(crate) equal: FxHashMap<Bound, FxHashSet<Bound>>,
     pub(crate) not_equal: FxHashMap<Bound, FxHashSet<Bound>>,

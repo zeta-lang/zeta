@@ -11,6 +11,11 @@ smallvec = "2.0.0-alpha.12"
 is-terminal = "0.4.17"
 owo-colors = "4.2.3"
 arrayvec = "0.7.6"
+stable-hash-proc-macro = { path = "../stable-hash-proc-macro" }
 
 [dev-dependencies]
 rstest = "0.26.1"
+
+[dependencies.xxhash-rust]
+version = "0.8.12"
+features = ["xxh3", "const_xxh3"]

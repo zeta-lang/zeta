@@ -59,50 +59,38 @@ pub fn collect_extern_c_names<'a, 'bump>(
     let mut externs = HashSet::default();
     for module in hir_modules {
         for item in module.items {
-            if let ir::hir::Hir::Func(f) = item {
-                if matches!(
+            if let ir::hir::Hir::Func(f) = item
+                && matches!(
                     f.function_metadata.extern_modifier,
                     ir::ast::ExternModifier::Abi(_)
-                ) && f.body.is_none()
-                {
-                    externs.insert(f.name);
-                }
+                )
+                && f.body.is_none()
+            {
+                externs.insert(f.name);
             }
         }
     }
     externs
 }
 
-pub fn parse_single_file<'a, 'bump>(
-    pool: Arc<StringPool>,
-    path: PathBuf,
-) -> Result<ModuleWithArena<'a, 'bump>, CompilerError<'a>>
-where
-    'a: 'bump,
-    'bump: 'a,
-{
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| CompilerError::FailedToReadFile(path.clone(), e))?;
-
-    parse_single_module(pool, path, contents)
-}
-
 pub fn parse_single_file_from_source<'a, 'bump>(
     pool: Arc<StringPool>,
     name: PathBuf,
     source: String,
+    bump: &'bump GrowableBump,
 ) -> Result<ModuleWithArena<'a, 'bump>, CompilerError<'a>>
 where
     'a: 'bump,
     'bump: 'a,
 {
-    parse_single_module(pool, name, source)
+    parse_single_module(pool, name, source, bump)
 }
 
 fn parse_single_module<'a, 'bump>(
     pool: Arc<StringPool>,
     path: PathBuf,
     contents: String,
+    bump: &'bump GrowableBump,
 ) -> Result<ModuleWithArena<'a, 'bump>, CompilerError<'a>>
 where
     'a: 'bump,
@@ -114,21 +102,8 @@ where
 
     let name = StrId(pool.intern(file_name_str));
 
-    let bump: Box<GrowableBump<'bump>> = Box::new(GrowableBump::new(
-        std::cmp::max(BASE, contents.len() * 2 + FOUR_KB),
-        8,
-    ));
-
-    // The Box may move, but the GrowableBump allocation itself will not.
-    //
-    // We need to manufacture the long-lived reference because Rust's
-    // borrow checker cannot express the self-reference between `bump`
-    // and `parse_result`.
-    let bump_ref: &'bump GrowableBump<'bump> = unsafe { &*(&*bump as *const GrowableBump<'bump>) };
-
     if contents.is_empty() {
         return Ok(ModuleWithArena {
-            bump,
             name,
             path,
             parse_result: ParseResult {
@@ -136,34 +111,19 @@ where
                 diagnostics: scribe_parser::parser::ParserDiagnostics::new(),
             },
             source: String::new(),
+            bump,
         });
     }
 
-    const BASE: usize = 16 * 1024;
-    const FOUR_KB: usize = 4 * 1024;
-
-    let file_name_static: &str = {
-        let bytes = file_name_str.as_bytes();
-        let stored = bump.alloc_slice(bytes);
-        // SAFETY: Always valid UTF-8
-        unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(stored.as_ptr(), bytes.len()))
-        }
-    };
-
-    let parse_result: ParseResult<'a, 'bump> = scribe_parser::parser::parse_program(
-        contents.as_str(),
-        file_name_static,
-        pool.clone(),
-        bump_ref,
-    );
+    let parse_result: ParseResult<'a, 'bump> =
+        scribe_parser::parser::parse_program(contents.as_str(), name.as_str(), pool.clone(), bump);
 
     Ok(ModuleWithArena {
-        bump,
         name,
         path,
         parse_result,
         source: contents,
+        bump,
     })
 }
 
@@ -172,10 +132,11 @@ pub(crate) fn emit_all<'a, 'bump>(
     compilation_order: &[usize],
     pool: Arc<StringPool>,
     extern_c_names: Rc<HashSet<StrId>>,
-    dep_graph: &'a RefCell<DepGraph>,
+    dep_graph: &'a RefCell<DepGraph<'a>>,
     registry: GlobalRegistry<'a, 'bump>,
     optimize: bool,
     verbose: bool,
+    bump: &'bump GrowableBump,
 ) -> (Instant, CraneliftBackend)
 where
     'bump: 'a,
@@ -192,6 +153,7 @@ where
         registry.instantiated_functions.clone(),
         registry.struct_methods.clone(),
         registry.clone(),
+        bump,
     )
     .lower_all_modules(hir_modules, compilation_order);
 

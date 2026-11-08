@@ -112,6 +112,11 @@ impl VmString {
     pub fn as_str(&self) -> &'static str {
         unsafe { from_utf8_unchecked(std::slice::from_raw_parts(self.offset, self.length)) }
     }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &'static [u8] {
+        unsafe { std::slice::from_raw_parts(self.offset, self.length) }
+    }
 }
 
 impl PartialEq for VmString {
@@ -268,16 +273,6 @@ impl StringPool {
     }
 
     #[inline(always)]
-    pub fn resolve_bytes(&self, vm_string: &VmString) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(vm_string.offset, vm_string.length) }
-    }
-
-    #[inline(always)]
-    pub fn resolve_string(&self, vm_string: &VmString) -> &str {
-        unsafe { from_utf8_unchecked(self.resolve_bytes(vm_string)) }
-    }
-
-    #[inline(always)]
     fn eq_simd(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
@@ -309,7 +304,7 @@ impl StringPool {
                 continue;
             }
 
-            let stored = self.resolve_bytes(&vm_string);
+            let stored = vm_string.as_bytes();
 
             if Self::eq_simd(stored, bytes) {
                 return Some(vm_string);
@@ -340,10 +335,10 @@ impl ThreadLocalStringPool<'_> {
     pub fn intern_bytes(&mut self, bytes: &[u8]) -> VmString {
         let hash = StringPool::hash_bytes(bytes);
 
-        if let Some(collision_list) = self.local_strings.get(&hash) {
-            if let Some(vm_string) = StringPool::find_simd(self.global, collision_list, bytes) {
-                return vm_string;
-            }
+        if let Some(collision_list) = self.local_strings.get(&hash)
+            && let Some(vm_string) = StringPool::find_simd(self.global, collision_list, bytes)
+        {
+            return vm_string;
         }
 
         let vm_string = self.global.intern_global(bytes, hash);

@@ -6,21 +6,18 @@ use std::io;
 use std::path::PathBuf;
 use zetaruntime::bump::GrowableBump;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ModuleWithArena<'a, 'bump> {
-    pub bump: Box<GrowableBump<'bump>>,
     pub name: StrId,
     pub path: PathBuf,
     pub parse_result: ParseResult<'a, 'bump>,
     pub source: String,
+    pub bump: &'bump GrowableBump,
 }
 
 impl<'a, 'bump> ModuleWithArena<'a, 'bump> {
-    /// SAFETY: `bump` is heap-allocated via `Box`; moving `ModuleWithArena`
-    /// afterwards only moves the pointer, not the `GrowableBump` itself, so
-    /// this reference stays valid for as long as the `Box` is kept alive.
-    pub fn bump_ref(&self) -> &'bump GrowableBump<'bump> {
-        unsafe { &*(self.bump.as_ref() as *const GrowableBump<'bump>) }
+    pub fn bump_ref(&self) -> &'bump GrowableBump {
+        self.bump
     }
 }
 

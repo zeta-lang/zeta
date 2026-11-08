@@ -12,7 +12,7 @@ use zetaruntime::bump::GrowableBump;
 use zetaruntime::string_pool::StringPool;
 
 pub struct LambdaHoister<'a, 'bump> {
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
     context: Arc<StringPool>,
     counter: usize,
     module_name: StrId,
@@ -25,7 +25,7 @@ pub struct LambdaHoister<'a, 'bump> {
 
 impl<'a, 'bump> LambdaHoister<'a, 'bump> {
     pub fn new(
-        bump: &'bump GrowableBump<'bump>,
+        bump: &'bump GrowableBump,
         context: Arc<StringPool>,
         module_name: StrId,
         closures: FxHashMap<usize, ClosureLowering<'a, 'bump>>,
@@ -765,6 +765,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 extern_modifier: ExternModifier::None,
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Safe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(params_slice),
@@ -877,6 +878,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
                 extern_modifier: ExternModifier::None,
                 inline_modifier: InlineModifier::None,
                 func_safety: FuncSafety::Safe,
+                execution_mode: ir::ast::AstExecutionMode::Runtime,
             },
             generics: None,
             params: Some(params_slice),
@@ -901,7 +903,7 @@ impl<'a, 'bump> LambdaHoister<'a, 'bump> {
         let name = zetaruntime::intern_fmt!(
             self.context,
             "__lambda_{}_{}",
-            self.context.resolve_string(&self.module_name),
+            self.module_name,
             self.counter
         );
         self.counter += 1;

@@ -5,7 +5,7 @@ use zetaruntime::bump::GrowableBump;
 pub fn substitute_type<'a, 'subs, 'bump>(
     ty: &HirType<'a, 'bump>,
     subs: &'subs HashMap<StrId, HirType<'a, 'bump>>,
-    bump: &'bump GrowableBump<'bump>,
+    bump: &'bump GrowableBump,
 ) -> HirType<'a, 'bump> {
     match &ty.kind {
         HirTypeKind::Generic(name) => subs.get(name).copied().unwrap_or(*ty),

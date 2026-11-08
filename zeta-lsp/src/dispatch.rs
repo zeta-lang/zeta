@@ -346,7 +346,7 @@ fn hover_for_item<'a, 'bump>(
         "func_sig" | "func_body" => {
             func_for_item(state, ctx, m, item_idx, tag).map(|f| format_func_signature(&f))
         }
-        "type" | "trait" => decl_hir_key(state, ctx, m, item_idx)
+        "type" | "interface" => decl_hir_key(state, ctx, m, item_idx)
             .and_then(|key| {
                 let k = key.as_str();
                 ctx.structs
@@ -840,7 +840,7 @@ pub fn hover_at<'a, 'bump>(state: &ServerState<'a, 'bump>, params: &HoverParams)
                             .or_else(|| ctx.enums.get(key).map(|e| format_enum_signature(e)))
                             .or_else(|| item_declaration_text(state, m, item_idx, tag)),
                         "const" | "static" => item_declaration_text(state, m, item_idx, tag),
-                        "trait" => ctx
+                        "interface" => ctx
                             .interfaces
                             .get(key)
                             .map(|i| format_interface_signature(i)),
@@ -1075,7 +1075,7 @@ pub fn item_decl_span<'a, 'bump>(
         (Stmt::FuncDecl(f), "func_sig" | "func_body") => Some(f.span),
         (Stmt::StructDecl(s), "type") => Some(s.span),
         (Stmt::EnumDecl(e), "type") => Some(e.span),
-        (Stmt::InterfaceDecl(i), "trait") => Some(i.span),
+        (Stmt::InterfaceDecl(i), "interface") => Some(i.span),
         (Stmt::Const(c), "const") => Some(c.span),
         (Stmt::TypeAliasDecl(t), "type") => Some(t.span),
         (Stmt::Let(l), "static") => Some(l.span),
@@ -1192,7 +1192,7 @@ pub fn format_enum_signature(e: &HirEnum) -> String {
     let mut sig = String::new();
     sig.push_str(visibility_prefix(e.visibility));
     sig.push_str("enum ");
-    sig.push_str(e.name.as_str());
+    sig.push_str(e.unmangled_name.as_str());
     if let Some(generics) = e.generics {
         if !generics.is_empty() {
             sig.push('<');
@@ -1226,7 +1226,7 @@ pub fn format_interface_signature(i: &HirInterface) -> String {
     let mut sig = String::new();
     sig.push_str(visibility_prefix(i.visibility));
     sig.push_str("interface ");
-    sig.push_str(i.name.as_str());
+    sig.push_str(i.unmangled_name.as_str());
     if let Some(generics) = i.generics {
         if !generics.is_empty() {
             sig.push('<');
@@ -1782,7 +1782,7 @@ fn declaration_symbol_at<'a, 'bump>(
             }
             Stmt::InterfaceDecl(i) => {
                 if on_name(i.name_span) {
-                    return Some(item("trait"));
+                    return Some(item("interface"));
                 }
                 let methods = i.methods.unwrap_or(&[]);
                 if let Some(method_idx) = methods.iter().position(|m| on_name(m.name_span)) {
@@ -1966,8 +1966,6 @@ const PRIMITIVES: &[&str] = &[
     "f64", "bool", "char", "str", "void",
 ];
 
-/// Drop cached completion candidates for the module at `path` (and, for open/close, the module
-/// count). Called *before* the compiler call so the borrows stay disjoint.
 fn invalidate_completions<'a, 'bump>(
     compiler: &zeta_compiler_api::Compiler<'a, 'bump>,
     cache: &mut crate::state::CompletionCache,
@@ -2004,7 +2002,6 @@ pub fn completions_at<'a, 'bump>(
     let cursor = byte_offset_from_utf16(line_text, position.character);
     let before = &line_text[..cursor];
 
-    // not inside a comment or string literal
     if let Some(i) = before.find("//") {
         if before[..i].matches('"').count() % 2 == 0 {
             return vec![];
@@ -2063,7 +2060,6 @@ fn split_typed(before: &str) -> (&str, &str) {
     (&before[..i], &before[i..])
 }
 
-/// `a.b.c` -> ["a", "b", "c"]; None if the receiver is anything else (call, index, ...).
 fn receiver_chain(base: &str) -> Option<Vec<&str>> {
     let mut segs = Vec::new();
     let mut rest = base;
@@ -2082,8 +2078,6 @@ fn receiver_chain(base: &str) -> Option<Vec<&str>> {
     segs.reverse();
     Some(segs)
 }
-
-// ---------- item builders ----------
 
 fn mk(label: &str, kind: K, detail: Option<String>, sort: &str) -> CompletionItem {
     CompletionItem {
@@ -2410,8 +2404,6 @@ fn import_completions<'a, 'bump>(
     Some(items)
 }
 
-// ---------- member access ----------
-
 enum Recv<'a, 'bump> {
     Value(HirType<'a, 'bump>),
     Type(usize, usize),
@@ -2480,7 +2472,7 @@ fn member_items<'a, 'bump>(
             SymbolId::Item {
                 module_idx: m,
                 item_idx,
-                tag: "type" | "trait",
+                tag: "type" | "interface",
             },
             _,
         )) => Some(Recv::Type(m, item_idx)),
@@ -2501,7 +2493,7 @@ fn member_items<'a, 'bump>(
         } else if let Some((m, idx, tag)) =
             resolve_visible_item(state, module_idx, StrId(ctx.string_pool.intern(first)))
         {
-            if matches!(tag, "type" | "trait") {
+            if matches!(tag, "type" | "interface") {
                 recv = Some(Recv::Type(m, idx));
             }
         }
@@ -2518,7 +2510,9 @@ fn member_items<'a, 'bump>(
                 let id = StrId(ctx.string_pool.intern(seg));
                 let dep = state.compiler.dep_graph_ref().borrow();
                 match dep.resolve_item_in_module(m, id) {
-                    Some((dm, idx, tag)) if matches!(tag, "type" | "trait") => Recv::Type(dm, idx),
+                    Some((dm, idx, tag)) if matches!(tag, "type" | "interface") => {
+                        Recv::Type(dm, idx)
+                    }
                     _ => return vec![],
                 }
             }
@@ -2744,8 +2738,6 @@ fn static_items<'a, 'bump>(
     method_items(ctx, key, false, from, &mut items, &mut seen);
     items
 }
-
-// ---------- struct literal fields ----------
 
 fn struct_init_items<'a, 'bump>(
     state: &ServerState<'a, 'bump>,

@@ -196,6 +196,8 @@ name = "codex-dependency-graph"
 version = "0.1.0"
 dependencies = [
  "ir",
+ "scribe-parser",
+ "smallvec 2.0.0-alpha.12",
  "thiserror",
  "zetaruntime",
 ]
@@ -817,7 +819,9 @@ dependencies = [
  "owo-colors",
  "rstest",
  "smallvec 2.0.0-alpha.12",
+ "stable-hash-proc-macro",
  "thiserror",
+ "xxhash-rust",
  "zetaruntime",
 ]
 
@@ -1243,11 +1247,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scribe-parser"
+name = "scribe-hir-lowerer"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
  "codex-dependency-graph",
+ "ir",
+ "smallvec 2.0.0-alpha.12",
+ "zetaruntime",
+]
+
+[[package]]
+name = "scribe-parser"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
  "ir",
  "smallvec 2.0.0-alpha.12",
  "zetaruntime",
@@ -1352,6 +1366,15 @@ name = "smallvec"
 version = "2.0.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
+
+[[package]]
+name = "stable-hash-proc-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "stable_deref_trait"
@@ -1738,6 +1761,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1829,6 +1858,7 @@ dependencies = [
  "engraver-assembly-emit",
  "io-uring",
  "ir",
+ "scribe-hir-lowerer",
  "scribe-parser",
  "sentinel-typechecker",
  "walkdir",
@@ -1841,10 +1871,12 @@ name = "zeta-lang"
 version = "0.3.1-alpha"
 dependencies = [
  "clap",
+ "codex-dependency-graph",
  "mimalloc",
  "thiserror",
  "walkdir",
  "zeta-compiler-api",
+ "zetaruntime",
 ]
 
 [[package]]
@@ -1853,6 +1885,7 @@ version = "0.3.1-alpha"
 dependencies = [
  "anyhow",
  "clap",
+ "codex-dependency-graph",
  "ir",
  "lsp-server",
  "lsp-types",
@@ -1860,6 +1893,7 @@ dependencies = [
  "serde_json",
  "url",
  "zeta-compiler-api",
+ "zetaruntime",
 ]
 
 [[package]]
