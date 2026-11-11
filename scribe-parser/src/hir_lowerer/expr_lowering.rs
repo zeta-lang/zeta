@@ -945,6 +945,7 @@ impl<'a, 'bump> HirLowerer<'a, 'bump> {
                 return Some(*iface_name);
             }
         }
+
         None
     }
 
